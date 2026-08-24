@@ -256,11 +256,6 @@ fn validate_one_shot_args(args: &ShadowArgs) -> Result<(), String> {
             "one-shot generation requires -p or --prompt-file; REPL is not implemented".into(),
         );
     }
-    if !args.nothink {
-        return Err(
-            "thinking output formatting is not implemented in ds4-rs; use --nothink".into(),
-        );
-    }
     if args.mtp.is_some() || args.dspark.is_some() {
         return Err("one-shot generation with --mtp/--dspark is not implemented in ds4-rs".into());
     }
@@ -275,6 +270,80 @@ fn generation_limit(ctx: i32, pos: i32, requested: i32) -> i32 {
 fn sampled_generation_limit(ctx: i32, pos: i32, requested: i32) -> i32 {
     let room = ctx.saturating_sub(pos).saturating_sub(1);
     requested.min(room).max(0)
+}
+
+const THINK_OPEN: &[u8] = b"<think>";
+const THINK_CLOSE: &[u8] = b"</think>";
+
+// Non-TTY byte parity only. The Rust shadow intentionally emits no ANSI color.
+struct TokenPrinter {
+    format_thinking: bool,
+    pending: Vec<u8>,
+    last_output_newline: bool,
+}
+
+impl TokenPrinter {
+    fn new(format_thinking: bool) -> Self {
+        Self {
+            format_thinking,
+            pending: Vec::new(),
+            last_output_newline: true,
+        }
+    }
+
+    fn write_text<W: std::io::Write>(&mut self, out: &mut W, text: &[u8]) -> std::io::Result<()> {
+        if !self.format_thinking {
+            out.write_all(text)?;
+            if let Some(last) = text.last() {
+                self.last_output_newline = *last == b'\n';
+            }
+            return Ok(());
+        }
+
+        let mut bytes = std::mem::take(&mut self.pending);
+        bytes.extend_from_slice(text);
+        let mut i = 0;
+        while i < bytes.len() {
+            let rem = &bytes[i..];
+            if rem.starts_with(THINK_OPEN) {
+                i += THINK_OPEN.len();
+                continue;
+            }
+            if rem.starts_with(THINK_CLOSE) {
+                if !self.last_output_newline {
+                    out.write_all(b"\n")?;
+                    self.last_output_newline = true;
+                }
+                i += THINK_CLOSE.len();
+                continue;
+            }
+            if rem[0] == b'<'
+                && ((rem.len() < THINK_OPEN.len() && THINK_OPEN.starts_with(rem))
+                    || (rem.len() < THINK_CLOSE.len() && THINK_CLOSE.starts_with(rem)))
+            {
+                self.pending.extend_from_slice(rem);
+                break;
+            }
+
+            out.write_all(&rem[..1])?;
+            self.last_output_newline = rem[0] == b'\n';
+            i += 1;
+        }
+        Ok(())
+    }
+
+    fn finish<W: std::io::Write>(&mut self, out: &mut W) -> std::io::Result<()> {
+        if self.format_thinking && !self.pending.is_empty() {
+            out.write_all(&self.pending)?;
+            self.last_output_newline = self.pending.last() == Some(&b'\n');
+            self.pending.clear();
+        }
+        if !self.last_output_newline {
+            out.write_all(b"\n")?;
+            self.last_output_newline = true;
+        }
+        out.flush()
+    }
 }
 
 fn run_one_shot(model: &ds4_core::Model, args: &ShadowArgs, text: &str) -> Result<i32, String> {
@@ -313,7 +382,7 @@ fn run_one_shot(model: &ds4_core::Model, args: &ShadowArgs, text: &str) -> Resul
     }
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let mut last_output_newline = true;
+    let mut printer = TokenPrinter::new(!args.nothink);
     let mut decode_error = None;
 
     for generated in 0..max_tokens {
@@ -341,10 +410,9 @@ fn run_one_shot(model: &ds4_core::Model, args: &ShadowArgs, text: &str) -> Resul
         }
 
         let piece = model.token_text(token).map_err(|e| e.to_string())?;
-        if let Some(last) = piece.last() {
-            last_output_newline = *last == b'\n';
-        }
-        out.write_all(&piece).map_err(|e| e.to_string())?;
+        printer
+            .write_text(&mut out, &piece)
+            .map_err(|e| e.to_string())?;
         out.flush().map_err(|e| e.to_string())?;
 
         if !sampled {
@@ -357,10 +425,7 @@ fn run_one_shot(model: &ds4_core::Model, args: &ShadowArgs, text: &str) -> Resul
             }
         }
     }
-    if !last_output_newline {
-        out.write_all(b"\n").map_err(|e| e.to_string())?;
-    }
-    out.flush().map_err(|e| e.to_string())?;
+    printer.finish(&mut out).map_err(|e| e.to_string())?;
     match decode_error {
         Some(error) => Err(error),
         None => Ok(0),
@@ -493,8 +558,8 @@ Usage:
   {name} --session-plan CMD [ARGS...]
   {name} --session-payload CMD [ARGS...]
   {name} -m MODEL [--backend cuda|cpu|metal] [-c CTX] [--lifecycle]
-  {name} -m MODEL (-p PROMPT | --prompt-file FILE) --nothink [-n N]
-      [--temp F --top-p F --min-p F --seed N]
+  {name} -m MODEL (-p PROMPT | --prompt-file FILE) [-n N]
+      [--think|--nothink] [--temp F --top-p F --min-p F --seed N]
   {name} -m MODEL --token-ids 1,2,3 [--predict N]
   {name} -m MODEL [--mtp GGUF] [--dspark GGUF] ...
   {name} --cuda -m MODEL --temp 0 -n N [--nothink] --dump-logprobs F \\
@@ -508,6 +573,7 @@ the engine, argmax decode, host stop set); ctx grows to fit prompt+n
 unless -c is explicit.
 One-shot sampling uses the native C sampler; an explicit --seed is
 reproducible across the C and Rust hosts.
+Thinking tags follow the C non-TTY byte contract; ANSI coloring is omitted.
 --tokens is the C-compatible output budget; --token-ids is the shadow-only
 raw token-ID diagnostic.
 
@@ -767,6 +833,16 @@ fn parse_tokens(value: &str) -> Result<Vec<i32>, String> {
 mod tests {
     use super::*;
 
+    fn format_fragments(format_thinking: bool, parts: &[&[u8]]) -> Vec<u8> {
+        let mut printer = TokenPrinter::new(format_thinking);
+        let mut out = Vec::new();
+        for part in parts {
+            printer.write_text(&mut out, part).unwrap();
+        }
+        printer.finish(&mut out).unwrap();
+        out
+    }
+
     fn args(parts: &[&str]) -> Vec<String> {
         std::iter::once("ds4-rs".to_string())
             .chain(parts.iter().map(|s| (*s).to_string()))
@@ -907,10 +983,8 @@ mod tests {
         let sampled = parse_args(args(&["-p", "hello", "--temp", "0.5", "--nothink"])).unwrap();
         assert!(validate_one_shot_args(&sampled).is_ok());
 
-        let thinking = parse_args(args(&["-p", "hello", "--temp", "0"])).unwrap();
-        assert!(validate_one_shot_args(&thinking)
-            .unwrap_err()
-            .contains("thinking output formatting is not implemented"));
+        let thinking = parse_args(args(&["-p", "hello", "--temp", "0", "--think"])).unwrap();
+        assert!(validate_one_shot_args(&thinking).is_ok());
 
         let mtp = parse_args(args(&[
             "-p",
@@ -954,6 +1028,49 @@ mod tests {
             "<｜begin▁of▁sentence｜>already rendered"
         ));
         assert!(!is_rendered_chat_prompt("plain user prompt"));
+    }
+
+    #[test]
+    fn formats_thinking_tags_split_across_pieces() {
+        assert_eq!(
+            format_fragments(
+                true,
+                &[b"<thi", b"nk>plan", b"</thi", b"nk>answer"],
+            ),
+            b"plan\nanswer\n"
+        );
+        assert_eq!(
+            format_fragments(true, &[b"<thi", b"x"]),
+            b"<thix\n"
+        );
+    }
+
+    #[test]
+    fn preserves_c_thinking_newline_and_finish_rules() {
+        assert_eq!(
+            format_fragments(true, &[b"</think>", b"answer\n"]),
+            b"answer\n"
+        );
+        assert_eq!(
+            format_fragments(
+                true,
+                &[b"plan\n</think>", b"\nanswer"],
+            ),
+            b"plan\n\nanswer\n"
+        );
+        assert_eq!(
+            format_fragments(true, &[b"plan</thi"]),
+            b"plan</thi\n"
+        );
+        assert_eq!(format_fragments(true, &[]), b"");
+    }
+
+    #[test]
+    fn leaves_nothink_output_unformatted() {
+        assert_eq!(
+            format_fragments(false, &[b"<thi", b"nk>x</think>"]),
+            b"<think>x</think>\n"
+        );
     }
 
     #[test]
