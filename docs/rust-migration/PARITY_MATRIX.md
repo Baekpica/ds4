@@ -62,11 +62,15 @@ C save    → C load
 
 No new checkpoint format.
 
-Current seams are green for metadata-only KVC indexing (including a sparse
-4 GiB payload fixture), bounded text-prefix comparison, and embedded DSV4
-range validation. The no-GPU C oracle proves nonzero seek, exact length,
-EOF rejection, and `uint64` overflow rejection. Production serial-server
-evict/save/restore and live same-model CUDA range restore remain pending.
+Current isolated seams are green for metadata-only KVC indexing (including a
+sparse 4 GiB payload fixture), bounded text-prefix comparison, embedded DSV4
+range validation, and a file-backed Rust payload writer. The writer stages the
+complete stream before eviction, protects a replaced destination, preserves
+the C-compatible O(trailer) fast path, and produces payload/trailer bytes read
+exactly by the C oracle. The no-GPU C oracle also proves nonzero seek, exact
+length, EOF rejection, and `uint64` overflow rejection. Production
+serial-server evict/save/restore and live same-model CUDA range restore remain
+pending.
 
 ### Phase 5 — web utility
 
