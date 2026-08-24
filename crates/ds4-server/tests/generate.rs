@@ -608,6 +608,41 @@ fn cont_stepper_streams_and_stops_on_budget() {
 }
 
 #[test]
+fn cont_stepper_stream_tool_id_matches_outcome() {
+    let mut parsed = tools_req();
+    parsed.stream = true;
+    let (mut stepper, _) = ContStepper::new(
+        &parsed,
+        0,
+        "chatcmpl-cont-tool",
+        CREATED_TEST,
+        false,
+        64,
+        b"prompt".to_vec(),
+        1,
+        8192,
+    );
+    let block = concat!(
+        "<｜DSML｜tool_calls>\n",
+        "<｜DSML｜invoke name=\"bash\">\n",
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls",
+        "</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n",
+        "</｜DSML｜tool_calls>"
+    );
+    let streamed = stepper.feed(block.as_bytes());
+    assert!(streamed.done);
+    let (terminal, outcome) =
+        stepper.finalize(false, 0, 1, ReqTimings::default(), false);
+    assert_eq!(outcome.tool_ids.len(), 1);
+    let id = &outcome.tool_ids[0];
+    assert!(id.starts_with("call_"));
+    assert_eq!(id.len(), 37);
+    assert!(String::from_utf8_lossy(&streamed.bytes).contains(id));
+    assert!(String::from_utf8_lossy(&terminal).contains("data: [DONE]"));
+}
+
+#[test]
 fn bridge_null_oracle_ok() {
     let p = if let Ok(v) = std::env::var("DS4_BRIDGE_NULL_ORACLE") {
         PathBuf::from(v)
@@ -665,7 +700,21 @@ fn scripted_dsml_tools_emit_tool_calls() {
     assert!(s.contains("\"finish_reason\":\"tool_calls\""), "{s}");
     assert!(s.contains("\"tool_calls\":["), "{s}");
     assert!(s.contains("\"name\":\"bash\""), "{s}");
-    assert!(s.contains("\"id\":\"chatcmpl-tools_tool_0\""), "{s}");
+    let id = s
+        .split("\"tool_calls\":[{\"id\":\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    assert_eq!(id.len(), 37, "{s}");
+    assert!(id.starts_with("call_"), "{s}");
+    assert!(
+        id[5..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{s}"
+    );
     assert!(s.contains("ls"), "{s}");
 }
 

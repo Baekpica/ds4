@@ -161,24 +161,40 @@ fn anthropic_tool_turn_publishes_and_holds_next_seat() {
             "</｜DSML｜tool_calls>"
         )
         .as_bytes()]);
-        for _ in 0..2 {
+        for _ in 0..3 {
             let (mut s, _) = listener.accept().unwrap();
             handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine), None);
         }
         let g = inner.lock().unwrap();
-        assert_eq!(g.creg.n_live(), 1);
-        assert!(g.creg.id_known("chatcmpl-1_tool_0"));
+        assert_eq!(g.creg.n_live(), 0);
     });
     let tools = r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":16,"thinking":{"type":"disabled"},"tools":[{"name":"bash","input_schema":{"type":"object"}}]}"#;
     let first = http_post(addr, "/v1/messages", tools);
     assert!(first.starts_with("HTTP/1.1 200 "), "{first}");
     assert!(first.contains("\"tool_use\""), "{first}");
+    let tool_id = first
+        .split("\"type\":\"tool_use\",\"id\":\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    assert_eq!(tool_id.len(), 38);
+    assert!(tool_id.starts_with("toolu_"));
     let second = http_post(
         addr,
         "/v1/chat/completions",
         r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#,
     );
-    h.join().unwrap();
     assert!(second.starts_with("HTTP/1.1 503 "), "{second}");
     assert!(second.contains("live tool continuation"), "{second}");
+    let resumed = http_post(
+        addr,
+        "/v1/messages",
+        &format!(
+            r#"{{"messages":[{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{tool_id}","content":"ok"}}]}}],"max_tokens":8}}"#
+        ),
+    );
+    h.join().unwrap();
+    assert!(resumed.starts_with("HTTP/1.1 200 "), "{resumed}");
 }

@@ -875,12 +875,16 @@ pub(crate) fn generate_terminal_at(
 
     let mut w = Writer::new(created);
     let mut oa = if req.stream && req.api == Api::Openai && req.kind == ReqKind::Chat {
-        Some(openai_stream_start(&req))
+        let mut stream = openai_stream_start(&req);
+        stream.tool.use_random_ids();
+        Some(stream)
     } else {
         None
     };
     let mut anth = if req.stream && req.api == Api::Anthropic {
-        Some(anthropic_sse_start_live(&mut w, &req, job_id, prompt_n))
+        let mut stream = anthropic_sse_start_live(&mut w, &req, job_id, prompt_n);
+        stream.tool.use_random_ids();
+        Some(stream)
     } else {
         None
     };
@@ -1056,7 +1060,14 @@ pub(crate) fn generate_terminal_at(
         if let Some(st) = anth.as_ref() {
             st.tool.apply_ids(&mut parsed_gen.calls);
         }
-        assign_tool_ids(&mut parsed_gen.calls, job_id);
+        assign_tool_ids(
+            &mut parsed_gen.calls,
+            if parsed.api == Api::Anthropic {
+                "toolu_"
+            } else {
+                "call_"
+            },
+        );
         finish = "tool_calls";
     }
     if let Some(visible) = motif3_no_think_visible_checkpoint(

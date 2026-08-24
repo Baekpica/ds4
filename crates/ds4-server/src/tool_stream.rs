@@ -5,10 +5,10 @@ use crate::json::json_escape_bytes;
 use crate::parse::ToolCall;
 use crate::stream::utf8_stream_safe_len;
 use crate::tools::{
-    dsml_attr, dsml_unescape_text, DSML_INVOKE_END, DSML_INVOKE_END_SHORT, DSML_INVOKE_START,
-    DSML_INVOKE_START_SHORT, DSML_PARAM_END, DSML_PARAM_END_SHORT, DSML_PARAM_START,
-    DSML_PARAM_START_SHORT, DSML_TOOL_CALLS_END, DSML_TOOL_CALLS_END_SHORT, DSML_TOOL_CALLS_START,
-    DSML_TOOL_CALLS_START_SHORT,
+    dsml_attr, dsml_unescape_text, mint_tool_id, DSML_INVOKE_END, DSML_INVOKE_END_SHORT,
+    DSML_INVOKE_START, DSML_INVOKE_START_SHORT, DSML_PARAM_END, DSML_PARAM_END_SHORT,
+    DSML_PARAM_START, DSML_PARAM_START_SHORT, DSML_TOOL_CALLS_END, DSML_TOOL_CALLS_END_SHORT,
+    DSML_TOOL_CALLS_START, DSML_TOOL_CALLS_START_SHORT,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +70,7 @@ pub struct DsmlToolStream {
     param_is_string: bool,
     ids: Vec<String>,
     id_prefix: &'static str,
+    random_ids: bool,
 }
 
 impl Default for DsmlToolStream {
@@ -86,6 +87,7 @@ impl Default for DsmlToolStream {
             param_is_string: false,
             ids: Vec::new(),
             id_prefix: "call_",
+            random_ids: false,
         }
     }
 }
@@ -98,9 +100,15 @@ impl DsmlToolStream {
         }
     }
 
+    pub(crate) fn use_random_ids(&mut self) {
+        self.random_ids = true;
+    }
+
     pub fn init(&mut self, raw: &[u8], pos: usize) -> bool {
         let prefix = self.id_prefix;
+        let random_ids = self.random_ids;
         *self = Self::with_prefix(prefix);
+        self.random_ids = random_ids;
         self.active = true;
         self.state = DsmlToolState::BetweenInvokes;
         for syn in DSML_SYNTAXES {
@@ -124,7 +132,11 @@ impl DsmlToolStream {
             self.ids.push(String::new());
         }
         if self.ids[i].is_empty() {
-            self.ids[i] = format!("{}{index}", self.id_prefix);
+            self.ids[i] = if self.random_ids {
+                mint_tool_id(self.id_prefix)
+            } else {
+                format!("{}{index}", self.id_prefix)
+            };
         }
         self.ids[i].clone()
     }
@@ -671,5 +683,32 @@ pub fn dump_script(name: &str) -> Vec<u8> {
             w.out
         }
         _ => b"ERROR unknown-script\n".to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::{DsmlToolStream, DSML_TOOL_CALLS_START};
+    use crate::parse::ToolCall;
+
+    #[test]
+    fn random_stream_ids_are_unique_and_inherited_by_final_calls() {
+        let mut first = DsmlToolStream::with_prefix("call_");
+        first.use_random_ids();
+        assert!(first.init(DSML_TOOL_CALLS_START.as_bytes(), 0));
+        let id = first.id_at(0);
+        assert_eq!(id.len(), 37);
+        assert!(id.starts_with("call_"));
+        assert!(id[5..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+
+        let mut calls = vec![ToolCall::default()];
+        first.apply_ids(&mut calls);
+        assert_eq!(calls[0].id, id);
+
+        let mut second = DsmlToolStream::with_prefix("call_");
+        second.use_random_ids();
+        assert_ne!(second.id_at(0), id);
     }
 }

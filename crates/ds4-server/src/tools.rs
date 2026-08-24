@@ -10,6 +10,11 @@ use crate::render::{
 };
 use crate::dsml::{DsmlDecodeState, DsmlDecodeTracker, SampleOverride, SamplePolicy};
 use crate::stream::{think_end, think_start, ChatFormat};
+use std::collections::HashSet;
+use std::fs::File;
+use std::io::Read as _;
+use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DSML_TOOL_CALLS_START: &str = "<｜DSML｜tool_calls>";
 pub const DSML_TOOL_CALLS_END: &str = "</｜DSML｜tool_calls>";
@@ -1044,12 +1049,53 @@ pub fn observe_tool_markers(
     (entered, closed)
 }
 
-pub fn assign_tool_ids(calls: &mut [ToolCall], id_prefix: &str) {
-    for (i, tc) in calls.iter_mut().enumerate() {
-        if tc.id.is_empty() {
-            tc.id = format!("{id_prefix}_tool_{i}");
+static TOOL_ID_COUNTER: OnceLock<Mutex<u128>> = OnceLock::new();
+
+fn tool_id_seed() -> u128 {
+    let mut bytes = [0u8; 16];
+    if File::open("/dev/urandom")
+        .and_then(|mut file| file.read_exact(&mut bytes))
+        .is_ok()
+    {
+        return u128::from_le_bytes(bytes);
+    }
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    time ^ u128::from(std::process::id())
+}
+
+pub(crate) fn mint_tool_id(prefix: &str) -> String {
+    let counter = TOOL_ID_COUNTER.get_or_init(|| Mutex::new(tool_id_seed()));
+    let mut counter = counter.lock().unwrap_or_else(|error| error.into_inner());
+    let value = *counter;
+    *counter = counter.wrapping_add(1);
+    format!("{prefix}{value:032x}")
+}
+
+fn assign_tool_ids_with(
+    calls: &mut [ToolCall],
+    prefix: &str,
+    mut mint: impl FnMut(&str) -> String,
+) {
+    let mut used: HashSet<String> = calls
+        .iter()
+        .filter(|call| !call.id.is_empty())
+        .map(|call| call.id.clone())
+        .collect();
+    for tc in calls {
+        while tc.id.is_empty() {
+            let id = mint(prefix);
+            if used.insert(id.clone()) {
+                tc.id = id;
+            }
         }
     }
+}
+
+pub fn assign_tool_ids(calls: &mut [ToolCall], prefix: &str) {
+    assign_tool_ids_with(calls, prefix, mint_tool_id);
 }
 
 fn stop_list_find_from(stops: &[String], text: &[u8], from: usize) -> Option<(usize, usize)> {
@@ -1340,4 +1386,25 @@ impl SemAccum {
 
 fn tail_ends_with(tail: &[u8], s: &[u8]) -> bool {
     tail.len() >= s.len() && tail[tail.len() - s.len()..] == s[..]
+}
+
+#[cfg(test)]
+mod tool_id_tests {
+    use super::assign_tool_ids_with;
+    use crate::parse::ToolCall;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn assignment_retries_ids_already_present_in_the_turn() {
+        let mut calls = vec![
+            ToolCall {
+                id: "call_taken".into(),
+                ..Default::default()
+            },
+            ToolCall::default(),
+        ];
+        let mut minted = VecDeque::from(["call_taken".to_string(), "call_fresh".to_string()]);
+        assign_tool_ids_with(&mut calls, "call_", |_| minted.pop_front().unwrap());
+        assert_eq!(calls[1].id, "call_fresh");
+    }
 }

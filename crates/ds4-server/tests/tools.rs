@@ -199,11 +199,26 @@ fn sem_accum_dsml_closes_and_no_tools_cuts() {
 
 #[test]
 fn assign_tool_ids_fills_empty() {
-    let mut calls = vec![ToolCall {
-        name: "a".into(),
-        arguments: "{}".into(),
-        ..Default::default()
-    }];
-    assign_tool_ids(&mut calls, "id");
-    assert_eq!(calls[0].id, "id_tool_0");
+    let mut calls = vec![
+        ToolCall {
+            name: "a".into(),
+            arguments: "{}".into(),
+            ..Default::default()
+        },
+        ToolCall {
+            id: "supplied".into(),
+            ..Default::default()
+        },
+        ToolCall::default(),
+    ];
+    assign_tool_ids(&mut calls, "call_");
+    for id in [&calls[0].id, &calls[2].id] {
+        assert_eq!(id.len(), 37);
+        assert!(id.starts_with("call_"));
+        assert!(id[5..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+    }
+    assert_ne!(calls[0].id, calls[2].id);
+    assert_eq!(calls[1].id, "supplied");
 }

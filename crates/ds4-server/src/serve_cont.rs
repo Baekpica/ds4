@@ -86,7 +86,8 @@ impl ContStepper {
         if req.stream {
             w.out.extend_from_slice(&sse_headers(cors));
             if req.api == Api::Openai && req.kind == ReqKind::Chat {
-                let st = openai_stream_start(&req);
+                let mut st = openai_stream_start(&req);
+                st.tool.use_random_ids();
                 oa = Some(st);
                 sse_chunk(&mut w, &req, job_id, None, None);
             }
@@ -248,7 +249,14 @@ impl ContStepper {
             if let Some(st) = self.oa.as_ref() {
                 st.tool.apply_ids(&mut parsed_gen.calls);
             }
-            assign_tool_ids(&mut parsed_gen.calls, &self.job_id);
+            assign_tool_ids(
+                &mut parsed_gen.calls,
+                if self.req.api == Api::Anthropic {
+                    "toolu_"
+                } else {
+                    "call_"
+                },
+            );
             self.finish = "tool_calls";
         }
         /* cont_usage_apply_engine_split, ordinary-request frame: whatever

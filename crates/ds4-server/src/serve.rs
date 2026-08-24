@@ -2119,7 +2119,12 @@ mod owner_tests {
                 &mut full,
             )
             .unwrap();
-            assert!(full.starts_with(&prefix));
+            let stable = [b"call_".as_slice(), b"toolu_".as_slice()]
+                .iter()
+                .filter_map(|needle| prefix.windows(needle.len()).position(|window| window == *needle))
+                .min()
+                .unwrap_or(prefix.len());
+            assert!(full.starts_with(&prefix[..stable]));
             assert!(String::from_utf8_lossy(&full).contains(terminal_marker));
         }
     }
@@ -2193,7 +2198,6 @@ mod owner_tests {
         assert_eq!(g.runtime.requests_completed, 0);
         assert_eq!(g.runtime.requests_canceled, 0);
         assert_eq!(g.runtime.requests_failed, 0);
-        assert!(!g.creg.id_known("chatcmpl-1_tool_0"));
         assert_eq!(g.creg.n_live(), 0);
     }
 
