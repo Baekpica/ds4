@@ -11,8 +11,13 @@ use crate::policy::{
 };
 use std::fs;
 use std::io::{self, Seek as _, SeekFrom, Write as _};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static PAYLOAD_TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub struct Entry {
@@ -32,6 +37,23 @@ pub struct Store {
     entries: Vec<Entry>,
 }
 
+#[derive(Debug)]
+pub struct PayloadTemp {
+    path: PathBuf,
+}
+
+impl PayloadTemp {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PayloadTemp {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 impl Store {
     pub fn open(
         dir: impl AsRef<Path>,
@@ -40,6 +62,12 @@ impl Store {
         opt: Options,
     ) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
+        #[cfg(unix)]
+        {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700).create(&dir)?;
+        }
+        #[cfg(not(unix))]
         fs::create_dir_all(&dir)?;
         let budget_mb = if budget_mb == 0 { DEFAULT_MB } else { budget_mb };
         let mut store = Self {
@@ -52,6 +80,24 @@ impl Store {
         };
         store.evict(0, None);
         Ok(store)
+    }
+
+    pub fn payload_temp(&self) -> io::Result<PayloadTemp> {
+        loop {
+            let seq = PAYLOAD_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = self
+                .dir
+                .join(format!(".payload.{}.{}", std::process::id(), seq));
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            match options.open(&path) {
+                Ok(_) => return Ok(PayloadTemp { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn refresh(&mut self) {
@@ -534,6 +580,78 @@ mod tests {
             payload: vec![0xAA],
             trailer: Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_nested_store_directories_are_private() {
+        let base =
+            std::env::temp_dir().join(format!("ds4-kv-private-dir-{}", std::process::id()));
+        let dir = base.join("nested/store");
+        let _ = fs::remove_dir_all(&base);
+
+        let _store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        for path in [&base, &base.join("nested"), &dir] {
+            assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+        }
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_store_directory_mode_is_unchanged() {
+        let dir =
+            std::env::temp_dir().join(format!("ds4-kv-existing-dir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o755);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payload_temp_is_private_and_drop_removes_it() {
+        let dir =
+            std::env::temp_dir().join(format!("ds4-kv-payload-temp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::open(&dir, 16, false, Options::default()).unwrap();
+
+        let temp = store.payload_temp().unwrap();
+        let path = temp.path().to_path_buf();
+        assert!(path.exists());
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+
+        drop(temp);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn payload_temps_are_distinct_and_drop_independently() {
+        let dir =
+            std::env::temp_dir().join(format!("ds4-kv-payload-pair-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::open(&dir, 16, false, Options::default()).unwrap();
+
+        let first = store.payload_temp().unwrap();
+        let second = store.payload_temp().unwrap();
+        let first_path = first.path().to_path_buf();
+        let second_path = second.path().to_path_buf();
+        assert_ne!(first_path, second_path);
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+
+        drop(first);
+        assert!(!first_path.exists());
+        assert!(second_path.exists());
+        drop(second);
+        assert!(!second_path.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
