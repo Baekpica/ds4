@@ -267,7 +267,33 @@ impl Store {
         quant_bits: u8,
         ctx_size: u32,
     ) -> io::Result<Option<(PathBuf, Envelope)>> {
-        let Some(index) = self.find_text_prefix(prompt, model_id, quant_bits, ctx_size) else {
+        self.prefix_candidate(prompt, model_id, quant_bits, ctx_size, false)
+    }
+
+    pub fn bank_text_prefix_candidate(
+        &mut self,
+        prompt: &[u8],
+        model_id: u8,
+        quant_bits: u8,
+        ctx_size: u32,
+    ) -> io::Result<Option<(PathBuf, Envelope)>> {
+        self.prefix_candidate(prompt, model_id, quant_bits, ctx_size, true)
+    }
+
+    fn prefix_candidate(
+        &mut self,
+        prompt: &[u8],
+        model_id: u8,
+        quant_bits: u8,
+        ctx_size: u32,
+        require_suffix: bool,
+    ) -> io::Result<Option<(PathBuf, Envelope)>> {
+        let index = if require_suffix {
+            self.find_bank_text_prefix(prompt, model_id, quant_bits, ctx_size)
+        } else {
+            self.find_text_prefix(prompt, model_id, quant_bits, ctx_size)
+        };
+        let Some(index) = index else {
             return Ok(None);
         };
         let entry = self.entries[index].clone();
@@ -280,10 +306,12 @@ impl Store {
             && header.text_bytes == entry.header.text_bytes;
         let bank_without_logits = is_bank_replay_v1(header.reason, header.ext_flags)
             && envelope.text.len() == prompt.len();
+        let missing_suffix = require_suffix && envelope.text.len() >= prompt.len();
         if !is_automatic_exact_replay(header.reason, header.ext_flags)
             || !unchanged
             || header.model_id != model_id
             || bank_without_logits
+            || missing_suffix
             || envelope.text.len() > prompt.len()
             || text_sha_hex(&envelope.text) != entry.sha
             || !prompt.starts_with(&envelope.text)
@@ -1126,6 +1154,57 @@ mod tests {
         file.flush().unwrap();
         assert!(store
             .text_prefix_candidate(b"shared prefix and suffix", 0, 2, 8192)
+            .unwrap()
+            .is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bank_candidate_requires_a_valid_strict_suffix() {
+        let dir = std::env::temp_dir().join(format!(
+            "ds4-kv-bank-candidate-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let mut record = rec(b"shared prefix", 512);
+        record.header.reason = Reason::BankShutdown;
+        record.header.ext_flags = crate::format::EXT_BANK_REPLAY_V1;
+        let path = store.write(record).unwrap();
+        let mut serial = rec(b"serial exact", 512);
+        serial.header.reason = Reason::Shutdown;
+        let serial_path = store.write(serial).unwrap();
+
+        assert!(store
+            .bank_text_prefix_candidate(b"shared prefix", 0, 2, 8192)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .bank_text_prefix_candidate(b"serial exact", 0, 2, 8192)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store
+                .bank_text_prefix_candidate(b"serial exact suffix", 0, 2, 8192)
+                .unwrap()
+                .unwrap()
+                .0,
+            serial_path
+        );
+        let (got_path, envelope) = store
+            .bank_text_prefix_candidate(b"shared prefix and suffix", 0, 2, 8192)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got_path, path);
+        assert_eq!(envelope.text, b"shared prefix");
+
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start((crate::format::FIXED_HEADER + 4) as u64))
+            .unwrap();
+        file.write_all(b"X").unwrap();
+        file.flush().unwrap();
+        assert!(store
+            .bank_text_prefix_candidate(b"shared prefix and suffix", 0, 2, 8192)
             .unwrap()
             .is_none());
         let _ = fs::remove_dir_all(&dir);
