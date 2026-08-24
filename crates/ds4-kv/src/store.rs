@@ -151,6 +151,39 @@ impl Store {
         Ok(path)
     }
 
+    /// Return an already-compatible KVC entry before the caller stages its
+    /// opaque native payload. A nonempty trailer follows the writer fast path.
+    pub fn reuse_compatible(
+        &mut self,
+        mut header: Header,
+        text: &[u8],
+        trailer: &[u8],
+    ) -> io::Result<Option<PathBuf>> {
+        if !trailer.is_empty() {
+            header.ext_flags |= EXT_TOOL_MAP;
+        }
+        let sha = text_sha_hex(text);
+        let path = path_for_sha(&self.dir, &sha);
+        let Ok(existing) = read_envelope(&path) else {
+            return Ok(None);
+        };
+        let compatible = existing.header.model_id == header.model_id
+            && (!self.reject_different_quant
+                || existing.header.quant_bits == header.quant_bits)
+            && existing.header.ctx_size <= header.ctx_size
+            && is_automatic_exact_replay(existing.header.reason, existing.header.ext_flags)
+            && is_automatic_exact_replay(header.reason, header.ext_flags)
+            && existing.text == text
+            && text_sha_hex(&existing.text) == sha;
+        if !compatible {
+            return Ok(None);
+        }
+        if !trailer.is_empty() {
+            rewrite_compatible_trailer(&path, &existing, header.ext_flags, trailer)?;
+        }
+        Ok(Some(path))
+    }
+
     /// Store an opaque native payload without buffering it in Rust memory.
     /// A nonempty trailer is the frozen server tool-map suffix.
     pub fn write_payload_file(
@@ -169,27 +202,11 @@ impl Store {
         if !trailer.is_empty() {
             header.ext_flags |= EXT_TOOL_MAP;
         }
+        if let Some(path) = self.reuse_compatible(header.clone(), text, trailer)? {
+            return Ok(path);
+        }
         let sha = text_sha_hex(text);
         let path = path_for_sha(&self.dir, &sha);
-        if let Ok(existing) = read_envelope(&path) {
-            let compatible = existing.header.model_id == header.model_id
-                && (!self.reject_different_quant
-                    || existing.header.quant_bits == header.quant_bits)
-                && existing.header.ctx_size <= header.ctx_size
-                && is_automatic_exact_replay(
-                    existing.header.reason,
-                    existing.header.ext_flags,
-                )
-                && is_automatic_exact_replay(header.reason, header.ext_flags)
-                && existing.text == text
-                && text_sha_hex(&existing.text) == sha;
-            if compatible {
-                if !trailer.is_empty() {
-                    rewrite_compatible_trailer(&path, &existing, header.ext_flags, trailer)?;
-                }
-                return Ok(path);
-            }
-        }
         if payload_path == path {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -841,6 +858,120 @@ mod tests {
             .unwrap();
         assert_eq!(got, path);
         assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(sibling.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reuse_compatible_empty_trailer_returns_existing_without_staging() {
+        let dir =
+            std::env::temp_dir().join(format!("ds4-kv-preflight-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let mut existing = rec(b"same prompt", 512);
+        existing.header.hits = 7;
+        existing.trailer = b"old trailer".to_vec();
+        let path = store.write(existing).unwrap();
+        let sibling = store.write(rec(b"sibling", 1024)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let sibling_before = fs::read(&sibling).unwrap();
+
+        let mut incoming = rec(b"same prompt", 2048).header;
+        incoming.quant_bits = 4;
+        incoming.reason = Reason::Continued;
+        incoming.ext_flags = crate::format::EXT_RESPONSES_VISIBLE;
+        incoming.ctx_size = 4096;
+        incoming.created_at = 99;
+        incoming.last_used = 99;
+        store.budget_bytes = 1;
+
+        let got = store
+            .reuse_compatible(incoming, b"same prompt", b"")
+            .unwrap();
+
+        assert_eq!(got, Some(path.clone()));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read(&sibling).unwrap(), sibling_before);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reuse_compatible_incompatible_entry_returns_none_without_mutation() {
+        let dir = std::env::temp_dir().join(format!(
+            "ds4-kv-preflight-incompatible-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let path = store.write(rec(b"same prompt", 512)).unwrap();
+        let sibling = store.write(rec(b"sibling", 1024)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let sibling_before = fs::read(&sibling).unwrap();
+        let mut incoming = rec(b"same prompt", 512).header;
+        incoming.model_id = 1;
+        store.budget_bytes = 1;
+
+        let got = store
+            .reuse_compatible(incoming, b"same prompt", b"")
+            .unwrap();
+
+        assert_eq!(got, None);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read(&sibling).unwrap(), sibling_before);
+        assert_eq!(store.entries().len(), 2);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reuse_compatible_nonempty_trailer_matches_writer_fast_path() {
+        let dir =
+            std::env::temp_dir().join(format!("ds4-kv-preflight-trailer-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let mut existing = rec(b"same prompt", 512);
+        existing.header.hits = 7;
+        existing.header.created_at = 42;
+        existing.header.last_used = 43;
+        existing.header.ext_flags = crate::format::EXT_RESPONSES_VISIBLE;
+        existing.payload = b"opaque payload".to_vec();
+        existing.trailer = b"old trailer".to_vec();
+        let path = store.write(existing).unwrap();
+        let sibling = store.write(rec(b"sibling", 1024)).unwrap();
+        let before = read_path(&path).unwrap();
+
+        let mut incoming = rec(b"same prompt", 2048).header;
+        incoming.reason = Reason::Continued;
+        incoming.ext_flags = crate::format::EXT_THINKING_VISIBLE;
+        incoming.ctx_size = 4096;
+        incoming.created_at = 99;
+        incoming.last_used = 99;
+        store.budget_bytes = 1;
+        let started = now_secs();
+
+        let got = store
+            .reuse_compatible(incoming, b"same prompt", b"new tool map")
+            .unwrap();
+        let after = read_path(&path).unwrap();
+
+        assert_eq!(got, Some(path));
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.payload, before.payload);
+        assert_eq!(after.trailer, b"new tool map");
+        assert_eq!(after.header.model_id, before.header.model_id);
+        assert_eq!(after.header.quant_bits, before.header.quant_bits);
+        assert_eq!(after.header.reason, before.header.reason);
+        assert_eq!(after.header.tokens, before.header.tokens);
+        assert_eq!(after.header.hits, before.header.hits);
+        assert_eq!(after.header.ctx_size, before.header.ctx_size);
+        assert_eq!(after.header.created_at, before.header.created_at);
+        assert_eq!(after.header.payload_bytes, before.header.payload_bytes);
+        assert_eq!(after.header.text_bytes, before.header.text_bytes);
+        assert_eq!(
+            after.header.ext_flags,
+            before.header.ext_flags | crate::format::EXT_TOOL_MAP
+        );
+        assert!(after.header.last_used >= started);
         assert!(sibling.exists());
         let _ = fs::remove_dir_all(&dir);
     }
