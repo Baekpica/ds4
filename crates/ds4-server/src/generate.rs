@@ -8,7 +8,14 @@
 //! host-owned (`cont`).
 
 use std::io::Write;
+#[cfg(any(feature = "native", test))]
+use std::path::Path;
 use std::time::Instant;
+#[cfg(any(feature = "native", test))]
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(any(feature = "native", test))]
+use ds4_kv::{Header as KvHeader, Reason as KvReason, Store as KvStore};
 
 use crate::dsml::{SampleOverride, SamplePolicy};
 use crate::parse::{ParsedRequest, ToolChoice};
@@ -66,7 +73,12 @@ pub trait DecodeIo {
     fn token_text(&self, token: i32) -> Result<Vec<u8>, GenerateError>;
     fn token_is_stop(&self, token: i32) -> bool;
     fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError>;
-    fn sync_prompt(&mut self, _prompt: &[u8], tokens: &[i32]) -> Result<i32, GenerateError> {
+    fn sync_prompt(
+        &mut self,
+        _prompt: &[u8],
+        tokens: &[i32],
+        _disk_eligible: bool,
+    ) -> Result<i32, GenerateError> {
         self.sync(tokens)?;
         Ok(0)
     }
@@ -79,6 +91,196 @@ pub trait DecodeIo {
     fn session_tokens(&self) -> Vec<i32> {
         Vec::new()
     }
+}
+
+#[cfg(any(feature = "native", test))]
+#[derive(Clone, Copy)]
+struct DiskSyncPolicy {
+    save_current: bool,
+    load: bool,
+}
+
+#[cfg(any(feature = "native", test))]
+trait SerialKvIo {
+    fn ctx(&self) -> i32;
+    fn live_tokens(&self) -> Vec<i32>;
+    fn render_tokens(&self, tokens: &[i32]) -> Result<Vec<u8>, GenerateError>;
+    fn tokenize_suffix(&mut self, suffix: &[u8]) -> Result<Vec<i32>, GenerateError>;
+    fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError>;
+    fn save_payload(&mut self, path: &Path) -> Result<(), GenerateError>;
+    fn load_payload_range(
+        &mut self,
+        path: &Path,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), GenerateError>;
+    fn invalidate(&mut self);
+}
+
+#[cfg(any(feature = "native", test))]
+fn kv_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(any(feature = "native", test))]
+fn kv_identity(model_id: i32, quant_bits: i32, ctx: i32) -> Option<(u8, u8, u32)> {
+    let model_id = u8::try_from(model_id).ok()?;
+    let quant_bits = match quant_bits {
+        2 | 4 => quant_bits as u8,
+        _ => return None,
+    };
+    let ctx = u32::try_from(ctx).ok().filter(|ctx| *ctx > 0)?;
+    Some((model_id, quant_bits, ctx))
+}
+
+#[cfg(any(feature = "native", test))]
+fn kv_header(model_id: u8, quant_bits: u8, ctx: u32, tokens: u32) -> KvHeader {
+    let now = kv_now();
+    KvHeader {
+        quant_bits,
+        reason: KvReason::Evict,
+        ext_flags: 0,
+        model_id,
+        tokens,
+        hits: 0,
+        ctx_size: ctx,
+        created_at: now,
+        last_used: now,
+        payload_bytes: 0,
+        text_bytes: 0,
+    }
+}
+
+#[cfg(any(feature = "native", test))]
+fn try_store_current(
+    io: &mut impl SerialKvIo,
+    store: &mut KvStore,
+    model_id: u8,
+    quant_bits: u8,
+    ctx: u32,
+) -> Result<(), GenerateError> {
+    let live = io.live_tokens();
+    if live.len() < store.opt.min_tokens.max(0) as usize {
+        return Ok(());
+    }
+    let tokens = u32::try_from(live.len())
+        .map_err(|_| GenerateError::Engine("KVC token count exceeds u32".into()))?;
+    let text = io.render_tokens(&live)?;
+    let header = kv_header(model_id, quant_bits, ctx, tokens);
+    if store
+        .reuse_compatible(header.clone(), &text, b"")
+        .map_err(|error| GenerateError::Engine(error.to_string()))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let payload = store
+        .payload_temp()
+        .map_err(|error| GenerateError::Engine(error.to_string()))?;
+    io.save_payload(payload.path())?;
+    store
+        .write_payload_file(header, &text, payload.path(), b"")
+        .map_err(|error| GenerateError::Engine(error.to_string()))?;
+    Ok(())
+}
+
+#[cfg(any(feature = "native", test))]
+fn cold_sync(io: &mut impl SerialKvIo, tokens: &[i32]) -> Result<i32, GenerateError> {
+    io.sync(tokens)?;
+    Ok(0)
+}
+
+#[cfg(any(feature = "native", test))]
+fn discard_loaded(store: &mut KvStore, io: &mut impl SerialKvIo, path: &Path) {
+    store.continued_last_store_tokens = 0;
+    let _ = store.discard(path);
+    io.invalidate();
+}
+
+#[cfg(any(feature = "native", test))]
+fn disk_sync_prompt(
+    io: &mut impl SerialKvIo,
+    store: &mut KvStore,
+    model_id: i32,
+    quant_bits: i32,
+    prompt: &[u8],
+    canonical_tokens: &[i32],
+    policy: DiskSyncPolicy,
+) -> Result<i32, GenerateError> {
+    let live = io.live_tokens();
+    if !live.is_empty() && canonical_tokens.starts_with(&live) {
+        io.sync(canonical_tokens)?;
+        return Ok(live.len() as i32);
+    }
+    if !live.is_empty() {
+        let rendered = io.render_tokens(&live)?;
+        if prompt.starts_with(&rendered) {
+            let cached = live.len() as i32;
+            let mut effective = live;
+            effective.extend(io.tokenize_suffix(&prompt[rendered.len()..])?);
+            io.sync(&effective)?;
+            return Ok(cached);
+        }
+    }
+
+    store.continued_last_store_tokens = 0;
+    let Some((model_id, quant_bits, ctx)) = kv_identity(model_id, quant_bits, io.ctx()) else {
+        return cold_sync(io, canonical_tokens);
+    };
+    if policy.save_current {
+        let _ = try_store_current(io, store, model_id, quant_bits, ctx);
+    }
+    if !policy.load {
+        return cold_sync(io, canonical_tokens);
+    }
+    let candidate = match store.text_prefix_candidate(prompt, model_id, quant_bits, ctx) {
+        Ok(candidate) => candidate,
+        Err(_) => return cold_sync(io, canonical_tokens),
+    };
+    let Some((path, envelope)) = candidate else {
+        return cold_sync(io, canonical_tokens);
+    };
+    if envelope.header.ext_flags != 0 || envelope.trailer_bytes != 0 {
+        return cold_sync(io, canonical_tokens);
+    }
+    if io
+        .load_payload_range(
+            &path,
+            envelope.payload_offset,
+            envelope.header.payload_bytes,
+        )
+        .is_err()
+    {
+        io.invalidate();
+        return cold_sync(io, canonical_tokens);
+    }
+    let loaded = io.live_tokens();
+    if loaded.len() != envelope.header.tokens as usize {
+        io.invalidate();
+        let _ = store.discard(&path);
+        return cold_sync(io, canonical_tokens);
+    }
+    let cached = loaded.len() as i32;
+    store.continued_last_store_tokens = cached;
+    let _ = store.touch_hit(&path);
+    let mut effective = loaded;
+    let suffix = &prompt[envelope.text.len()..];
+    let suffix_tokens = match io.tokenize_suffix(suffix) {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            discard_loaded(store, io, &path);
+            return Err(error);
+        }
+    };
+    effective.extend(suffix_tokens);
+    if let Err(error) = io.sync(&effective) {
+        discard_loaded(store, io, &path);
+        return Err(error);
+    }
+    Ok(cached)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -131,6 +333,14 @@ pub fn render_prompt(parsed: &ParsedRequest, model_id: i32) -> Result<Vec<u8>, G
             parsed.tool_choice,
         )?),
     }
+}
+
+fn ordinary_disk_cache_eligible(parsed: &ParsedRequest) -> bool {
+    parsed.api == Api::Openai
+        && !think_mode_enabled(parsed.think_mode)
+        && !parsed.has_tools
+        && !parsed.has_tool_results
+        && parsed.live_call_ids.is_empty()
 }
 
 fn prepare_required_prefixes(
@@ -442,7 +652,11 @@ pub(crate) fn generate_terminal_at(
         ReqKind::Chat => engine.tokenize_rendered_chat(&prompt)?,
     };
     let t_prefill = Instant::now();
-    let cached = engine.sync_prompt(&prompt, &tokens)?;
+    let cached = engine.sync_prompt(
+        &prompt,
+        &tokens,
+        ordinary_disk_cache_eligible(&parsed),
+    )?;
     let decode_t0 = Instant::now();
     let mut first_tok = None;
     let mut decode_steps = 0i32;
@@ -907,10 +1121,73 @@ impl DecodeIo for ScriptedDecode {
 }
 
 #[cfg(feature = "native")]
+struct NativeSerialKvIo<'s, 'm, 'v> {
+    session: &'s mut ds4_core::Session<'m>,
+    vocab: &'v ds4_core::Vocab,
+}
+
+#[cfg(feature = "native")]
+impl SerialKvIo for NativeSerialKvIo<'_, '_, '_> {
+    fn ctx(&self) -> i32 {
+        self.session.ctx()
+    }
+
+    fn live_tokens(&self) -> Vec<i32> {
+        if self.session.host().valid {
+            self.session.host().tokens().to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn render_tokens(&self, tokens: &[i32]) -> Result<Vec<u8>, GenerateError> {
+        let mut text = Vec::new();
+        for &token in tokens {
+            text.extend(self.vocab.token_text(token));
+        }
+        Ok(text)
+    }
+
+    fn tokenize_suffix(&mut self, suffix: &[u8]) -> Result<Vec<i32>, GenerateError> {
+        Ok(self.vocab.encode_rendered_bytes(suffix))
+    }
+
+    fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError> {
+        let tokens = ds4_core::TokenBuffer::from_tokens(tokens.to_vec());
+        self.session
+            .sync(&tokens)
+            .map_err(|error| GenerateError::Engine(error.to_string()))
+    }
+
+    fn save_payload(&mut self, path: &Path) -> Result<(), GenerateError> {
+        self.session
+            .save_payload(path)
+            .map_err(|error| GenerateError::Engine(error.to_string()))
+    }
+
+    fn load_payload_range(
+        &mut self,
+        path: &Path,
+        offset: u64,
+        length: u64,
+    ) -> Result<(), GenerateError> {
+        self.session
+            .load_payload_range(path, offset, length)
+            .map_err(|error| GenerateError::Engine(error.to_string()))
+    }
+
+    fn invalidate(&mut self) {
+        self.session.invalidate();
+    }
+}
+
+#[cfg(feature = "native")]
 pub struct NativeDecode<'a> {
     model: &'a ds4_core::Model,
     vocab: Option<&'a ds4_core::Vocab>,
     session: Option<ds4_core::Session<'a>>,
+    store: Option<KvStore>,
+    session_disk_storable: bool,
     ctx: i32,
 }
 
@@ -921,12 +1198,19 @@ impl<'a> NativeDecode<'a> {
             model,
             vocab: None,
             session: None,
+            store: None,
+            session_disk_storable: false,
             ctx,
         }
     }
 
     pub fn with_vocab(mut self, vocab: &'a ds4_core::Vocab) -> Self {
         self.vocab = Some(vocab);
+        self
+    }
+
+    pub fn with_store(mut self, store: KvStore) -> Self {
+        self.store = Some(store);
         self
     }
 
@@ -992,6 +1276,46 @@ impl DecodeIo for NativeDecode<'_> {
             .map_err(|e| GenerateError::Engine(e.to_string()))
     }
 
+    fn sync_prompt(
+        &mut self,
+        prompt: &[u8],
+        tokens: &[i32],
+        disk_eligible: bool,
+    ) -> Result<i32, GenerateError> {
+        if self.store.is_none() {
+            self.session_disk_storable = false;
+            self.sync(tokens)?;
+            return Ok(0);
+        }
+
+        let model_id = self.model.model_id();
+        let quant_bits = self.model.routed_quant_bits();
+        let vocab = self.vocab.unwrap_or_else(|| self.model.vocab());
+        let save_current = self.session_disk_storable;
+        self.session()?;
+        let session = self.session.as_mut().ok_or_else(|| {
+            GenerateError::Engine("native session was not created".into())
+        })?;
+        let store = self.store.as_mut().ok_or_else(|| {
+            GenerateError::Engine("disk KV store was not configured".into())
+        })?;
+        let mut io = NativeSerialKvIo { session, vocab };
+        let result = disk_sync_prompt(
+            &mut io,
+            store,
+            model_id,
+            quant_bits,
+            prompt,
+            tokens,
+            DiskSyncPolicy {
+                save_current,
+                load: disk_eligible,
+            },
+        );
+        self.session_disk_storable = result.is_ok() && disk_eligible;
+        result
+    }
+
     fn eval(&mut self, token: i32) -> Result<(), GenerateError> {
         self.session()?
             .eval(token)
@@ -1030,5 +1354,417 @@ impl DecodeIo for NativeDecode<'_> {
             .as_ref()
             .map(|s| s.host().tokens().to_vec())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod disk_sync_tests {
+    use super::{
+        discard_loaded, disk_sync_prompt, ordinary_disk_cache_eligible, DiskSyncPolicy,
+        GenerateError, SerialKvIo,
+    };
+    use crate::parse::{parse_request, ParseEnv};
+    use crate::route::{Api, ThinkMode, WireSurface};
+    use ds4_kv::{read_envelope, Header, Options, Reason, Record, Store};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    #[derive(Debug)]
+    struct FakeSerial {
+        ctx: i32,
+        live: Vec<i32>,
+        rendered_live: Vec<u8>,
+        suffix_tokens: Vec<i32>,
+        loaded_tokens: Vec<i32>,
+        fail_load: bool,
+        fail_sync: bool,
+        invalidations: usize,
+        syncs: Vec<Vec<i32>>,
+        suffixes: Vec<Vec<u8>>,
+        loads: Vec<(PathBuf, u64, u64)>,
+        events: Vec<&'static str>,
+    }
+
+    impl FakeSerial {
+        fn new(live: &[i32], rendered_live: &[u8]) -> Self {
+            Self {
+                ctx: 4096,
+                live: live.to_vec(),
+                rendered_live: rendered_live.to_vec(),
+                suffix_tokens: Vec::new(),
+                loaded_tokens: Vec::new(),
+                fail_load: false,
+                fail_sync: false,
+                invalidations: 0,
+                syncs: Vec::new(),
+                suffixes: Vec::new(),
+                loads: Vec::new(),
+                events: Vec::new(),
+            }
+        }
+    }
+
+    impl SerialKvIo for FakeSerial {
+        fn ctx(&self) -> i32 {
+            self.ctx
+        }
+
+        fn live_tokens(&self) -> Vec<i32> {
+            self.live.clone()
+        }
+
+        fn render_tokens(&self, _tokens: &[i32]) -> Result<Vec<u8>, GenerateError> {
+            Ok(self.rendered_live.clone())
+        }
+
+        fn tokenize_suffix(&mut self, suffix: &[u8]) -> Result<Vec<i32>, GenerateError> {
+            self.suffixes.push(suffix.to_vec());
+            Ok(self.suffix_tokens.clone())
+        }
+
+        fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError> {
+            self.events.push("sync");
+            self.syncs.push(tokens.to_vec());
+            if self.fail_sync {
+                return Err(GenerateError::Engine("injected suffix sync failure".into()));
+            }
+            self.live = tokens.to_vec();
+            Ok(())
+        }
+
+        fn save_payload(&mut self, path: &Path) -> Result<(), GenerateError> {
+            self.events.push("save");
+            fs::write(path, b"current-payload").map_err(|e| GenerateError::Engine(e.to_string()))
+        }
+
+        fn load_payload_range(
+            &mut self,
+            path: &Path,
+            offset: u64,
+            length: u64,
+        ) -> Result<(), GenerateError> {
+            self.events.push("load");
+            self.loads.push((path.to_path_buf(), offset, length));
+            if self.fail_load {
+                return Err(GenerateError::Engine("injected payload load failure".into()));
+            }
+            self.live = self.loaded_tokens.clone();
+            Ok(())
+        }
+
+        fn invalidate(&mut self) {
+            self.events.push("invalidate");
+            self.invalidations += 1;
+            self.live.clear();
+        }
+    }
+
+    fn store(tag: &str) -> (PathBuf, Store) {
+        let dir =
+            std::env::temp_dir().join(format!("ds4-server-disk-sync-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let options = Options {
+            min_tokens: 1,
+            cold_max_tokens: 32,
+            continued_interval_tokens: 8,
+            boundary_trim_tokens: 0,
+            boundary_align_tokens: 0,
+        };
+        let store = Store::open(&dir, 16, true, options).unwrap();
+        (dir, store)
+    }
+
+    fn candidate(store: &mut Store, text: &[u8], tokens: u32) -> PathBuf {
+        store
+            .write(Record {
+                header: Header {
+                    quant_bits: 2,
+                    reason: Reason::Evict,
+                    ext_flags: 0,
+                    model_id: 0,
+                    tokens,
+                    hits: 0,
+                    ctx_size: 4096,
+                    created_at: 1,
+                    last_used: 1,
+                    payload_bytes: 0,
+                    text_bytes: 0,
+                },
+                text: text.to_vec(),
+                payload: b"candidate-payload".to_vec(),
+                trailer: Vec::new(),
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn disk_sync_prompt_cold_miss_syncs_canonical_prompt() {
+        let (dir, mut store) = store("cold");
+        let mut io = FakeSerial::new(&[], b"");
+
+        let cached = disk_sync_prompt(
+            &mut io,
+            &mut store,
+            0,
+            2,
+            b"cold prompt",
+            &[1, 2],
+            DiskSyncPolicy {
+                save_current: false,
+                load: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cached, 0);
+        assert_eq!(io.syncs, [vec![1, 2]]);
+        assert!(io.loads.is_empty());
+        assert_eq!(io.events, ["sync"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disk_sync_prompt_reuses_current_exact_and_byte_prefixes() {
+        let (dir, mut store) = store("current");
+        let mut exact = FakeSerial::new(&[1, 2], b"unused");
+        let cached = disk_sync_prompt(
+            &mut exact,
+            &mut store,
+            0,
+            2,
+            b"hello",
+            &[1, 2, 3],
+            DiskSyncPolicy {
+                save_current: false,
+                load: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(cached, 2);
+        assert_eq!(exact.syncs, [vec![1, 2, 3]]);
+        assert!(exact.loads.is_empty());
+
+        let mut byte_prefix = FakeSerial::new(&[9], b"hello ");
+        byte_prefix.suffix_tokens = vec![10, 11];
+        let cached = disk_sync_prompt(
+            &mut byte_prefix,
+            &mut store,
+            0,
+            2,
+            b"hello world",
+            &[90, 91],
+            DiskSyncPolicy {
+                save_current: false,
+                load: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(cached, 1);
+        assert_eq!(byte_prefix.suffixes, [b"world".to_vec()]);
+        assert_eq!(byte_prefix.syncs, [vec![9, 10, 11]]);
+        assert!(byte_prefix.loads.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disk_sync_prompt_hit_loads_exact_tokens_retokenizes_suffix_and_touches_hit() {
+        let (dir, mut store) = store("hit");
+        let path = candidate(&mut store, b"hello ", 2);
+        let envelope = read_envelope(&path).unwrap();
+        let mut io = FakeSerial::new(&[7], b"old conversation");
+        io.loaded_tokens = vec![41, 42];
+        io.suffix_tokens = vec![43];
+
+        let cached =
+            disk_sync_prompt(
+                &mut io,
+                &mut store,
+                0,
+                2,
+                b"hello world",
+                &[90, 91],
+                DiskSyncPolicy {
+                    save_current: true,
+                    load: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(cached, 2);
+        assert_eq!(io.suffixes, [b"world".to_vec()]);
+        assert_eq!(io.syncs, [vec![41, 42, 43]]);
+        assert_eq!(
+            io.loads,
+            [(
+                path.clone(),
+                envelope.payload_offset,
+                envelope.header.payload_bytes
+            )]
+        );
+        let save = io
+            .events
+            .iter()
+            .position(|event| *event == "save")
+            .expect("live checkpoint save event");
+        let load = io
+            .events
+            .iter()
+            .position(|event| *event == "load")
+            .expect("candidate load event");
+        assert!(
+            save < load,
+            "live checkpoint must be staged before a disk restore: {:?}",
+            io.events
+        );
+        assert!(store
+            .text_prefix_candidate(b"old conversation", 0, 2, 4096)
+            .unwrap()
+            .is_some());
+        assert_eq!(store.read(&path).unwrap().header.hits, 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disk_sync_prompt_token_count_mismatch_discards_then_cold_syncs() {
+        let (dir, mut store) = store("count-mismatch");
+        let path = candidate(&mut store, b"hello ", 2);
+        let mut io = FakeSerial::new(&[], b"");
+        io.loaded_tokens = vec![41];
+        io.suffix_tokens = vec![43];
+
+        let cached =
+            disk_sync_prompt(
+                &mut io,
+                &mut store,
+                0,
+                2,
+                b"hello world",
+                &[90, 91],
+                DiskSyncPolicy {
+                    save_current: false,
+                    load: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(cached, 0);
+        assert_eq!(io.invalidations, 1);
+        assert_eq!(io.syncs, [vec![90, 91]]);
+        assert!(!path.exists());
+        assert!(store.entries().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disk_sync_prompt_load_failure_keeps_candidate_and_cold_syncs() {
+        let (dir, mut store) = store("load-failure");
+        let path = candidate(&mut store, b"hello ", 2);
+        let mut io = FakeSerial::new(&[], b"");
+        io.fail_load = true;
+
+        let cached = disk_sync_prompt(
+            &mut io,
+            &mut store,
+            0,
+            2,
+            b"hello world",
+            &[90, 91],
+            DiskSyncPolicy {
+                save_current: false,
+                load: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cached, 0);
+        assert_eq!(io.invalidations, 1);
+        assert_eq!(io.syncs, [vec![90, 91]]);
+        assert!(path.exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disk_sync_prompt_suffix_sync_failure_discards_and_returns_error() {
+        let (dir, mut store) = store("sync-failure");
+        let path = candidate(&mut store, b"hello ", 2);
+        let mut io = FakeSerial::new(&[], b"");
+        io.loaded_tokens = vec![41, 42];
+        io.suffix_tokens = vec![43];
+        io.fail_sync = true;
+
+        let error =
+            disk_sync_prompt(
+                &mut io,
+                &mut store,
+                0,
+                2,
+                b"hello world",
+                &[90, 91],
+                DiskSyncPolicy {
+                    save_current: false,
+                    load: true,
+                },
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected suffix sync failure"));
+        assert_eq!(io.invalidations, 1);
+        assert_eq!(io.syncs, [vec![41, 42, 43]]);
+        assert!(!path.exists());
+        assert!(store.entries().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn discard_failure_still_resets_marker_and_invalidates_session() {
+        let (dir, mut store) = store("discard-race");
+        let mut io = FakeSerial::new(&[41, 42], b"hello");
+        store.continued_last_store_tokens = 2;
+
+        discard_loaded(&mut store, &mut io, &dir.join("missing.kvc"));
+
+        assert_eq!(store.continued_last_store_tokens, 0);
+        assert_eq!(io.invalidations, 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disk_cache_eligibility_excludes_protocol_state() {
+        let env = ParseEnv {
+            default_model: "ds4".into(),
+            default_tokens: 16,
+            default_effort: ThinkMode::None,
+            default_temp: 0.0,
+            live_ids: Vec::new(),
+        };
+        let ordinary = parse_request(
+            WireSurface::OpenaiChat,
+            &env,
+            r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#,
+        )
+        .unwrap();
+        assert!(ordinary_disk_cache_eligible(&ordinary));
+
+        let mut cases = Vec::new();
+        let mut request = ordinary.clone();
+        request.api = Api::Anthropic;
+        cases.push(request);
+        let mut request = ordinary.clone();
+        request.api = Api::Responses;
+        cases.push(request);
+        let mut request = ordinary.clone();
+        request.think_mode = ThinkMode::Low;
+        cases.push(request);
+        let mut request = ordinary.clone();
+        request.has_tools = true;
+        cases.push(request);
+        let mut request = ordinary.clone();
+        request.has_tool_results = true;
+        cases.push(request);
+        let mut request = ordinary;
+        request.live_call_ids.push("call_1".into());
+        cases.push(request);
+
+        assert!(cases.iter().all(|request| !ordinary_disk_cache_eligible(request)));
     }
 }

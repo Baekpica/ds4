@@ -42,6 +42,7 @@ struct PromptSyncDecode {
     effective_prompt_pos: i32,
     prompt_sync_calls: usize,
     sync_calls: usize,
+    disk_eligible: Vec<bool>,
 }
 
 impl PromptSyncDecode {
@@ -52,6 +53,7 @@ impl PromptSyncDecode {
             effective_prompt_pos,
             prompt_sync_calls: 0,
             sync_calls: 0,
+            disk_eligible: Vec::new(),
         }
     }
 }
@@ -86,8 +88,14 @@ impl DecodeIo for PromptSyncDecode {
         self.inner.sync(tokens)
     }
 
-    fn sync_prompt(&mut self, _prompt: &[u8], tokens: &[i32]) -> Result<i32, GenerateError> {
+    fn sync_prompt(
+        &mut self,
+        _prompt: &[u8],
+        tokens: &[i32],
+        disk_eligible: bool,
+    ) -> Result<i32, GenerateError> {
         self.prompt_sync_calls += 1;
+        self.disk_eligible.push(disk_eligible);
         self.inner.live = tokens.to_vec();
         self.inner.pos = self.effective_prompt_pos;
         Ok(self.cached_tokens)
@@ -209,6 +217,7 @@ fn prompt_sync_reports_buffered_cache_usage_from_effective_pos() {
     );
     assert_eq!(engine.prompt_sync_calls, 1);
     assert_eq!(engine.sync_calls, 0);
+    assert_eq!(engine.disk_eligible, [true]);
 }
 
 #[test]
@@ -244,6 +253,7 @@ fn prompt_sync_reports_streaming_cache_usage_from_effective_pos() {
     );
     assert_eq!(engine.prompt_sync_calls, 1);
     assert_eq!(engine.sync_calls, 0);
+    assert_eq!(engine.disk_eligible, [true]);
 }
 
 #[test]
@@ -530,6 +540,7 @@ fn recovery_suffix_uses_sync_not_prompt_sync() {
 
     assert_eq!(engine.prompt_sync_calls, 1, "only the initial prompt uses the hook");
     assert_eq!(engine.sync_calls, 1, "the recovery suffix uses ordinary sync");
+    assert_eq!(engine.disk_eligible, [false]);
     assert!(engine.inner.idx >= 2, "the retry must run a second decode pass");
 }
 
