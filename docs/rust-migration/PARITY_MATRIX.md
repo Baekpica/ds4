@@ -188,6 +188,27 @@ or ABBA. Publish SHA + GGUF identity + command/env with the numbers.
 Unexplained 2–3% is a fail even if it sits inside the provisional
 percent table.
 
+### Recorded ABBA (2026-08-24, cross-lane)
+
+Host SHA `9463b3c` (+ scratch runner `scratch/rust-host-live/abba.sh`),
+GGUF `Motif-3-MQ87-88-FIT.gguf`, ctx 8192, cold 6782-token prompt,
+114 decode tokens, temp 0, thinking disabled, sequential loads with
+teardown + `clear_cache` between cells:
+
+| Cell | Lane | prefill tok/s | decode tok/s | ttft ms | peak GPU MiB |
+|---|---|---|---|---|---|
+| C #1 | continuous | 633.4 | 14.8 | 10755 | 112145 |
+| Rust #1 | serial | 579.8 | 15.4 | 11834 | 102357 |
+| Rust #2 | serial | 577.5 | 15.5 | 11877 | 102357 |
+| C #2 | continuous | 633.0 | 14.8 | 10780 | 114529 |
+
+All four completions are byte-identical greedy text (SHA1
+`4d34f24352e7`) — the Token axis passes across hosts and lanes.
+Pair spreads are ≤0.4%. The −8.6% prefill / +4.4% decode delta is
+attributed to the lane difference (Rust has no continuous lane yet),
+not to FFI overhead; the same-lane ABBA re-run is required after the
+continuous port before Phase 9.
+
 ## Status of this matrix
 
 Track per-subsystem color in [STATUS.md](STATUS.md). This file is
