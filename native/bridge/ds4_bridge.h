@@ -231,6 +231,24 @@ void ds4_bridge_batch_ctx_destroy(ds4_bridge_batch_ctx *c);
 int ds4_bridge_batch_ctx_max_seq(ds4_bridge_batch_ctx *c);
 int ds4_bridge_batch_ctx_seq_cap(ds4_bridge_batch_ctx *c);
 
+/* Opaque durable-bank seam.  Host metadata stays outside the native batch;
+ * committed tokens are copied into caller storage and payload bytes move only
+ * through files owned by the caller. */
+int ds4_bridge_batch_ctx_bank_snapshot(ds4_bridge_batch_ctx *c, int32_t bank,
+                                       int32_t *tokens, int32_t cap,
+                                       int32_t *n_tokens,
+                                       uint64_t *generation,
+                                       char *err, size_t errlen);
+int ds4_bridge_batch_ctx_bank_save_payload(ds4_bridge_batch_ctx *c,
+                                           int32_t bank, const char *path,
+                                           char *err, size_t errlen);
+int ds4_bridge_batch_ctx_bank_load_payload_range(ds4_bridge_batch_ctx *c,
+                                                 int32_t bank,
+                                                 const char *path,
+                                                 uint64_t offset,
+                                                 uint64_t length,
+                                                 char *err, size_t errlen);
+
 typedef struct {
     const int32_t *tokens;  /* caller-owned; keep alive until on_done */
     int32_t n;

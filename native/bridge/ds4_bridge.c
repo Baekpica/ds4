@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 /* Thin wrappers over the existing engine/session API.  No inference logic
  * lives here; this file exists so Rust never includes ds4.h. */
@@ -927,6 +928,161 @@ int ds4_bridge_batch_ctx_seq_cap(ds4_bridge_batch_ctx *c)
 {
     if (!c || !c->ctx) return 0;
     return ds4_batch_ctx_seq_cap(c->ctx);
+}
+
+int ds4_bridge_batch_ctx_bank_snapshot(ds4_bridge_batch_ctx *c, int32_t bank,
+                                       int32_t *tokens, int32_t cap,
+                                       int32_t *n_tokens,
+                                       uint64_t *generation,
+                                       char *err, size_t errlen)
+{
+    const int *committed = NULL;
+    int n;
+
+    if (n_tokens) *n_tokens = 0;
+    if (generation) *generation = 0;
+    if (!c || !c->ctx) {
+        set_err(err, errlen, "batch ctx is NULL");
+        return 1;
+    }
+    if (!n_tokens) {
+        set_err(err, errlen, "bank snapshot output is NULL");
+        return 1;
+    }
+    if (bank < 0 || bank >= ds4_batch_ctx_max_seq(c->ctx)) {
+        set_err(err, errlen, "bank is out of range");
+        return 1;
+    }
+    n = ds4_batch_ctx_bank_committed(c->ctx, bank, &committed);
+    if (generation)
+        *generation = ds4_batch_ctx_bank_generation(c->ctx, bank);
+    *n_tokens = n;
+    if (n <= 0) return 0;
+    if (!committed || !tokens || cap < n) {
+        set_err(err, errlen, "bank snapshot buffer is too small");
+        return 1;
+    }
+    memcpy(tokens, committed, (size_t)n * sizeof(*tokens));
+    return 0;
+}
+
+int ds4_bridge_batch_ctx_bank_save_payload(ds4_bridge_batch_ctx *c,
+                                           int32_t bank, const char *path,
+                                           char *err, size_t errlen)
+{
+    char *tmp;
+    FILE *fp;
+    int fd;
+    int rc;
+    size_t path_len;
+
+    if (!c || !c->ctx) {
+        set_err(err, errlen, "batch ctx is NULL");
+        return 1;
+    }
+    if (bank < 0 || bank >= ds4_batch_ctx_max_seq(c->ctx)) {
+        set_err(err, errlen, "bank is out of range");
+        return 1;
+    }
+    if (!path || !path[0]) {
+        set_err(err, errlen, "payload path is required");
+        return 1;
+    }
+    path_len = strlen(path);
+    if (path_len > SIZE_MAX - sizeof(".tmp.XXXXXX")) {
+        set_err(err, errlen, "bank payload path is too long");
+        return 1;
+    }
+    tmp = malloc(path_len + sizeof(".tmp.XXXXXX"));
+    if (!tmp) {
+        set_err(err, errlen, "failed to allocate bank payload path");
+        return 1;
+    }
+    snprintf(tmp, path_len + sizeof(".tmp.XXXXXX"), "%s.tmp.XXXXXX", path);
+    fd = mkstemp(tmp);
+    if (fd < 0) {
+        free(tmp);
+        set_err(err, errlen, "failed to create bank payload staging file");
+        return 1;
+    }
+    fp = fdopen(fd, "wb");
+    if (!fp) {
+        close(fd);
+        unlink(tmp);
+        free(tmp);
+        set_err(err, errlen, "failed to open bank payload staging file");
+        return 1;
+    }
+    rc = ds4_cont_bank_save_payload(c->ctx, (uint32_t)bank, fp, err, errlen);
+    if (fclose(fp) != 0 && rc == 0) {
+        set_err(err, errlen, "failed to close bank payload");
+        rc = 1;
+    }
+    if (rc == 0 && rename(tmp, path) != 0) {
+        set_err(err, errlen, "failed to install bank payload");
+        rc = 1;
+    }
+    if (rc != 0) unlink(tmp);
+    free(tmp);
+    return rc;
+}
+
+int ds4_bridge_batch_ctx_bank_load_payload_range(ds4_bridge_batch_ctx *c,
+                                                 int32_t bank,
+                                                 const char *path,
+                                                 uint64_t offset,
+                                                 uint64_t length,
+                                                 char *err, size_t errlen)
+{
+    FILE *fp;
+    int rc;
+    off_t sz;
+    uint64_t file_bytes;
+
+    if (!c || !c->ctx) {
+        set_err(err, errlen, "batch ctx is NULL");
+        return 1;
+    }
+    if (bank < 0 || bank >= ds4_batch_ctx_max_seq(c->ctx)) {
+        set_err(err, errlen, "bank is out of range");
+        return 1;
+    }
+    if (!path || !path[0]) {
+        set_err(err, errlen, "payload path is required");
+        return 1;
+    }
+    if (offset > UINT64_MAX - length) {
+        set_err(err, errlen, "bank payload range overflows");
+        return 1;
+    }
+    fp = fopen(path, "rb");
+    if (!fp) {
+        set_err(err, errlen, "failed to open bank payload for read");
+        return 1;
+    }
+    if (fseeko(fp, 0, SEEK_END) != 0 || (sz = ftello(fp)) < 0) {
+        fclose(fp);
+        set_err(err, errlen, "failed to measure bank payload");
+        return 1;
+    }
+    file_bytes = (uint64_t)sz;
+    if (offset > file_bytes || length > file_bytes - offset) {
+        fclose(fp);
+        set_err(err, errlen, "truncated bank payload range");
+        return 1;
+    }
+    if (fseeko(fp, (off_t)offset, SEEK_SET) != 0) {
+        fclose(fp);
+        set_err(err, errlen, "failed to seek bank payload range");
+        return 1;
+    }
+    rc = ds4_cont_bank_restore_payload(c->ctx, (uint32_t)bank, fp, length,
+                                       err, errlen);
+    if (fclose(fp) != 0 && rc == 0) {
+        set_err(err, errlen, "failed to close bank payload");
+        return 1;
+    }
+    return rc;
 }
 
 /* Trampolines: the engine receives bridge-owned callbacks whose ud is this

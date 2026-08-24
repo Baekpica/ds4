@@ -8,16 +8,18 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
+use std::path::Path;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::{self, NonNull};
 
 use ds4_sys::{
     ds4_bridge_batch_ctx, ds4_bridge_batch_ctx_create_fit, ds4_bridge_batch_ctx_destroy,
-    ds4_bridge_batch_ctx_max_seq, ds4_bridge_batch_ctx_seq_cap, ds4_bridge_cont_request,
-    ds4_bridge_continuous_generate,
+    ds4_bridge_batch_ctx_bank_load_payload_range, ds4_bridge_batch_ctx_bank_save_payload,
+    ds4_bridge_batch_ctx_bank_snapshot, ds4_bridge_batch_ctx_max_seq,
+    ds4_bridge_batch_ctx_seq_cap, ds4_bridge_cont_request, ds4_bridge_continuous_generate,
 };
 
-use crate::{Error, Model, Result};
+use crate::{cstring_payload_path, fail, Error, Model, Result};
 
 /// `ds4_cont_request.sample_override` result encoding (`DS4_SAMPLE_OVERRIDE_*`).
 pub const CONT_SAMPLE_NONE: i32 = 0;
@@ -181,6 +183,13 @@ pub struct BatchCtx<'m> {
     _not_send: PhantomData<*const ()>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BankSnapshot {
+    pub bank: i32,
+    pub tokens: Vec<i32>,
+    pub generation: u64,
+}
+
 impl Model {
     /// `ds4_batch_ctx_create_fit`: `max_seq` is a cap; the engine sizes the
     /// bank count down to the memory budget. Read the width back with
@@ -228,6 +237,92 @@ impl BatchCtx<'_> {
         unsafe { ds4_bridge_batch_ctx_seq_cap(self.raw.as_ptr()) }
     }
 
+    /// Copies the native committed frontier; no C token pointer escapes.
+    pub fn bank_snapshot(&self, bank: i32) -> Result<BankSnapshot> {
+        let cap = self.seq_cap();
+        if cap <= 0 {
+            return Err(Error {
+                code: 1,
+                message: "batch context has no token capacity".into(),
+            });
+        }
+        let mut tokens = vec![0; cap as usize];
+        let mut n = 0;
+        let mut generation = 0;
+        let mut err = [0u8; 512];
+        let rc = unsafe {
+            ds4_bridge_batch_ctx_bank_snapshot(
+                self.raw.as_ptr(),
+                bank,
+                tokens.as_mut_ptr(),
+                cap,
+                &mut n,
+                &mut generation,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(fail(rc, &err));
+        }
+        if n < 0 || n > cap {
+            return Err(Error {
+                code: 1,
+                message: format!("invalid native bank snapshot bank={bank} tokens={n} cap={cap}"),
+            });
+        }
+        tokens.truncate(n as usize);
+        Ok(BankSnapshot {
+            bank,
+            tokens,
+            generation,
+        })
+    }
+
+    pub fn save_bank_payload(&mut self, bank: i32, path: impl AsRef<Path>) -> Result<()> {
+        let c_path = cstring_payload_path(path.as_ref())?;
+        let mut err = [0u8; 512];
+        let rc = unsafe {
+            ds4_bridge_batch_ctx_bank_save_payload(
+                self.raw.as_ptr(),
+                bank,
+                c_path.as_ptr(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(fail(rc, &err));
+        }
+        Ok(())
+    }
+
+    pub fn load_bank_payload_range(
+        &mut self,
+        bank: i32,
+        path: impl AsRef<Path>,
+        offset: u64,
+        length: u64,
+    ) -> Result<BankSnapshot> {
+        let c_path = cstring_payload_path(path.as_ref())?;
+        let mut err = [0u8; 512];
+        let rc = unsafe {
+            ds4_bridge_batch_ctx_bank_load_payload_range(
+                self.raw.as_ptr(),
+                bank,
+                c_path.as_ptr(),
+                offset,
+                length,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(fail(rc, &err));
+        }
+        self.bank_snapshot(bank)
+    }
+
     /// Runs the engine's rolling loop until the active set is empty and
     /// `driver.admit()` returns `None`.
     pub fn continuous_generate(&mut self, driver: &mut dyn ContDriver) -> Result<()> {
@@ -258,5 +353,118 @@ impl BatchCtx<'_> {
 impl Drop for BatchCtx<'_> {
     fn drop(&mut self) {
         unsafe { ds4_bridge_batch_ctx_destroy(self.raw.as_ptr()) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::ffi::CStr;
+    use std::mem::ManuallyDrop;
+
+    thread_local! {
+        static TOKENS: RefCell<Vec<i32>> = RefCell::new(vec![10, 20, 30]);
+        static LOAD: RefCell<Option<(i32, String, u64, u64)>> = const { RefCell::new(None) };
+        static SAVE_BANK: Cell<i32> = const { Cell::new(-1) };
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_batch_ctx_seq_cap(_c: *mut ds4_bridge_batch_ctx) -> c_int {
+        8
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_batch_ctx_bank_snapshot(
+        _c: *mut ds4_bridge_batch_ctx,
+        bank: i32,
+        out: *mut i32,
+        cap: i32,
+        n: *mut i32,
+        generation: *mut u64,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> c_int {
+        let tokens = TOKENS.with(|tokens| tokens.borrow().clone());
+        if cap < tokens.len() as i32 {
+            *n = tokens.len() as i32;
+            return 1;
+        }
+        std::ptr::copy_nonoverlapping(tokens.as_ptr(), out, tokens.len());
+        *n = tokens.len() as i32;
+        *generation = 41 + bank as u64;
+        0
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_batch_ctx_bank_save_payload(
+        _c: *mut ds4_bridge_batch_ctx,
+        bank: i32,
+        path: *const c_char,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> c_int {
+        SAVE_BANK.with(|seen| seen.set(bank));
+        std::fs::write(CStr::from_ptr(path).to_string_lossy().as_ref(), b"BANK").is_err() as i32
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_batch_ctx_bank_load_payload_range(
+        _c: *mut ds4_bridge_batch_ctx,
+        bank: i32,
+        path: *const c_char,
+        offset: u64,
+        length: u64,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> c_int {
+        LOAD.with(|load| {
+            *load.borrow_mut() = Some((
+                bank,
+                CStr::from_ptr(path).to_string_lossy().into_owned(),
+                offset,
+                length,
+            ));
+        });
+        0
+    }
+
+    fn fake_batch() -> ManuallyDrop<BatchCtx<'static>> {
+        ManuallyDrop::new(BatchCtx {
+            raw: NonNull::dangling(),
+            _model: PhantomData,
+            _not_send: PhantomData,
+        })
+    }
+
+    #[test]
+    fn bank_snapshot_is_an_owned_copy() {
+        TOKENS.with(|tokens| *tokens.borrow_mut() = vec![10, 20, 30]);
+        let batch = fake_batch();
+        let snapshot = batch.bank_snapshot(2).unwrap();
+        TOKENS.with(|tokens| tokens.borrow_mut()[0] = 99);
+
+        assert_eq!(snapshot.tokens, [10, 20, 30]);
+        assert_eq!(snapshot.generation, 43);
+    }
+
+    #[test]
+    fn bank_payload_paths_stay_opaque() {
+        TOKENS.with(|tokens| *tokens.borrow_mut() = vec![10, 20, 30]);
+        let mut batch = fake_batch();
+        let path = std::env::temp_dir().join(format!(
+            "ds4-core-bank-payload-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        batch.save_bank_payload(1, &path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"BANK");
+        assert_eq!(SAVE_BANK.with(Cell::get), 1);
+        let restored = batch.load_bank_payload_range(1, &path, 7, 11).unwrap();
+        let load = LOAD.with(|load| load.borrow().clone()).unwrap();
+        assert_eq!((load.0, load.2, load.3), (1, 7, 11));
+        assert_eq!(restored.tokens, [10, 20, 30]);
+        std::fs::remove_file(path).unwrap();
     }
 }

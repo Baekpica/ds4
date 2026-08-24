@@ -4,6 +4,7 @@
 #include "ds4.h"
 #include "native/bridge/ds4_bridge.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,15 @@ extern unsigned bridge_sync_calls;
 extern unsigned bridge_progress_sets;
 extern unsigned bridge_progress_clears;
 extern int bridge_progress_active;
+extern int bridge_batch_max_seq;
+extern int bridge_bank_committed;
+extern int bridge_bank_tokens[8];
+extern uint64_t bridge_bank_generation;
+extern unsigned bridge_bank_save_calls;
+extern int bridge_bank_save_result;
+extern unsigned bridge_bank_load_calls;
+extern int64_t bridge_bank_load_offset;
+extern uint64_t bridge_bank_load_bytes;
 
 struct ds4_bridge_model {
     ds4_engine *engine;
@@ -27,6 +37,10 @@ struct ds4_bridge_model {
 struct ds4_bridge_session {
     ds4_bridge_model *model;
     ds4_session *session;
+};
+
+struct ds4_bridge_batch_ctx {
+    ds4_batch_ctx *ctx;
 };
 
 static void fail(const char *m) {
@@ -294,6 +308,109 @@ int main(void) {
                                            err, sizeof(err)) == 0)
             fail("cont NULL ctx");
         if (!strstr(err, "NULL")) fail("cont err");
+
+        n = -1;
+        memset(err, 0, sizeof(err));
+        if (ds4_bridge_batch_ctx_bank_snapshot(NULL, 0, toks, 4, &n,
+                                               NULL, err, sizeof(err)) == 0)
+            fail("bank snapshot NULL ctx");
+        if (n != 0) fail("bank snapshot NULL n");
+        if (!strstr(err, "NULL")) fail("bank snapshot NULL err");
+        if (ds4_bridge_batch_ctx_bank_save_payload(NULL, 0, "/tmp/nope",
+                                                   err, sizeof(err)) == 0)
+            fail("bank save NULL ctx");
+        if (ds4_bridge_batch_ctx_bank_load_payload_range(
+                NULL, 0, "/tmp/nope", 0, 1, err, sizeof(err)) == 0)
+            fail("bank load NULL ctx");
+
+        {
+            ds4_batch_ctx *fake_native = malloc(1);
+            struct ds4_bridge_batch_ctx fake = {fake_native};
+            uint64_t generation = 0;
+            char path[] = "/tmp/ds4-bridge-bank-XXXXXX";
+            unsigned char data[16] = {0};
+            if (!fake_native) fail("bank fake ctx");
+            bridge_batch_max_seq = 2;
+            bridge_bank_committed = 3;
+            bridge_bank_tokens[0] = 11;
+            bridge_bank_tokens[1] = 22;
+            bridge_bank_tokens[2] = 33;
+            bridge_bank_generation = 9;
+            n = -1;
+            memset(toks, 0, sizeof(toks));
+            if (ds4_bridge_batch_ctx_bank_snapshot(&fake, 1, toks, 4, &n,
+                                                   &generation, err,
+                                                   sizeof(err)) != 0)
+                fail("bank snapshot success");
+            if (n != 3 || generation != 9 || toks[0] != 11 ||
+                toks[1] != 22 || toks[2] != 33)
+                fail("bank snapshot values");
+            n = -1;
+            generation = 99;
+            if (ds4_bridge_batch_ctx_bank_snapshot(&fake, 2, toks, 4, &n,
+                                                   &generation, err,
+                                                   sizeof(err)) == 0)
+                fail("bank snapshot OOB");
+            if (n != 0 || generation != 0) fail("bank snapshot OOB outputs");
+            n = -1;
+            if (ds4_bridge_batch_ctx_bank_snapshot(&fake, 1, toks, 2, &n,
+                                                   &generation, err,
+                                                   sizeof(err)) == 0)
+                fail("bank snapshot short buffer");
+            if (n != 3) fail("bank snapshot required length");
+
+            int fd = mkstemp(path);
+            if (fd < 0) fail("bank payload fixture");
+            if (write(fd, "KEEP", 4) != 4) fail("bank sentinel write");
+            if (close(fd) != 0) fail("bank payload fixture close");
+            bridge_bank_save_calls = 0;
+            bridge_bank_save_result = 1;
+            if (ds4_bridge_batch_ctx_bank_save_payload(&fake, 1, path,
+                                                       err, sizeof(err)) == 0)
+                fail("bank payload failed save");
+            fd = open(path, O_RDONLY);
+            if (fd < 0) fail("bank sentinel open");
+            char saved[4];
+            if (read(fd, saved, sizeof(saved)) != (ssize_t)sizeof(saved) ||
+                memcmp(saved, "KEEP", sizeof(saved)))
+                fail("bank failed save replaced destination");
+            close(fd);
+            bridge_bank_save_result = 0;
+            if (ds4_bridge_batch_ctx_bank_save_payload(&fake, 1, path,
+                                                       err, sizeof(err)) != 0)
+                fail("bank payload save");
+            if (bridge_bank_save_calls != 2) fail("bank payload save call");
+            fd = open(path, O_RDONLY);
+            if (fd < 0) fail("bank payload saved open");
+            if (read(fd, saved, sizeof(saved)) != (ssize_t)sizeof(saved) ||
+                memcmp(saved, "BANK", sizeof(saved)))
+                fail("bank payload saved bytes");
+            close(fd);
+
+            fd = open(path, O_WRONLY | O_TRUNC);
+            if (fd < 0 || write(fd, data, sizeof(data)) != (ssize_t)sizeof(data))
+                fail("bank payload range fixture");
+            close(fd);
+            bridge_bank_load_calls = 0;
+            bridge_bank_load_offset = -1;
+            bridge_bank_load_bytes = 0;
+            if (ds4_bridge_batch_ctx_bank_load_payload_range(
+                    &fake, 1, path, 3, 5, err, sizeof(err)) != 0)
+                fail("bank payload range load");
+            if (bridge_bank_load_calls != 1 || bridge_bank_load_offset != 3 ||
+                bridge_bank_load_bytes != 5)
+                fail("bank payload range delegation");
+            if (ds4_bridge_batch_ctx_bank_load_payload_range(
+                    &fake, 1, path, 12, 5, err, sizeof(err)) == 0)
+                fail("bank payload range truncated");
+            if (ds4_bridge_batch_ctx_bank_load_payload_range(
+                    &fake, 1, path, UINT64_MAX, 2, err, sizeof(err)) == 0)
+                fail("bank payload range overflow");
+            if (bridge_bank_load_calls != 1)
+                fail("bank invalid range called native");
+            if (unlink(path) != 0) fail("bank payload unlink");
+            free(fake_native);
+        }
     }
 
     printf("ok\n");

@@ -470,6 +470,35 @@ extern "C" {
 
     pub fn ds4_bridge_batch_ctx_seq_cap(c: *mut ds4_bridge_batch_ctx) -> c_int;
 
+    pub fn ds4_bridge_batch_ctx_bank_snapshot(
+        c: *mut ds4_bridge_batch_ctx,
+        bank: i32,
+        tokens: *mut i32,
+        cap: i32,
+        n_tokens: *mut i32,
+        generation: *mut u64,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_batch_ctx_bank_save_payload(
+        c: *mut ds4_bridge_batch_ctx,
+        bank: i32,
+        path: *const c_char,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_batch_ctx_bank_load_payload_range(
+        c: *mut ds4_bridge_batch_ctx,
+        bank: i32,
+        path: *const c_char,
+        offset: u64,
+        length: u64,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
     pub fn ds4_bridge_continuous_generate(
         c: *mut ds4_bridge_batch_ctx,
         admit: Option<unsafe extern "C" fn(*mut c_void, *mut ds4_bridge_cont_request) -> c_int>,

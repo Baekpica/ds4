@@ -33,7 +33,8 @@ pub use bind::{
     HOST_BIND_MISS,
 };
 pub use batch::{
-    cont_sample_token, BatchCtx, ContAdmit, ContDriver, CONT_SAMPLE_GREEDY, CONT_SAMPLE_NONE,
+    cont_sample_token, BankSnapshot, BatchCtx, ContAdmit, ContDriver, CONT_SAMPLE_GREEDY,
+    CONT_SAMPLE_NONE,
 };
 pub use gguf::{GgufError, GgufFile};
 pub use identify::{dump_parse, identify_file, identify_gguf, Identified, IdentifyError};

@@ -24,6 +24,15 @@ unsigned bridge_sync_calls;
 unsigned bridge_progress_sets;
 unsigned bridge_progress_clears;
 int bridge_progress_active;
+int bridge_batch_max_seq;
+int bridge_bank_committed;
+int bridge_bank_tokens[8];
+uint64_t bridge_bank_generation;
+unsigned bridge_bank_save_calls;
+int bridge_bank_save_result;
+unsigned bridge_bank_load_calls;
+int64_t bridge_bank_load_offset;
+uint64_t bridge_bank_load_bytes;
 
 static ds4_session_progress_fn bridge_progress;
 static void *bridge_progress_ud;
@@ -158,8 +167,46 @@ int ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq,
     STUB("ds4_batch_ctx_create_fit");
 }
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) { (void)ctx; }
-int ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
+int ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx) {
+    (void)ctx;
+    return bridge_batch_max_seq;
+}
 int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
+int ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank,
+                                 const int **tokens) {
+    (void)ctx;
+    if (bank < 0 || bank >= bridge_batch_max_seq) {
+        if (tokens) *tokens = NULL;
+        return 0;
+    }
+    if (tokens) {
+        *tokens = bridge_bank_committed > 0 ? bridge_bank_tokens : NULL;
+    }
+    return bridge_bank_committed;
+}
+uint64_t ds4_batch_ctx_bank_generation(const ds4_batch_ctx *ctx, int bank) {
+    (void)ctx;
+    return bank >= 0 && bank < bridge_batch_max_seq ? bridge_bank_generation : 0;
+}
+int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank, FILE *fp,
+                               char *err, size_t errlen) {
+    (void)ctx; (void)bank;
+    bridge_bank_save_calls++;
+    if (bridge_bank_save_result != 0) {
+        if (err && errlen) snprintf(err, errlen, "bank save failed");
+        return bridge_bank_save_result;
+    }
+    return fwrite("BANK", 1, 4, fp) == 4 ? 0 : 1;
+}
+int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank, FILE *fp,
+                                  uint64_t payload_bytes,
+                                  char *err, size_t errlen) {
+    (void)ctx; (void)bank; (void)err; (void)errlen;
+    bridge_bank_load_calls++;
+    bridge_bank_load_offset = (int64_t)ftello(fp);
+    bridge_bank_load_bytes = payload_bytes;
+    return 0;
+}
 int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                    int (*admit)(void *ud, ds4_cont_request *req),
                                    int (*on_token)(void *ud, void *user, int token),
