@@ -69,6 +69,17 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes,
     (void)s; (void)fp; (void)payload_bytes; (void)err; (void)errlen;
     STUB("ds4_session_load_payload");
 }
+int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap,
+                              char *err, size_t errlen) {
+    (void)s; (void)snap; (void)err; (void)errlen;
+    STUB("ds4_session_save_snapshot");
+}
+int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap,
+                              char *err, size_t errlen) {
+    (void)s; (void)snap; (void)err; (void)errlen;
+    STUB("ds4_session_load_snapshot");
+}
+void ds4_session_snapshot_free(ds4_session_snapshot *snap) { (void)snap; }
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
     (void)e; (void)text; (void)out; STUB("ds4_tokenize_text");
 }

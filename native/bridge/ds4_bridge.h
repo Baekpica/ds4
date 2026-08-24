@@ -16,6 +16,7 @@ extern "C" {
 
 typedef struct ds4_bridge_model ds4_bridge_model;
 typedef struct ds4_bridge_session ds4_bridge_session;
+typedef struct ds4_bridge_snapshot ds4_bridge_snapshot;
 
 enum {
     DS4_BRIDGE_BACKEND_CUDA = 0,
@@ -118,6 +119,17 @@ int ds4_bridge_session_save_payload(ds4_bridge_session *s, const char *path,
                                     char *err, size_t errlen);
 int ds4_bridge_session_load_payload(ds4_bridge_session *s, const char *path,
                                     char *err, size_t errlen);
+
+int ds4_bridge_snapshot_create(ds4_bridge_snapshot **out,
+                               char *err, size_t errlen);
+void ds4_bridge_snapshot_free(ds4_bridge_snapshot *snap);
+uint64_t ds4_bridge_snapshot_len(const ds4_bridge_snapshot *snap);
+int ds4_bridge_session_save_snapshot(ds4_bridge_session *s,
+                                     ds4_bridge_snapshot *snap,
+                                     char *err, size_t errlen);
+int ds4_bridge_session_load_snapshot(ds4_bridge_session *s,
+                                     const ds4_bridge_snapshot *snap,
+                                     char *err, size_t errlen);
 
 /* Caller-owned token / text buffers.  n_out is always written on a
  * successful length discovery, including the "buffer too small" error. */

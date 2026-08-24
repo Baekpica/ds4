@@ -20,6 +20,10 @@ struct ds4_bridge_session {
     ds4_session *session;
 };
 
+struct ds4_bridge_snapshot {
+    ds4_session_snapshot snapshot;
+};
+
 static void set_err(char *err, size_t errlen, const char *msg)
 {
     if (!err || errlen == 0) return;
@@ -428,6 +432,67 @@ int ds4_bridge_session_load_payload(ds4_bridge_session *s, const char *path,
         return 1;
     }
     return rc;
+}
+
+int ds4_bridge_snapshot_create(ds4_bridge_snapshot **out,
+                               char *err, size_t errlen)
+{
+    ds4_bridge_snapshot *snap;
+
+    if (out) *out = NULL;
+    if (!out) {
+        set_err(err, errlen, "out is NULL");
+        return 1;
+    }
+    snap = calloc(1, sizeof(*snap));
+    if (!snap) {
+        set_err(err, errlen, "out of memory");
+        return 1;
+    }
+    *out = snap;
+    return 0;
+}
+
+void ds4_bridge_snapshot_free(ds4_bridge_snapshot *snap)
+{
+    if (!snap) return;
+    ds4_session_snapshot_free(&snap->snapshot);
+    free(snap);
+}
+
+uint64_t ds4_bridge_snapshot_len(const ds4_bridge_snapshot *snap)
+{
+    return snap ? snap->snapshot.len : 0;
+}
+
+int ds4_bridge_session_save_snapshot(ds4_bridge_session *s,
+                                     ds4_bridge_snapshot *snap,
+                                     char *err, size_t errlen)
+{
+    if (!s || !s->session) {
+        set_err(err, errlen, "session is NULL");
+        return 1;
+    }
+    if (!snap) {
+        set_err(err, errlen, "snapshot is NULL");
+        return 1;
+    }
+    return ds4_session_save_snapshot(s->session, &snap->snapshot, err, errlen);
+}
+
+int ds4_bridge_session_load_snapshot(ds4_bridge_session *s,
+                                     const ds4_bridge_snapshot *snap,
+                                     char *err, size_t errlen)
+{
+    if (!s || !s->session) {
+        set_err(err, errlen, "session is NULL");
+        return 1;
+    }
+    if (!snap) {
+        set_err(err, errlen, "snapshot is NULL");
+        return 1;
+    }
+    return ds4_session_load_snapshot(s->session, &snap->snapshot, err, errlen);
 }
 
 static int copy_tokens(ds4_tokens *tv, int32_t *out, int cap, int *n_out,

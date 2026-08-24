@@ -17,6 +17,11 @@ pub struct ds4_bridge_session {
 }
 
 #[repr(C)]
+pub struct ds4_bridge_snapshot {
+    _opaque: [u8; 0],
+}
+
+#[repr(C)]
 pub struct ds4_bridge_batch_ctx {
     _opaque: [u8; 0],
 }
@@ -308,6 +313,30 @@ extern "C" {
     pub fn ds4_bridge_session_load_payload(
         s: *mut ds4_bridge_session,
         path: *const c_char,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_snapshot_create(
+        out: *mut *mut ds4_bridge_snapshot,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_snapshot_free(snap: *mut ds4_bridge_snapshot);
+
+    pub fn ds4_bridge_snapshot_len(snap: *const ds4_bridge_snapshot) -> u64;
+
+    pub fn ds4_bridge_session_save_snapshot(
+        s: *mut ds4_bridge_session,
+        snap: *mut ds4_bridge_snapshot,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_session_load_snapshot(
+        s: *mut ds4_bridge_session,
+        snap: *const ds4_bridge_snapshot,
         err: *mut c_char,
         errlen: usize,
     ) -> c_int;

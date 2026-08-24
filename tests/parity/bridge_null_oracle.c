@@ -46,6 +46,19 @@ int main(void) {
     if (ds4_bridge_session_argmax(NULL) != -1) fail("argmax");
     if (ds4_bridge_session_pos(NULL) != -1) fail("pos");
 
+    {
+        ds4_bridge_snapshot *snap = NULL;
+        memset(err, 0, sizeof(err));
+        if (ds4_bridge_snapshot_create(&snap, err, sizeof(err)) != 0 || !snap)
+            fail("snapshot create");
+        if (ds4_bridge_snapshot_len(snap) != 0) fail("snapshot initial len");
+        if (ds4_bridge_session_save_snapshot(NULL, snap, err, sizeof(err)) == 0)
+            fail("snapshot save NULL session");
+        if (ds4_bridge_session_load_snapshot(NULL, snap, err, sizeof(err)) == 0)
+            fail("snapshot load NULL session");
+        ds4_bridge_snapshot_free(snap);
+    }
+
     if (ds4_bridge_mem_census_snap(NULL) == 0) fail("census NULL");
     if (ds4_bridge_mem_observe_snap(NULL) == 0) fail("observe NULL");
     {

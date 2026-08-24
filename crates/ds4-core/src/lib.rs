@@ -84,8 +84,11 @@ use ds4_sys::{
     ds4_bridge_session_generation, ds4_bridge_session_invalidate,
     ds4_bridge_session_load_payload, ds4_bridge_session_prefill_cap,
     ds4_bridge_session_rewind, ds4_bridge_session_sample,
-    ds4_bridge_session_save_payload, ds4_bridge_session_sync, ds4_bridge_session_top_logprobs,
-    ds4_bridge_shard, ds4_bridge_token_score,
+    ds4_bridge_session_load_snapshot, ds4_bridge_session_save_payload,
+    ds4_bridge_session_save_snapshot, ds4_bridge_session_sync,
+    ds4_bridge_session_top_logprobs, ds4_bridge_shard, ds4_bridge_snapshot,
+    ds4_bridge_snapshot_create, ds4_bridge_snapshot_free, ds4_bridge_snapshot_len,
+    ds4_bridge_token_score,
     ds4_host_bind_look, ds4_host_bind_map, ds4_host_shape, ds4_host_str, ds4_host_tensor,
     ds4_host_tensor_dir, ds4_host_vocab,
     DS4_BRIDGE_BACKEND_CPU,
@@ -469,6 +472,52 @@ pub struct Session<'m> {
     host: SessionLedger,
     _model: PhantomData<&'m Model>,
     _not_send: PhantomData<*const ()>,
+}
+
+pub struct SessionSnapshot {
+    raw: NonNull<ds4_bridge_snapshot>,
+    host: Option<SessionLedger>,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl SessionSnapshot {
+    pub fn new() -> Result<Self> {
+        let mut raw = ptr::null_mut();
+        let mut err = [0u8; 256];
+        let rc = unsafe {
+            ds4_bridge_snapshot_create(
+                &mut raw,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(fail(rc, &err));
+        }
+        let raw = NonNull::new(raw).ok_or_else(|| Error {
+            code: 1,
+            message: "ds4_bridge_snapshot_create returned NULL".into(),
+        })?;
+        Ok(Self {
+            raw,
+            host: None,
+            _not_send: PhantomData,
+        })
+    }
+
+    pub fn len(&self) -> u64 {
+        if self.host.is_none() {
+            0
+        } else {
+            unsafe { ds4_bridge_snapshot_len(self.raw.as_ptr()) }
+        }
+    }
+}
+
+impl Drop for SessionSnapshot {
+    fn drop(&mut self) {
+        unsafe { ds4_bridge_snapshot_free(self.raw.as_ptr()) }
+    }
 }
 
 fn c_err(buf: &[u8]) -> String {
@@ -962,6 +1011,59 @@ impl Session<'_> {
                 rng,
             )
         }
+    }
+
+    pub fn save_snapshot(&self, snapshot: &mut SessionSnapshot) -> Result<()> {
+        snapshot.host = None;
+        let mut err = [0u8; 512];
+        let rc = unsafe {
+            ds4_bridge_session_save_snapshot(
+                self.raw.as_ptr(),
+                snapshot.raw.as_ptr(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(fail(rc, &err));
+        }
+        snapshot.host = Some(self.host.clone());
+        Ok(())
+    }
+
+    pub fn load_snapshot(&mut self, snapshot: &SessionSnapshot) -> Result<()> {
+        let saved = snapshot.host.as_ref().ok_or_else(|| Error {
+            code: 1,
+            message: "session snapshot is empty".into(),
+        })?;
+        if saved.family != self.host.family
+            || saved.backend != self.host.backend
+            || saved.ctx != self.host.ctx
+            || saved.prefill_cap != self.host.prefill_cap
+        {
+            return Err(Error {
+                code: 1,
+                message: "session snapshot belongs to an incompatible session".into(),
+            });
+        }
+
+        let mut err = [0u8; 512];
+        let rc = unsafe {
+            ds4_bridge_session_load_snapshot(
+                self.raw.as_ptr(),
+                snapshot.raw.as_ptr(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            self.host.clear_checkpoint_keep_generation();
+            self.host.generation = self.native_generation();
+            return Err(fail(rc, &err));
+        }
+        self.host = saved.clone();
+        self.host.generation = self.native_generation();
+        Ok(())
     }
 
     /// Native writes the full DSV4 file (header + tokens + GPU tail).
