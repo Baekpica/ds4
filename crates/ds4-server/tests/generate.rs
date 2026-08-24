@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 use std::thread;
+use std::time::Duration;
 
 fn env() -> ParseEnv {
     ParseEnv {
@@ -45,6 +46,7 @@ struct PromptSyncDecode {
     sync_calls: usize,
     disk_eligible: Vec<bool>,
     thinking_visible_eligible: Vec<bool>,
+    prompt_sync_elapsed: Option<Duration>,
     remembered: Vec<(Vec<u8>, i32)>,
     invalidations: usize,
 }
@@ -59,6 +61,7 @@ impl PromptSyncDecode {
             sync_calls: 0,
             disk_eligible: Vec::new(),
             thinking_visible_eligible: Vec::new(),
+            prompt_sync_elapsed: None,
             remembered: Vec::new(),
             invalidations: 0,
         }
@@ -109,6 +112,10 @@ impl DecodeIo for PromptSyncDecode {
         self.inner.live = tokens.to_vec();
         self.inner.pos = self.effective_prompt_pos;
         Ok(self.cached_tokens)
+    }
+
+    fn prompt_sync_elapsed(&self) -> Option<Duration> {
+        self.prompt_sync_elapsed
     }
 
     fn eval(&mut self, token: i32) -> Result<(), GenerateError> {
@@ -216,6 +223,7 @@ fn prompt_sync_reports_buffered_cache_usage_from_effective_pos() {
             .collect::<Vec<_>>(),
     );
     let mut engine = PromptSyncDecode::new(inner, 4, 6);
+    engine.prompt_sync_elapsed = Some(Duration::from_secs(2));
     let mut out = Vec::new();
 
     generate_and_write(
@@ -237,6 +245,7 @@ fn prompt_sync_reports_buffered_cache_usage_from_effective_pos() {
     );
     assert!(s.contains("\"prefill_tokens\":2"), "{s}");
     assert!(s.contains("\"prefill_cached_tokens\":4"), "{s}");
+    assert!(s.contains("\"prefill_tok_s\":1.0"), "{s}");
     assert_eq!(engine.prompt_sync_calls, 1);
     assert_eq!(engine.sync_calls, 0);
     assert_eq!(engine.disk_eligible, [true]);

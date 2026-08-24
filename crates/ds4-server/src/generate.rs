@@ -10,7 +10,7 @@
 use std::io::Write;
 #[cfg(any(feature = "native", test))]
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 #[cfg(any(feature = "native", test))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -82,6 +82,9 @@ pub trait DecodeIo {
     ) -> Result<i32, GenerateError> {
         self.sync(tokens)?;
         Ok(0)
+    }
+    fn prompt_sync_elapsed(&self) -> Option<Duration> {
+        None
     }
     fn eval(&mut self, token: i32) -> Result<(), GenerateError>;
     fn sample(&mut self, temperature: f32, top_k: i32, top_p: f32, min_p: f32, rng: &mut u64)
@@ -735,6 +738,9 @@ pub(crate) fn generate_terminal_at(
         thinking_visible_cache_eligible(&parsed),
     )?;
     let decode_t0 = Instant::now();
+    let prefill_elapsed = engine
+        .prompt_sync_elapsed()
+        .unwrap_or_else(|| decode_t0.duration_since(t_prefill));
     let mut first_tok = None;
     let mut decode_steps = 0i32;
 
@@ -915,7 +921,7 @@ pub(crate) fn generate_terminal_at(
             req.timings = ReqTimings {
                 valid: true,
                 ttft_ms: t_first.duration_since(t_arrive).as_secs_f64() * 1e3,
-                prefill_ms: decode_t0.duration_since(t_prefill).as_secs_f64() * 1e3,
+                prefill_ms: prefill_elapsed.as_secs_f64() * 1e3,
                 decode_ms: Instant::now().duration_since(t_first).as_secs_f64() * 1e3,
                 prefill_tokens: prompt_n - req.cache_read_tokens,
                 prefill_cached: req.cache_read_tokens,
@@ -1215,6 +1221,7 @@ impl DecodeIo for ScriptedDecode {
 struct NativeSerialKvIo<'s, 'm, 'v> {
     session: &'s mut ds4_core::Session<'m>,
     vocab: &'v ds4_core::Vocab,
+    sync_elapsed: Duration,
 }
 
 #[cfg(feature = "native")]
@@ -1245,9 +1252,13 @@ impl SerialKvIo for NativeSerialKvIo<'_, '_, '_> {
 
     fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError> {
         let tokens = ds4_core::TokenBuffer::from_tokens(tokens.to_vec());
-        self.session
+        let started = Instant::now();
+        let result = self
+            .session
             .sync(&tokens)
-            .map_err(|error| GenerateError::Engine(error.to_string()))
+            .map_err(|error| GenerateError::Engine(error.to_string()));
+        self.sync_elapsed += started.elapsed();
+        result
     }
 
     fn save_payload(&mut self, path: &Path) -> Result<(), GenerateError> {
@@ -1280,6 +1291,7 @@ pub struct NativeDecode<'a> {
     store: Option<KvStore>,
     session_disk_storable: bool,
     thinking_visible: Option<ThinkingVisibleCheckpoint>,
+    prompt_sync_elapsed: Option<Duration>,
     ctx: i32,
 }
 
@@ -1293,6 +1305,7 @@ impl<'a> NativeDecode<'a> {
             store: None,
             session_disk_storable: false,
             thinking_visible: None,
+            prompt_sync_elapsed: None,
             ctx,
         }
     }
@@ -1376,6 +1389,7 @@ impl DecodeIo for NativeDecode<'_> {
         disk_eligible: bool,
         thinking_visible_eligible: bool,
     ) -> Result<i32, GenerateError> {
+        self.prompt_sync_elapsed = None;
         let model_id = self.model.model_id();
         let quant_bits = self.model.routed_quant_bits();
         let vocab = self.vocab.unwrap_or_else(|| self.model.vocab());
@@ -1390,7 +1404,11 @@ impl DecodeIo for NativeDecode<'_> {
         let session = session.as_mut().ok_or_else(|| {
             GenerateError::Engine("native session was not created".into())
         })?;
-        let mut io = NativeSerialKvIo { session, vocab };
+        let mut io = NativeSerialKvIo {
+            session,
+            vocab,
+            sync_elapsed: Duration::ZERO,
+        };
         let result = disk_sync_prompt(
             &mut io,
             store.as_mut(),
@@ -1405,9 +1423,16 @@ impl DecodeIo for NativeDecode<'_> {
                 load: disk_eligible,
             },
         );
+        if result.is_ok() {
+            self.prompt_sync_elapsed = Some(io.sync_elapsed);
+        }
         self.session_disk_storable = result.is_ok() && disk_eligible && has_store;
         settle_thinking_visible_checkpoint(&mut self.thinking_visible, result.is_ok());
         result
+    }
+
+    fn prompt_sync_elapsed(&self) -> Option<Duration> {
+        self.prompt_sync_elapsed
     }
 
     fn eval(&mut self, token: i32) -> Result<(), GenerateError> {
