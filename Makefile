@@ -75,9 +75,9 @@ endif
         proof-cuda-smoke proof-cuda-long proof-cuda-opp-c \
         proof-rust-cuda-opp-c print-version \
         test-motif3-loader test-motif3-reference test-motif3-tokenizer \
-        test-motif3-cuda test-motif3-resident \
-        test-dots3-loader test-dots3-tokenizer test-dots3-reference \
-        test-dots3-resident test-dots3-batch \
+        test-motif3-cuda test-motif3-resident test-motif3-batch \
+        test-dots3-loader test-dots3-tokenizer \
+        test-dots3-resident \
         test-mmq-parity test-model-family-kernels \
         test-solar-loader test-solar-kda test-solar-kda-prefill \
         test-solar-kda-chunk \

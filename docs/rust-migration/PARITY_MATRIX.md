@@ -174,12 +174,13 @@ Makefile variables, not flags:
 | Family | Targets |
 |---|---|
 | Motif-3 | `test-motif3-{loader,reference,tokenizer,cuda,resident,batch}` |
-| Solar | `test-solar-{loader,tokenizer,forward,session,kda,...}` |
+| Solar | `test-solar-{loader,tokenizer,forward,session,kda,kda-prefill,kda-chunk,gates,kv}` |
 | K-EXAONE | `test-exaone-{ref,kernels,batch}` |
-| dots3-note | `test-dots3-{loader,tokenizer,reference,resident,batch}` |
+| dots3-note | `test-dots3-{loader,tokenizer,resident}` |
 | Shared | `test-model-family-kernels`, `test-mmq-parity` |
 
-Resident tests load real weights. Use tmux + `scripts/guarded-run.sh`.
+Resident tests load real weights. Use tmux + workspace-local
+`../scripts/guarded-run.sh` (outside this repository).
 One resident model at a time.
 
 ## Performance protocol
