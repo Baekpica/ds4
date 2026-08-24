@@ -363,7 +363,7 @@ fn tcp_models_options_unknown_bad_http() {
     let out = one_shot(&cfg, b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}");
     assert_eq!(
         out,
-        wire_http_error_bytes(WireSurface::OpenaiChat, 404, "unknown endpoint", true, None)
+        wire_http_error_bytes(WireSurface::OpenaiChat, 400, "missing messages", true, None)
     );
 
     let out = one_shot(&cfg, b"NOTHTTP");

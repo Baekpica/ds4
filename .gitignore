@@ -11,6 +11,7 @@
 /tests/parity/dist_c_oracle
 /tests/parity/route_c_oracle
 /tests/parity/server_c_oracle
+/tests/parity/parse_c_oracle
 /ds4_native
 /ds4_server_test
 /ds4_test

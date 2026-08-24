@@ -2,6 +2,14 @@
 
 use crate::json::json_escape;
 
+pub fn model_alias_disables_thinking(model: &str) -> bool {
+    model == "deepseek-chat" || model == "k-exaone-236b-a23b-chat"
+}
+
+pub fn model_alias_enables_thinking(model: &str) -> bool {
+    model == "deepseek-reasoner"
+}
+
 pub fn model_alias_known(id: &str) -> bool {
     matches!(
         id,

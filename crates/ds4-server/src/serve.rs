@@ -5,9 +5,10 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 
 use crate::error::{http_response_bytes, wire_http_error_bytes};
-use crate::http::{chunked_enabled, read_http_request};
+use crate::http::{chunked_enabled, parse_surface_for_path, read_http_request};
 use crate::models::{model_id_known, model_one_json, models_list_json};
-use crate::route::WireSurface;
+use crate::parse::{parse_request, ParseEnv};
+use crate::route::{ThinkMode, WireSurface};
 
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -84,6 +85,28 @@ pub fn handle_client(cfg: &ServerConfig, stream: &mut TcpStream) {
                 &http_response_bytes(200, Some("application/json"), None, cfg.cors, &body),
             );
             return;
+        }
+    }
+    if req.method == "POST" {
+        if let Some(surf) = parse_surface_for_path(&req.path) {
+            let env = ParseEnv {
+                default_model: cfg.model_id.clone(),
+                default_tokens: cfg.default_tokens,
+                default_effort: ThinkMode::Low,
+                default_temp: crate::parse::default_temperature(),
+            };
+            let body = std::str::from_utf8(&req.body).unwrap_or("");
+            match parse_request(surf, &env, body) {
+                Err(e) => {
+                    let msg = if e.is_empty() { "invalid JSON request" } else { &e };
+                    write_all(
+                        stream,
+                        &wire_http_error_bytes(surf, 400, msg, cfg.cors, None),
+                    );
+                    return;
+                }
+                Ok(_) => {}
+            }
         }
     }
     write_all(

@@ -81,9 +81,11 @@ SNAPSHOT_* / DSV4 gather, `ds4_dist_session_*` wired through `ds4.c`.
 
 `route_decide` + `request_compute_needs` are the routing oracle.
 The HTTP door (reader, native error envelopes, schema-format refusal,
-`/v1/models` porcelain) is `make test-server-parity`. Remaining:
-four JSON parsers, continuation registry, enqueue/shed, stream
-projectors, generation dispatch. Do not improve the table.
+`/v1/models` porcelain) and the four JSON parsers (chat / completion /
+Anthropic / Responses, tokenize/render cut off) are
+`make test-server-parity`. Remaining: continuation registry,
+enqueue/shed, stream projectors, generation dispatch. Do not improve
+the table.
 
 All four surfaces:
 

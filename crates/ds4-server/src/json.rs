@@ -279,6 +279,73 @@ pub fn json_skip_value(p: &mut Json<'_>) -> bool {
     skip_value_depth(p, 0)
 }
 
+pub fn json_raw_value(p: &mut Json<'_>) -> Option<String> {
+    p.ws();
+    let start = p.i;
+    if !json_skip_value(p) {
+        return None;
+    }
+    String::from_utf8(p.s[start..p.i].to_vec()).ok()
+}
+
+pub fn json_content(p: &mut Json<'_>) -> Option<String> {
+    p.ws();
+    if p.peek() == Some(b'"') {
+        return json_string(p);
+    }
+    if p.lit("null") {
+        return Some(String::new());
+    }
+    if p.peek() != Some(b'[') {
+        if !json_skip_value(p) {
+            return None;
+        }
+        return Some(String::new());
+    }
+    p.i += 1;
+    let mut b = String::new();
+    p.ws();
+    while p.peek().is_some() && p.peek() != Some(b']') {
+        if p.peek() == Some(b'"') {
+            b.push_str(&json_string(p)?);
+        } else if p.peek() == Some(b'{') {
+            p.i += 1;
+            p.ws();
+            while p.peek().is_some() && p.peek() != Some(b'}') {
+                let key = json_string(p)?;
+                p.ws();
+                if p.bump() != Some(b':') {
+                    return None;
+                }
+                if key == "text" {
+                    b.push_str(&json_string(p)?);
+                } else if !json_skip_value(p) {
+                    return None;
+                }
+                p.ws();
+                if p.peek() == Some(b',') {
+                    p.i += 1;
+                }
+                p.ws();
+            }
+            if p.bump() != Some(b'}') {
+                return None;
+            }
+        } else if !json_skip_value(p) {
+            return None;
+        }
+        p.ws();
+        if p.peek() == Some(b',') {
+            p.i += 1;
+        }
+        p.ws();
+    }
+    if p.bump() != Some(b']') {
+        return None;
+    }
+    Some(b)
+}
+
 /// Surrounding quotes included, matching `json_escape`.
 pub fn json_escape(s: &str) -> String {
     let mut out = vec![b'"'];

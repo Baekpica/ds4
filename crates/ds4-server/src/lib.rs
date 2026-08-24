@@ -5,6 +5,7 @@ pub mod format;
 pub mod http;
 pub mod json;
 pub mod models;
+pub mod parse;
 pub mod route;
 pub mod serve;
 
@@ -20,10 +21,19 @@ pub use http::{
     chunked_enabled, content_length, header_accepts_json, header_chunked, header_end,
     parse_surface_for_path, read_http_request, shed_surface_for_path, HttpRequest,
 };
-pub use json::{json_escape, json_skip_value, json_string, Json};
+pub use json::{
+    json_bool, json_content, json_escape, json_int, json_number, json_raw_value, json_skip_value,
+    json_string, Json,
+};
 pub use models::{
-    append_model_json_values, json_models_array_dup, model_alias_known, model_id_from_gguf_path,
-    model_id_known, model_one_json, models_list_json,
+    append_model_json_values, json_models_array_dup, model_alias_disables_thinking,
+    model_alias_enables_thinking, model_alias_known, model_id_from_gguf_path, model_id_known,
+    model_one_json, models_list_json,
+};
+pub use parse::{
+    default_temperature, parse_anthropic_request, parse_chat_request, parse_completion_request,
+    parse_request, parse_responses_request, ParseEnv, ParsedRequest, ToolChoice, DEFAULT_MIN_P,
+    DEFAULT_TEMPERATURE, DEFAULT_TOP_P,
 };
 pub use route::{
     compute_needs, decode_budget, parse_reasoning_effort_name, route_decide, think_mode_enabled,
