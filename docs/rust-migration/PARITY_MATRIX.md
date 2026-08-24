@@ -139,9 +139,48 @@ at 2,038.4/2,078.9/2,018.0 ms TTFT. Header timestamps and hit counters remain
 intentionally volatile; the text and payload bodies are exact. These cells are
 a correctness/cross-read gate, not a cold-policy ABBA performance claim.
 
-This is not the whole Phase 4 gate. C's default continued interval
-(`continued=10000`) is not exposed or executed by the Rust shadow, and
-tool-map checkpoint replay is also missing.
+The ordinary serial continued final-sync call/order is CPU-green, while the
+decode frontier is live-green under
+`scratch/rust-host-live/continued-fourway-oJTYrf/`. C and Rust used ctx 8,192,
+`cold=0`, `continued=6800`, trim 0, align 1, and request A
+(`a765063d...`). Both wrote
+`411e439f9951c2df3addaa93e73cabee465bf0b2.kv`, 300,423,338 bytes,
+reason 2, ext 0, model 3, tokens 6,800, ctx 8,192. The rendered-text SHA-256
+was `025231236a8afc77532eeecdb6ea16b3f94b51456641e29224438813605764ae`
+and payload SHA-256 was
+`be4d59a936d236809bfeae3953408b067df3a5dac86212b85df21ecf98550838`
+for both hosts; their 114-token answer was exact.
+
+The first restart fixture was intentionally retained as a negative oracle:
+Motif live generation contains `<think></think>`, while a closed no-think
+assistant history drops that empty pair in both C and Rust. It therefore
+misses the record by construction. The positive fixture prepends the same
+empty pair to the assistant replay (SHA-256 `6bbd72ee...`) so its rendered
+bytes preserve the live KVC prefix. Four isolated/cross-host loader cells
+then passed:
+
+```text
+C save    → Rust load   PASS  cached=6800 computed=111 output=4
+Rust save → C load      PASS  cached=6800 computed=111 output=4
+Rust save → Rust load   PASS  cached=6800 computed=111 output=4
+C save    → C load      PASS  cached=6800 computed=111 output=4
+```
+
+All returned `RESTORED_OK` with semantic response SHA-256 `f61bf763...`.
+The C binary was `04f25a86...`; the live-tested Rust binary was
+`beadabe4...`. The subsequent cheap-frontier build `42a1ddfb...` removes the
+non-due token-vector copy and passed the full CPU/parity/link gates; it did not
+need another 100 GiB live matrix because checkpoint bytes and ordering are
+unchanged. Teardown and `clear_cache` ran between resident models, and the
+final host had no compute application or listener. These cells prove
+decode-frontier continued correctness and cross-read; the final-sync
+call/order is covered by the CPU integration test. Neither is a performance
+gate.
+
+This is still not the whole Phase 4 gate. C's intermediate-prefill progress
+checkpoints, tool-map checkpoint replay, continuous-bank checkpoints, the
+default configured 10,000-token/effective aligned 10,240-token interval, and
+full default-policy ABBA remain pending.
 
 ### Phase 5 — web utility
 

@@ -1,8 +1,8 @@
 //! Four-way KVC matrix: C save/load × Rust save/load.
 
 use ds4_kv::{
-    chat_anchor_pos, decode_file, encode_file, eviction_score, read_path, store_len, write_path,
-    Header, Options, Reason, Record, ScoreEntry, Store,
+    chat_anchor_pos, continued_store_target, decode_file, encode_file, eviction_score, read_path,
+    store_len, write_path, Header, Options, Reason, Record, ScoreEntry, Store,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -233,6 +233,46 @@ fn store_len_matches_c() {
         assert!(out.status.success());
         let c: i32 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
         assert_eq!(store_len(&Options::default(), tokens), c, "tokens={tokens}");
+    }
+}
+
+#[test]
+fn continued_target_matches_c() {
+    for (name, min, interval, align, last, live, expected) in [
+        ("default", 512, 10000, 2048, 0, 10240, 10240),
+        ("disabled", 512, 0, 2048, 0, 10240, 0),
+        ("custom-align", 512, 10000, 4096, 0, 12288, 12288),
+        ("below-min", 20000, 10000, 2048, 0, 10240, 0),
+        ("prior-marker", 512, 10000, 2048, 10240, 10240, 0),
+        ("nonmultiple", 512, 10000, 2048, 0, 10239, 0),
+        ("serial-align1", 512, 6800, 1, 0, 6800, 6800),
+    ] {
+        let out = Command::new(require_oracle())
+            .args([
+                "continued-target",
+                "--min",
+                &min.to_string(),
+                "--interval",
+                &interval.to_string(),
+                "--align",
+                &align.to_string(),
+                "--last",
+                &last.to_string(),
+                "--live",
+                &live.to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "C continued-target failed for {name}");
+        let c: i32 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+        assert_eq!(c, expected, "C case={name}");
+        let opt = Options {
+            min_tokens: min,
+            continued_interval_tokens: interval,
+            boundary_align_tokens: align,
+            ..Options::default()
+        };
+        assert_eq!(continued_store_target(&opt, last, live), c, "case={name}");
     }
 }
 

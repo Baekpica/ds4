@@ -54,6 +54,9 @@ impl DiskKvArgs {
             "--kv-cache-cold-max-tokens" => {
                 self.options.cold_max_tokens = nonnegative_i32(option, &value()?)?
             }
+            "--kv-cache-continued-interval-tokens" => {
+                self.options.continued_interval_tokens = nonnegative_i32(option, &value()?)?
+            }
             "--kv-cache-boundary-trim-tokens" => {
                 self.options.boundary_trim_tokens = nonnegative_i32(option, &value()?)?
             }
@@ -98,12 +101,13 @@ impl DiskKvArgs {
         ) {
             Ok(store) => {
                 eprintln!(
-                    "ds4-server-rs: KV disk cache {} (budget={} MiB, cross-quant={}, min={}, cold_max={}, trim={}, align={}; ordinary serial cold/evict/load)",
+                    "ds4-server-rs: KV disk cache {} (budget={} MiB, cross-quant={}, min={}, cold_max={}, continued={}, trim={}, align={}; ordinary serial cold/continued/evict/load)",
                     dir.display(),
                     store.budget_bytes / (1024 * 1024),
                     if self.reject_different_quant { "reject" } else { "accept" },
                     self.options.min_tokens,
                     self.options.cold_max_tokens,
+                    self.options.continued_interval_tokens,
                     self.options.boundary_trim_tokens,
                     self.options.boundary_align_tokens,
                 );
@@ -145,13 +149,14 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_serial_cold_policy_flags_parse() {
+    fn ordinary_serial_checkpoint_policy_flags_parse() {
         let mut kv = DiskKvArgs::default();
         let cases = [
             ("--kv-disk-dir", "cache"),
             ("--kv-disk-space-mb", "64"),
             ("--kv-cache-min-tokens", "1024"),
             ("--kv-cache-cold-max-tokens", "4096"),
+            ("--kv-cache-continued-interval-tokens", "2048"),
             ("--kv-cache-boundary-trim-tokens", "16"),
             ("--kv-cache-boundary-align-tokens", "512"),
         ];
@@ -163,14 +168,11 @@ mod tests {
         assert!(kv
             .parse_arg("--kv-cache-reject-different-quant", &mut empty)
             .unwrap());
-        for inactive in ["--kv-cache-continued-interval-tokens"] {
-            assert!(!kv.parse_arg(inactive, &mut empty).unwrap());
-        }
-
         assert_eq!(kv.dir.as_deref(), Some(std::path::Path::new("cache")));
         assert_eq!(kv.space_mb, 64);
         assert_eq!(kv.options.min_tokens, 1024);
         assert_eq!(kv.options.cold_max_tokens, 4096);
+        assert_eq!(kv.options.continued_interval_tokens, 2048);
         assert_eq!(kv.options.boundary_trim_tokens, 16);
         assert_eq!(kv.options.boundary_align_tokens, 512);
         assert!(kv.reject_different_quant);
@@ -181,6 +183,7 @@ mod tests {
         let mut kv = DiskKvArgs::default();
         for option in [
             "--kv-cache-cold-max-tokens",
+            "--kv-cache-continued-interval-tokens",
             "--kv-cache-boundary-trim-tokens",
             "--kv-cache-boundary-align-tokens",
         ] {
@@ -188,6 +191,7 @@ mod tests {
             assert!(kv.parse_arg(option, &mut zero).unwrap());
         }
         assert_eq!(kv.options.cold_max_tokens, 0);
+        assert_eq!(kv.options.continued_interval_tokens, 0);
         assert_eq!(kv.options.boundary_trim_tokens, 0);
         assert_eq!(kv.options.boundary_align_tokens, 0);
         kv.validate().unwrap();
@@ -208,6 +212,7 @@ mod tests {
         kv.set_min_tokens("2147483647").unwrap();
         for option in [
             "--kv-cache-cold-max-tokens",
+            "--kv-cache-continued-interval-tokens",
             "--kv-cache-boundary-trim-tokens",
             "--kv-cache-boundary-align-tokens",
         ] {
@@ -217,6 +222,7 @@ mod tests {
         assert_eq!(kv.space_mb, i32::MAX as u64);
         assert_eq!(kv.options.min_tokens, i32::MAX);
         assert_eq!(kv.options.cold_max_tokens, i32::MAX);
+        assert_eq!(kv.options.continued_interval_tokens, i32::MAX);
         assert_eq!(kv.options.boundary_trim_tokens, i32::MAX);
         assert_eq!(kv.options.boundary_align_tokens, i32::MAX);
     }
@@ -236,6 +242,7 @@ mod tests {
         }
         for option in [
             "--kv-cache-cold-max-tokens",
+            "--kv-cache-continued-interval-tokens",
             "--kv-cache-boundary-trim-tokens",
             "--kv-cache-boundary-align-tokens",
         ] {
@@ -256,6 +263,7 @@ mod tests {
         for option in [
             "--kv-disk-dir",
             "--kv-cache-cold-max-tokens",
+            "--kv-cache-continued-interval-tokens",
             "--kv-cache-boundary-trim-tokens",
             "--kv-cache-boundary-align-tokens",
         ] {

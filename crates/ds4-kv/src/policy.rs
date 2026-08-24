@@ -82,10 +82,9 @@ pub fn continued_step(opt: &Options) -> i32 {
     let mut step = opt.continued_interval_tokens;
     let align = opt.boundary_align_tokens;
     if align > 0 {
-        step = ((step + align - 1) / align) * align;
-        if step <= 0 {
-            step = align;
-        }
+        let rounded = ((i64::from(step) + i64::from(align) - 1) / i64::from(align))
+            * i64::from(align);
+        step = i32::try_from(rounded).unwrap_or(0);
     }
     step
 }
@@ -242,6 +241,18 @@ mod tests {
         assert_eq!(continued_store_target(&opt, 0, 8192), 0);
         assert_eq!(continued_store_target(&opt, 0, 10240), 10240);
         assert_eq!(continued_store_target(&opt, 10240, 10240), 0);
+    }
+
+    #[test]
+    fn continued_step_disables_unrepresentable_aligned_interval() {
+        let opt = Options {
+            min_tokens: 1,
+            continued_interval_tokens: i32::MAX,
+            boundary_align_tokens: 2048,
+            ..Options::default()
+        };
+        assert_eq!(continued_step(&opt), 0);
+        assert_eq!(continued_store_target(&opt, 0, 2048), 0);
     }
 
     #[test]

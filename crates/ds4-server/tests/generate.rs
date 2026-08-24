@@ -49,6 +49,9 @@ struct PromptSyncDecode {
     prompt_sync_elapsed: Option<Duration>,
     remembered: Vec<(Vec<u8>, i32)>,
     invalidations: usize,
+    continued_positions: Vec<i32>,
+    fail_continued: bool,
+    events: Vec<&'static str>,
 }
 
 impl PromptSyncDecode {
@@ -64,6 +67,9 @@ impl PromptSyncDecode {
             prompt_sync_elapsed: None,
             remembered: Vec::new(),
             invalidations: 0,
+            continued_positions: Vec::new(),
+            fail_continued: false,
+            events: Vec::new(),
         }
     }
 }
@@ -105,6 +111,7 @@ impl DecodeIo for PromptSyncDecode {
         disk_eligible: bool,
         thinking_visible_eligible: bool,
     ) -> Result<i32, GenerateError> {
+        self.events.push("sync");
         self.prompt_sync_calls += 1;
         self.disk_eligible.push(disk_eligible);
         self.thinking_visible_eligible
@@ -119,6 +126,7 @@ impl DecodeIo for PromptSyncDecode {
     }
 
     fn eval(&mut self, token: i32) -> Result<(), GenerateError> {
+        self.events.push("eval");
         self.inner.eval(token)
     }
 
@@ -130,6 +138,7 @@ impl DecodeIo for PromptSyncDecode {
         min_p: f32,
         rng: &mut u64,
     ) -> i32 {
+        self.events.push("sample");
         self.inner
             .sample(temperature, top_k, top_p, min_p, rng)
     }
@@ -148,6 +157,18 @@ impl DecodeIo for PromptSyncDecode {
 
     fn session_tokens(&self) -> Vec<i32> {
         self.inner.session_tokens()
+    }
+
+    fn maybe_store_continued(&mut self) -> Result<(), GenerateError> {
+        self.events.push("continued");
+        self.continued_positions.push(self.pos());
+        if self.fail_continued {
+            Err(GenerateError::Engine(
+                "injected continued save failure".into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn remember_thinking_visible_checkpoint(&mut self, text: Vec<u8>) {
@@ -178,6 +199,45 @@ fn family_generate_allows_tools() {
     let mut tools = parsed.clone();
     tools.has_tools = true;
     assert_eq!(generation_blocked(&tools, 0), None);
+}
+
+#[test]
+fn continued_store_is_best_effort_and_runs_before_sampling_without_final_catchup() {
+    let mut parsed = user_req();
+    parsed.max_tokens = 2;
+    parsed.max_tokens_set = true;
+    let inner = ScriptedDecode::from_pieces(&[b"a", b"b"]);
+    let mut engine = PromptSyncDecode::new(inner, 0, 1);
+    engine.fail_continued = true;
+    let mut out = Vec::new();
+
+    let outcome = generate_and_write(
+        &mut engine,
+        &parsed,
+        "chatcmpl-continued-order",
+        CREATED_TEST,
+        false,
+        2,
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(outcome.finish, "length");
+    assert_eq!(engine.continued_positions, [1, 1, 2]);
+    assert_eq!(
+        engine.events,
+        [
+            "sync",
+            "continued",
+            "continued",
+            "sample",
+            "eval",
+            "continued",
+            "sample",
+            "eval",
+        ]
+    );
+    assert_eq!(engine.pos(), 3);
 }
 
 #[test]

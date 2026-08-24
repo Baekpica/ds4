@@ -16,8 +16,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(any(feature = "native", test))]
 use ds4_kv::{
-    chat_anchor_pos as kv_chat_anchor_pos, store_len as kv_store_len, Header as KvHeader,
-    Reason as KvReason, Store as KvStore, EXT_THINKING_VISIBLE,
+    chat_anchor_pos as kv_chat_anchor_pos, continued_store_target as kv_continued_store_target,
+    store_len as kv_store_len, Header as KvHeader, Reason as KvReason, Store as KvStore,
+    EXT_THINKING_VISIBLE,
 };
 
 use crate::dsml::{SampleOverride, SamplePolicy};
@@ -89,6 +90,9 @@ pub trait DecodeIo {
     fn prompt_sync_elapsed(&self) -> Option<Duration> {
         None
     }
+    fn maybe_store_continued(&mut self) -> Result<(), GenerateError> {
+        Ok(())
+    }
     fn eval(&mut self, token: i32) -> Result<(), GenerateError>;
     fn sample(&mut self, temperature: f32, top_k: i32, top_p: f32, min_p: f32, rng: &mut u64)
         -> i32;
@@ -131,6 +135,7 @@ trait SerialKvIo {
     fn chat_token_ids(&self) -> (i32, i32) {
         (-1, -1)
     }
+    fn live_len(&self) -> i32;
     fn live_tokens(&self) -> Vec<i32>;
     fn render_tokens(&self, tokens: &[i32]) -> Result<Vec<u8>, GenerateError>;
     fn tokenize_suffix(&mut self, suffix: &[u8]) -> Result<Vec<i32>, GenerateError>;
@@ -222,6 +227,44 @@ fn try_store_live(
         .write_payload_file(header, &text, payload.path(), b"")
         .map_err(|error| GenerateError::Engine(error.to_string()))?;
     Ok(())
+}
+
+#[cfg(any(feature = "native", test))]
+fn try_store_continued(
+    io: &mut impl SerialKvIo,
+    store: &mut KvStore,
+    identity: (u8, u8, u32),
+) -> Result<bool, GenerateError> {
+    let target = kv_continued_store_target(
+        &store.opt,
+        store.continued_last_store_tokens,
+        io.live_len(),
+    );
+    if target == 0 {
+        return Ok(false);
+    }
+    let (model_id, quant_bits, ctx) = identity;
+    try_store_live(
+        io,
+        store,
+        model_id,
+        quant_bits,
+        ctx,
+        KvReason::Continued,
+        None,
+    )?;
+    store.continued_last_store_tokens = store.continued_last_store_tokens.max(target);
+    Ok(true)
+}
+
+fn store_continued_best_effort(engine: &mut dyn DecodeIo) {
+    if let Err(error) = engine.maybe_store_continued() {
+        eprintln!("ds4-server-rs: continued KV checkpoint failed: {error}");
+    }
+}
+
+fn continued_decode_allowed(acc: &SemAccum) -> bool {
+    !(acc.track_tools && (acc.saw_tool_start || acc.dsml_state().is_tool()))
 }
 
 #[cfg(any(feature = "native", test))]
@@ -649,6 +692,9 @@ fn decode_pass(
 ) -> Result<(), GenerateError> {
     while acc.completion < max_tokens && engine.pos() < engine.ctx() {
         out.flush().map_err(|_| GenerateError::Io)?;
+        if continued_decode_allowed(acc) {
+            store_continued_best_effort(engine);
+        }
         let mut temperature = parsed.temperature;
         let mut top_k = parsed.top_k;
         let mut top_p = parsed.top_p;
@@ -809,6 +855,7 @@ pub(crate) fn generate_terminal_at(
         ordinary_disk_cache_eligible(&parsed),
         thinking_visible_cache_eligible(&parsed),
     )?;
+    store_continued_best_effort(engine);
     let decode_t0 = Instant::now();
     let prefill_elapsed = engine
         .prompt_sync_elapsed()
@@ -1306,6 +1353,10 @@ impl SerialKvIo for NativeSerialKvIo<'_, '_, '_> {
         (self.vocab.user_id, self.vocab.assistant_id)
     }
 
+    fn live_len(&self) -> i32 {
+        self.session.host().live_len()
+    }
+
     fn live_tokens(&self) -> Vec<i32> {
         if self.session.host().valid {
             self.session.host().tokens().to_vec()
@@ -1511,6 +1562,30 @@ impl DecodeIo for NativeDecode<'_> {
         self.prompt_sync_elapsed
     }
 
+    fn maybe_store_continued(&mut self) -> Result<(), GenerateError> {
+        if !self.session_disk_storable {
+            return Ok(());
+        }
+        let Some(identity) = kv_identity(
+            self.model.model_id(),
+            self.model.routed_quant_bits(),
+            self.ctx(),
+        ) else {
+            return Ok(());
+        };
+        let vocab = self.vocab.unwrap_or_else(|| self.model.vocab());
+        let (Some(session), Some(store)) = (&mut self.session, &mut self.store) else {
+            return Ok(());
+        };
+        let mut io = NativeSerialKvIo {
+            session,
+            vocab,
+            sync_elapsed: Duration::ZERO,
+        };
+        try_store_continued(&mut io, store, identity)?;
+        Ok(())
+    }
+
     fn eval(&mut self, token: i32) -> Result<(), GenerateError> {
         self.session()?
             .eval(token)
@@ -1568,13 +1643,18 @@ impl DecodeIo for NativeDecode<'_> {
 #[cfg(test)]
 mod disk_sync_tests {
     use super::{
-        discard_loaded, disk_sync_prompt, ordinary_disk_cache_eligible,
-        settle_thinking_visible_checkpoint, thinking_visible_cache_eligible, DiskSyncPolicy,
-        GenerateError, SerialKvIo, ThinkingVisibleCheckpoint,
+        continued_decode_allowed, discard_loaded, disk_sync_prompt, ordinary_disk_cache_eligible,
+        settle_thinking_visible_checkpoint, thinking_visible_cache_eligible,
+        try_store_continued, DiskSyncPolicy, GenerateError, SerialKvIo,
+        ThinkingVisibleCheckpoint,
     };
-    use crate::parse::{parse_request, ParseEnv};
+    use crate::parse::{parse_request, ChatMsg, ParseEnv};
+    use crate::render::render_motif3_chat_ex;
     use crate::route::{Api, ThinkMode, WireSurface};
+    use crate::stream::ChatFormat;
+    use crate::tools::SemAccum;
     use ds4_kv::{read_envelope, Header, Options, Reason, Record, Store, EXT_THINKING_VISIBLE};
+    use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1596,6 +1676,7 @@ mod disk_sync_tests {
         events: Vec<&'static str>,
         user_token_id: i32,
         assistant_token_id: i32,
+        live_token_reads: Cell<usize>,
     }
 
     impl FakeSerial {
@@ -1617,6 +1698,7 @@ mod disk_sync_tests {
                 events: Vec::new(),
                 user_token_id: -1,
                 assistant_token_id: -1,
+                live_token_reads: Cell::new(0),
             }
         }
     }
@@ -1630,7 +1712,12 @@ mod disk_sync_tests {
             (self.user_token_id, self.assistant_token_id)
         }
 
+        fn live_len(&self) -> i32 {
+            i32::try_from(self.live.len()).unwrap_or(0)
+        }
+
         fn live_tokens(&self) -> Vec<i32> {
+            self.live_token_reads.set(self.live_token_reads.get() + 1);
             self.live.clone()
         }
 
@@ -1937,6 +2024,189 @@ mod disk_sync_tests {
         let _ = fs::remove_dir_all(save_dir);
         let _ = fs::remove_dir_all(sync_dir);
         let _ = fs::remove_dir_all(tail_dir);
+    }
+
+    #[test]
+    fn continued_store_requires_an_exact_frontier_and_advances_only_on_success() {
+        let (dir, mut continued_store) = store("continued");
+        let mut io = FakeSerial::new(&[1, 2, 3, 4, 5, 6, 7], b"continued");
+        assert!(!try_store_continued(&mut io, &mut continued_store, (0, 2, 4096)).unwrap());
+        assert!(io.events.is_empty());
+        assert_eq!(io.live_token_reads.get(), 0);
+        assert_eq!(continued_store.continued_last_store_tokens, 0);
+
+        io.live.push(8);
+        assert!(try_store_continued(&mut io, &mut continued_store, (0, 2, 4096)).unwrap());
+        assert_eq!(io.events, ["save"]);
+        assert_eq!(io.live_token_reads.get(), 1);
+        assert_eq!(continued_store.continued_last_store_tokens, 8);
+        assert_eq!(continued_store.entries().len(), 1);
+        assert_eq!(continued_store.entries()[0].header.reason, Reason::Continued);
+        assert_eq!(continued_store.entries()[0].header.tokens, 8);
+
+        continued_store.continued_last_store_tokens = 0;
+        io.events.clear();
+        assert!(try_store_continued(&mut io, &mut continued_store, (0, 2, 4096)).unwrap());
+        assert!(io.events.is_empty());
+        assert_eq!(continued_store.continued_last_store_tokens, 8);
+
+        let (fail_dir, mut fail_store) = store("continued-fail");
+        let mut fail_io = FakeSerial::new(&[1, 2, 3, 4, 5, 6, 7, 8], b"continued-fail");
+        fail_io.fail_save = true;
+        assert!(try_store_continued(&mut fail_io, &mut fail_store, (0, 2, 4096)).is_err());
+        assert_eq!(fail_io.events, ["save"]);
+        assert_eq!(fail_store.continued_last_store_tokens, 0);
+        assert!(fail_store.entries().is_empty());
+
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(fail_dir);
+    }
+
+    #[test]
+    fn continued_decode_gate_stops_after_tool_syntax_begins() {
+        let plain = SemAccum::init(true, false, false, ChatFormat::DeepSeek, b"");
+        assert!(continued_decode_allowed(&plain));
+
+        let mut tools = SemAccum::init(true, true, false, ChatFormat::DeepSeek, b"");
+        assert!(continued_decode_allowed(&tools));
+        tools.feed("<｜DSML｜tool_calls>\n".as_bytes(), &[]);
+        assert!(tools.saw_tool_start);
+        assert!(!continued_decode_allowed(&tools));
+
+        let mut thinking = SemAccum::init(true, true, true, ChatFormat::DeepSeek, b"");
+        thinking.feed("<｜DSML｜tool_calls>\n".as_bytes(), &[]);
+        assert!(!thinking.saw_tool_start);
+        assert!(thinking.dsml_state().is_tool());
+        assert!(!continued_decode_allowed(&thinking));
+    }
+
+    fn chat_msg(role: &str, content: &str) -> ChatMsg {
+        ChatMsg {
+            role: role.into(),
+            content: content.into(),
+            ..ChatMsg::default()
+        }
+    }
+
+    #[test]
+    fn continued_prefix_hit_misses_motif_history_wrap() {
+        let (dir, mut store) = store("continued-motif-prefix");
+        let user = "summarize this";
+        let live_decode = "The model serves five families.";
+        let first = render_motif3_chat_ex(&[chat_msg("user", user)], "", &[], ThinkMode::None)
+            .unwrap();
+        let mut live = first.clone();
+        live.extend_from_slice(live_decode.as_bytes());
+
+        store
+            .write(Record {
+                header: Header {
+                    quant_bits: 2,
+                    reason: Reason::Continued,
+                    ext_flags: 0,
+                    model_id: 0,
+                    tokens: 8,
+                    hits: 0,
+                    ctx_size: 4096,
+                    created_at: 1,
+                    last_used: 1,
+                    payload_bytes: 0,
+                    text_bytes: 0,
+                },
+                text: live.clone(),
+                payload: b"continued-payload".to_vec(),
+                trailer: Vec::new(),
+            })
+            .unwrap();
+
+        let mut prefix_follow = live.clone();
+        prefix_follow.extend_from_slice(b"\nReply with exactly RESTORED_OK.");
+        let (path, envelope) = store
+            .text_prefix_candidate(&prefix_follow, 0, 2, 4096)
+            .unwrap()
+            .expect("continued live text is a prefix of a completions follow-up");
+        assert_eq!(envelope.header.reason, Reason::Continued);
+        assert_eq!(envelope.text, live);
+
+        let mut hit = FakeSerial::new(&[], b"");
+        hit.loaded_tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        hit.suffix_tokens = vec![9];
+        let cached = disk_sync_prompt(
+            &mut hit,
+            Some(&mut store),
+            0,
+            2,
+            &prefix_follow,
+            &[90, 91],
+            None,
+            false,
+            DiskSyncPolicy {
+                save_current: false,
+                load: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(cached, 8);
+        assert_eq!(hit.suffixes, [b"\nReply with exactly RESTORED_OK.".to_vec()]);
+        assert_eq!(hit.syncs, [vec![1, 2, 3, 4, 5, 6, 7, 8, 9]]);
+        assert_eq!(
+            hit.loads,
+            [(
+                path,
+                envelope.payload_offset,
+                envelope.header.payload_bytes
+            )]
+        );
+
+        let wrap = render_motif3_chat_ex(
+            &[
+                chat_msg("user", user),
+                chat_msg("assistant", live_decode),
+                chat_msg("user", "Reply with exactly RESTORED_OK."),
+            ],
+            "",
+            &[],
+            ThinkMode::None,
+        )
+        .unwrap();
+        assert!(
+            !wrap.starts_with(&live),
+            "closed Motif assistant history is not live decode bytes"
+        );
+        assert!(
+            live.windows(b"<think></think>".len())
+                .any(|window| window == b"<think></think>"),
+            "live frontier keeps the open-assistant think tags"
+        );
+        assert!(
+            store
+                .text_prefix_candidate(&wrap, 0, 2, 4096)
+                .unwrap()
+                .is_none(),
+            "history wrap must miss the continued live-decode record"
+        );
+
+        let mut miss = FakeSerial::new(&[], b"");
+        miss.loaded_tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let cached = disk_sync_prompt(
+            &mut miss,
+            Some(&mut store),
+            0,
+            2,
+            &wrap,
+            &[90, 91],
+            None,
+            false,
+            DiskSyncPolicy {
+                save_current: false,
+                load: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(cached, 0);
+        assert!(miss.loads.is_empty());
+        assert_eq!(miss.syncs, [vec![90, 91]]);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

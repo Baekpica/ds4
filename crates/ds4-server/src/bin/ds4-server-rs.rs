@@ -177,7 +177,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: ds4-server-rs --listen HOST PORT [--model-id ID] [-m GGUF] [--backend cuda|cpu|metal] [--tokens N] [-c N] [-t N] [--cont-width N] [--cors]\n\
          Disk KV: [--kv-disk-dir DIR] [--kv-disk-space-mb N] [--kv-cache-min-tokens N]\n\
-         [--kv-cache-cold-max-tokens N] [--kv-cache-boundary-trim-tokens N]\n\
+         [--kv-cache-cold-max-tokens N] [--kv-cache-continued-interval-tokens N]\n\
+         [--kv-cache-boundary-trim-tokens N]\n\
          [--kv-cache-boundary-align-tokens N]\n\
          [--kv-cache-reject-different-quant]"
     );

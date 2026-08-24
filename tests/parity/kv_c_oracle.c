@@ -186,6 +186,24 @@ static int cmd_store_len(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_continued_target(int argc, char **argv) {
+    ds4_kvstore kc;
+    memset(&kc, 0, sizeof(kc));
+    kc.enabled = true;
+    kc.opt = ds4_kvstore_default_options();
+    int live_tokens = 0;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--min")) kc.opt.min_tokens = atoi(need(&i, argc, argv, "--min"));
+        else if (!strcmp(argv[i], "--interval")) kc.opt.continued_interval_tokens = atoi(need(&i, argc, argv, "--interval"));
+        else if (!strcmp(argv[i], "--align")) kc.opt.boundary_align_tokens = atoi(need(&i, argc, argv, "--align"));
+        else if (!strcmp(argv[i], "--last")) kc.continued_last_store_tokens = atoi(need(&i, argc, argv, "--last"));
+        else if (!strcmp(argv[i], "--live")) live_tokens = atoi(need(&i, argc, argv, "--live"));
+        else die("unknown continued-target flag");
+    }
+    printf("%d\n", ds4_kvstore_continued_store_target(&kc, live_tokens));
+    return 0;
+}
+
 static int cmd_chat_anchor(int argc, char **argv) {
     if (argc < 4) die("chat-anchor USER ASSISTANT [TOKENS...]");
     ds4_kvstore kc;
@@ -203,12 +221,13 @@ static int cmd_chat_anchor(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) die("write|read|sha1|score|store-len|chat-anchor");
+    if (argc < 2) die("write|read|sha1|score|store-len|continued-target|chat-anchor");
     if (!strcmp(argv[1], "write")) return cmd_write(argc, argv);
     if (!strcmp(argv[1], "read")) return cmd_read(argc, argv);
     if (!strcmp(argv[1], "sha1")) return cmd_sha1(argc, argv);
     if (!strcmp(argv[1], "score")) return cmd_score(argc, argv);
     if (!strcmp(argv[1], "store-len")) return cmd_store_len(argc, argv);
+    if (!strcmp(argv[1], "continued-target")) return cmd_continued_target(argc, argv);
     if (!strcmp(argv[1], "chat-anchor")) return cmd_chat_anchor(argc, argv);
     die("unknown command");
     return 2;
