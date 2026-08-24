@@ -14392,15 +14392,14 @@ static char *build_toolless_thinking_visible_prefix(const request *r,
  * only <|endofturn|>, the tool response, and the new assistant prefix instead
  * of throwing away the live KV on the two-token template mismatch.
  *
- * Do not include <|endofturn|> here: generation stops as soon as a complete
- * tool_call closes, so that delimiter belongs to the newly tokenized suffix on
+ * Do not include <|endofturn|> here: the generation stop token is not evaluated
+ * into the session, so that delimiter belongs to the newly tokenized suffix on
  * the continuation request. */
-static char *build_motif3_no_think_tool_visible_text(
+static char *build_motif3_no_think_visible_text(
         const request *r, const char *content, const tool_calls *calls) {
     static const char empty_think[] = "<think></think>";
     if (!r || r->model_syntax != SERVER_MODEL_SYNTAX_MOTIF3 ||
-        ds4_think_mode_enabled(r->think_mode) || !r->prompt_text ||
-        !calls || calls->len == 0)
+        ds4_think_mode_enabled(r->think_mode) || !r->prompt_text || !calls)
     {
         return NULL;
     }
@@ -14417,23 +14416,25 @@ static char *build_motif3_no_think_tool_visible_text(
     buf visible = {0};
     buf_append(&visible, r->prompt_text, prompt_len - empty_think_len);
     motif3_buf_put_trimmed(&visible, content);
-    append_motif3_tool_calls_text(&visible, calls, true);
+    if (calls->len > 0) {
+        append_motif3_tool_calls_text(&visible, calls, true);
+    }
     return buf_take(&visible);
 }
 
-static bool remember_motif3_no_think_tool_checkpoint(
+static bool remember_motif3_no_think_checkpoint(
         server *s, const job *j, const char *ctx,
         uint64_t trace_id, const char *content, const tool_calls *calls) {
-    char *visible = build_motif3_no_think_tool_visible_text(
+    char *visible = build_motif3_no_think_visible_text(
         &j->req, content, calls);
     if (!visible) return false;
 
     thinking_live_remember(s, visible);
     server_log(DS4_LOG_KVCACHE,
-               "ds4-server: Motif-3 no-think tool live checkpoint remembered ctx=%s live=%d visible=%zu",
+               "ds4-server: Motif-3 no-think live checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(s->session), strlen(visible));
     trace_event(s, trace_id,
-                "Motif-3 no-think tool live checkpoint remembered: live=%d visible=%zu",
+                "Motif-3 no-think live checkpoint remembered: live=%d visible=%zu",
                 ds4_session_pos(s->session), strlen(visible));
     free(visible);
     return true;
@@ -15629,16 +15630,21 @@ decode_again:
         }
     }
 
-    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+    const bool motif3_no_think_checkpoint =
+        j->req.kind == REQ_CHAT &&
         j->req.api == API_OPENAI &&
         j->req.model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 &&
-        !ds4_think_mode_enabled(j->req.think_mode))
+        !ds4_think_mode_enabled(j->req.think_mode) &&
+        (parsed_calls.len > 0 ||
+         (!j->req.has_tools && strcmp(final_finish, "error") &&
+          strcmp(final_finish, "length")));
+    if (motif3_no_think_checkpoint)
     {
         /* The official Motif-3 renderer omits the generation-only empty think
-         * pair when this assistant tool turn becomes history.  Bind that
+         * pair when this assistant turn becomes history.  Bind that
          * visible replay to the exact sampled KV instead of canonicalizing or
          * rebuilding the whole prompt. */
-        if (!remember_motif3_no_think_tool_checkpoint(
+        if (!remember_motif3_no_think_checkpoint(
                 s, j, ctx_span, trace_id,
                 parsed_content ? parsed_content : "", &parsed_calls))
         {
@@ -25417,7 +25423,7 @@ static void test_parse_motif3_tool_call_message(void) {
     tool_calls_free(&calls);
 }
 
-static void test_motif3_no_think_tool_visible_checkpoint(void) {
+static void test_motif3_no_think_visible_checkpoint(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.model_syntax = SERVER_MODEL_SYNTAX_MOTIF3;
@@ -25436,7 +25442,7 @@ static void test_motif3_no_think_tool_visible_checkpoint(void) {
         "\n<tool_call>{\"name\": \"get_weather\", \"arguments\": "
         "{\"city\":\"Seoul\"}}</tool_call>");
 
-    char *visible = build_motif3_no_think_tool_visible_text(
+    char *visible = build_motif3_no_think_visible_text(
         &r, "  \n", &calls);
     TEST_ASSERT(visible != NULL);
     TEST_ASSERT(strstr(visible, "<think></think>") == NULL);
@@ -25450,7 +25456,25 @@ static void test_motif3_no_think_tool_visible_checkpoint(void) {
         "\n<tool_call>{\"name\": \"get_weather\", \"arguments\": "
         "{\"city\":\"Seoul\"}}</tool_call>"));
 
+    tool_calls none = {0};
+    char *plain = build_motif3_no_think_visible_text(
+        &r, "  Clear skies.  ", &none);
+    TEST_ASSERT(plain != NULL);
+    const char *plain_expected =
+        "<|beginoftext|><|startofturn|><|user|>weather?"
+        "<|endofturn|><|startofturn|><|assistant|>Clear skies.";
+    TEST_ASSERT(!strcmp(plain, plain_expected));
+    const char *next_prompt =
+        "<|beginoftext|><|startofturn|><|user|>weather?"
+        "<|endofturn|><|startofturn|><|assistant|>Clear skies."
+        "<|endofturn|><|startofturn|><|user|>again?"
+        "<|endofturn|><|startofturn|><|assistant|><think></think>";
+    TEST_ASSERT(!memcmp(next_prompt, plain, strlen(plain)));
+    TEST_ASSERT(!strncmp(next_prompt + strlen(plain),
+                         "<|endofturn|>", strlen("<|endofturn|>")));
+
     free(visible);
+    free(plain);
     tool_calls_free(&calls);
     request_free(&r);
 }
@@ -33844,7 +33868,7 @@ static void ds4_server_unit_tests_run(void) {
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
     test_parse_motif3_tool_call_message();
-    test_motif3_no_think_tool_visible_checkpoint();
+    test_motif3_no_think_visible_checkpoint();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
