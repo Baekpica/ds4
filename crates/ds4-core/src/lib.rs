@@ -84,6 +84,7 @@ use ds4_sys::{
     ds4_bridge_model_open, ds4_bridge_model_open_options, ds4_bridge_session,
     ds4_bridge_session_argmax, ds4_bridge_session_argmax_excluding,
     ds4_bridge_session_create,
+    ds4_bridge_session_ctx,
     ds4_bridge_session_exaone_rewind_span, ds4_bridge_session_free,
     ds4_bridge_session_generation, ds4_bridge_session_invalidate,
     ds4_bridge_session_load_payload, ds4_bridge_session_load_payload_range,
@@ -1017,7 +1018,7 @@ impl Session<'_> {
     }
 
     pub fn ctx(&self) -> i32 {
-        self.host.ctx
+        unsafe { ds4_bridge_session_ctx(self.raw.as_ptr()) }
     }
 
     pub fn sample(
@@ -1287,6 +1288,29 @@ mod tests {
         let err = cstring_path("a\0b").unwrap_err();
         assert_eq!(err.code, 1);
         assert!(err.message.contains("NUL"));
+    }
+
+    #[no_mangle]
+    extern "C" fn ds4_bridge_session_ctx(s: *mut ds4_bridge_session) -> i32 {
+        assert!(!s.is_null());
+        4096
+    }
+
+    #[test]
+    fn session_ctx_uses_native_effective_ctx_not_configured_ledger_ctx() {
+        let session = std::mem::ManuallyDrop::new(Session {
+            raw: NonNull::<ds4_bridge_session>::dangling(),
+            host: SessionLedger::new(
+                ModelFamily::DeepSeek4,
+                SessionBackend::Cuda,
+                8192,
+                1,
+            ),
+            _model: PhantomData,
+            _not_send: PhantomData,
+        });
+
+        assert_eq!(session.ctx(), 4096);
     }
 
     #[cfg(unix)]
