@@ -1553,6 +1553,7 @@ mod owner_tests {
         fn pos(&self) -> i32 { self.pos }
         fn ctx(&self) -> i32 { 8192 }
         fn generation(&self) -> u64 { 1 }
+        fn invalidate(&mut self) { self.pos = 0; }
     }
 
     impl DecodeIo for SlowPrepDecode {
@@ -1589,6 +1590,7 @@ mod owner_tests {
         fn pos(&self) -> i32 { self.pos }
         fn ctx(&self) -> i32 { 8192 }
         fn generation(&self) -> u64 { 1 }
+        fn invalidate(&mut self) { self.pos = 0; }
     }
 
     impl ContExec for TestCont {

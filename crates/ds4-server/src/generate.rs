@@ -15,7 +15,7 @@ use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(any(feature = "native", test))]
-use ds4_kv::{Header as KvHeader, Reason as KvReason, Store as KvStore};
+use ds4_kv::{Header as KvHeader, Reason as KvReason, Store as KvStore, EXT_THINKING_VISIBLE};
 
 use crate::dsml::{SampleOverride, SamplePolicy};
 use crate::parse::{ParsedRequest, ToolChoice};
@@ -78,6 +78,7 @@ pub trait DecodeIo {
         _prompt: &[u8],
         tokens: &[i32],
         _disk_eligible: bool,
+        _thinking_visible_eligible: bool,
     ) -> Result<i32, GenerateError> {
         self.sync(tokens)?;
         Ok(0)
@@ -91,6 +92,8 @@ pub trait DecodeIo {
     fn session_tokens(&self) -> Vec<i32> {
         Vec::new()
     }
+    fn remember_thinking_visible_checkpoint(&mut self, _text: Vec<u8>) {}
+    fn invalidate(&mut self);
 }
 
 #[cfg(any(feature = "native", test))]
@@ -98,6 +101,22 @@ pub trait DecodeIo {
 struct DiskSyncPolicy {
     save_current: bool,
     load: bool,
+}
+
+#[cfg(any(feature = "native", test))]
+struct ThinkingVisibleCheckpoint {
+    text: Vec<u8>,
+    frontier: i32,
+}
+
+#[cfg(any(feature = "native", test))]
+fn settle_thinking_visible_checkpoint(
+    checkpoint: &mut Option<ThinkingVisibleCheckpoint>,
+    sync_succeeded: bool,
+) {
+    if sync_succeeded {
+        *checkpoint = None;
+    }
 }
 
 #[cfg(any(feature = "native", test))]
@@ -161,6 +180,7 @@ fn try_store_current(
     model_id: u8,
     quant_bits: u8,
     ctx: u32,
+    checkpoint: Option<&ThinkingVisibleCheckpoint>,
 ) -> Result<(), GenerateError> {
     let live = io.live_tokens();
     if live.len() < store.opt.min_tokens.max(0) as usize {
@@ -168,8 +188,14 @@ fn try_store_current(
     }
     let tokens = u32::try_from(live.len())
         .map_err(|_| GenerateError::Engine("KVC token count exceeds u32".into()))?;
-    let text = io.render_tokens(&live)?;
-    let header = kv_header(model_id, quant_bits, ctx, tokens);
+    let (text, ext_flags) = match checkpoint {
+        Some(checkpoint) if usize::try_from(checkpoint.frontier).ok() == Some(live.len()) => {
+            (checkpoint.text.clone(), EXT_THINKING_VISIBLE)
+        }
+        _ => (io.render_tokens(&live)?, 0),
+    };
+    let mut header = kv_header(model_id, quant_bits, ctx, tokens);
+    header.ext_flags = ext_flags;
     if store
         .reuse_compatible(header.clone(), &text, b"")
         .map_err(|error| GenerateError::Engine(error.to_string()))?
@@ -203,17 +229,34 @@ fn discard_loaded(store: &mut KvStore, io: &mut impl SerialKvIo, path: &Path) {
 #[cfg(any(feature = "native", test))]
 fn disk_sync_prompt(
     io: &mut impl SerialKvIo,
-    store: &mut KvStore,
+    store: Option<&mut KvStore>,
     model_id: i32,
     quant_bits: i32,
     prompt: &[u8],
     canonical_tokens: &[i32],
+    checkpoint: Option<&ThinkingVisibleCheckpoint>,
+    thinking_visible_eligible: bool,
     policy: DiskSyncPolicy,
 ) -> Result<i32, GenerateError> {
     let live = io.live_tokens();
     if !live.is_empty() && canonical_tokens.starts_with(&live) {
         io.sync(canonical_tokens)?;
         return Ok(live.len() as i32);
+    }
+    if thinking_visible_eligible {
+        if let Some(checkpoint) = checkpoint {
+            if !live.is_empty()
+                && usize::try_from(checkpoint.frontier).ok() == Some(live.len())
+                && checkpoint.text.len() < prompt.len()
+                && prompt.starts_with(&checkpoint.text)
+            {
+                let cached = live.len() as i32;
+                let mut effective = live;
+                effective.extend(io.tokenize_suffix(&prompt[checkpoint.text.len()..])?);
+                io.sync(&effective)?;
+                return Ok(cached);
+            }
+        }
     }
     if !live.is_empty() {
         let rendered = io.render_tokens(&live)?;
@@ -226,12 +269,15 @@ fn disk_sync_prompt(
         }
     }
 
+    let Some(store) = store else {
+        return cold_sync(io, canonical_tokens);
+    };
     store.continued_last_store_tokens = 0;
     let Some((model_id, quant_bits, ctx)) = kv_identity(model_id, quant_bits, io.ctx()) else {
         return cold_sync(io, canonical_tokens);
     };
     if policy.save_current {
-        let _ = try_store_current(io, store, model_id, quant_bits, ctx);
+        let _ = try_store_current(io, store, model_id, quant_bits, ctx, checkpoint);
     }
     if !policy.load {
         return cold_sync(io, canonical_tokens);
@@ -243,7 +289,9 @@ fn disk_sync_prompt(
     let Some((path, envelope)) = candidate else {
         return cold_sync(io, canonical_tokens);
     };
-    if envelope.header.ext_flags != 0 || envelope.trailer_bytes != 0 {
+    if (envelope.header.ext_flags != 0 && envelope.header.ext_flags != EXT_THINKING_VISIBLE)
+        || envelope.trailer_bytes != 0
+    {
         return cold_sync(io, canonical_tokens);
     }
     if io
@@ -341,6 +389,33 @@ fn ordinary_disk_cache_eligible(parsed: &ParsedRequest) -> bool {
         && !parsed.has_tools
         && !parsed.has_tool_results
         && parsed.live_call_ids.is_empty()
+}
+
+fn thinking_visible_cache_eligible(parsed: &ParsedRequest) -> bool {
+    parsed.kind == ReqKind::Chat && parsed.api != Api::Responses
+}
+
+fn motif3_no_think_visible_checkpoint(
+    parsed: &ParsedRequest,
+    syntax: ModelSyntax,
+    prompt: &[u8],
+    content: &[u8],
+    finish: &str,
+) -> Option<Vec<u8>> {
+    if parsed.kind != ReqKind::Chat
+        || syntax != ModelSyntax::Motif3
+        || !ordinary_disk_cache_eligible(parsed)
+        || finish == "error"
+        || finish == "length"
+    {
+        return None;
+    }
+    let prefix = prompt.strip_suffix(b"<think></think>")?;
+    let content = content.trim_ascii();
+    let mut visible = Vec::with_capacity(prefix.len() + content.len());
+    visible.extend_from_slice(prefix);
+    visible.extend_from_slice(content);
+    Some(visible)
 }
 
 fn prepare_required_prefixes(
@@ -567,6 +642,7 @@ fn decode_pass(
 
         if feed.hit_stop {
             *finish = "stop";
+            engine.invalidate();
             break;
         }
         if acc.track_tools && acc.saw_tool_end && req.chat_format == ChatFormat::DeepSeek {
@@ -656,6 +732,7 @@ pub(crate) fn generate_terminal_at(
         &prompt,
         &tokens,
         ordinary_disk_cache_eligible(&parsed),
+        thinking_visible_cache_eligible(&parsed),
     )?;
     let decode_t0 = Instant::now();
     let mut first_tok = None;
@@ -856,6 +933,15 @@ pub(crate) fn generate_terminal_at(
         }
         assign_tool_ids(&mut parsed_gen.calls, job_id);
         finish = "tool_calls";
+    }
+    if let Some(visible) = motif3_no_think_visible_checkpoint(
+        &parsed,
+        syntax,
+        &prompt,
+        &parsed_gen.content,
+        finish,
+    ) {
+        engine.remember_thinking_visible_checkpoint(visible);
     }
     let matched_stop = acc.matched_stop.clone();
     let terminal = if req.stream {
@@ -1118,6 +1204,11 @@ impl DecodeIo for ScriptedDecode {
             self.live.clone()
         }
     }
+
+    fn invalidate(&mut self) {
+        self.live.clear();
+        self.pos = 0;
+    }
 }
 
 #[cfg(feature = "native")]
@@ -1188,6 +1279,7 @@ pub struct NativeDecode<'a> {
     session: Option<ds4_core::Session<'a>>,
     store: Option<KvStore>,
     session_disk_storable: bool,
+    thinking_visible: Option<ThinkingVisibleCheckpoint>,
     ctx: i32,
 }
 
@@ -1200,6 +1292,7 @@ impl<'a> NativeDecode<'a> {
             session: None,
             store: None,
             session_disk_storable: false,
+            thinking_visible: None,
             ctx,
         }
     }
@@ -1281,38 +1374,39 @@ impl DecodeIo for NativeDecode<'_> {
         prompt: &[u8],
         tokens: &[i32],
         disk_eligible: bool,
+        thinking_visible_eligible: bool,
     ) -> Result<i32, GenerateError> {
-        if self.store.is_none() {
-            self.session_disk_storable = false;
-            self.sync(tokens)?;
-            return Ok(0);
-        }
-
         let model_id = self.model.model_id();
         let quant_bits = self.model.routed_quant_bits();
         let vocab = self.vocab.unwrap_or_else(|| self.model.vocab());
         let save_current = self.session_disk_storable;
+        let has_store = self.store.is_some();
         self.session()?;
-        let session = self.session.as_mut().ok_or_else(|| {
+        let (session, store, checkpoint) = (
+            &mut self.session,
+            &mut self.store,
+            &self.thinking_visible,
+        );
+        let session = session.as_mut().ok_or_else(|| {
             GenerateError::Engine("native session was not created".into())
-        })?;
-        let store = self.store.as_mut().ok_or_else(|| {
-            GenerateError::Engine("disk KV store was not configured".into())
         })?;
         let mut io = NativeSerialKvIo { session, vocab };
         let result = disk_sync_prompt(
             &mut io,
-            store,
+            store.as_mut(),
             model_id,
             quant_bits,
             prompt,
             tokens,
+            checkpoint.as_ref(),
+            thinking_visible_eligible,
             DiskSyncPolicy {
                 save_current,
                 load: disk_eligible,
             },
         );
-        self.session_disk_storable = result.is_ok() && disk_eligible;
+        self.session_disk_storable = result.is_ok() && disk_eligible && has_store;
+        settle_thinking_visible_checkpoint(&mut self.thinking_visible, result.is_ok());
         result
     }
 
@@ -1355,17 +1449,31 @@ impl DecodeIo for NativeDecode<'_> {
             .map(|s| s.host().tokens().to_vec())
             .unwrap_or_default()
     }
+
+    fn remember_thinking_visible_checkpoint(&mut self, text: Vec<u8>) {
+        self.thinking_visible = Some(ThinkingVisibleCheckpoint {
+            text,
+            frontier: self.pos(),
+        });
+    }
+
+    fn invalidate(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            session.invalidate();
+        }
+    }
 }
 
 #[cfg(test)]
 mod disk_sync_tests {
     use super::{
-        discard_loaded, disk_sync_prompt, ordinary_disk_cache_eligible, DiskSyncPolicy,
-        GenerateError, SerialKvIo,
+        discard_loaded, disk_sync_prompt, ordinary_disk_cache_eligible,
+        settle_thinking_visible_checkpoint, thinking_visible_cache_eligible, DiskSyncPolicy,
+        GenerateError, SerialKvIo, ThinkingVisibleCheckpoint,
     };
     use crate::parse::{parse_request, ParseEnv};
     use crate::route::{Api, ThinkMode, WireSurface};
-    use ds4_kv::{read_envelope, Header, Options, Reason, Record, Store};
+    use ds4_kv::{read_envelope, Header, Options, Reason, Record, Store, EXT_THINKING_VISIBLE};
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1504,11 +1612,13 @@ mod disk_sync_tests {
 
         let cached = disk_sync_prompt(
             &mut io,
-            &mut store,
+            Some(&mut store),
             0,
             2,
             b"cold prompt",
             &[1, 2],
+            None,
+            false,
             DiskSyncPolicy {
                 save_current: false,
                 load: true,
@@ -1529,11 +1639,13 @@ mod disk_sync_tests {
         let mut exact = FakeSerial::new(&[1, 2], b"unused");
         let cached = disk_sync_prompt(
             &mut exact,
-            &mut store,
+            Some(&mut store),
             0,
             2,
             b"hello",
             &[1, 2, 3],
+            None,
+            false,
             DiskSyncPolicy {
                 save_current: false,
                 load: false,
@@ -1548,11 +1660,13 @@ mod disk_sync_tests {
         byte_prefix.suffix_tokens = vec![10, 11];
         let cached = disk_sync_prompt(
             &mut byte_prefix,
-            &mut store,
+            Some(&mut store),
             0,
             2,
             b"hello world",
             &[90, 91],
+            None,
+            false,
             DiskSyncPolicy {
                 save_current: false,
                 load: false,
@@ -1563,6 +1677,50 @@ mod disk_sync_tests {
         assert_eq!(byte_prefix.suffixes, [b"world".to_vec()]);
         assert_eq!(byte_prefix.syncs, [vec![9, 10, 11]]);
         assert!(byte_prefix.loads.is_empty());
+
+        let checkpoint = ThinkingVisibleCheckpoint {
+            text: b"canonical assistant".to_vec(),
+            frontier: 2,
+        };
+        let mut visible = FakeSerial::new(&[41, 42], b"generation <think></think> assistant");
+        visible.suffix_tokens = vec![6, 43];
+        let cached = disk_sync_prompt(
+            &mut visible,
+            None,
+            0,
+            2,
+            b"canonical assistant<|endofturn|>next",
+            &[90, 91],
+            Some(&checkpoint),
+            true,
+            DiskSyncPolicy {
+                save_current: false,
+                load: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(cached, 2);
+        assert_eq!(visible.suffixes, [b"<|endofturn|>next".to_vec()]);
+        assert_eq!(visible.syncs, [vec![41, 42, 6, 43]]);
+
+        let mut ineligible = FakeSerial::new(&[41, 42], b"not a prompt prefix");
+        let cached = disk_sync_prompt(
+            &mut ineligible,
+            None,
+            0,
+            2,
+            b"canonical assistant<|endofturn|>next",
+            &[90, 91],
+            Some(&checkpoint),
+            false,
+            DiskSyncPolicy {
+                save_current: false,
+                load: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(cached, 0);
+        assert_eq!(ineligible.syncs, [vec![90, 91]]);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1578,11 +1736,13 @@ mod disk_sync_tests {
         let cached =
             disk_sync_prompt(
                 &mut io,
-                &mut store,
+                Some(&mut store),
                 0,
                 2,
                 b"hello world",
                 &[90, 91],
+                None,
+                false,
                 DiskSyncPolicy {
                     save_current: true,
                     load: true,
@@ -1635,11 +1795,13 @@ mod disk_sync_tests {
         let cached =
             disk_sync_prompt(
                 &mut io,
-                &mut store,
+                Some(&mut store),
                 0,
                 2,
                 b"hello world",
                 &[90, 91],
+                None,
+                false,
                 DiskSyncPolicy {
                     save_current: false,
                     load: true,
@@ -1664,11 +1826,13 @@ mod disk_sync_tests {
 
         let cached = disk_sync_prompt(
             &mut io,
-            &mut store,
+            Some(&mut store),
             0,
             2,
             b"hello world",
             &[90, 91],
+            None,
+            false,
             DiskSyncPolicy {
                 save_current: false,
                 load: true,
@@ -1695,11 +1859,13 @@ mod disk_sync_tests {
         let error =
             disk_sync_prompt(
                 &mut io,
-                &mut store,
+                Some(&mut store),
                 0,
                 2,
                 b"hello world",
                 &[90, 91],
+                None,
+                false,
                 DiskSyncPolicy {
                     save_current: false,
                     load: true,
@@ -1713,6 +1879,80 @@ mod disk_sync_tests {
         assert!(!path.exists());
         assert!(store.entries().is_empty());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disk_sync_prompt_saves_and_restores_thinking_visible_checkpoint() {
+        let (dir, mut store) = store("thinking-visible");
+        let checkpoint = ThinkingVisibleCheckpoint {
+            text: b"canonical assistant".to_vec(),
+            frontier: 2,
+        };
+        let mut saving = FakeSerial::new(&[41, 42], b"generation <think></think> assistant");
+
+        disk_sync_prompt(
+            &mut saving,
+            Some(&mut store),
+            0,
+            2,
+            b"unrelated prompt",
+            &[90],
+            Some(&checkpoint),
+            false,
+            DiskSyncPolicy {
+                save_current: true,
+                load: false,
+            },
+        )
+        .unwrap();
+
+        let prompt = b"canonical assistant<|endofturn|>next";
+        let (path, envelope) = store
+            .text_prefix_candidate(prompt, 0, 2, 4096)
+            .unwrap()
+            .expect("canonical visible checkpoint");
+        assert_eq!(envelope.header.ext_flags, EXT_THINKING_VISIBLE);
+        assert_eq!(envelope.header.tokens, 2);
+        assert_eq!(envelope.text, checkpoint.text);
+
+        let mut loading = FakeSerial::new(&[], b"");
+        loading.loaded_tokens = vec![41, 42];
+        loading.suffix_tokens = vec![6, 43];
+        let cached = disk_sync_prompt(
+            &mut loading,
+            Some(&mut store),
+            0,
+            2,
+            prompt,
+            &[90, 91],
+            None,
+            false,
+            DiskSyncPolicy {
+                save_current: false,
+                load: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cached, 2);
+        assert_eq!(loading.suffixes, [b"<|endofturn|>next".to_vec()]);
+        assert_eq!(loading.syncs, [vec![41, 42, 6, 43]]);
+        assert_eq!(store.read(&path).unwrap().header.hits, 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn thinking_visible_checkpoint_clears_only_after_successful_sync() {
+        let mut checkpoint = Some(ThinkingVisibleCheckpoint {
+            text: b"visible".to_vec(),
+            frontier: 2,
+        });
+
+        settle_thinking_visible_checkpoint(&mut checkpoint, false);
+        assert_eq!(checkpoint.as_ref().unwrap().frontier, 2);
+
+        settle_thinking_visible_checkpoint(&mut checkpoint, true);
+        assert!(checkpoint.is_none());
     }
 
     #[test]
@@ -1744,6 +1984,19 @@ mod disk_sync_tests {
         )
         .unwrap();
         assert!(ordinary_disk_cache_eligible(&ordinary));
+        assert!(thinking_visible_cache_eligible(&ordinary));
+
+        let mut anthropic = ordinary.clone();
+        anthropic.api = Api::Anthropic;
+        assert!(thinking_visible_cache_eligible(&anthropic));
+
+        let mut completion = ordinary.clone();
+        completion.kind = crate::route::ReqKind::Completion;
+        assert!(!thinking_visible_cache_eligible(&completion));
+
+        let mut responses = ordinary.clone();
+        responses.api = Api::Responses;
+        assert!(!thinking_visible_cache_eligible(&responses));
 
         let mut cases = Vec::new();
         let mut request = ordinary.clone();

@@ -1,9 +1,10 @@
 //! Scripted decode + HTTP generate path. No GGUF.
 
 use ds4_server::{
-    generate_and_write, handle_client_inner, generation_blocked, stop_list_find_from, ContStepper,
-    DecodeIo, GenerateError, ParseEnv, ParsedRequest, ReqTimings, ScriptedDecode, ScriptedStep,
-    ServerConfig, ServerInner, ThinkMode, CREATED_TEST, TAPE_PLAIN,
+    generate_and_write, handle_client_inner, generation_blocked, render_prompt,
+    stop_list_find_from, ContStepper, DecodeIo, GenerateError, ParseEnv, ParsedRequest,
+    ReqTimings, ScriptedDecode, ScriptedStep, ServerConfig, ServerInner, ThinkMode, CREATED_TEST,
+    TAPE_PLAIN,
 };
 use ds4_server::parse::parse_request;
 use ds4_server::route::WireSurface;
@@ -43,6 +44,9 @@ struct PromptSyncDecode {
     prompt_sync_calls: usize,
     sync_calls: usize,
     disk_eligible: Vec<bool>,
+    thinking_visible_eligible: Vec<bool>,
+    remembered: Vec<(Vec<u8>, i32)>,
+    invalidations: usize,
 }
 
 impl PromptSyncDecode {
@@ -54,6 +58,9 @@ impl PromptSyncDecode {
             prompt_sync_calls: 0,
             sync_calls: 0,
             disk_eligible: Vec::new(),
+            thinking_visible_eligible: Vec::new(),
+            remembered: Vec::new(),
+            invalidations: 0,
         }
     }
 }
@@ -93,9 +100,12 @@ impl DecodeIo for PromptSyncDecode {
         _prompt: &[u8],
         tokens: &[i32],
         disk_eligible: bool,
+        thinking_visible_eligible: bool,
     ) -> Result<i32, GenerateError> {
         self.prompt_sync_calls += 1;
         self.disk_eligible.push(disk_eligible);
+        self.thinking_visible_eligible
+            .push(thinking_visible_eligible);
         self.inner.live = tokens.to_vec();
         self.inner.pos = self.effective_prompt_pos;
         Ok(self.cached_tokens)
@@ -131,6 +141,16 @@ impl DecodeIo for PromptSyncDecode {
 
     fn session_tokens(&self) -> Vec<i32> {
         self.inner.session_tokens()
+    }
+
+    fn remember_thinking_visible_checkpoint(&mut self, text: Vec<u8>) {
+        self.remembered.push((text, self.pos()));
+    }
+
+    fn invalidate(&mut self) {
+        self.invalidations += 1;
+        self.inner.live.clear();
+        self.inner.pos = 0;
     }
 }
 
@@ -218,6 +238,7 @@ fn prompt_sync_reports_buffered_cache_usage_from_effective_pos() {
     assert_eq!(engine.prompt_sync_calls, 1);
     assert_eq!(engine.sync_calls, 0);
     assert_eq!(engine.disk_eligible, [true]);
+    assert_eq!(engine.thinking_visible_eligible, [true]);
 }
 
 #[test]
@@ -254,6 +275,135 @@ fn prompt_sync_reports_streaming_cache_usage_from_effective_pos() {
     assert_eq!(engine.prompt_sync_calls, 1);
     assert_eq!(engine.sync_calls, 0);
     assert_eq!(engine.disk_eligible, [true]);
+    assert_eq!(engine.thinking_visible_eligible, [true]);
+}
+
+#[test]
+fn prompt_sync_receives_thinking_visible_surface_gate() {
+    let cases = [
+        (
+            WireSurface::OpenaiChat,
+            r#"{"messages":[{"role":"user","content":"hi"}]}"#,
+            true,
+        ),
+        (
+            WireSurface::OpenaiCompletion,
+            r#"{"prompt":"hi"}"#,
+            false,
+        ),
+        (
+            WireSurface::Anthropic,
+            r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#,
+            true,
+        ),
+        (WireSurface::Responses, r#"{"input":"hi"}"#, false),
+    ];
+
+    for (surface, body, expected) in cases {
+        let parsed = parse_request(surface, &env(), body).unwrap();
+        let inner = ScriptedDecode::from_pieces(&[b"ok"]);
+        let mut engine = PromptSyncDecode::new(inner, 0, 1);
+        let mut out = Vec::new();
+
+        generate_and_write(
+            &mut engine,
+            &parsed,
+            "visible-surface",
+            CREATED_TEST,
+            false,
+            16,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(engine.thinking_visible_eligible, [expected], "{surface:?}");
+    }
+}
+
+#[test]
+fn motif3_no_think_remembers_canonical_visible_checkpoint() {
+    let parsed = user_req();
+    let inner = ScriptedDecode {
+        model_id: 3,
+        ..ScriptedDecode::from_pieces(&[b"  Clear skies.  "])
+    };
+    let mut engine = PromptSyncDecode::new(inner, 0, 1);
+    let mut out = Vec::new();
+
+    generate_and_write(
+        &mut engine,
+        &parsed,
+        "chatcmpl-visible",
+        CREATED_TEST,
+        false,
+        16,
+        &mut out,
+    )
+    .unwrap();
+
+    let mut expected = render_prompt(&parsed, 3).unwrap();
+    assert!(expected.ends_with(b"<think></think>"));
+    expected.truncate(expected.len() - b"<think></think>".len());
+    expected.extend_from_slice(b"Clear skies.");
+    assert_eq!(engine.remembered, [(expected, engine.pos())]);
+    assert!(!engine.remembered[0].0.ends_with(b"<|endofturn|>"));
+
+    let mut length = parsed;
+    length.max_tokens = 1;
+    length.max_tokens_set = true;
+    let inner = ScriptedDecode {
+        model_id: 3,
+        ..ScriptedDecode::from_pieces(&[b"partial"])
+    };
+    let mut engine = PromptSyncDecode::new(inner, 0, 1);
+    let mut out = Vec::new();
+    let outcome = generate_and_write(
+        &mut engine,
+        &length,
+        "chatcmpl-visible-length",
+        CREATED_TEST,
+        false,
+        16,
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(outcome.finish, "length");
+    assert!(engine.remembered.is_empty());
+}
+
+#[test]
+fn motif3_no_think_invalidates_user_stop_and_tool_syntax_cut() {
+    let cases = [
+        (vec!["STOP".into()], b"Clear STOP tail".as_slice()),
+        (Vec::new(), b"Clear <tool_call>".as_slice()),
+    ];
+
+    for (stops, piece) in cases {
+        let mut parsed = user_req();
+        parsed.stops = stops;
+        let inner = ScriptedDecode {
+            model_id: 3,
+            ..ScriptedDecode::from_pieces(&[piece])
+        };
+        let mut engine = PromptSyncDecode::new(inner, 0, 1);
+        let mut out = Vec::new();
+
+        let outcome = generate_and_write(
+            &mut engine,
+            &parsed,
+            "chatcmpl-visible-cut",
+            CREATED_TEST,
+            false,
+            16,
+            &mut out,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.finish, "stop");
+        assert_eq!(engine.invalidations, 1);
+        assert_eq!(engine.pos(), 0);
+        assert!(engine.remembered.iter().all(|(_, frontier)| *frontier == 0));
+    }
 }
 
 #[test]
