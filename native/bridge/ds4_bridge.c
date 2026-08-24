@@ -213,6 +213,12 @@ int ds4_bridge_model_open(ds4_bridge_model **out,
     return 0;
 }
 
+void ds4_bridge_model_boot_prewarm(ds4_bridge_model *m)
+{
+    if (!m) return;
+    ds4_engine_boot_prewarm(m->engine);
+}
+
 void ds4_bridge_model_free(ds4_bridge_model *m)
 {
     if (!m) return;

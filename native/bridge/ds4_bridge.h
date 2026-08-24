@@ -91,6 +91,7 @@ int ds4_bridge_bind_plan_match(const ds4_bridge_bind_plan *host,
 int ds4_bridge_model_open(ds4_bridge_model **out,
                           const ds4_bridge_model_open_options *opt,
                           char *err, size_t errlen);
+void ds4_bridge_model_boot_prewarm(ds4_bridge_model *m);
 void ds4_bridge_model_free(ds4_bridge_model *m);
 
 int ds4_bridge_session_create(ds4_bridge_session **out,

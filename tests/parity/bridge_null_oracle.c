@@ -13,6 +13,7 @@ extern unsigned bridge_payload_load_calls;
 extern int64_t bridge_payload_load_offset;
 extern uint64_t bridge_payload_load_bytes;
 extern int bridge_routed_quant_bits;
+extern unsigned bridge_boot_prewarm_calls;
 
 struct ds4_bridge_model {
     ds4_engine *engine;
@@ -57,6 +58,9 @@ int main(void) {
     if (ds4_bridge_token_is_stop(NULL, 1) != 0) fail("token_is_stop");
     if (ds4_bridge_model_id(NULL) != -1) fail("model_id");
     if (ds4_bridge_model_routed_quant_bits(NULL) != 0) fail("routed_quant_bits NULL");
+    bridge_boot_prewarm_calls = 0;
+    ds4_bridge_model_boot_prewarm(NULL);
+    if (bridge_boot_prewarm_calls != 0) fail("boot_prewarm NULL");
     {
         ds4_engine *fake_native = malloc(1);
         struct ds4_bridge_model fake = {fake_native};
@@ -64,6 +68,9 @@ int main(void) {
         bridge_routed_quant_bits = 4;
         if (ds4_bridge_model_routed_quant_bits(&fake) != 4)
             fail("routed_quant_bits delegation");
+        ds4_bridge_model_boot_prewarm(&fake);
+        if (bridge_boot_prewarm_calls != 1)
+            fail("boot_prewarm delegation");
         free(fake_native);
     }
     if (ds4_bridge_session_sample(NULL, 1.0f, 0, 1.0f, 0.05f, &rng) != -1)

@@ -274,6 +274,8 @@ extern "C" {
         errlen: usize,
     ) -> c_int;
 
+    pub fn ds4_bridge_model_boot_prewarm(m: *mut ds4_bridge_model);
+
     pub fn ds4_bridge_model_free(m: *mut ds4_bridge_model);
 
     pub fn ds4_bridge_session_create(

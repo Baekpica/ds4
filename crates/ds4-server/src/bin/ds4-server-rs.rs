@@ -104,24 +104,8 @@ fn main() {
     };
     let kv_store = if model.is_some() { kv.open() } else { None };
 
-    let listener = listen(&cfg).unwrap_or_else(|e| {
-        eprintln!(
-            "ds4-server-rs: listen {}:{}: {e}",
-            cfg.listen_host, cfg.listen_port
-        );
-        std::process::exit(1);
-    });
-    eprintln!(
-        "ds4-server-rs: listening on {}:{} model_id={} engine={} host_vocab={} (host continuation registry + incremental live DSML tool stream + corrective retry)",
-        cfg.listen_host,
-        cfg.listen_port,
-        cfg.model_id,
-        if cfg.have_engine { "open" } else { "none" },
-        if model.is_some() { "yes" } else { "no" }
-    );
-
-    if let Some(ref model) = model {
-        let lane = if cont_width > 0 && backend == Backend::Cuda {
+    let lane = if let Some(ref model) = model {
+        if cont_width > 0 && backend == Backend::Cuda {
             match model.batch_ctx_fit(cfg.ctx, cont_width, cfg.ctx.saturating_mul(cont_width)) {
                 Ok(batch) => {
                     eprintln!(
@@ -143,7 +127,31 @@ fn main() {
             }
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
+    if let Some(ref model) = model {
+        model.boot_prewarm();
+    }
+
+    let listener = listen(&cfg).unwrap_or_else(|e| {
+        eprintln!(
+            "ds4-server-rs: listen {}:{}: {e}",
+            cfg.listen_host, cfg.listen_port
+        );
+        std::process::exit(1);
+    });
+    eprintln!(
+        "ds4-server-rs: listening on {}:{} model_id={} engine={} host_vocab={} (host continuation registry + incremental live DSML tool stream + corrective retry)",
+        cfg.listen_host,
+        cfg.listen_port,
+        cfg.model_id,
+        if cfg.have_engine { "open" } else { "none" },
+        if model.is_some() { "yes" } else { "no" }
+    );
+
+    if let Some(ref model) = model {
         let mut engine = NativeDecode::new(model, cfg.ctx).with_vocab(model.vocab());
         if let Some(store) = kv_store {
             engine = engine.with_store(store);
