@@ -178,6 +178,25 @@ int main(int argc, char **argv) {
         };
         ds4_route_decision d = route_decide(need_u(argv[2]), need_i(argv[3]), &env);
         printf("lane=%u reason=%u", d.lane, d.reason);
+    } else if (!strcmp(argv[1], "budget")) {
+        if (argc < 5) die("budget SET TOKENS DEFAULT");
+        int set = need_i(argv[2]);
+        int tokens = need_i(argv[3]);
+        int def = need_i(argv[4]);
+        int out;
+        if (set && tokens <= 0) out = 0;
+        else out = tokens > 0 ? tokens : def;
+        printf("%d", out);
+    } else if (!strcmp(argv[1], "effort")) {
+        if (argc < 3) die("effort NAME");
+        const char *s = argv[2];
+        int mode = -1;
+        if (!strcmp(s, "max")) mode = 3;
+        else if (!strcmp(s, "high") || !strcmp(s, "xhigh")) mode = 2;
+        else if (!strcmp(s, "low") || !strcmp(s, "medium") || !strcmp(s, "minimal")) mode = 1;
+        else if (!strcmp(s, "none") || !strcmp(s, "off")) mode = 0;
+        if (mode < 0) printf("ERROR");
+        else printf("%d", mode);
     } else if (!strcmp(argv[1], "needs")) {
         if (argc < 15) die("needs api stream temp think stops tools echo rlt rlr alt bank maxset maxt");
         float temp = (float)strtod(argv[4], NULL);

@@ -38,7 +38,7 @@ C golden baseline: `v0.6.3-dfm`
 | 4 | KV store port + 4-way matrix | **format/policy green** (`make test-kv-parity`); live session payload still C |
 | 5 | Web utility port | **done** (`make test-web-parity`); `ds4-agent` still links C `ds4_web.c` |
 | 6 | Distributed runtime port | **blocking runtime green** (`make test-dist-parity`); C still owns pipelined prefetch, snapshot, `ds4_dist_session_*` |
-| 7 | Server shadow by feature | **route_decide / compute_needs green** (`make test-route-parity`); HTTP/wire still C |
+| 7 | Server shadow by feature | **route_decide / needs / budget / effort names green** (`make test-route-parity`); HTTP/wire still C |
 | 8 | `ds4.c` decomposition | not started |
 | 9 | Promote Rust binaries to default names | not started |
 | split | `SPLIT_READINESS.md` + `dfm-rs` genesis | blocked on 9 |

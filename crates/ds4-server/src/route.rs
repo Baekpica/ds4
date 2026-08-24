@@ -265,3 +265,47 @@ pub fn route_decide(needs: u32, surf: WireSurface, env: &RouteEnv) -> RouteDecis
     d.reason = REASON_CONT_UNAVAILABLE;
     d
 }
+
+/// Inc 0b three-state budget. Parsers preload the server default into
+/// `max_tokens` when the client omitted the field.
+pub fn decode_budget(max_tokens_set: bool, max_tokens: i32, server_default: i32) -> i32 {
+    if max_tokens_set && max_tokens <= 0 {
+        return 0;
+    }
+    if max_tokens > 0 {
+        max_tokens
+    } else {
+        server_default
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkMode {
+    None = 0,
+    Low = 1,
+    High = 2,
+    Max = 3,
+}
+
+pub fn think_mode_enabled(mode: ThinkMode) -> bool {
+    mode != ThinkMode::None
+}
+
+pub fn think_mode_from_enabled(enabled: bool, effort: ThinkMode) -> ThinkMode {
+    if !enabled || effort == ThinkMode::None {
+        ThinkMode::None
+    } else {
+        effort
+    }
+}
+
+/// Exact names from `parse_reasoning_effort_name`. Aliases round down.
+pub fn parse_reasoning_effort_name(s: &str) -> Option<ThinkMode> {
+    match s {
+        "max" => Some(ThinkMode::Max),
+        "high" | "xhigh" => Some(ThinkMode::High),
+        "low" | "medium" | "minimal" => Some(ThinkMode::Low),
+        "none" | "off" => Some(ThinkMode::None),
+        _ => None,
+    }
+}

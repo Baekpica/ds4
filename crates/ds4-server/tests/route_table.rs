@@ -540,3 +540,67 @@ fn compute_needs_matches_c() {
     };
     assert_eq!(compute_needs(&reason), NEED_LIVE_FRONTIER);
 }
+
+#[test]
+fn decode_budget_three_states_match_c() {
+    fn c(set: bool, tokens: i32, def: i32) -> i32 {
+        let out = Command::new(require_oracle())
+            .args([
+                "budget",
+                &(set as i32).to_string(),
+                &tokens.to_string(),
+                &def.to_string(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+    }
+    let def = 393216;
+    assert_eq!(ds4_server::decode_budget(false, def, def), def);
+    assert_eq!(c(false, def, def), def);
+    assert_eq!(ds4_server::decode_budget(true, 4096, def), 4096);
+    assert_eq!(c(true, 4096, def), 4096);
+    assert_eq!(ds4_server::decode_budget(true, 0, def), 0);
+    assert_eq!(c(true, 0, def), 0);
+    assert_eq!(ds4_server::decode_budget(true, -5, def), 0);
+    assert_eq!(c(true, -5, def), 0);
+}
+
+#[test]
+fn reasoning_effort_names_match_c() {
+    fn c(name: &str) -> String {
+        let out = Command::new(require_oracle())
+            .args(["effort", name])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+    let rows = [
+        ("max", Some(ds4_server::ThinkMode::Max)),
+        ("high", Some(ds4_server::ThinkMode::High)),
+        ("xhigh", Some(ds4_server::ThinkMode::High)),
+        ("low", Some(ds4_server::ThinkMode::Low)),
+        ("medium", Some(ds4_server::ThinkMode::Low)),
+        ("minimal", Some(ds4_server::ThinkMode::Low)),
+        ("none", Some(ds4_server::ThinkMode::None)),
+        ("off", Some(ds4_server::ThinkMode::None)),
+        ("banana", None),
+    ];
+    for (name, want) in rows {
+        assert_eq!(ds4_server::parse_reasoning_effort_name(name), want);
+        match want {
+            Some(m) => assert_eq!(c(name), (m as i32).to_string()),
+            None => assert_eq!(c(name), "ERROR"),
+        }
+    }
+    assert_eq!(
+        ds4_server::think_mode_from_enabled(false, ds4_server::ThinkMode::High),
+        ds4_server::ThinkMode::None
+    );
+    assert_eq!(
+        ds4_server::think_mode_from_enabled(true, ds4_server::ThinkMode::High),
+        ds4_server::ThinkMode::High
+    );
+}
