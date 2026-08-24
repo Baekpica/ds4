@@ -98,6 +98,23 @@ pub struct Record {
     pub trailer: Vec<u8>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Metadata {
+    pub(crate) header: Header,
+    pub(crate) payload_offset: u64,
+    pub(crate) trailer_bytes: u64,
+    pub(crate) file_size: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Envelope {
+    pub header: Header,
+    pub text: Vec<u8>,
+    pub payload_offset: u64,
+    pub trailer_bytes: u64,
+    pub file_size: u64,
+}
+
 #[derive(Debug)]
 pub enum FormatError {
     Io(io::Error),
@@ -296,6 +313,72 @@ pub fn read_path(path: &Path) -> Result<Record, FormatError> {
     decode_file(&bytes)
 }
 
+pub fn read_envelope(path: &Path) -> Result<Envelope, FormatError> {
+    let (metadata, text) = read_text_prefix(path, usize::MAX)?;
+    if text.len() != metadata.header.text_bytes as usize {
+        return Err(FormatError::Truncated);
+    }
+    Ok(Envelope {
+        header: metadata.header,
+        text,
+        payload_offset: metadata.payload_offset,
+        trailer_bytes: metadata.trailer_bytes,
+        file_size: metadata.file_size,
+    })
+}
+
+pub(crate) fn read_metadata(path: &Path) -> Result<Metadata, FormatError> {
+    let mut f = fs::File::open(path)?;
+    read_metadata_file(&mut f)
+}
+
+pub(crate) fn read_text_prefix(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<(Metadata, Vec<u8>), FormatError> {
+    let mut f = fs::File::open(path)?;
+    let metadata = read_metadata_file(&mut f)?;
+    let want = (metadata.header.text_bytes as usize).min(max_bytes);
+    let mut text = Vec::with_capacity(want);
+    f.take(want as u64).read_to_end(&mut text)?;
+    Ok((metadata, text))
+}
+
+fn read_metadata_file(f: &mut fs::File) -> Result<Metadata, FormatError> {
+    let file_size = f.metadata()?.len();
+    if file_size < (FIXED_HEADER + 4) as u64 {
+        return Err(FormatError::Truncated);
+    }
+
+    let mut raw_header = [0u8; FIXED_HEADER];
+    read_exact(f, &mut raw_header)?;
+    let mut raw_text_bytes = [0u8; 4];
+    read_exact(f, &mut raw_text_bytes)?;
+    let text_bytes = le_get32(&raw_text_bytes);
+    let header = parse_header(&raw_header, text_bytes)?;
+    let payload_offset = (FIXED_HEADER + 4) as u64 + u64::from(text_bytes);
+    let payload_end = payload_offset
+        .checked_add(header.payload_bytes)
+        .ok_or(FormatError::Truncated)?;
+    if file_size < payload_end {
+        return Err(FormatError::Truncated);
+    }
+
+    Ok(Metadata {
+        header,
+        payload_offset,
+        trailer_bytes: file_size - payload_end,
+        file_size,
+    })
+}
+
+fn read_exact(f: &mut fs::File, buf: &mut [u8]) -> Result<(), FormatError> {
+    match f.read_exact(buf) {
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Err(FormatError::Truncated),
+        result => result.map_err(FormatError::Io),
+    }
+}
+
 pub fn text_sha_hex(text: &[u8]) -> String {
     sha1_hex(text)
 }
@@ -375,6 +458,28 @@ mod tests {
         assert_eq!(&bytes[..3], b"KVC");
         assert_eq!(bytes[3], 1);
         assert_eq!(bytes[20], 2);
+    }
+
+    #[test]
+    fn envelope_has_offsets_without_payload() {
+        let dir = std::env::temp_dir().join(format!("ds4-kv-envelope-{}", std::process::id()));
+        let path = dir.join("sample.kv");
+        let _ = fs::remove_dir_all(&dir);
+        let mut rec = sample();
+        rec.trailer = b"end".to_vec();
+        write_path(&path, &rec).unwrap();
+
+        let got = read_envelope(&path).unwrap();
+        assert_eq!(got.header, rec.header);
+        assert_eq!(got.text, rec.text);
+        assert_eq!(
+            got.payload_offset,
+            (FIXED_HEADER + 4 + rec.text.len()) as u64
+        );
+        assert_eq!(got.trailer_bytes, rec.trailer.len() as u64);
+        assert_eq!(got.file_size, fs::metadata(&path).unwrap().len());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

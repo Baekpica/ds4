@@ -1,8 +1,8 @@
 //! Directory-backed KVC catalog: refresh, prefix lookup, LCP, evict.
 
 use crate::format::{
-    is_automatic_exact_replay, is_bank_replay_v1, path_for_sha, read_path, sha_hex_name,
-    text_sha_hex, write_path, Header, Record,
+    is_automatic_exact_replay, is_bank_replay_v1, path_for_sha, read_metadata, read_path,
+    read_text_prefix, sha_hex_name, text_sha_hex, write_path, Header, Record,
 };
 use crate::policy::{
     eviction_score, file_size_fits, EvictionContext, Options, ScoreEntry, DEFAULT_MB,
@@ -62,16 +62,12 @@ impl Store {
             let Some(name) = name.to_str() else { continue };
             let Some(sha) = sha_hex_name(name) else { continue };
             let path = ent.path();
-            let Ok(meta) = fs::metadata(&path) else { continue };
-            let Ok(rec) = read_path(&path) else { continue };
-            if meta.len() < 48 + 4 + u64::from(rec.header.text_bytes) + rec.header.payload_bytes {
-                continue;
-            }
+            let Ok(metadata) = read_metadata(&path) else { continue };
             self.entries.push(Entry {
                 sha,
                 path,
-                header: rec.header,
-                file_size: meta.len(),
+                header: metadata.header,
+                file_size: metadata.file_size,
             });
         }
     }
@@ -209,10 +205,15 @@ impl Store {
             if u64::from(e.header.text_bytes) > 8 * prompt.len() as u64 {
                 continue;
             }
-            let Ok(rec) = read_path(&e.path) else { continue };
             let want = (e.header.text_bytes as usize).min(prompt.len());
+            let Ok((metadata, text)) = read_text_prefix(&e.path, want) else {
+                continue;
+            };
+            if metadata.header.text_bytes != e.header.text_bytes {
+                continue;
+            }
             let mut lcp = 0;
-            while lcp < want && rec.text[lcp] == prompt[lcp] {
+            while lcp < text.len() && text[lcp] == prompt[lcp] {
                 lcp += 1;
             }
             if lcp < min_lcp {
@@ -295,7 +296,10 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::{Header, Reason};
+    use crate::format::{
+        fill_header, le_put32, read_metadata, read_text_prefix, Header, Reason, FIXED_HEADER,
+    };
+    use std::io::Write as _;
 
     fn rec(text: &[u8], tokens: u32) -> Record {
         Record {
@@ -343,6 +347,46 @@ mod tests {
         store.write(r).unwrap();
         assert!(store.find_bank_text_prefix(b"hello", 0, 2, 2048).is_none());
         assert!(store.find_bank_text_prefix(b"hello!", 0, 2, 2048).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn indexes_sparse_payload_without_reading_it() {
+        const PAYLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+        const TRAILER_BYTES: u64 = 17;
+
+        let dir = std::env::temp_dir().join(format!("ds4-kv-sparse-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let text = [b'x'; 64];
+        let prompt = [b'x'; 8];
+        let path = path_for_sha(&dir, &text_sha_hex(&text));
+        let header = fill_header(0, 2, Reason::Cold, 0, 512, 0, 2048, 1, 1, PAYLOAD_BYTES);
+        let mut text_len = [0u8; 4];
+        le_put32(&mut text_len, text.len() as u32);
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(&text_len).unwrap();
+        file.write_all(&text).unwrap();
+        let payload_offset = (FIXED_HEADER + 4 + text.len()) as u64;
+        file.set_len(payload_offset + PAYLOAD_BYTES + TRAILER_BYTES)
+            .unwrap();
+        drop(file);
+
+        let metadata = read_metadata(&path).unwrap();
+        assert_eq!(metadata.header.text_bytes, text.len() as u32);
+        let (_, prefix) = read_text_prefix(&path, prompt.len()).unwrap();
+        assert_eq!(prefix, prompt);
+
+        let mut store = Store::open(&dir, 8192, false, Options::default()).unwrap();
+        assert_eq!(store.entries().len(), 1);
+        assert_eq!(
+            store.entries()[0].file_size,
+            payload_offset + PAYLOAD_BYTES + TRAILER_BYTES
+        );
+        let (_, lcp) = store.find_text_lcp(&prompt, 0, 2, 2048, 5).unwrap();
+        assert_eq!(lcp, prompt.len());
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
