@@ -1,14 +1,16 @@
 //! Directory-backed KVC catalog: refresh, prefix lookup, LCP, evict.
 
 use crate::format::{
-    is_automatic_exact_replay, is_bank_replay_v1, path_for_sha, read_metadata, read_path,
-    read_text_prefix, sha_hex_name, text_sha_hex, write_path, Header, Record,
+    fill_header, is_automatic_exact_replay, is_bank_replay_v1, path_for_sha, read_envelope,
+    read_metadata, read_path, read_text_prefix, sha_hex_name, text_sha_hex, write_path,
+    stage_stream, Envelope, FormatError, Header, Record, EXT_TOOL_MAP,
 };
 use crate::policy::{
-    eviction_score, file_size_fits, EvictionContext, Options, ScoreEntry, DEFAULT_MB,
+    eviction_score, file_size_bytes, file_size_fits, EvictionContext, Options, ScoreEntry,
+    DEFAULT_MB,
 };
 use std::fs;
-use std::io;
+use std::io::{self, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -99,6 +101,88 @@ impl Store {
         let extra = 48 + 4 + record.text.len() as u64 + record.payload.len() as u64 + record.trailer.len() as u64;
         self.evict(extra, Some(&incoming));
         write_path(&path, &record).map_err(|e| io::Error::other(e))?;
+        self.refresh();
+        Ok(path)
+    }
+
+    /// Store an opaque native payload without buffering it in Rust memory.
+    /// A nonempty trailer is the frozen server tool-map suffix.
+    pub fn write_payload_file(
+        &mut self,
+        mut header: Header,
+        text: &[u8],
+        payload_path: &Path,
+        trailer: &[u8],
+    ) -> io::Result<PathBuf> {
+        if text.len() > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "KVC text exceeds u32 length",
+            ));
+        }
+        if !trailer.is_empty() {
+            header.ext_flags |= EXT_TOOL_MAP;
+        }
+        let sha = text_sha_hex(text);
+        let path = path_for_sha(&self.dir, &sha);
+        if let Ok(existing) = read_envelope(&path) {
+            let compatible = existing.header.model_id == header.model_id
+                && (!self.reject_different_quant
+                    || existing.header.quant_bits == header.quant_bits)
+                && existing.header.ctx_size <= header.ctx_size
+                && is_automatic_exact_replay(
+                    existing.header.reason,
+                    existing.header.ext_flags,
+                )
+                && is_automatic_exact_replay(header.reason, header.ext_flags)
+                && existing.text == text
+                && text_sha_hex(&existing.text) == sha;
+            if compatible {
+                if !trailer.is_empty() {
+                    rewrite_compatible_trailer(&path, &existing, header.ext_flags, trailer)?;
+                }
+                return Ok(path);
+            }
+        }
+        if payload_path == path {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "KVC payload source aliases destination",
+            ));
+        }
+        let mut payload = fs::File::open(payload_path)?;
+        let payload_bytes = payload.metadata()?.len();
+        let extra = file_size_bytes(text.len() as u64, payload_bytes, trailer.len() as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "KVC file size overflows")
+            })?;
+        if !file_size_fits(
+            self.budget_bytes,
+            text.len() as u64,
+            payload_bytes,
+            trailer.len() as u64,
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "KVC file exceeds budget",
+            ));
+        }
+        header.text_bytes = text.len() as u32;
+        header.payload_bytes = payload_bytes;
+        let incoming = EvictionContext {
+            text,
+            model_id: header.model_id,
+            quant_bits: header.quant_bits,
+            ctx_size: header.ctx_size,
+            reject_different_quant: self.reject_different_quant,
+        };
+        let staged = stage_stream(&path, &header, text, &mut payload, payload_bytes, trailer)
+            .map_err(format_io_error)?;
+        self.evict_excluding(extra, Some(&incoming), Some(&path));
+        if let Err(error) = fs::rename(&staged, &path) {
+            let _ = fs::remove_file(staged);
+            return Err(error);
+        }
         self.refresh();
         Ok(path)
     }
@@ -236,6 +320,15 @@ impl Store {
     }
 
     pub fn evict(&mut self, extra_bytes: u64, incoming: Option<&EvictionContext<'_>>) {
+        self.evict_excluding(extra_bytes, incoming, None);
+    }
+
+    fn evict_excluding(
+        &mut self,
+        extra_bytes: u64,
+        incoming: Option<&EvictionContext<'_>>,
+        protected: Option<&Path>,
+    ) {
         if self.budget_bytes == 0 || extra_bytes > self.budget_bytes {
             return;
         }
@@ -243,21 +336,33 @@ impl Store {
         let now = now_secs();
         let target = self.budget_bytes - extra_bytes;
         loop {
-            let total: u64 = self.entries.iter().map(|e| e.file_size).sum();
+            let total: u64 = self
+                .entries
+                .iter()
+                .filter(|e| protected.is_none_or(|path| path != e.path))
+                .map(|e| e.file_size)
+                .sum();
             if total <= target || self.entries.is_empty() {
                 break;
             }
-            let mut victim = 0;
-            let mut victim_score = self.score_at(0, now, incoming);
-            for i in 1..self.entries.len() {
+            let mut victim: Option<usize> = None;
+            let mut victim_score = 0.0;
+            for i in 0..self.entries.len() {
+                if protected.is_some_and(|path| path == self.entries[i].path) {
+                    continue;
+                }
                 let score = self.score_at(i, now, incoming);
-                if score < victim_score
-                    || (score == victim_score && self.entries[i].header.last_used < self.entries[victim].header.last_used)
+                if victim.is_none()
+                    || score < victim_score
+                    || (score == victim_score
+                        && self.entries[i].header.last_used
+                            < self.entries[victim.unwrap()].header.last_used)
                 {
-                    victim = i;
+                    victim = Some(i);
                     victim_score = score;
                 }
             }
+            let Some(victim) = victim else { break };
             let path = self.entries[victim].path.clone();
             let unlinked = fs::remove_file(path).is_ok();
             self.entries.remove(victim);
@@ -289,6 +394,54 @@ impl Store {
     }
 }
 
+fn rewrite_compatible_trailer(
+    path: &Path,
+    existing: &Envelope,
+    incoming_ext_flags: u8,
+    trailer: &[u8],
+) -> io::Result<()> {
+    // The C fast path is O(trailer); copying a multi-GiB payload here would
+    // turn a compatible save into a full checkpoint rewrite.
+    let payload_end = existing
+        .payload_offset
+        .checked_add(existing.header.payload_bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "KVC payload end overflows"))?;
+    let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+    file.seek(SeekFrom::Start(payload_end))?;
+    file.set_len(payload_end)?;
+    file.write_all(trailer)?;
+    file.flush()?;
+
+    let mut header = existing.header.clone();
+    header.ext_flags |= incoming_ext_flags & EXT_TOOL_MAP;
+    header.last_used = now_secs();
+    let raw = fill_header(
+        header.model_id,
+        header.quant_bits,
+        header.reason,
+        header.ext_flags,
+        header.tokens,
+        header.hits,
+        header.ctx_size,
+        header.created_at,
+        header.last_used,
+        header.payload_bytes,
+    );
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&raw)?;
+    file.flush()
+}
+
+fn format_io_error(error: FormatError) -> io::Error {
+    match error {
+        FormatError::Io(error) => error,
+        FormatError::Truncated => {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "truncated KVC payload")
+        }
+        other => io::Error::new(io::ErrorKind::InvalidData, other),
+    }
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -302,7 +455,6 @@ mod tests {
     use crate::format::{
         fill_header, le_put32, read_metadata, read_text_prefix, Header, Reason, FIXED_HEADER,
     };
-    use std::io::Write as _;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -415,5 +567,164 @@ mod tests {
 
         assert_eq!(disk_files, 2);
         assert_eq!(remaining_tokens, vec![1024]);
+    }
+
+    #[test]
+    fn compatible_empty_trailer_reuses_existing_bytes() {
+        let dir = std::env::temp_dir().join(format!("ds4-kv-reuse-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let mut existing = rec(b"same prompt", 512);
+        existing.header.hits = 7;
+        existing.trailer = b"old trailer".to_vec();
+        let path = store.write(existing).unwrap();
+        let sibling = store.write(rec(b"sibling", 1024)).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let mut incoming = rec(b"same prompt", 2048).header;
+        incoming.quant_bits = 4;
+        incoming.reason = Reason::Continued;
+        incoming.ext_flags = crate::format::EXT_RESPONSES_VISIBLE;
+        incoming.ctx_size = 4096;
+        incoming.created_at = 99;
+        incoming.last_used = 99;
+        store.budget_bytes = 1;
+
+        let got = store
+            .write_payload_file(incoming, b"same prompt", &dir.join("missing-payload"), b"")
+            .unwrap();
+        assert_eq!(got, path);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(sibling.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compatible_trailer_rewrite_preserves_payload_and_header() {
+        let dir = std::env::temp_dir().join(format!("ds4-kv-reuse-trailer-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let mut existing = rec(b"same prompt", 512);
+        existing.header.hits = 7;
+        existing.header.created_at = 42;
+        existing.header.last_used = 43;
+        existing.header.ext_flags = crate::format::EXT_RESPONSES_VISIBLE;
+        existing.payload = b"opaque payload".to_vec();
+        existing.trailer = b"old trailer".to_vec();
+        let path = store.write(existing).unwrap();
+        let sibling = store.write(rec(b"sibling", 1024)).unwrap();
+        let before = read_path(&path).unwrap();
+
+        let mut incoming = rec(b"same prompt", 2048).header;
+        incoming.reason = Reason::Continued;
+        incoming.ext_flags = crate::format::EXT_THINKING_VISIBLE;
+        incoming.ctx_size = 4096;
+        incoming.created_at = 99;
+        incoming.last_used = 99;
+        store.budget_bytes = 1;
+        let started = now_secs();
+
+        store
+            .write_payload_file(
+                incoming,
+                b"same prompt",
+                &dir.join("missing-payload"),
+                b"new tool map",
+            )
+            .unwrap();
+        let got = read_path(&path).unwrap();
+        assert_eq!(got.text, before.text);
+        assert_eq!(got.payload, before.payload);
+        assert_eq!(got.trailer, b"new tool map");
+        assert_eq!(got.header.model_id, before.header.model_id);
+        assert_eq!(got.header.quant_bits, before.header.quant_bits);
+        assert_eq!(got.header.reason, before.header.reason);
+        assert_eq!(got.header.tokens, before.header.tokens);
+        assert_eq!(got.header.hits, before.header.hits);
+        assert_eq!(got.header.ctx_size, before.header.ctx_size);
+        assert_eq!(got.header.created_at, before.header.created_at);
+        assert_eq!(got.header.payload_bytes, before.header.payload_bytes);
+        assert_eq!(got.header.text_bytes, before.header.text_bytes);
+        assert_eq!(
+            got.header.ext_flags,
+            before.header.ext_flags | crate::format::EXT_TOOL_MAP
+        );
+        assert!(got.header.last_used >= started);
+        assert!(sibling.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn payload_destination_alias_is_rejected_without_data_loss() {
+        let dir = std::env::temp_dir().join(format!("ds4-kv-alias-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let path = store.write(rec(b"same prompt", 512)).unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut incompatible = rec(b"same prompt", 512).header;
+        incompatible.model_id = 1;
+
+        let error = store
+            .write_payload_file(incompatible, b"same prompt", &path, b"")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stream_truncation_maps_to_unexpected_eof() {
+        assert_eq!(
+            format_io_error(FormatError::Truncated).kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn failed_incompatible_stage_preserves_existing_entries() {
+        let dir = std::env::temp_dir().join(format!("ds4-kv-stage-fail-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let target = store.write(rec(b"same prompt", 8192)).unwrap();
+        let sibling = store.write(rec(b"sibling", 512)).unwrap();
+        let target_before = fs::read(&target).unwrap();
+        let sibling_before = fs::read(&sibling).unwrap();
+        let mut incoming = rec(b"same prompt", 1024).header;
+        incoming.model_id = 1;
+
+        let error = store
+            .write_payload_file(incoming, b"same prompt", &dir.join("missing-payload"), b"")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert_eq!(fs::read(&target).unwrap(), target_before);
+        assert_eq!(fs::read(&sibling).unwrap(), sibling_before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incompatible_replacement_credits_target_and_keeps_sibling() {
+        let dir = std::env::temp_dir().join(format!("ds4-kv-replace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let text = b"same prompt";
+        let target = store.write(rec(text, 8192)).unwrap();
+        let sibling = store.write(rec(b"sibling", 512)).unwrap();
+        let payload = b"new payload";
+        let payload_path = dir.join("incoming.payload");
+        fs::write(&payload_path, payload).unwrap();
+        let incoming_bytes = file_size_bytes(text.len() as u64, payload.len() as u64, 0).unwrap();
+        store.budget_bytes = fs::metadata(&sibling).unwrap().len() + incoming_bytes;
+        let mut incoming = rec(text, 1024).header;
+        incoming.model_id = 1;
+
+        let got = store
+            .write_payload_file(incoming, text, &payload_path, b"")
+            .unwrap();
+        let replaced = read_path(&target).unwrap();
+        assert_eq!(got, target);
+        assert_eq!(replaced.header.model_id, 1);
+        assert_eq!(replaced.payload, payload);
+        assert!(sibling.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

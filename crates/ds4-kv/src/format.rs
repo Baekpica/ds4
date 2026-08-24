@@ -309,6 +309,7 @@ pub fn write_path(path: &Path, record: &Record) -> Result<(), FormatError> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn write_stream(
     path: &Path,
     header: &Header,
