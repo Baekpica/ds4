@@ -142,9 +142,17 @@ matrix. Live gates follow that document, not byte dumps.
 make proof-cuda-smoke
 make proof-cuda-long
 make proof-cuda-opp-c
+make proof-rust-cuda-opp-c
 ```
 
-must be runnable on the Rust execution path before that path is
+`proof-cuda-opp-c` remains the native-drift gate against the tracked
+golden. `proof-rust-cuda-opp-c` is the separate host-parity gate: it
+writes a temporary snapshot with the current C oracle, then checks the
+Rust binary through the same stable runner path. Its artifacts remain
+under `/tmp/ds4_proof/proof-rust-cuda-opp-c.*` for audit; it does not
+rewrite or replace the tracked native golden.
+
+Both OPP-C gates must be green before the Rust execution path becomes
 default. Long-context captured-vs-eager stays a release gate.
 
 ### Phase 9 / split

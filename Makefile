@@ -72,7 +72,8 @@ CUDA_EXTRA_BINS := ds4_weight_server
 endif
 
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression \
-        proof-cuda-smoke proof-cuda-long proof-cuda-opp-c print-version \
+        proof-cuda-smoke proof-cuda-long proof-cuda-opp-c \
+        proof-rust-cuda-opp-c print-version \
         test-motif3-loader test-motif3-reference test-motif3-tokenizer \
         test-motif3-cuda test-motif3-resident \
         test-dots3-loader test-dots3-tokenizer test-dots3-reference \
@@ -132,7 +133,7 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 cuda-regression:
 	@echo "cuda-regression requires a CUDA build"
 
-proof-cuda-smoke proof-cuda-long proof-cuda-opp-c:
+proof-cuda-smoke proof-cuda-long proof-cuda-opp-c proof-rust-cuda-opp-c:
 	@echo "$@ requires a CUDA build"
 else
 all: help
@@ -155,6 +156,7 @@ help:
 	@echo "  make test-catalog-parity C↔Rust shape catalog + mmap GGUF identify + tensor inventory + bind plan + host bind lookup + host load apply + host validate + host vocab apply + host layout + MTP/DSpark sibling catalogs (Phase 8)"
 	@echo "  make test-tokenizer-parity C↔Rust tokenizer encode/decode/stop (Phase 8)"
 	@echo "  make test-session-parity C↔Rust session ledger / DSV4 prefix (Phase 8)"
+	@echo "  make proof-rust-cuda-opp-c C→Rust OPP-C host parity (temporary C oracle)"
 	@echo "  make ds4-server-rs       Build Rust shadow ./ds4-server-rs (HTTP door + host generate; default names stay C)"
 	@echo "  make clean               Remove build outputs (keeps the recorded cuda configuration)"
 
@@ -219,7 +221,10 @@ cuda-regression: tests/cuda_long_context_smoke
 #     Regenerate the golden after an intentional output change with:
 #       tests/ds4_proof.py --scenario cuda-opp-c-full \
 #         --write-expected tests/proof/expected/cuda-opp-c-full.json [weight-server flags]
-DS4_PROOF_REQUIRE_BASE := @if [ -z "$$DS4_PROOF_BASE" ]; then echo "$@: set DS4_PROOF_BASE to a base model gguf path" >&2; exit 2; fi
+#   - rust opp-c: HOST PARITY gate. The current C binary writes an ephemeral
+#     snapshot and the Rust binary checks it through the same stable runner
+#     path. This complements, and never replaces, the committed native golden.
+DS4_PROOF_REQUIRE_BASE = @if [ -z "$$DS4_PROOF_BASE" ]; then echo "$@: set DS4_PROOF_BASE to a base model gguf path" >&2; exit 2; fi
 
 proof-cuda-smoke: ds4
 	$(DS4_PROOF_REQUIRE_BASE)
@@ -233,6 +238,22 @@ proof-cuda-opp-c: ds4
 	$(DS4_PROOF_REQUIRE_BASE)
 	tests/ds4_proof.py --scenario cuda-opp-c-full --work-dir /tmp/ds4_proof/$@ \
 		--check-expected tests/proof/expected/cuda-opp-c-full.json
+
+proof-rust-cuda-opp-c: ds4 ds4-rs
+	$(DS4_PROOF_REQUIRE_BASE)
+	@set -eu; \
+		mkdir -p /tmp/ds4_proof; \
+		root=$$(mktemp -d /tmp/ds4_proof/$@.XXXXXX); \
+		runner=$$root/bin; \
+		expected=$$root/c-expected.json; \
+		mkdir -p "$$root/c" "$$root/rust"; \
+		ln -s "$(CURDIR)/ds4" "$$runner"; \
+		echo "proof_artifacts=$$root"; \
+		tests/ds4_proof.py --bin "$$runner" --scenario cuda-opp-c-full \
+			--work-dir "$$root/c" --write-expected "$$expected"; \
+		ln -sfn "$(CURDIR)/ds4-rs" "$$runner"; \
+		tests/ds4_proof.py --bin "$$runner" --scenario cuda-opp-c-full \
+			--work-dir "$$root/rust" --check-expected "$$expected"
 endif
 
 ds4.o: ds4.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h
