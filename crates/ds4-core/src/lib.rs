@@ -1094,13 +1094,27 @@ impl Session<'_> {
         if rc != 0 {
             return Err(fail(rc, &err));
         }
-        let bytes = std::fs::read(path).map_err(|e| Error {
+        let mut file = std::fs::File::open(path).map_err(|e| Error {
             code: 1,
-            message: format!("failed to reread session payload: {e}"),
+            message: format!("failed to reopen session payload: {e}"),
         })?;
-        let prefix = crate::payload::parse_prefix(&bytes).map_err(|e| Error {
+        let payload_bytes = file
+            .metadata()
+            .map_err(|e| Error {
+                code: 1,
+                message: format!("failed to measure session payload: {e}"),
+            })?
+            .len();
+        let prefix = crate::payload::read_prefix_range(
+            &mut file,
+            0,
+            payload_bytes,
+            self.host.family,
+            self.host.ctx,
+        )
+        .map_err(|e| Error {
             code: 1,
-            message: e.message.to_string(),
+            message: e.to_string(),
         })?;
         let host_tok: Vec<u32> = self.host.tokens().iter().map(|&t| t as u32).collect();
         if prefix.tokens != host_tok {
@@ -1116,26 +1130,28 @@ impl Session<'_> {
     /// GPU/logits tail. Generation follows native (`ds4_session_load_payload`
     /// bumps it). Tokens come from the host-parsed prefix.
     pub fn load_payload(&mut self, path: &str) -> Result<()> {
-        let bytes = std::fs::read(path).map_err(|e| Error {
+        let mut file = std::fs::File::open(path).map_err(|e| Error {
             code: 1,
-            message: format!("failed to read session payload: {e}"),
+            message: format!("failed to open session payload: {e}"),
         })?;
-        let prefix = crate::payload::parse_prefix(&bytes).map_err(|e| Error {
+        let payload_bytes = file
+            .metadata()
+            .map_err(|e| Error {
+                code: 1,
+                message: format!("failed to measure session payload: {e}"),
+            })?
+            .len();
+        let prefix = crate::payload::read_prefix_range(
+            &mut file,
+            0,
+            payload_bytes,
+            self.host.family,
+            self.host.ctx,
+        )
+        .map_err(|e| Error {
             code: 1,
-            message: e.message.to_string(),
+            message: e.to_string(),
         })?;
-        if prefix.layout().family() != self.host.family {
-            return Err(Error {
-                code: 1,
-                message: "session payload was written for a different model family".into(),
-            });
-        }
-        if prefix.tokens.len() >= self.host.ctx.max(0) as usize {
-            return Err(Error {
-                code: 1,
-                message: "session payload exceeds context".into(),
-            });
-        }
         let c_path = cstring_path(path)?;
         let mut err = [0u8; 512];
         let generation_before = self.native_generation();
