@@ -157,7 +157,7 @@ fn incoming_supersedes_continued(e: &ScoreEntry<'_>, incoming: &EvictionContext<
     if e.reason != Reason::Continued && e.reason != Reason::BankCheckpoint {
         return false;
     }
-    if e.text_bytes == 0 || e.text_bytes > incoming.text.len() as u64 {
+    if e.text_bytes == 0 || e.text_bytes >= incoming.text.len() as u64 {
         return false;
     }
     if e.model_id != incoming.model_id {
@@ -248,5 +248,36 @@ mod tests {
     fn budget_adds_one_percent() {
         assert_eq!(budget_required(100), Some(101));
         assert_eq!(budget_required(101), Some(103));
+    }
+
+    #[test]
+    fn equal_length_incoming_does_not_discount_continued() {
+        let text = b"same prefix";
+        let sha = text_sha_hex(text);
+        let entry = ScoreEntry {
+            sha: &sha,
+            quant_bits: 2,
+            model_id: 0,
+            reason: Reason::Continued,
+            tokens: 512,
+            hits: 0,
+            ctx_size: 2048,
+            created_at: 1000,
+            last_used: 1000,
+            text_bytes: text.len() as u64,
+            file_size: 4096,
+        };
+        let incoming = EvictionContext {
+            text,
+            model_id: 0,
+            quant_bits: 2,
+            ctx_size: 2048,
+            reject_different_quant: true,
+        };
+
+        assert_eq!(
+            eviction_score(&entry, 1000, Some(&incoming)),
+            eviction_score(&entry, 1000, None)
+        );
     }
 }
