@@ -86,6 +86,7 @@ widen the existing ones to dump internals.
 | `ds4_bridge_session_sample` | `ds4_session_sample` (caller-owned rng) |
 | `ds4_bridge_session_save_payload` | path wrapper over `ds4_session_save_payload` (native writes header+tokens+GPU tail) |
 | `ds4_bridge_session_load_payload` | path wrapper; `payload_bytes` = file size |
+| `ds4_bridge_session_load_payload_range` | path + checked `offset`/`length`; native consumes exactly that embedded DSV4 range |
 | `ds4_bridge_tokenize_text` | caller-owned `int32_t *` + cap + `n_out` |
 | `ds4_bridge_tokenize_rendered_chat` | same buffer contract, special-token path |
 | `ds4_bridge_token_text` | caller-owned byte buffer; C frees the malloc |
@@ -140,7 +141,12 @@ native token-string pointers stay valid for the engine lifetime.
 rewrite / rewind / generation (`ds4-core::SessionLedger`) is host-owned;
 `Session::pos` / `generation` read the ledger. The DSV4 payload prefix
 (13×u32 LE header + token ids; magic `DSV4`, version 3) is host-owned
-(`ds4-core::payload`); GPU / logits / family tensor tails stay native.
+(`ds4-core::payload`). `Session::load_payload_range` reads only that
+prefix, rejects overflow / out-of-file ranges before FFI, and passes the
+bounded range to native. A bridge-side preflight failure preserves the
+existing host ledger; failures after native load begins follow the native
+generation and invalidate the host checkpoint. GPU / logits / family tensor
+tails stay native.
 The Inc 5 continuation registry (`ds4-server::ContRegistry`) is
 host-owned: publish / resolve / hold / pin / TTL / bank claim do not
 cross FFI. Weight bind and native prefill/eval still go through the
