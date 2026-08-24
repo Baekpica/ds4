@@ -23,6 +23,9 @@ pub struct ShadowArgs {
     pub dump_logprobs: Option<String>,
     pub logprobs_top_k: i32,
     pub temp: f32,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub seed: u64,
     pub lifecycle_only: bool,
     pub identify: bool,
     pub inventory: bool,
@@ -65,6 +68,9 @@ impl Default for ShadowArgs {
             dump_logprobs: None,
             logprobs_top_k: 20,
             temp: 1.0,
+            top_p: 1.0,
+            min_p: 0.05,
+            seed: 0,
             lifecycle_only: false,
             identify: false,
             inventory: false,
@@ -130,9 +136,19 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
             }
             "--temp" => {
                 let v = require_value(&arg, iter.next())?;
-                parsed.temp = v
-                    .parse::<f32>()
-                    .map_err(|_| format!("{arg} expects a float, got {v}"))?;
+                parsed.temp = parse_f32_range(&arg, &v, 0.0, 100.0)?;
+            }
+            "--top-p" => {
+                let v = require_value(&arg, iter.next())?;
+                parsed.top_p = parse_f32_range(&arg, &v, 0.0, 1.0)?;
+            }
+            "--min-p" => {
+                let v = require_value(&arg, iter.next())?;
+                parsed.min_p = parse_f32_range(&arg, &v, 0.0, 1.0)?;
+            }
+            "--seed" => {
+                let v = require_value(&arg, iter.next())?;
+                parsed.seed = parse_positive_u64(&arg, &v)?;
             }
             "--think" => parsed.nothink = false,
             "--nothink" => parsed.nothink = true,
@@ -240,9 +256,6 @@ fn validate_one_shot_args(args: &ShadowArgs) -> Result<(), String> {
             "one-shot generation requires -p or --prompt-file; REPL is not implemented".into(),
         );
     }
-    if args.temp != 0.0 {
-        return Err("sampling is not implemented in ds4-rs; use --temp 0".into());
-    }
     if !args.nothink {
         return Err(
             "thinking output formatting is not implemented in ds4-rs; use --nothink".into(),
@@ -256,6 +269,11 @@ fn validate_one_shot_args(args: &ShadowArgs) -> Result<(), String> {
 
 fn generation_limit(ctx: i32, pos: i32, requested: i32) -> i32 {
     let room = ctx.saturating_sub(pos);
+    requested.min(room).max(0)
+}
+
+fn sampled_generation_limit(ctx: i32, pos: i32, requested: i32) -> i32 {
+    let room = ctx.saturating_sub(pos).saturating_sub(1);
     requested.min(room).max(0)
 }
 
@@ -279,33 +297,64 @@ fn run_one_shot(model: &ds4_core::Model, args: &ShadowArgs, text: &str) -> Resul
     let mut session = model.session(args.ctx).map_err(|e| e.to_string())?;
     session.sync(&prompt).map_err(|e| e.to_string())?;
 
-    let max_tokens = generation_limit(session.ctx(), session.pos(), args.n_predict);
+    let sampled = args.temp > 0.0;
+    let max_tokens = if sampled {
+        sampled_generation_limit(session.ctx(), session.pos(), args.n_predict)
+    } else {
+        generation_limit(session.ctx(), session.pos(), args.n_predict)
+    };
+    let mut rng = args.seed;
+    if sampled && rng == 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        rng = (now ^ (u64::from(std::process::id()) << 32)) | 1;
+    }
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let mut last_output_newline = true;
     let mut decode_error = None;
 
     for generated in 0..max_tokens {
-        let token = session.argmax();
+        let token = if sampled {
+            session.sample(args.temp, 0, args.top_p, args.min_p, &mut rng)
+        } else {
+            session.argmax()
+        };
         if token < 0 {
-            decode_error = Some("failed to select the next token".into());
+            decode_error = Some(if sampled {
+                "failed to sample the next token".into()
+            } else {
+                "failed to select the next token".into()
+            });
             break;
         }
         if model.token_is_stop(token) {
             break;
         }
+        if sampled {
+            if let Err(e) = session.eval(token) {
+                decode_error = Some(e.to_string());
+                break;
+            }
+        }
+
         let piece = model.token_text(token).map_err(|e| e.to_string())?;
         if let Some(last) = piece.last() {
             last_output_newline = *last == b'\n';
         }
         out.write_all(&piece).map_err(|e| e.to_string())?;
         out.flush().map_err(|e| e.to_string())?;
-        if generated + 1 == max_tokens {
-            break;
-        }
-        if let Err(e) = session.eval(token) {
-            decode_error = Some(e.to_string());
-            break;
+
+        if !sampled {
+            if generated + 1 == max_tokens {
+                break;
+            }
+            if let Err(e) = session.eval(token) {
+                decode_error = Some(e.to_string());
+                break;
+            }
         }
     }
     if !last_output_newline {
@@ -444,7 +493,8 @@ Usage:
   {name} --session-plan CMD [ARGS...]
   {name} --session-payload CMD [ARGS...]
   {name} -m MODEL [--backend cuda|cpu|metal] [-c CTX] [--lifecycle]
-  {name} -m MODEL (-p PROMPT | --prompt-file FILE) --temp 0 --nothink [-n N]
+  {name} -m MODEL (-p PROMPT | --prompt-file FILE) --nothink [-n N]
+      [--temp F --top-p F --min-p F --seed N]
   {name} -m MODEL --token-ids 1,2,3 [--predict N]
   {name} -m MODEL [--mtp GGUF] [--dspark GGUF] ...
   {name} --cuda -m MODEL --temp 0 -n N [--nothink] --dump-logprobs F \\
@@ -456,6 +506,8 @@ sibling's name walk and layout check.
 --dump-logprobs mirrors the C CLI proof loop (chat-template encode via
 the engine, argmax decode, host stop set); ctx grows to fit prompt+n
 unless -c is explicit.
+One-shot sampling uses the native C sampler; an explicit --seed is
+reproducible across the C and Rust hosts.
 --tokens is the C-compatible output budget; --token-ids is the shadow-only
 raw token-ID diagnostic.
 
@@ -661,6 +713,23 @@ fn parse_positive_i32(flag: &str, value: &str) -> Result<i32, String> {
         .ok_or_else(|| format!("invalid value for {flag}: {value}"))
 }
 
+fn parse_f32_range(flag: &str, value: &str, min: f32, max: f32) -> Result<f32, String> {
+    let parsed = value
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= min && *v <= max)
+        .ok_or_else(|| format!("invalid value for {flag}: {value}"))?;
+    Ok(parsed)
+}
+
+fn parse_positive_u64(flag: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|v| *v > 0)
+        .ok_or_else(|| format!("invalid value for {flag}: {value}"))
+}
+
 #[cfg(target_os = "macos")]
 fn default_backend() -> Backend {
     Backend::Metal
@@ -723,7 +792,38 @@ mod tests {
         assert_eq!(parsed.n_predict, 50000);
         assert_eq!(parsed.system, "You are a helpful assistant");
         assert_eq!(parsed.temp, 1.0);
+        assert_eq!(parsed.top_p, 1.0);
+        assert_eq!(parsed.min_p, 0.05);
+        assert_eq!(parsed.seed, 0);
         assert!(!parsed.nothink);
+    }
+
+    #[test]
+    fn parses_c_cli_sampling_options() {
+        let parsed = parse_args(args(&[
+            "--temp", "0.8", "--top-p", "0.9", "--min-p", "0.02", "--seed", "424242",
+        ]))
+        .unwrap();
+
+        assert_eq!(parsed.temp, 0.8);
+        assert_eq!(parsed.top_p, 0.9);
+        assert_eq!(parsed.min_p, 0.02);
+        assert_eq!(parsed.seed, 424242);
+    }
+
+    #[test]
+    fn rejects_sampling_outside_c_cli_ranges() {
+        for bad in [
+            ["--temp", "NaN"],
+            ["--temp", "101"],
+            ["--top-p", "-0.1"],
+            ["--top-p", "1.1"],
+            ["--min-p", "-0.1"],
+            ["--min-p", "1.1"],
+            ["--seed", "0"],
+        ] {
+            assert!(parse_args(args(&bad)).is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]
@@ -804,10 +904,8 @@ mod tests {
         let greedy = parse_args(args(&["-p", "hello", "--temp", "0", "--nothink"])).unwrap();
         assert!(validate_one_shot_args(&greedy).is_ok());
 
-        let sampled = parse_args(args(&["-p", "hello", "--temp", "0.5"])).unwrap();
-        assert!(validate_one_shot_args(&sampled)
-            .unwrap_err()
-            .contains("sampling is not implemented"));
+        let sampled = parse_args(args(&["-p", "hello", "--temp", "0.5", "--nothink"])).unwrap();
+        assert!(validate_one_shot_args(&sampled).is_ok());
 
         let thinking = parse_args(args(&["-p", "hello", "--temp", "0"])).unwrap();
         assert!(validate_one_shot_args(&thinking)
@@ -844,6 +942,10 @@ mod tests {
         assert_eq!(generation_limit(128, 127, 10), 1);
         assert_eq!(generation_limit(128, 128, 10), 0);
         assert_eq!(generation_limit(128, 120, 4), 4);
+
+        assert_eq!(sampled_generation_limit(128, 127, 10), 0);
+        assert_eq!(sampled_generation_limit(128, 126, 10), 1);
+        assert_eq!(sampled_generation_limit(128, 120, 4), 4);
     }
 
     #[test]
