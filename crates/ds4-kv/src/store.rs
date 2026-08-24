@@ -298,6 +298,23 @@ impl Store {
         Ok(())
     }
 
+    pub fn discard(&mut self, path: &Path) -> io::Result<()> {
+        if !self.entries.iter().any(|entry| entry.path == path) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "KVC discard path is not a catalog entry",
+            ));
+        }
+        self.continued_last_store_tokens = 0;
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.refresh();
+        Ok(())
+    }
+
     pub fn find_bank_text_prefix(
         &mut self,
         prompt: &[u8],
@@ -651,6 +668,60 @@ mod tests {
         assert!(second_path.exists());
         drop(second);
         assert!(!second_path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discard_removes_existing_candidate_and_refreshes_index() {
+        let dir = std::env::temp_dir().join(format!("ds4-kv-discard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let discarded = store.write(rec(b"discarded", 512)).unwrap();
+        let retained = store.write(rec(b"retained", 1024)).unwrap();
+        store.continued_last_store_tokens = 512;
+        assert_eq!(store.entries().len(), 2);
+
+        store.discard(&discarded).unwrap();
+
+        assert!(!discarded.exists());
+        assert!(retained.exists());
+        assert_eq!(store.entries().len(), 1);
+        assert_eq!(store.entries()[0].path, retained);
+        assert_eq!(store.continued_last_store_tokens, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discard_missing_candidate_is_ok_and_refreshes_index() {
+        let dir =
+            std::env::temp_dir().join(format!("ds4-kv-discard-missing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let missing = store.write(rec(b"missing", 512)).unwrap();
+        store.continued_last_store_tokens = 512;
+        fs::remove_file(&missing).unwrap();
+        assert_eq!(store.entries().len(), 1);
+
+        store.discard(&missing).unwrap();
+
+        assert!(store.entries().is_empty());
+        assert_eq!(store.continued_last_store_tokens, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discard_rejects_paths_outside_the_catalog() {
+        let dir = std::env::temp_dir().join(format!("ds4-kv-discard-scope-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let outside = dir.with_extension("outside");
+        fs::write(&outside, b"keep").unwrap();
+
+        let error = store.discard(&outside).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(fs::read(&outside).unwrap(), b"keep");
+        fs::remove_file(outside).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 
