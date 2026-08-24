@@ -104,6 +104,15 @@ static int cmd_read(int argc, char **argv) {
     if (fread(text, 1, text_bytes, fp) != text_bytes) die("short text");
     if (fread(payload, 1, (size_t)e.payload_bytes, fp) != (size_t)e.payload_bytes)
         die("short payload");
+    long payload_end = ftell(fp);
+    if (payload_end < 0 || fseek(fp, 0, SEEK_END) != 0) die("measure trailer");
+    long file_end = ftell(fp);
+    if (file_end < payload_end) die("invalid trailer length");
+    size_t trailer_len = (size_t)(file_end - payload_end);
+    unsigned char *trailer = malloc(trailer_len ? trailer_len : 1);
+    if (!trailer) die("oom");
+    if (fseek(fp, payload_end, SEEK_SET) != 0) die("seek trailer");
+    if (fread(trailer, 1, trailer_len, fp) != trailer_len) die("short trailer");
     fclose(fp);
     printf("model_id=%u\n", e.model_id);
     printf("quant_bits=%u\n", e.quant_bits);
@@ -120,9 +129,12 @@ static int cmd_read(int argc, char **argv) {
     print_hex(text, text_bytes);
     printf("\npayload_hex=");
     print_hex(payload, (size_t)e.payload_bytes);
+    printf("\ntrailer_hex=");
+    print_hex(trailer, trailer_len);
     printf("\n");
     free(text);
     free(payload);
+    free(trailer);
     return 0;
 }
 

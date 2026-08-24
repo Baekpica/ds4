@@ -2,7 +2,7 @@
 
 use ds4_kv::{
     decode_file, encode_file, eviction_score, read_path, store_len, write_path, Header, Options,
-    Reason, Record, ScoreEntry,
+    Reason, Record, ScoreEntry, Store,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -115,6 +115,7 @@ fn c_read(path: &Path) -> Record {
             "text_bytes" => rec.header.text_bytes = v.parse().unwrap(),
             "text_hex" => rec.text = unhex(v),
             "payload_hex" => rec.payload = unhex(v),
+            "trailer_hex" => rec.trailer = unhex(v),
             _ => {}
         }
     }
@@ -137,8 +138,11 @@ fn same_envelope(a: &Record, b: &Record) {
     assert_eq!(a.header.ctx_size, b.header.ctx_size);
     assert_eq!(a.header.created_at, b.header.created_at);
     assert_eq!(a.header.last_used, b.header.last_used);
+    assert_eq!(a.header.payload_bytes, b.header.payload_bytes);
+    assert_eq!(a.header.text_bytes, b.header.text_bytes);
     assert_eq!(a.text, b.text);
     assert_eq!(a.payload, b.payload);
+    assert_eq!(a.trailer, b.trailer);
 }
 
 #[test]
@@ -176,6 +180,35 @@ fn c_save_rust_load() {
     c_write(&path, &rec);
     let got = decode_file(&fs::read(&path).unwrap()).unwrap();
     same_envelope(&rec, &got);
+}
+
+#[test]
+fn rust_stream_payload_with_trailer_loads_in_c() {
+    let base = tmp("stream-rust-c");
+    let store_dir = base.join("store");
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let mut rec = sample();
+    rec.payload = b"DSV4 opaque native payload\0\xff".to_vec();
+    rec.trailer = b"KVT1 tool-map trailer".to_vec();
+    rec.header.ext_flags = ds4_kv::EXT_TOOL_MAP;
+    rec.header.text_bytes = rec.text.len() as u32;
+    rec.header.payload_bytes = rec.payload.len() as u64;
+    let payload_path = ds4_kv::path_for_sha(&store_dir, &ds4_kv::text_sha_hex(&rec.text))
+        .with_extension(format!("kv.tmp.{}", std::process::id()));
+    fs::create_dir_all(&store_dir).unwrap();
+    fs::write(&payload_path, &rec.payload).unwrap();
+
+    let mut store = Store::open(&store_dir, 16, false, Options::default()).unwrap();
+    let path = store
+        .write_payload_file(rec.header.clone(), &rec.text, &payload_path, &rec.trailer)
+        .unwrap();
+    assert_eq!(fs::read(&payload_path).unwrap(), rec.payload);
+    let got = c_read(&path);
+    same_envelope(&rec, &got);
+
+    let _ = fs::remove_dir_all(&base);
 }
 
 #[test]
