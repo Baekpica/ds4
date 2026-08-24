@@ -32,6 +32,14 @@ fn positive_i32(option: &str, value: &str) -> Result<i32, String> {
         .ok_or_else(|| format!("ds4-server-rs: invalid value for {option}: {value}"))
 }
 
+fn nonnegative_i32(option: &str, value: &str) -> Result<i32, String> {
+    value
+        .parse::<i32>()
+        .ok()
+        .filter(|value| *value >= 0)
+        .ok_or_else(|| format!("ds4-server-rs: invalid value for {option}: {value}"))
+}
+
 impl DiskKvArgs {
     pub fn parse_arg(
         &mut self,
@@ -43,6 +51,15 @@ impl DiskKvArgs {
             "--kv-disk-dir" => self.dir = Some(value()?.into()),
             "--kv-disk-space-mb" => self.set_space_mb(&value()?)?,
             "--kv-cache-min-tokens" => self.set_min_tokens(&value()?)?,
+            "--kv-cache-cold-max-tokens" => {
+                self.options.cold_max_tokens = nonnegative_i32(option, &value()?)?
+            }
+            "--kv-cache-boundary-trim-tokens" => {
+                self.options.boundary_trim_tokens = nonnegative_i32(option, &value()?)?
+            }
+            "--kv-cache-boundary-align-tokens" => {
+                self.options.boundary_align_tokens = nonnegative_i32(option, &value()?)?
+            }
             "--kv-cache-reject-different-quant" => self.reject_different_quant = true,
             _ => return Ok(false),
         }
@@ -59,6 +76,18 @@ impl DiskKvArgs {
         Ok(())
     }
 
+    pub fn validate(&self) -> Result<(), String> {
+        if self.options.cold_max_tokens > 0
+            && self.options.cold_max_tokens < self.options.min_tokens
+        {
+            return Err(
+                "ds4-server-rs: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn open(&self) -> Option<Store> {
         let dir = self.dir.as_ref()?;
         match Store::open(
@@ -69,11 +98,14 @@ impl DiskKvArgs {
         ) {
             Ok(store) => {
                 eprintln!(
-                    "ds4-server-rs: KV disk cache {} (budget={} MiB, cross-quant={}, min={}; ordinary serial evict/load)",
+                    "ds4-server-rs: KV disk cache {} (budget={} MiB, cross-quant={}, min={}, cold_max={}, trim={}, align={}; ordinary serial cold/evict/load)",
                     dir.display(),
                     store.budget_bytes / (1024 * 1024),
                     if self.reject_different_quant { "reject" } else { "accept" },
                     self.options.min_tokens,
+                    self.options.cold_max_tokens,
+                    self.options.boundary_trim_tokens,
+                    self.options.boundary_align_tokens,
                 );
                 Some(store)
             }
@@ -113,12 +145,15 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_serial_kv_flags_parse_without_claiming_inactive_policy() {
+    fn ordinary_serial_cold_policy_flags_parse() {
         let mut kv = DiskKvArgs::default();
         let cases = [
             ("--kv-disk-dir", "cache"),
             ("--kv-disk-space-mb", "64"),
             ("--kv-cache-min-tokens", "1024"),
+            ("--kv-cache-cold-max-tokens", "4096"),
+            ("--kv-cache-boundary-trim-tokens", "16"),
+            ("--kv-cache-boundary-align-tokens", "512"),
         ];
         for (option, value) in cases {
             let mut values = [value.to_string()].into_iter();
@@ -128,19 +163,42 @@ mod tests {
         assert!(kv
             .parse_arg("--kv-cache-reject-different-quant", &mut empty)
             .unwrap());
-        for inactive in [
-            "--kv-cache-cold-max-tokens",
-            "--kv-cache-continued-interval-tokens",
-            "--kv-cache-boundary-trim-tokens",
-            "--kv-cache-boundary-align-tokens",
-        ] {
+        for inactive in ["--kv-cache-continued-interval-tokens"] {
             assert!(!kv.parse_arg(inactive, &mut empty).unwrap());
         }
 
         assert_eq!(kv.dir.as_deref(), Some(std::path::Path::new("cache")));
         assert_eq!(kv.space_mb, 64);
         assert_eq!(kv.options.min_tokens, 1024);
+        assert_eq!(kv.options.cold_max_tokens, 4096);
+        assert_eq!(kv.options.boundary_trim_tokens, 16);
+        assert_eq!(kv.options.boundary_align_tokens, 512);
         assert!(kv.reject_different_quant);
+    }
+
+    #[test]
+    fn cold_policy_allows_zero_and_validates_against_minimum() {
+        let mut kv = DiskKvArgs::default();
+        for option in [
+            "--kv-cache-cold-max-tokens",
+            "--kv-cache-boundary-trim-tokens",
+            "--kv-cache-boundary-align-tokens",
+        ] {
+            let mut zero = ["0".to_string()].into_iter();
+            assert!(kv.parse_arg(option, &mut zero).unwrap());
+        }
+        assert_eq!(kv.options.cold_max_tokens, 0);
+        assert_eq!(kv.options.boundary_trim_tokens, 0);
+        assert_eq!(kv.options.boundary_align_tokens, 0);
+        kv.validate().unwrap();
+
+        let mut enabled = DiskKvArgs::default();
+        enabled.options.min_tokens = 1024;
+        enabled.options.cold_max_tokens = 512;
+        assert_eq!(
+            enabled.validate().unwrap_err(),
+            "ds4-server-rs: --kv-cache-cold-max-tokens must be 0 or >= --kv-cache-min-tokens"
+        );
     }
 
     #[test]
@@ -148,8 +206,19 @@ mod tests {
         let mut kv = DiskKvArgs::default();
         kv.set_space_mb("2147483647").unwrap();
         kv.set_min_tokens("2147483647").unwrap();
+        for option in [
+            "--kv-cache-cold-max-tokens",
+            "--kv-cache-boundary-trim-tokens",
+            "--kv-cache-boundary-align-tokens",
+        ] {
+            let mut max = ["2147483647".to_string()].into_iter();
+            assert!(kv.parse_arg(option, &mut max).unwrap());
+        }
         assert_eq!(kv.space_mb, i32::MAX as u64);
         assert_eq!(kv.options.min_tokens, i32::MAX);
+        assert_eq!(kv.options.cold_max_tokens, i32::MAX);
+        assert_eq!(kv.options.boundary_trim_tokens, i32::MAX);
+        assert_eq!(kv.options.boundary_align_tokens, i32::MAX);
     }
 
     #[test]
@@ -165,16 +234,37 @@ mod tests {
                 format!("ds4-server-rs: invalid value for --kv-cache-min-tokens: {value}")
             );
         }
+        for option in [
+            "--kv-cache-cold-max-tokens",
+            "--kv-cache-boundary-trim-tokens",
+            "--kv-cache-boundary-align-tokens",
+        ] {
+            for value in ["", "-1", "junk", "2147483648"] {
+                let mut kv = DiskKvArgs::default();
+                let mut values = [value.to_string()].into_iter();
+                assert_eq!(
+                    kv.parse_arg(option, &mut values).unwrap_err(),
+                    format!("ds4-server-rs: invalid value for {option}: {value}")
+                );
+            }
+        }
     }
 
     #[test]
     fn missing_value_is_reported() {
         let mut missing = DiskKvArgs::default();
-        let mut empty = std::iter::empty();
-        assert_eq!(
-            missing.parse_arg("--kv-disk-dir", &mut empty).unwrap_err(),
-            "ds4-server-rs: missing value for --kv-disk-dir"
-        );
+        for option in [
+            "--kv-disk-dir",
+            "--kv-cache-cold-max-tokens",
+            "--kv-cache-boundary-trim-tokens",
+            "--kv-cache-boundary-align-tokens",
+        ] {
+            let mut empty = std::iter::empty();
+            assert_eq!(
+                missing.parse_arg(option, &mut empty).unwrap_err(),
+                format!("ds4-server-rs: missing value for {option}")
+            );
+        }
     }
 
     #[test]

@@ -1,8 +1,8 @@
 //! Four-way KVC matrix: C save/load × Rust save/load.
 
 use ds4_kv::{
-    decode_file, encode_file, eviction_score, read_path, store_len, write_path, Header, Options,
-    Reason, Record, ScoreEntry, Store,
+    chat_anchor_pos, decode_file, encode_file, eviction_score, read_path, store_len, write_path,
+    Header, Options, Reason, Record, ScoreEntry, Store,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -234,6 +234,22 @@ fn store_len_matches_c() {
         let c: i32 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
         assert_eq!(store_len(&Options::default(), tokens), c, "tokens={tokens}");
     }
+}
+
+#[test]
+fn chat_anchor_matches_c() {
+    let mut tokens = vec![7; 600];
+    tokens[512] = 99;
+    tokens[530] = 99;
+    tokens[550] = 100;
+    tokens[560] = 99;
+    let mut args = vec!["chat-anchor".to_string(), "99".into(), "100".into()];
+    args.extend(tokens.iter().map(i32::to_string));
+    let out = Command::new(require_oracle()).args(&args).output().unwrap();
+    assert!(out.status.success());
+    let c: i32 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+    assert_eq!(chat_anchor_pos(&Options::default(), &tokens, 99, 100), c);
+    assert_eq!(c, 530);
 }
 
 #[test]

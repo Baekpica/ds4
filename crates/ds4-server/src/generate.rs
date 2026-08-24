@@ -15,7 +15,10 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(any(feature = "native", test))]
-use ds4_kv::{Header as KvHeader, Reason as KvReason, Store as KvStore, EXT_THINKING_VISIBLE};
+use ds4_kv::{
+    chat_anchor_pos as kv_chat_anchor_pos, store_len as kv_store_len, Header as KvHeader,
+    Reason as KvReason, Store as KvStore, EXT_THINKING_VISIBLE,
+};
 
 use crate::dsml::{SampleOverride, SamplePolicy};
 use crate::parse::{ParsedRequest, ToolChoice};
@@ -125,6 +128,9 @@ fn settle_thinking_visible_checkpoint(
 #[cfg(any(feature = "native", test))]
 trait SerialKvIo {
     fn ctx(&self) -> i32;
+    fn chat_token_ids(&self) -> (i32, i32) {
+        (-1, -1)
+    }
     fn live_tokens(&self) -> Vec<i32>;
     fn render_tokens(&self, tokens: &[i32]) -> Result<Vec<u8>, GenerateError>;
     fn tokenize_suffix(&mut self, suffix: &[u8]) -> Result<Vec<i32>, GenerateError>;
@@ -177,12 +183,13 @@ fn kv_header(model_id: u8, quant_bits: u8, ctx: u32, tokens: u32) -> KvHeader {
 }
 
 #[cfg(any(feature = "native", test))]
-fn try_store_current(
+fn try_store_live(
     io: &mut impl SerialKvIo,
     store: &mut KvStore,
     model_id: u8,
     quant_bits: u8,
     ctx: u32,
+    reason: KvReason,
     checkpoint: Option<&ThinkingVisibleCheckpoint>,
 ) -> Result<(), GenerateError> {
     let live = io.live_tokens();
@@ -198,6 +205,7 @@ fn try_store_current(
         _ => (io.render_tokens(&live)?, 0),
     };
     let mut header = kv_header(model_id, quant_bits, ctx, tokens);
+    header.reason = reason;
     header.ext_flags = ext_flags;
     if store
         .reuse_compatible(header.clone(), &text, b"")
@@ -219,6 +227,60 @@ fn try_store_current(
 #[cfg(any(feature = "native", test))]
 fn cold_sync(io: &mut impl SerialKvIo, tokens: &[i32]) -> Result<i32, GenerateError> {
     io.sync(tokens)?;
+    Ok(0)
+}
+
+#[cfg(any(feature = "native", test))]
+fn cold_sync_and_store(
+    io: &mut impl SerialKvIo,
+    store: &mut KvStore,
+    identity: (u8, u8, u32),
+    tokens: &[i32],
+) -> Result<i32, GenerateError> {
+    let (model_id, quant_bits, ctx) = identity;
+    let Ok(full_len) = i32::try_from(tokens.len()) else {
+        return cold_sync(io, tokens);
+    };
+    if full_len < store.opt.min_tokens
+        || store.opt.cold_max_tokens <= 0
+        || full_len > store.opt.cold_max_tokens
+    {
+        return cold_sync(io, tokens);
+    }
+    let (user_id, assistant_id) = io.chat_token_ids();
+    let anchor = kv_chat_anchor_pos(&store.opt, tokens, user_id, assistant_id);
+    let target = if anchor >= store.opt.min_tokens {
+        anchor
+    } else {
+        kv_store_len(&store.opt, full_len)
+    };
+    if target < store.opt.min_tokens || target > full_len {
+        return cold_sync(io, tokens);
+    }
+    let target = target as usize;
+    if target < tokens.len() {
+        io.sync(&tokens[..target])?;
+    } else {
+        io.sync(tokens)?;
+    }
+    if try_store_live(
+        io,
+        store,
+        model_id,
+        quant_bits,
+        ctx,
+        KvReason::Cold,
+        None,
+    )
+    .is_ok()
+    {
+        store.continued_last_store_tokens = store
+            .continued_last_store_tokens
+            .max(target as i32);
+    }
+    if target < tokens.len() {
+        io.sync(tokens)?;
+    }
     Ok(0)
 }
 
@@ -280,22 +342,32 @@ fn disk_sync_prompt(
         return cold_sync(io, canonical_tokens);
     };
     if policy.save_current {
-        let _ = try_store_current(io, store, model_id, quant_bits, ctx, checkpoint);
+        let _ = try_store_live(
+            io,
+            store,
+            model_id,
+            quant_bits,
+            ctx,
+            KvReason::Evict,
+            checkpoint,
+        );
     }
     if !policy.load {
         return cold_sync(io, canonical_tokens);
     }
     let candidate = match store.text_prefix_candidate(prompt, model_id, quant_bits, ctx) {
         Ok(candidate) => candidate,
-        Err(_) => return cold_sync(io, canonical_tokens),
+        Err(_) => {
+            return cold_sync_and_store(io, store, (model_id, quant_bits, ctx), canonical_tokens)
+        }
     };
     let Some((path, envelope)) = candidate else {
-        return cold_sync(io, canonical_tokens);
+        return cold_sync_and_store(io, store, (model_id, quant_bits, ctx), canonical_tokens);
     };
     if (envelope.header.ext_flags != 0 && envelope.header.ext_flags != EXT_THINKING_VISIBLE)
         || envelope.trailer_bytes != 0
     {
-        return cold_sync(io, canonical_tokens);
+        return cold_sync_and_store(io, store, (model_id, quant_bits, ctx), canonical_tokens);
     }
     if io
         .load_payload_range(
@@ -306,13 +378,13 @@ fn disk_sync_prompt(
         .is_err()
     {
         io.invalidate();
-        return cold_sync(io, canonical_tokens);
+        return cold_sync_and_store(io, store, (model_id, quant_bits, ctx), canonical_tokens);
     }
     let loaded = io.live_tokens();
     if loaded.len() != envelope.header.tokens as usize {
         io.invalidate();
         let _ = store.discard(&path);
-        return cold_sync(io, canonical_tokens);
+        return cold_sync_and_store(io, store, (model_id, quant_bits, ctx), canonical_tokens);
     }
     let cached = loaded.len() as i32;
     store.continued_last_store_tokens = cached;
@@ -1230,6 +1302,10 @@ impl SerialKvIo for NativeSerialKvIo<'_, '_, '_> {
         self.session.ctx()
     }
 
+    fn chat_token_ids(&self) -> (i32, i32) {
+        (self.vocab.user_id, self.vocab.assistant_id)
+    }
+
     fn live_tokens(&self) -> Vec<i32> {
         if self.session.host().valid {
             self.session.host().tokens().to_vec()
@@ -1511,11 +1587,15 @@ mod disk_sync_tests {
         loaded_tokens: Vec<i32>,
         fail_load: bool,
         fail_sync: bool,
+        fail_sync_at: Option<usize>,
+        fail_save: bool,
         invalidations: usize,
         syncs: Vec<Vec<i32>>,
         suffixes: Vec<Vec<u8>>,
         loads: Vec<(PathBuf, u64, u64)>,
         events: Vec<&'static str>,
+        user_token_id: i32,
+        assistant_token_id: i32,
     }
 
     impl FakeSerial {
@@ -1528,11 +1608,15 @@ mod disk_sync_tests {
                 loaded_tokens: Vec::new(),
                 fail_load: false,
                 fail_sync: false,
+                fail_sync_at: None,
+                fail_save: false,
                 invalidations: 0,
                 syncs: Vec::new(),
                 suffixes: Vec::new(),
                 loads: Vec::new(),
                 events: Vec::new(),
+                user_token_id: -1,
+                assistant_token_id: -1,
             }
         }
     }
@@ -1540,6 +1624,10 @@ mod disk_sync_tests {
     impl SerialKvIo for FakeSerial {
         fn ctx(&self) -> i32 {
             self.ctx
+        }
+
+        fn chat_token_ids(&self) -> (i32, i32) {
+            (self.user_token_id, self.assistant_token_id)
         }
 
         fn live_tokens(&self) -> Vec<i32> {
@@ -1558,7 +1646,7 @@ mod disk_sync_tests {
         fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError> {
             self.events.push("sync");
             self.syncs.push(tokens.to_vec());
-            if self.fail_sync {
+            if self.fail_sync || self.fail_sync_at == Some(self.syncs.len()) {
                 return Err(GenerateError::Engine("injected suffix sync failure".into()));
             }
             self.live = tokens.to_vec();
@@ -1567,6 +1655,9 @@ mod disk_sync_tests {
 
         fn save_payload(&mut self, path: &Path) -> Result<(), GenerateError> {
             self.events.push("save");
+            if self.fail_save {
+                return Err(GenerateError::Engine("injected payload save failure".into()));
+            }
             fs::write(path, b"current-payload").map_err(|e| GenerateError::Engine(e.to_string()))
         }
 
@@ -1631,9 +1722,9 @@ mod disk_sync_tests {
     }
 
     #[test]
-    fn disk_sync_prompt_cold_miss_syncs_canonical_prompt() {
+    fn disk_sync_prompt_cold_miss_syncs_then_saves_full_prompt() {
         let (dir, mut store) = store("cold");
-        let mut io = FakeSerial::new(&[], b"");
+        let mut io = FakeSerial::new(&[], b"cold prompt");
 
         let cached = disk_sync_prompt(
             &mut io,
@@ -1654,8 +1745,198 @@ mod disk_sync_tests {
         assert_eq!(cached, 0);
         assert_eq!(io.syncs, [vec![1, 2]]);
         assert!(io.loads.is_empty());
-        assert_eq!(io.events, ["sync"]);
+        assert_eq!(io.events, ["sync", "save"]);
+        assert_eq!(store.entries().len(), 1);
+        assert_eq!(store.entries()[0].header.reason, Reason::Cold);
+        assert_eq!(store.entries()[0].header.tokens, 2);
+        assert_eq!(store.entries()[0].header.ext_flags, 0);
+        assert_eq!(store.continued_last_store_tokens, 2);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disk_sync_prompt_cold_miss_saves_stable_prefix_before_full_sync() {
+        let (dir, mut store) = store("cold-prefix");
+        store.opt.boundary_trim_tokens = 1;
+        store.opt.boundary_align_tokens = 4;
+        let mut io = FakeSerial::new(&[], b"stable prefix");
+        let prompt_tokens: Vec<i32> = (1..=10).collect();
+
+        let cached = disk_sync_prompt(
+            &mut io,
+            Some(&mut store),
+            0,
+            2,
+            b"cold prompt",
+            &prompt_tokens,
+            None,
+            false,
+            DiskSyncPolicy {
+                save_current: false,
+                load: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cached, 0);
+        assert_eq!(io.syncs, [prompt_tokens[..8].to_vec(), prompt_tokens]);
+        assert_eq!(io.events, ["sync", "save", "sync"]);
+        assert_eq!(store.entries().len(), 1);
+        assert_eq!(store.entries()[0].header.reason, Reason::Cold);
+        assert_eq!(store.entries()[0].header.tokens, 8);
+        assert_eq!(store.continued_last_store_tokens, 8);
+        let record = store.read(&store.entries()[0].path).unwrap();
+        assert_eq!(record.text, b"stable prefix");
+        assert_eq!(record.payload, b"current-payload");
+        assert!(record.trailer.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disk_sync_prompt_cold_miss_prefers_chat_anchor() {
+        let (dir, mut store) = store("cold-anchor");
+        store.opt.boundary_trim_tokens = 1;
+        store.opt.boundary_align_tokens = 4;
+        let mut io = FakeSerial::new(&[], b"chat anchor");
+        io.user_token_id = 99;
+        io.assistant_token_id = 100;
+        let prompt_tokens = vec![10, 11, 99, 12, 13, 100, 14, 15, 16, 17];
+
+        disk_sync_prompt(
+            &mut io,
+            Some(&mut store),
+            0,
+            2,
+            b"cold prompt",
+            &prompt_tokens,
+            None,
+            false,
+            DiskSyncPolicy {
+                save_current: false,
+                load: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(io.syncs, [prompt_tokens[..2].to_vec(), prompt_tokens]);
+        assert_eq!(store.entries()[0].header.tokens, 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disk_sync_prompt_cold_policy_respects_disable_limit_and_lane_gate() {
+        let prompt_tokens: Vec<i32> = (1..=10).collect();
+        for (tag, min, cold_max, load) in [
+            ("cold-below-min", 11, 32, true),
+            ("cold-disabled", 1, 0, true),
+            ("cold-above-max", 1, 4, true),
+            ("cold-ineligible", 1, 32, false),
+        ] {
+            let (dir, mut store) = store(tag);
+            store.opt.min_tokens = min;
+            store.opt.cold_max_tokens = cold_max;
+            let mut io = FakeSerial::new(&[], b"cold prompt");
+            disk_sync_prompt(
+                &mut io,
+                Some(&mut store),
+                0,
+                2,
+                b"cold prompt",
+                &prompt_tokens,
+                None,
+                false,
+                DiskSyncPolicy {
+                    save_current: false,
+                    load,
+                },
+            )
+            .unwrap();
+            assert_eq!(io.syncs, [prompt_tokens.clone()], "{tag}");
+            assert_eq!(io.events, ["sync"], "{tag}");
+            assert!(store.entries().is_empty(), "{tag}");
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn disk_sync_prompt_cold_save_is_nonfatal_but_prefix_sync_failure_is_fatal() {
+        let prompt_tokens: Vec<i32> = (1..=10).collect();
+        let (save_dir, mut save_store) = store("cold-save-fail");
+        save_store.opt.boundary_trim_tokens = 1;
+        save_store.opt.boundary_align_tokens = 4;
+        let mut save_io = FakeSerial::new(&[], b"stable prefix");
+        save_io.fail_save = true;
+        disk_sync_prompt(
+            &mut save_io,
+            Some(&mut save_store),
+            0,
+            2,
+            b"cold prompt",
+            &prompt_tokens,
+            None,
+            false,
+            DiskSyncPolicy {
+                save_current: false,
+                load: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(save_io.syncs, [prompt_tokens[..8].to_vec(), prompt_tokens.clone()]);
+        assert_eq!(save_io.events, ["sync", "save", "sync"]);
+        assert!(save_store.entries().is_empty());
+        assert_eq!(save_store.continued_last_store_tokens, 0);
+
+        let (sync_dir, mut sync_store) = store("cold-sync-fail");
+        sync_store.opt.boundary_trim_tokens = 1;
+        sync_store.opt.boundary_align_tokens = 4;
+        let mut sync_io = FakeSerial::new(&[], b"stable prefix");
+        sync_io.fail_sync = true;
+        assert!(disk_sync_prompt(
+            &mut sync_io,
+            Some(&mut sync_store),
+            0,
+            2,
+            b"cold prompt",
+            &prompt_tokens,
+            None,
+            false,
+            DiskSyncPolicy {
+                save_current: false,
+                load: true,
+            },
+        )
+        .is_err());
+        assert_eq!(sync_io.syncs, [prompt_tokens[..8].to_vec()]);
+        assert_eq!(sync_io.events, ["sync"]);
+        assert!(sync_store.entries().is_empty());
+
+        let (tail_dir, mut tail_store) = store("cold-tail-sync-fail");
+        tail_store.opt.boundary_trim_tokens = 1;
+        tail_store.opt.boundary_align_tokens = 4;
+        let mut tail_io = FakeSerial::new(&[], b"stable prefix");
+        tail_io.fail_sync_at = Some(2);
+        assert!(disk_sync_prompt(
+            &mut tail_io,
+            Some(&mut tail_store),
+            0,
+            2,
+            b"cold prompt",
+            &prompt_tokens,
+            None,
+            false,
+            DiskSyncPolicy {
+                save_current: false,
+                load: true,
+            },
+        )
+        .is_err());
+        assert_eq!(tail_io.events, ["sync", "save", "sync"]);
+        assert_eq!(tail_store.entries().len(), 1);
+        assert_eq!(tail_store.entries()[0].header.reason, Reason::Cold);
+        assert_eq!(tail_store.continued_last_store_tokens, 8);
+        let _ = fs::remove_dir_all(save_dir);
+        let _ = fs::remove_dir_all(sync_dir);
+        let _ = fs::remove_dir_all(tail_dir);
     }
 
     #[test]
@@ -1801,19 +2082,20 @@ mod disk_sync_tests {
             "live checkpoint must be staged before a disk restore: {:?}",
             io.events
         );
-        assert!(store
+        let (_, old) = store
             .text_prefix_candidate(b"old conversation", 0, 2, 4096)
             .unwrap()
-            .is_some());
+            .expect("old conversation checkpoint");
+        assert_eq!(old.header.reason, Reason::Evict);
         assert_eq!(store.read(&path).unwrap().header.hits, 1);
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn disk_sync_prompt_token_count_mismatch_discards_then_cold_syncs() {
+    fn disk_sync_prompt_token_count_mismatch_discards_then_cold_stores() {
         let (dir, mut store) = store("count-mismatch");
         let path = candidate(&mut store, b"hello ", 2);
-        let mut io = FakeSerial::new(&[], b"");
+        let mut io = FakeSerial::new(&[], b"hello world");
         io.loaded_tokens = vec![41];
         io.suffix_tokens = vec![43];
 
@@ -1838,7 +2120,9 @@ mod disk_sync_tests {
         assert_eq!(io.invalidations, 1);
         assert_eq!(io.syncs, [vec![90, 91]]);
         assert!(!path.exists());
-        assert!(store.entries().is_empty());
+        assert_eq!(store.entries().len(), 1);
+        assert_eq!(store.entries()[0].header.reason, Reason::Cold);
+        assert_eq!(store.entries()[0].header.tokens, 2);
         let _ = fs::remove_dir_all(dir);
     }
 

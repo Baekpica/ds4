@@ -124,12 +124,24 @@ scope (computed suffix sync only): live Rust was 69.2 tok/s versus C
 the timing-scope binary was
 `ea714d4d7ae4e2618bf052aa842d40e290cd978ac404ac1f39aa15f5d76779f9`.
 
-This is not the whole Phase 4 gate. C defaults to cold/continued checkpoints
-(`cold_max=30000`, `continued=10000`), while the Rust shadow does not expose or
-execute those policies yet. The old 6,782-token Motif fixture demonstrates why
-the omission matters: C's 6,144-token cold checkpoint changes the native
-prefill partition and produced a different greedy continuation than the
-shared cold-disabled path. Tool-call checkpoint replay is also missing.
+The C-default ordinary cold slice (`cold_max=30000`, trim 32, align 2048) is
+live-green for this fixture under
+`scratch/rust-host-live/rust-cold-default-0IeCd9/`. For the 6,782-token Motif
+fixture, both hosts selected the same 6,144-token prefix. The rendered text
+SHA-256 was
+`ebd540ec7d9b9059649a1066c222dae4b02ca54bed54570da6fda0b81fd66f5e`
+and the payload SHA-256 was
+`0f0af1d1e189561aee24534cb4918bc292ef68a418522a51e615ac0bfade5862`
+for both C and Rust. Rust→Rust, Rust→C, and C→Rust restart cells restored the
+prefix and emitted the same 106-token output
+(`49b5f8a8b7c4e3aa2f768fd3afd29ad33a1d2cc327fe0361a0cd6d2c21afcdd9`)
+at 2,038.4/2,078.9/2,018.0 ms TTFT. Header timestamps and hit counters remain
+intentionally volatile; the text and payload bodies are exact. These cells are
+a correctness/cross-read gate, not a cold-policy ABBA performance claim.
+
+This is not the whole Phase 4 gate. C's default continued interval
+(`continued=10000`) is not exposed or executed by the Rust shadow, and
+tool-map checkpoint replay is also missing.
 
 ### Phase 5 — web utility
 

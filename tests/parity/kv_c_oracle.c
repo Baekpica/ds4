@@ -186,13 +186,30 @@ static int cmd_store_len(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_chat_anchor(int argc, char **argv) {
+    if (argc < 4) die("chat-anchor USER ASSISTANT [TOKENS...]");
+    ds4_kvstore kc;
+    memset(&kc, 0, sizeof(kc));
+    kc.opt = ds4_kvstore_default_options();
+    ds4_tokens prompt = {0};
+    prompt.len = prompt.cap = argc - 4;
+    prompt.v = calloc((size_t)(prompt.len ? prompt.len : 1), sizeof(*prompt.v));
+    if (!prompt.v) die("oom");
+    for (int i = 0; i < prompt.len; i++) prompt.v[i] = atoi(argv[i + 4]);
+    printf("%d\n", ds4_kvstore_chat_anchor_pos(&kc, &prompt,
+                                                atoi(argv[2]), atoi(argv[3])));
+    free(prompt.v);
+    return 0;
+}
+
 int main(int argc, char **argv) {
-    if (argc < 2) die("write|read|sha1|score|store-len");
+    if (argc < 2) die("write|read|sha1|score|store-len|chat-anchor");
     if (!strcmp(argv[1], "write")) return cmd_write(argc, argv);
     if (!strcmp(argv[1], "read")) return cmd_read(argc, argv);
     if (!strcmp(argv[1], "sha1")) return cmd_sha1(argc, argv);
     if (!strcmp(argv[1], "score")) return cmd_score(argc, argv);
     if (!strcmp(argv[1], "store-len")) return cmd_store_len(argc, argv);
+    if (!strcmp(argv[1], "chat-anchor")) return cmd_chat_anchor(argc, argv);
     die("unknown command");
     return 2;
 }
