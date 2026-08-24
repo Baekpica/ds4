@@ -1,11 +1,22 @@
 /* NULL-handle FFI checks for the Phase 7 generation ABI. Links
  * ds4_bridge.o against stubs so it does not load CUDA or a GGUF. */
 
+#include "ds4.h"
 #include "native/bridge/ds4_bridge.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+extern unsigned bridge_payload_load_calls;
+extern int64_t bridge_payload_load_offset;
+extern uint64_t bridge_payload_load_bytes;
+
+struct ds4_bridge_session {
+    ds4_bridge_model *model;
+    ds4_session *session;
+};
 
 static void fail(const char *m) {
     fprintf(stderr, "bridge_null_oracle: %s\n", m);
@@ -47,6 +58,55 @@ int main(void) {
     if (ds4_bridge_session_argmax_excluding(NULL, 7) != -1)
         fail("argmax_excluding");
     if (ds4_bridge_session_pos(NULL) != -1) fail("pos");
+
+    memset(err, 0, sizeof(err));
+    if (ds4_bridge_session_load_payload_range(NULL, "/tmp/missing", 0, 1,
+                                              err, sizeof(err)) == 0)
+        fail("payload range NULL session");
+    if (!strstr(err, "NULL")) fail("payload range err");
+
+    {
+        ds4_session *fake_native = malloc(1);
+        struct ds4_bridge_session fake = {NULL, fake_native};
+        ds4_bridge_session *session = &fake;
+        char path[] = "/tmp/ds4-bridge-range-XXXXXX";
+        unsigned char data[16] = {0};
+        if (!fake_native) fail("payload range fake session");
+        int fd = mkstemp(path);
+        if (fd < 0)
+            fail("payload range fixture");
+        if (write(fd, data, sizeof(data)) != (ssize_t)sizeof(data)) {
+            close(fd);
+            unlink(path);
+            fail("payload range fixture write");
+        }
+        if (close(fd) != 0) {
+            unlink(path);
+            fail("payload range fixture close");
+        }
+
+        bridge_payload_load_calls = 0;
+        bridge_payload_load_offset = -1;
+        bridge_payload_load_bytes = 0;
+        if (ds4_bridge_session_load_payload_range(session, path, 3, 5,
+                                                  err, sizeof(err)) != 0)
+            fail("payload range load");
+        if (bridge_payload_load_calls != 1) fail("payload range call count");
+        if (bridge_payload_load_offset != 3) fail("payload range seek");
+        if (bridge_payload_load_bytes != 5) fail("payload range length");
+
+        if (ds4_bridge_session_load_payload_range(session, path, 12, 5,
+                                                  err, sizeof(err)) == 0)
+            fail("payload range EOF");
+        if (bridge_payload_load_calls != 1) fail("payload range EOF called native");
+
+        if (ds4_bridge_session_load_payload_range(session, path, UINT64_MAX, 2,
+                                                  err, sizeof(err)) == 0)
+            fail("payload range overflow");
+        if (bridge_payload_load_calls != 1) fail("payload range overflow called native");
+        if (unlink(path) != 0) fail("payload range unlink");
+        free(fake_native);
+    }
 
     {
         ds4_bridge_snapshot *snap = NULL;

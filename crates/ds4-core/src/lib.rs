@@ -83,7 +83,8 @@ use ds4_sys::{
     ds4_bridge_session_create,
     ds4_bridge_session_exaone_rewind_span, ds4_bridge_session_free,
     ds4_bridge_session_generation, ds4_bridge_session_invalidate,
-    ds4_bridge_session_load_payload, ds4_bridge_session_prefill_cap,
+    ds4_bridge_session_load_payload, ds4_bridge_session_load_payload_range,
+    ds4_bridge_session_prefill_cap,
     ds4_bridge_session_rewind, ds4_bridge_session_sample,
     ds4_bridge_session_load_snapshot, ds4_bridge_session_save_payload,
     ds4_bridge_session_save_snapshot, ds4_bridge_session_sync,
@@ -1137,6 +1138,7 @@ impl Session<'_> {
         }
         let c_path = cstring_path(path)?;
         let mut err = [0u8; 512];
+        let generation_before = self.native_generation();
         let rc = unsafe {
             ds4_bridge_session_load_payload(
                 self.raw.as_ptr(),
@@ -1146,8 +1148,58 @@ impl Session<'_> {
             )
         };
         if rc != 0 {
-            self.host.clear_checkpoint_keep_generation();
-            self.host.generation = self.native_generation();
+            let generation_after = self.native_generation();
+            if generation_after != generation_before {
+                self.host.clear_checkpoint_keep_generation();
+            }
+            self.host.generation = generation_after;
+            return Err(fail(rc, &err));
+        }
+        self.host.apply_payload(&prefix).map_err(|e| Error {
+            code: 1,
+            message: e.message.to_string(),
+        })?;
+        self.host.generation = self.native_generation();
+        Ok(())
+    }
+
+    /// Restore one DSV4 payload embedded in a larger file. Only the host
+    /// prefix is read in Rust; the native loader consumes the bounded range.
+    pub fn load_payload_range(&mut self, path: &str, offset: u64, length: u64) -> Result<()> {
+        let mut file = std::fs::File::open(path).map_err(|e| Error {
+            code: 1,
+            message: format!("failed to open session payload range: {e}"),
+        })?;
+        let prefix = crate::payload::read_prefix_range(
+            &mut file,
+            offset,
+            length,
+            self.host.family,
+            self.host.ctx,
+        )
+        .map_err(|e| Error {
+            code: 1,
+            message: e.to_string(),
+        })?;
+        let c_path = cstring_path(path)?;
+        let mut err = [0u8; 512];
+        let generation_before = self.native_generation();
+        let rc = unsafe {
+            ds4_bridge_session_load_payload_range(
+                self.raw.as_ptr(),
+                c_path.as_ptr(),
+                offset,
+                length,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            let generation_after = self.native_generation();
+            if generation_after != generation_before {
+                self.host.clear_checkpoint_keep_generation();
+            }
+            self.host.generation = generation_after;
             return Err(fail(rc, &err));
         }
         self.host.apply_payload(&prefix).map_err(|e| Error {

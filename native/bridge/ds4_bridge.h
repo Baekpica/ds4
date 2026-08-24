@@ -121,6 +121,9 @@ int ds4_bridge_session_save_payload(ds4_bridge_session *s, const char *path,
                                     char *err, size_t errlen);
 int ds4_bridge_session_load_payload(ds4_bridge_session *s, const char *path,
                                     char *err, size_t errlen);
+int ds4_bridge_session_load_payload_range(ds4_bridge_session *s, const char *path,
+                                          uint64_t offset, uint64_t length,
+                                          char *err, size_t errlen);
 
 int ds4_bridge_snapshot_create(ds4_bridge_snapshot **out,
                                char *err, size_t errlen);

@@ -345,6 +345,15 @@ extern "C" {
         errlen: usize,
     ) -> c_int;
 
+    pub fn ds4_bridge_session_load_payload_range(
+        s: *mut ds4_bridge_session,
+        path: *const c_char,
+        offset: u64,
+        length: u64,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
     pub fn ds4_bridge_snapshot_create(
         out: *mut *mut ds4_bridge_snapshot,
         err: *mut c_char,

@@ -441,6 +441,62 @@ int ds4_bridge_session_load_payload(ds4_bridge_session *s, const char *path,
     return rc;
 }
 
+int ds4_bridge_session_load_payload_range(ds4_bridge_session *s, const char *path,
+                                          uint64_t offset, uint64_t length,
+                                          char *err, size_t errlen)
+{
+    FILE *fp;
+    int rc;
+    off_t sz;
+    uint64_t file_bytes;
+
+    if (!s || !s->session) {
+        set_err(err, errlen, "session is NULL");
+        return 1;
+    }
+    if (!path || !path[0]) {
+        set_err(err, errlen, "payload path is required");
+        return 1;
+    }
+    if (offset > UINT64_MAX - length) {
+        set_err(err, errlen, "session payload range overflows");
+        return 1;
+    }
+    fp = fopen(path, "rb");
+    if (!fp) {
+        set_err(err, errlen, "failed to open session payload for read");
+        return 1;
+    }
+    if (fseeko(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        set_err(err, errlen, "failed to measure session payload");
+        return 1;
+    }
+    sz = ftello(fp);
+    if (sz < 0) {
+        fclose(fp);
+        set_err(err, errlen, "failed to measure session payload");
+        return 1;
+    }
+    file_bytes = (uint64_t)sz;
+    if (offset > file_bytes || length > file_bytes - offset) {
+        fclose(fp);
+        set_err(err, errlen, "truncated session payload range");
+        return 1;
+    }
+    if (fseeko(fp, (off_t)offset, SEEK_SET) != 0) {
+        fclose(fp);
+        set_err(err, errlen, "failed to seek session payload range");
+        return 1;
+    }
+    rc = ds4_session_load_payload(s->session, fp, length, err, errlen);
+    if (fclose(fp) != 0 && rc == 0) {
+        set_err(err, errlen, "failed to close session payload");
+        return 1;
+    }
+    return rc;
+}
+
 int ds4_bridge_snapshot_create(ds4_bridge_snapshot **out,
                                char *err, size_t errlen)
 {

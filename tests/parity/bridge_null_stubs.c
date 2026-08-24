@@ -14,6 +14,10 @@
         abort(); \
     } while (0)
 
+unsigned bridge_payload_load_calls;
+int64_t bridge_payload_load_offset;
+uint64_t bridge_payload_load_bytes;
+
 void ds4_host_tensor_dir_install(const ds4_host_tensor_dir *d) { (void)d; }
 void ds4_host_tensor_dir_clear(void) {}
 void ds4_host_shape_install(const ds4_host_shape *s) { (void)s; }
@@ -69,8 +73,11 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes,
                              char *err, size_t errlen) {
-    (void)s; (void)fp; (void)payload_bytes; (void)err; (void)errlen;
-    STUB("ds4_session_load_payload");
+    (void)s; (void)err; (void)errlen;
+    bridge_payload_load_calls++;
+    bridge_payload_load_offset = (int64_t)ftello(fp);
+    bridge_payload_load_bytes = payload_bytes;
+    return 0;
 }
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap,
                               char *err, size_t errlen) {

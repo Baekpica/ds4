@@ -3,6 +3,8 @@
 //!
 //! Copied from `ds4.c` / `ds4.h` at v0.6.3-dfm. Little-endian `payload_put_u32`.
 
+use std::io::{self, Read, Seek, SeekFrom};
+
 use crate::session::SessionLedger;
 use crate::shape::ModelFamily;
 
@@ -123,7 +125,7 @@ pub fn encode_fields(fields: &[u32; U32_FIELDS], tokens: &[u32]) -> Vec<u8> {
     .encode()
 }
 
-pub fn parse_prefix(bytes: &[u8]) -> Result<HostPrefix, PayloadError> {
+fn parse_fields(bytes: &[u8]) -> Result<[u32; U32_FIELDS], PayloadError> {
     if bytes.len() < HEADER_BYTES {
         return Err(err("truncated session payload"));
     }
@@ -135,6 +137,11 @@ pub fn parse_prefix(bytes: &[u8]) -> Result<HostPrefix, PayloadError> {
     if fields[0] != MAGIC || fields[1] == 0 || fields[1] > VERSION {
         return Err(err("unsupported session payload version"));
     }
+    Ok(fields)
+}
+
+pub fn parse_prefix(bytes: &[u8]) -> Result<HostPrefix, PayloadError> {
+    let fields = parse_fields(bytes)?;
     let n = fields[7] as usize;
     let need = HEADER_BYTES.saturating_add(n.saturating_mul(4));
     if bytes.len() < need {
@@ -147,6 +154,64 @@ pub fn parse_prefix(bytes: &[u8]) -> Result<HostPrefix, PayloadError> {
     }
     let prefix = HostPrefix { fields, tokens };
     validate_layout(&prefix)?;
+    Ok(prefix)
+}
+
+fn invalid_data(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn read_payload_exact(reader: &mut impl Read, bytes: &mut [u8]) -> io::Result<()> {
+    reader.read_exact(bytes).map_err(|e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            invalid_data("truncated session payload")
+        } else {
+            e
+        }
+    })
+}
+
+pub(crate) fn read_prefix_range(
+    reader: &mut (impl Read + Seek),
+    offset: u64,
+    length: u64,
+    family: ModelFamily,
+    ctx: i32,
+) -> io::Result<HostPrefix> {
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| invalid_data("session payload range overflows"))?;
+    if end > reader.seek(SeekFrom::End(0))? {
+        return Err(invalid_data("truncated session payload range"));
+    }
+    if length < HEADER_BYTES as u64 {
+        return Err(invalid_data("truncated session payload"));
+    }
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut header = [0u8; HEADER_BYTES];
+    read_payload_exact(reader, &mut header)?;
+    let fields = parse_fields(&header).map_err(|e| invalid_data(e.message))?;
+    if PayloadLayout::from_fields(&fields).family() != family {
+        return Err(invalid_data(
+            "session payload was written for a different model family",
+        ));
+    }
+    let n = fields[7] as usize;
+    if n >= ctx.max(0) as usize {
+        return Err(invalid_data("session payload exceeds context"));
+    }
+    let prefix_len = HEADER_BYTES as u64 + fields[7] as u64 * 4;
+    if prefix_len > length {
+        return Err(invalid_data("truncated session payload"));
+    }
+    let token_bytes = n
+        .checked_mul(4)
+        .ok_or_else(|| invalid_data("session payload range overflows"))?;
+    let mut raw_tokens = vec![0u8; token_bytes];
+    read_payload_exact(reader, &mut raw_tokens)?;
+    let tokens = raw_tokens.chunks_exact(4).map(get_u32).collect();
+    let prefix = HostPrefix { fields, tokens };
+    validate_layout(&prefix).map_err(|e| invalid_data(e.message))?;
     Ok(prefix)
 }
 
@@ -452,4 +517,82 @@ pub fn dump_cmd(cmd: &str, args: &[&str]) -> String {
         }
     }
     dump_script(cmd)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Seek};
+
+    use super::*;
+
+    #[test]
+    fn range_reader_validates_prefix_without_reading_native_tail() {
+        let prefix = fixture_deepseek();
+        let mut bytes = vec![0xaa, 0xbb, 0xcc];
+        bytes.extend_from_slice(&prefix.encode());
+        bytes.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let range_len = (bytes.len() - 3) as u64;
+
+        let mut cursor = Cursor::new(bytes.clone());
+        let parsed =
+            read_prefix_range(&mut cursor, 3, range_len, ModelFamily::DeepSeek4, 8192).unwrap();
+        assert_eq!(parsed, prefix);
+        assert_eq!(
+            cursor.stream_position().unwrap(),
+            3 + prefix.prefix_len() as u64
+        );
+
+        let mut cursor = Cursor::new(bytes.clone());
+        let err = read_prefix_range(
+            &mut cursor,
+            3,
+            prefix.prefix_len() as u64 - 1,
+            ModelFamily::DeepSeek4,
+            8192,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "truncated session payload");
+
+        let mut cursor = Cursor::new(bytes.clone());
+        let err = read_prefix_range(
+            &mut cursor,
+            3,
+            range_len + 1,
+            ModelFamily::DeepSeek4,
+            8192,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "truncated session payload range");
+
+        let mut cursor = Cursor::new(bytes.clone());
+        let err = read_prefix_range(
+            &mut cursor,
+            u64::MAX,
+            2,
+            ModelFamily::DeepSeek4,
+            8192,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "session payload range overflows");
+
+        let mut cursor = Cursor::new(bytes.clone());
+        let err = read_prefix_range(
+            &mut cursor,
+            3,
+            range_len,
+            ModelFamily::DeepSeek4,
+            prefix.token_count() as i32,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "session payload exceeds context");
+
+        let mut cursor = Cursor::new(bytes);
+        let err = read_prefix_range(&mut cursor, 3, range_len, ModelFamily::SolarOpen2, 8192)
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "session payload was written for a different model family"
+        );
+        assert_eq!(cursor.stream_position().unwrap(), 3 + HEADER_BYTES as u64);
+    }
 }
