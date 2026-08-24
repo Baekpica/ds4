@@ -72,6 +72,14 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes,
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
     (void)e; (void)text; (void)out; STUB("ds4_tokenize_text");
 }
+void ds4_encode_chat_prompt(ds4_engine *e, const char *system, const char *prompt,
+                            ds4_think_mode think_mode, ds4_tokens *out) {
+    (void)e; (void)system; (void)prompt; (void)think_mode; (void)out;
+    STUB("ds4_encode_chat_prompt");
+}
+int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
+    (void)s; (void)out; (void)k; STUB("ds4_session_top_logprobs");
+}
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
     (void)e; (void)text; (void)out; STUB("ds4_tokenize_rendered_chat");
 }

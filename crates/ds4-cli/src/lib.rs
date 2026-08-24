@@ -9,9 +9,17 @@ pub struct ShadowArgs {
     pub dspark: Option<String>,
     pub backend: Backend,
     pub ctx: i32,
+    pub ctx_set: bool,
     pub threads: i32,
     pub tokens: Vec<i32>,
     pub predict: i32,
+    pub n_predict: i32,
+    pub nothink: bool,
+    pub prompt: Option<String>,
+    pub prompt_file: Option<String>,
+    pub dump_logprobs: Option<String>,
+    pub logprobs_top_k: i32,
+    pub temp: f32,
     pub lifecycle_only: bool,
     pub identify: bool,
     pub inventory: bool,
@@ -42,9 +50,17 @@ impl Default for ShadowArgs {
             dspark: None,
             backend: Backend::Cuda,
             ctx: 2048,
+            ctx_set: false,
             threads: 0,
             tokens: Vec::new(),
             predict: 0,
+            n_predict: 128,
+            nothink: false,
+            prompt: None,
+            prompt_file: None,
+            dump_logprobs: None,
+            logprobs_top_k: 20,
+            temp: 0.0,
             lifecycle_only: false,
             identify: false,
             inventory: false,
@@ -89,8 +105,36 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
             "--backend" => {
                 parsed.backend = parse_backend(&require_value(&arg, iter.next())?)?;
             }
+            /* C CLI backend spellings, so the proof harness command line
+             * (`--cuda -m ...`) drives this shadow unchanged. */
+            "--cuda" => parsed.backend = Backend::Cuda,
+            "--cpu" => parsed.backend = Backend::Cpu,
+            "--metal" => parsed.backend = Backend::Metal,
             "-c" | "--ctx" => {
                 parsed.ctx = parse_i32(&arg, &require_value(&arg, iter.next())?)?;
+                parsed.ctx_set = true;
+            }
+            "-n" | "--n-predict" => {
+                parsed.n_predict = parse_i32(&arg, &require_value(&arg, iter.next())?)?;
+            }
+            "--temp" => {
+                let v = require_value(&arg, iter.next())?;
+                parsed.temp = v
+                    .parse::<f32>()
+                    .map_err(|_| format!("{arg} expects a float, got {v}"))?;
+            }
+            "--nothink" => parsed.nothink = true,
+            "-p" | "--prompt" => {
+                parsed.prompt = Some(require_value(&arg, iter.next())?);
+            }
+            "--prompt-file" => {
+                parsed.prompt_file = Some(require_value(&arg, iter.next())?);
+            }
+            "--dump-logprobs" => {
+                parsed.dump_logprobs = Some(require_value(&arg, iter.next())?);
+            }
+            "--logprobs-top-k" => {
+                parsed.logprobs_top_k = parse_i32(&arg, &require_value(&arg, iter.next())?)?;
             }
             "-t" | "--threads" => {
                 parsed.threads = parse_i32(&arg, &require_value(&arg, iter.next())?)?;
@@ -150,6 +194,114 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
     Ok(parsed)
 }
 
+/// Proof-harness dump: mirror of the C CLI `run_logprob_dump` loop
+/// (top_logprobs -> argmax -> write step -> stop check -> eval).  The
+/// prompt encodes through the engine chat template for exact `-p` token
+/// parity; token text and the stop set come from the host vocab.
+fn run_logprob_dump(model: &ds4_core::Model, args: &ShadowArgs) -> Result<i32, String> {
+    use std::io::Write;
+
+    const THINK_NONE: i32 = 0;
+    const THINK_LOW: i32 = 1;
+    const TOP_K_CAP: usize = 128;
+
+    let prompt_text = match (&args.prompt, &args.prompt_file) {
+        (Some(p), _) => p.clone(),
+        (None, Some(f)) => std::fs::read_to_string(f).map_err(|e| format!("prompt-file: {e}"))?,
+        (None, None) => return Err("--dump-logprobs requires -p or --prompt-file".into()),
+    };
+    let think = if args.nothink { THINK_NONE } else { THINK_LOW };
+    let prompt = model
+        .encode_chat_prompt(None, &prompt_text, think)
+        .map_err(|e| e.to_string())?;
+    let n_prompt = prompt.len() as i32;
+
+    /* C defaults ctx to 262144 on CUDA; the ids do not depend on ctx size,
+     * so grow to fit unless -c was explicit. */
+    let ctx = if args.ctx_set {
+        args.ctx
+    } else {
+        args.ctx.max(n_prompt + args.n_predict + 8)
+    };
+    let mut session = model.session(ctx).map_err(|e| e.to_string())?;
+    session.sync(&prompt).map_err(|e| e.to_string())?;
+
+    let path = args.dump_logprobs.as_deref().unwrap();
+    let mut fp = std::io::BufWriter::new(
+        std::fs::File::create(path).map_err(|e| format!("dump-logprobs {path}: {e}"))?,
+    );
+    let k = (args.logprobs_top_k.max(1) as usize).min(TOP_K_CAP);
+    let mut w = |s: String| fp.write_all(s.as_bytes()).map_err(|e| e.to_string());
+
+    w(format!(
+        "{{\n  \"source\":\"ds4\",\n  \"prompt_tokens\":{n_prompt},\n  \"ctx\":{ctx},\n  \"top_k\":{k},\n  \"steps\":[\n"
+    ))?;
+
+    let mut max_tokens = args.n_predict;
+    let room = session.ctx() - session.pos();
+    if room <= 1 {
+        max_tokens = 0;
+    } else if max_tokens > room - 1 {
+        max_tokens = room - 1;
+    }
+
+    for generated in 0..max_tokens {
+        let scores = session.top_logprobs(k);
+        let token = session.argmax();
+        if generated > 0 {
+            w(",\n".into())?;
+        }
+        w(format!("    {{\"step\":{generated},\"selected\":"))?;
+        w(json_token(model, token))?;
+        w(",\"top_logprobs\":[".into())?;
+        for (i, s) in scores.iter().take_while(|s| s.id >= 0).enumerate() {
+            if i > 0 {
+                w(",".into())?;
+            }
+            /* Rust shortest-roundtrip floats, not C's %.9g: the md5
+             * contract reads only the selected ids. */
+            w(format!(
+                "{{\"token\":{},\"logit\":{},\"logprob\":{}}}",
+                json_token(model, s.id),
+                s.logit,
+                s.logprob
+            ))?;
+        }
+        w("]}".into())?;
+
+        if model.token_is_stop(token) {
+            break;
+        }
+        session.eval(token).map_err(|e| e.to_string())?;
+    }
+
+    w("\n  ]\n}\n".into())?;
+    fp.flush().map_err(|e| e.to_string())?;
+    Ok(0)
+}
+
+fn json_token(model: &ds4_core::Model, token: i32) -> String {
+    let bytes = model.token_text(token).unwrap_or_default();
+    let mut s = format!("{{\"id\":{token},\"text\":\"");
+    for &b in &bytes {
+        match b {
+            b'"' => s.push_str("\\\""),
+            b'\\' => s.push_str("\\\\"),
+            0x20..=0x7e => s.push(b as char),
+            _ => s.push_str(&format!("\\u{:04x}", b)),
+        }
+    }
+    s.push_str("\",\"bytes\":[");
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&b.to_string());
+    }
+    s.push_str("]}");
+    s
+}
+
 pub fn help_text(name: &str) -> String {
     format!(
         "\
@@ -169,10 +321,15 @@ Usage:
   {name} -m MODEL [--backend cuda|cpu|metal] [-c CTX] [--lifecycle]
   {name} -m MODEL --tokens 1,2,3 [--predict N]
   {name} -m MODEL [--mtp GGUF] [--dspark GGUF] ...
+  {name} --cuda -m MODEL --temp 0 -n N [--nothink] --dump-logprobs F \\
+      --logprobs-top-k K (-p PROMPT | --prompt-file FILE)
 
 --mtp/--dspark attach the DeepSeek-only sibling support models; the host
 resolves each sibling bind catalog + expected layouts, native skips that
 sibling's name walk and layout check.
+--dump-logprobs mirrors the C CLI proof loop (chat-template encode via
+the engine, argmax decode, host stop set); ctx grows to fit prompt+n
+unless -c is explicit.
 
 --identify mmaps GGUF metadata only (no CUDA, no ds4_bridge_model_open).
 --inventory mmaps the tensor directory + split remap (no CUDA, no engine open).
@@ -307,6 +464,11 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
         args.dspark.as_deref(),
     )
     .map_err(|e| e.to_string())?;
+
+    if args.dump_logprobs.is_some() {
+        return run_logprob_dump(&model, &args);
+    }
+
     let mut session = model.session(args.ctx).map_err(|e| e.to_string())?;
 
     if args.lifecycle_only {

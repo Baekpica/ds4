@@ -33,6 +33,14 @@ pub const DS4_BRIDGE_MEMD_COUNT: usize = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct ds4_bridge_token_score {
+    pub id: i32,
+    pub logit: c_float,
+    pub logprob: c_float,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct ds4_bridge_mem_cell {
     pub requested: u64,
     pub committed: u64,
@@ -339,6 +347,24 @@ extern "C" {
     pub fn ds4_bridge_token_is_stop(m: *mut ds4_bridge_model, token: i32) -> c_int;
 
     pub fn ds4_bridge_model_id(m: *mut ds4_bridge_model) -> c_int;
+
+    pub fn ds4_bridge_encode_chat_prompt(
+        m: *mut ds4_bridge_model,
+        system: *const c_char,
+        prompt: *const c_char,
+        think_mode: c_int,
+        out: *mut i32,
+        cap: c_int,
+        n_out: *mut c_int,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_session_top_logprobs(
+        s: *mut ds4_bridge_session,
+        out: *mut ds4_bridge_token_score,
+        k: c_int,
+    ) -> c_int;
 
     pub fn ds4_bridge_mem_census_snap(out: *mut ds4_bridge_mem_census) -> c_int;
 

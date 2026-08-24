@@ -68,6 +68,21 @@ int main(void) {
     }
 
     {
+        ds4_bridge_token_score sc[2];
+        memset(err, 0, sizeof(err));
+        n = -1;
+        if (ds4_bridge_encode_chat_prompt(NULL, NULL, "hi", 0, toks, 4, &n,
+                                          err, sizeof(err)) == 0)
+            fail("encode_chat NULL model");
+        if (n != 0) fail("encode_chat n_out");
+        if (ds4_bridge_encode_chat_prompt(NULL, NULL, "hi", 9, toks, 4, &n,
+                                          err, sizeof(err)) == 0)
+            fail("encode_chat think range");
+        if (ds4_bridge_session_top_logprobs(NULL, sc, 2) != -1)
+            fail("top_logprobs NULL");
+    }
+
+    {
         ds4_bridge_batch_ctx *bc = (ds4_bridge_batch_ctx *)0;
         memset(err, 0, sizeof(err));
         if (ds4_bridge_batch_ctx_create_fit(NULL, 2048, 4, 8192, &bc,

@@ -548,6 +548,55 @@ int ds4_bridge_model_id(ds4_bridge_model *m)
     return ds4_engine_model_id(m->engine);
 }
 
+int ds4_bridge_encode_chat_prompt(ds4_bridge_model *m, const char *system,
+                                  const char *prompt, int think_mode,
+                                  int32_t *out, int cap, int *n_out,
+                                  char *err, size_t errlen)
+{
+    ds4_tokens tv;
+
+    if (!m || !m->engine) {
+        if (n_out) *n_out = 0;
+        set_err(err, errlen, "model is NULL");
+        return 1;
+    }
+    if (think_mode < DS4_THINK_NONE || think_mode > DS4_THINK_MAX) {
+        if (n_out) *n_out = 0;
+        set_err(err, errlen, "think_mode out of range");
+        return 1;
+    }
+    if (cap < 0) {
+        if (n_out) *n_out = 0;
+        set_err(err, errlen, "cap is negative");
+        return 1;
+    }
+    memset(&tv, 0, sizeof(tv));
+    ds4_encode_chat_prompt(m->engine, system, prompt ? prompt : "",
+                           (ds4_think_mode)think_mode, &tv);
+    return copy_tokens(&tv, out, cap, n_out, err, errlen);
+}
+
+int ds4_bridge_session_top_logprobs(ds4_bridge_session *s,
+                                    ds4_bridge_token_score *out, int k)
+{
+    enum { SCORE_CAP = 128 };   /* matches the C CLI clamp */
+    ds4_token_score scores[SCORE_CAP];
+    int n, i;
+
+    if (!s || !s->session || !out || k <= 0) return -1;
+    if (k > SCORE_CAP) k = SCORE_CAP;
+    n = ds4_session_top_logprobs(s->session, scores, k);
+    if (n < 0) return -1;
+    if (n > k) n = k;
+
+    for (i = 0; i < n; i++) {
+        out[i].id = scores[i].id;
+        out[i].logit = scores[i].logit;
+        out[i].logprob = scores[i].logprob;
+    }
+    return n;
+}
+
 /* Declared in ds4_gpu.h; the bridge does not include that header. */
 uint64_t ds4_gpu_substrate_outstanding(void);
 

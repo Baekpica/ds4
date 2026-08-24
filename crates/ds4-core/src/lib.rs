@@ -76,14 +76,16 @@ use std::ptr::{self, NonNull};
 
 use ds4_sys::{
     ds4_bridge_bind_plan, ds4_bridge_bind_plan_check, ds4_bridge_bind_slot,
-    ds4_bridge_eval, ds4_bridge_model, ds4_bridge_model_free, ds4_bridge_model_id,
+    ds4_bridge_encode_chat_prompt, ds4_bridge_eval, ds4_bridge_model, ds4_bridge_model_free,
+    ds4_bridge_model_id,
     ds4_bridge_model_open, ds4_bridge_model_open_options, ds4_bridge_session,
     ds4_bridge_session_argmax, ds4_bridge_session_create,
     ds4_bridge_session_exaone_rewind_span, ds4_bridge_session_free,
     ds4_bridge_session_generation, ds4_bridge_session_invalidate,
     ds4_bridge_session_load_payload, ds4_bridge_session_prefill_cap,
     ds4_bridge_session_rewind, ds4_bridge_session_sample,
-    ds4_bridge_session_save_payload, ds4_bridge_session_sync, ds4_bridge_shard,
+    ds4_bridge_session_save_payload, ds4_bridge_session_sync, ds4_bridge_session_top_logprobs,
+    ds4_bridge_shard, ds4_bridge_token_score,
     ds4_host_bind_look, ds4_host_bind_map, ds4_host_shape, ds4_host_str, ds4_host_tensor,
     ds4_host_tensor_dir, ds4_host_vocab,
     DS4_BRIDGE_BACKEND_CPU,
@@ -167,6 +169,13 @@ impl Default for TokenBuffer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EvalResult {
     pub pos: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TokenScore {
+    pub id: i32,
+    pub logit: f32,
+    pub logprob: f32,
 }
 
 pub struct Model {
@@ -745,6 +754,50 @@ impl Model {
         self.vocab.is_stop(token)
     }
 
+    /// CLI chat-template encode through the engine (`ds4_encode_chat_prompt`):
+    /// exact C `-p` prompt-token parity for the proof harness.
+    pub fn encode_chat_prompt(
+        &self,
+        system: Option<&str>,
+        prompt: &str,
+        think_mode: i32,
+    ) -> Result<TokenBuffer> {
+        let c_system = match system {
+            Some(s) => Some(CString::new(s).map_err(|_| Error {
+                code: 1,
+                message: "system contains NUL".into(),
+            })?),
+            None => None,
+        };
+        let c_prompt = CString::new(prompt).map_err(|_| Error {
+            code: 1,
+            message: "prompt contains NUL".into(),
+        })?;
+        // BPE merges only shrink and specials add a bounded prefix.
+        let cap = prompt.len() + system.map_or(0, str::len) + 256;
+        let mut out = vec![0i32; cap];
+        let mut n_out = 0i32;
+        let mut err = [0u8; 256];
+        let rc = unsafe {
+            ds4_bridge_encode_chat_prompt(
+                self.raw.as_ptr(),
+                c_system.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                c_prompt.as_ptr(),
+                think_mode,
+                out.as_mut_ptr(),
+                cap as i32,
+                &mut n_out,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(fail(rc, &err));
+        }
+        out.truncate(n_out.max(0) as usize);
+        Ok(TokenBuffer::from_tokens(out))
+    }
+
     pub fn tokenize_text(&self, text: &str) -> Result<TokenBuffer> {
         Ok(TokenBuffer::from_tokens(self.vocab.encode_text(text)))
     }
@@ -852,6 +905,35 @@ impl Session<'_> {
 
     pub fn argmax(&self) -> i32 {
         unsafe { ds4_bridge_session_argmax(self.raw.as_ptr()) }
+    }
+
+    /// Post-prefill distribution head, up to `k` entries (`k` clamps to the
+    /// C CLI's 128). Empty when the backend keeps no logits.
+    pub fn top_logprobs(&self, k: usize) -> Vec<TokenScore> {
+        const SCORE_CAP: usize = 128;
+        let k = k.clamp(1, SCORE_CAP);
+        let mut raw = vec![
+            ds4_bridge_token_score {
+                id: -1,
+                logit: 0.0,
+                logprob: 0.0,
+            };
+            k
+        ];
+        let n = unsafe {
+            ds4_bridge_session_top_logprobs(self.raw.as_ptr(), raw.as_mut_ptr(), k as i32)
+        };
+        if n <= 0 {
+            return Vec::new();
+        }
+        raw.truncate(n as usize);
+        raw.into_iter()
+            .map(|s| TokenScore {
+                id: s.id,
+                logit: s.logit,
+                logprob: s.logprob,
+            })
+            .collect()
     }
 
     pub fn pos(&self) -> i32 {
