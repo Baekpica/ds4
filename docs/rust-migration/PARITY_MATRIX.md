@@ -177,10 +177,53 @@ decode-frontier continued correctness and cross-read; the final-sync
 call/order is covered by the CPU integration test. Neither is a performance
 gate.
 
+The scoped ordinary-serial DeepSeek tool-map slice is live-green under
+`scratch/rust-host-live/tool-fourway-20260825/` at `cc1bf0f`. The producer
+fixture used OpenAI Chat, no-think, `pair_values(a: integer, b: integer)`, and
+asserted `finish_reason=tool_calls`; literal `tool_choice=required` was not
+used because that path ends in the same tool parse error on the C oracle. C
+and Rust both sampled arguments `{"a":1,"b":2}` with 365 prompt + 59 output
+tokens, then an unrelated `EVICT_OK` request saved the live state.
+
+Both hosts wrote a 25,851,198-byte record named
+`29cf875c11df369237f528cb8155b8d1979f5b32.kv`: reason 3, ext flags 1,
+model 0, payload ABI 2, 424 tokens, 1,913 text bytes, 25,848,936 payload bytes,
+and a valid one-entry 297-byte `KTM\x01` trailer. The rendered-text SHA-256 is
+`20e492de0058ac24efd1bc22b72b7467caad69d7cec8d3d0468b1bde2ddb7c11`
+and the payload SHA-256 is
+`f427f9263acf8316bf9bd9de03467a52cb77909ae16882e5316148f33cbf9c8e`
+for both producers. The 244-byte sampled DSML occurs in the checkpoint text
+and in each trailer. The trailers differ only in the process-unique tool ID;
+header timestamps are run-specific:
+`call_361e9fbdea60bfa15a23be22020fede1` for C and
+`call_aefef96b236c98f22ce68ef16d907c57` for Rust.
+
+Each loader ran in a fresh process against an isolated copy of the selected
+record. Its assistant-history arguments were deliberately reordered to
+`{"b":2,"a":1}`, so a canonical re-render cannot match the saved prefix
+without KTM restoration:
+
+```text
+C save    → Rust load   PASS  cached=424 computed=28 output=5 TTFT=436.9 ms
+Rust save → C load      PASS  cached=424 computed=28 output=5 TTFT=493.1 ms
+Rust save → Rust load   PASS  cached=424 computed=28 output=5 TTFT=435.8 ms
+C save    → C load      PASS  cached=424 computed=28 output=5 TTFT=485.8 ms
+```
+
+Every cell returned `RESTORED_OK`, finish `stop`, prompt tokens 452,
+`prefill_cached_tokens=424`, and the serial OpenAI Chat route. C binary
+SHA-256 was `04f25a86040940674984c35160d2e4eec7f6c6d4e30313815ce10309cd57e662`;
+Rust binary SHA-256 was
+`6e920f1d46e79ac5f733ce3243c5b1799091d80f885d57025d0fb143bf6975ef`.
+The complete process was sequential; every resident exited before
+`clear_cache`, and the final host had no GPU compute application.
+
 This is still not the whole Phase 4 gate. C's intermediate-prefill progress
-checkpoints, tool-map checkpoint replay, continuous-bank checkpoints, the
-default configured 10,000-token/effective aligned 10,240-token interval, and
-full default-policy ABBA remain pending.
+checkpoints, continuous-bank checkpoints, the default configured
+10,000-token/effective aligned 10,240-token interval, and full default-policy
+ABBA remain pending. Tool-map replay is green only for the scoped OpenAI Chat,
+DeepSeek, no-think, ordinary-serial lane above; other surfaces and combined
+extension records remain pending.
 
 ### Phase 5 — web utility
 
