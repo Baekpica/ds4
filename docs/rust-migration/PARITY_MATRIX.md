@@ -71,6 +71,12 @@ without changing the subprocess/search contract. No Tokio.
 Explicit integer codecs. Wire bytes match C. Do not serialize
 `#[repr(C)]` Rust structs.
 
+Runtime (blocking, one WORK at a time): CLI/option error strings,
+route-plan search order, HELLO register + stale prepend, WORK
+validate strings, RESULT logits/hidden. Not yet: pipelined prefetch
+(`DS4_DIST_WORKER_PREFETCH_DEPTH`), worker-to-worker relay threads,
+SNAPSHOT_* / DSV4 gather, `ds4_dist_session_*` wired through `ds4.c`.
+
 ### Phase 7 — server shadow
 
 All four surfaces:

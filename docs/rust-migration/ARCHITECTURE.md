@@ -81,7 +81,7 @@ From `AGENT.md` and the current layout:
 | `ds4_bench.c` / `ds4_eval.c` / `ds4_agent.c` | tools |
 | `ds4_kvstore.c` | KVC file format, eviction, prefix, trailers |
 | `ds4_web.c` | blocking sockets, poll, subprocess |
-| `ds4_distributed.c` | coordinator/worker sockets + poll + pthread |
+| `ds4_distributed.c` | C oracle: pipelined prefetch, snapshot gather, `ds4_dist_session_*`. Rust `ds4-dist` owns blocking HELLO/WORK/RESULT + route plan. |
 | `ds4_cuda.cu` + `cuda/mmq/` | production GPU |
 | `ds4_metal.m` + `metal/` | macOS backend (keep compiling; not the DFM gate) |
 | `ds4.h` | existing narrow engine/session API used by C CLI/server |

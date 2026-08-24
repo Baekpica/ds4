@@ -3,7 +3,10 @@
  * without linking the engine. */
 
 #include <arpa/inet.h>
+#include <errno.h>
+#include <limits.h>
 #include <math.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -168,6 +171,299 @@ static float bits_to_f32(const char *hex) {
     return f;
 }
 
+/* CLI / option copies from ds4_distributed.c at v0.6.3-dfm. */
+typedef enum { OR_NONE = 0, OR_COORDINATOR, OR_WORKER } oracle_role;
+typedef struct {
+    uint32_t start, end;
+    bool has_output, set;
+} oracle_layers;
+typedef struct {
+    oracle_role role;
+    oracle_layers layers;
+    const char *listen_host;
+    int listen_port;
+    const char *coordinator_host;
+    int coordinator_port;
+    uint32_t prefill_chunk, prefill_window, activation_bits;
+    bool replay_check, debug;
+} oracle_opt;
+
+static const char *oracle_role_name(oracle_role role) {
+    if (role == OR_NONE) return "none";
+    if (role == OR_COORDINATOR) return "coordinator";
+    if (role == OR_WORKER) return "worker";
+    return "unknown";
+}
+
+static bool oracle_parse_role(const char *s, oracle_role *out) {
+    if (!s || !out) return false;
+    if (!strcmp(s, "none")) { *out = OR_NONE; return true; }
+    if (!strcmp(s, "coordinator")) { *out = OR_COORDINATOR; return true; }
+    if (!strcmp(s, "worker")) { *out = OR_WORKER; return true; }
+    return false;
+}
+
+static bool oracle_parse_u32_component(const char *p, size_t len, uint32_t *out) {
+    if (!p || len == 0 || !out) return false;
+    char buf[32];
+    if (len >= sizeof(buf)) return false;
+    memcpy(buf, p, len);
+    buf[len] = '\0';
+    errno = 0;
+    char *end = NULL;
+    unsigned long v = strtoul(buf, &end, 10);
+    if (errno != 0 || end == buf || *end != '\0' || v > UINT32_MAX) return false;
+    *out = (uint32_t)v;
+    return true;
+}
+
+static bool oracle_parse_layers(const char *s, oracle_layers *out, char *err, size_t errlen) {
+    if (!s || !out) {
+        if (errlen) snprintf(err, errlen, "missing layer range");
+        return false;
+    }
+    const char *colon = strchr(s, ':');
+    if (!colon || colon == s || colon[1] == '\0') {
+        if (errlen) snprintf(err, errlen, "expected A:B or A:output");
+        return false;
+    }
+    if (strchr(colon + 1, ':')) {
+        if (errlen) snprintf(err, errlen, "layer range has too many ':' separators");
+        return false;
+    }
+    oracle_layers parsed = {0};
+    if (!oracle_parse_u32_component(s, (size_t)(colon - s), &parsed.start)) {
+        if (errlen) snprintf(err, errlen, "invalid start layer in %s", s);
+        return false;
+    }
+    const char *end = colon + 1;
+    if (!strcmp(end, "output")) {
+        parsed.end = UINT32_MAX;
+        parsed.has_output = true;
+    } else {
+        if (!oracle_parse_u32_component(end, strlen(end), &parsed.end)) {
+            if (errlen) snprintf(err, errlen, "invalid end layer in %s", s);
+            return false;
+        }
+        if (parsed.end < parsed.start) {
+            if (errlen) snprintf(err, errlen, "layer range end precedes start in %s", s);
+            return false;
+        }
+    }
+    parsed.set = true;
+    *out = parsed;
+    return true;
+}
+
+static const char *oracle_need_arg(int *index, int argc, char **argv, const char *arg, char *err, size_t errlen) {
+    if (!index || !argv || *index + 1 >= argc) {
+        if (errlen) snprintf(err, errlen, "%s requires an argument", arg);
+        return NULL;
+    }
+    return argv[++*index];
+}
+
+static bool oracle_parse_port(const char *s, const char *arg, int *out, char *err, size_t errlen) {
+    if (!s || !out) {
+        if (errlen) snprintf(err, errlen, "%s requires a TCP port", arg);
+        return false;
+    }
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (errno != 0 || s[0] == '\0' || *end != '\0' || v <= 0 || v > 65535) {
+        if (errlen) snprintf(err, errlen, "invalid value for %s: %s", arg, s);
+        return false;
+    }
+    *out = (int)v;
+    return true;
+}
+
+static bool oracle_parse_positive_u32(const char *s, const char *name, uint32_t *out, char *err, size_t errlen) {
+    if (!s || !out) {
+        if (errlen) snprintf(err, errlen, "%s requires a positive integer", name);
+        return false;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long v = strtoul(s, &end, 10);
+    if (errno != 0 || s[0] == '\0' || *end != '\0' || v == 0 || v > UINT32_MAX) {
+        if (errlen) snprintf(err, errlen, "invalid value for %s: %s", name, s);
+        return false;
+    }
+    *out = (uint32_t)v;
+    return true;
+}
+
+static bool oracle_bits_valid(uint32_t bits) {
+    bits = bits ? bits : 32u;
+    return bits == 32u || bits == 16u || bits == 8u;
+}
+
+static int oracle_parse_cli_arg(const char *arg, int *index, int argc, char **argv, oracle_opt *opt, char *err, size_t errlen) {
+    if (!arg) return 2;
+    if (!strcmp(arg, "--role")) {
+        const char *role = oracle_need_arg(index, argc, argv, arg, err, errlen);
+        if (!role) return 0;
+        if (!opt || !oracle_parse_role(role, &opt->role)) {
+            if (errlen) snprintf(err, errlen,
+                                 "invalid distributed role: %s (valid roles: none, coordinator, worker)",
+                                 role);
+            return 0;
+        }
+        return 1;
+    }
+    if (!strcmp(arg, "--layers")) {
+        const char *layers = oracle_need_arg(index, argc, argv, arg, err, errlen);
+        if (!layers) return 0;
+        if (!oracle_parse_layers(layers, &opt->layers, err, errlen)) {
+            char detail[160];
+            if (errlen && err[0] != '\0') {
+                snprintf(detail, sizeof(detail), "%s", err);
+                snprintf(err, errlen, "invalid --layers %s: %s", layers, detail);
+            }
+            return 0;
+        }
+        return 1;
+    }
+    if (!strcmp(arg, "--listen")) {
+        if (opt->listen_host || opt->listen_port) {
+            if (errlen) snprintf(err, errlen, "specify --listen only once");
+            return 0;
+        }
+        const char *host = oracle_need_arg(index, argc, argv, arg, err, errlen);
+        if (!host) return 0;
+        const char *port = oracle_need_arg(index, argc, argv, arg, err, errlen);
+        if (!port) return 0;
+        if (!oracle_parse_port(port, arg, &opt->listen_port, err, errlen)) return 0;
+        opt->listen_host = host;
+        return 1;
+    }
+    if (!strcmp(arg, "--coordinator")) {
+        if (opt->coordinator_host || opt->coordinator_port) {
+            if (errlen) snprintf(err, errlen, "specify --coordinator only once");
+            return 0;
+        }
+        const char *host = oracle_need_arg(index, argc, argv, arg, err, errlen);
+        if (!host) return 0;
+        const char *port = oracle_need_arg(index, argc, argv, arg, err, errlen);
+        if (!port) return 0;
+        if (!oracle_parse_port(port, arg, &opt->coordinator_port, err, errlen)) return 0;
+        opt->coordinator_host = host;
+        return 1;
+    }
+    if (!strcmp(arg, "--dist-prefill-chunk")) {
+        const char *value = oracle_need_arg(index, argc, argv, arg, err, errlen);
+        if (!value) return 0;
+        if (!oracle_parse_positive_u32(value, arg, &opt->prefill_chunk, err, errlen)) return 0;
+        return 1;
+    }
+    if (!strcmp(arg, "--dist-prefill-window")) {
+        const char *value = oracle_need_arg(index, argc, argv, arg, err, errlen);
+        if (!value) return 0;
+        if (!oracle_parse_positive_u32(value, arg, &opt->prefill_window, err, errlen)) return 0;
+        if (opt->prefill_window > 64u) {
+            if (errlen) snprintf(err, errlen, "%s must be <= 64", arg);
+            return 0;
+        }
+        return 1;
+    }
+    if (!strcmp(arg, "--dist-activation-bits")) {
+        const char *value = oracle_need_arg(index, argc, argv, arg, err, errlen);
+        if (!value) return 0;
+        uint32_t bits = 0;
+        if (!oracle_parse_positive_u32(value, arg, &bits, err, errlen)) return 0;
+        if (!oracle_bits_valid(bits)) {
+            if (errlen) snprintf(err, errlen, "%s must be 32, 16, or 8", arg);
+            return 0;
+        }
+        opt->activation_bits = bits;
+        return 1;
+    }
+    if (!strcmp(arg, "--dist-replay-check")) { opt->replay_check = true; return 1; }
+    if (!strcmp(arg, "--debug")) { opt->debug = true; return 1; }
+    return 2;
+}
+
+static int oracle_validate(const oracle_opt *opt, char *err, size_t errlen) {
+    if (opt->role == OR_NONE) {
+        if (opt->layers.set || opt->listen_host || opt->listen_port ||
+            opt->coordinator_host || opt->coordinator_port ||
+            opt->prefill_chunk != 0 || opt->prefill_window != 0 ||
+            opt->activation_bits != 0) {
+            if (errlen) snprintf(err, errlen, "distributed options require --role coordinator or --role worker");
+            return 1;
+        }
+        return 0;
+    }
+    if (!opt->layers.set) {
+        if (errlen) snprintf(err, errlen, "--role %s requires --layers", oracle_role_name(opt->role));
+        return 1;
+    }
+    if (opt->prefill_window > 64u) {
+        if (errlen) snprintf(err, errlen, "--dist-prefill-window must be <= 64");
+        return 1;
+    }
+    if (opt->activation_bits != 0 && !oracle_bits_valid(opt->activation_bits)) {
+        if (errlen) snprintf(err, errlen, "--dist-activation-bits must be 32, 16, or 8");
+        return 1;
+    }
+    if (opt->role == OR_COORDINATOR) {
+        if (!opt->listen_host || opt->listen_port <= 0) {
+            if (errlen) snprintf(err, errlen, "--role coordinator requires --listen HOST PORT");
+            return 1;
+        }
+        if (opt->coordinator_host || opt->coordinator_port) {
+            if (errlen) snprintf(err, errlen, "--role coordinator must not use --coordinator");
+            return 1;
+        }
+        return 0;
+    }
+    if (opt->role == OR_WORKER) {
+        if (!opt->coordinator_host || opt->coordinator_port <= 0) {
+            if (errlen) snprintf(err, errlen, "--role worker requires --coordinator HOST PORT");
+            return 1;
+        }
+        if (opt->prefill_chunk != 0) {
+            if (errlen) snprintf(err, errlen, "--dist-prefill-chunk requires --role coordinator");
+            return 1;
+        }
+        if (opt->prefill_window != 0) {
+            if (errlen) snprintf(err, errlen, "--dist-prefill-window requires --role coordinator");
+            return 1;
+        }
+        if (opt->activation_bits != 0) {
+            if (errlen) snprintf(err, errlen, "--dist-activation-bits requires --role coordinator");
+            return 1;
+        }
+        return 0;
+    }
+    if (errlen) snprintf(err, errlen, "invalid distributed role");
+    return 1;
+}
+
+static int oracle_validate_layers(const oracle_opt *opt, uint32_t n_layers, char *err, size_t errlen) {
+    if (!opt || opt->role == OR_NONE || !opt->layers.set) return 0;
+    if (n_layers == 0) {
+        if (errlen) snprintf(err, errlen, "model reports no layers");
+        return 1;
+    }
+    const uint32_t last = n_layers - 1u;
+    if (opt->layers.start > last) {
+        if (errlen) snprintf(err, errlen, "layer range starts past final model layer %u", last);
+        return 1;
+    }
+    if (!opt->layers.has_output && opt->layers.end > last) {
+        if (errlen) snprintf(err, errlen, "layer range ends past final model layer %u", last);
+        return 1;
+    }
+    if (opt->role == OR_COORDINATOR && opt->layers.start != 0) {
+        if (errlen) snprintf(err, errlen, "coordinator layer range must start at layer 0");
+        return 1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) die("usage");
     const char *cmd = argv[1];
@@ -240,6 +536,48 @@ int main(int argc, char **argv) {
         if (argc < 3) die("f8 F32HEX");
         uint8_t h = dist_f32_to_f8_e4m3(bits_to_f32(argv[2]));
         print_hex(&h, 1);
+    } else if (!strcmp(cmd, "layers")) {
+        if (argc < 3) die("layers SPEC");
+        oracle_layers L = {0};
+        char err[256] = {0};
+        if (!oracle_parse_layers(argv[2], &L, err, sizeof(err))) printf("ERROR:%s", err);
+        else printf("start=%u end=%u has_output=%u", L.start, L.end, L.has_output ? 1u : 0u);
+    } else if (!strcmp(cmd, "role")) {
+        if (argc < 3) die("role NAME");
+        oracle_role r;
+        if (!oracle_parse_role(argv[2], &r)) {
+            printf("ERROR:invalid distributed role: %s (valid roles: none, coordinator, worker)", argv[2]);
+        } else {
+            printf("%s", oracle_role_name(r));
+        }
+    } else if (!strcmp(cmd, "cli")) {
+        oracle_opt opt;
+        memset(&opt, 0, sizeof(opt));
+        char err[256] = {0};
+        for (int i = 2; i < argc; i++) {
+            int r = oracle_parse_cli_arg(argv[i], &i, argc, argv, &opt, err, sizeof(err));
+            if (r == 0) { printf("ERROR:%s", err); return 0; }
+            if (r == 2) { printf("ERROR:unmatched %s", argv[i]); return 0; }
+        }
+        if (oracle_validate(&opt, err, sizeof(err)) != 0) printf("ERROR:%s", err);
+        else printf("OK");
+    } else if (!strcmp(cmd, "layers-for-model")) {
+        if (argc < 3) die("layers-for-model N ...");
+        uint32_t n_layers = need_u32(argv[2]);
+        oracle_opt opt;
+        memset(&opt, 0, sizeof(opt));
+        char err[256] = {0};
+        for (int i = 3; i < argc; i++) {
+            int r = oracle_parse_cli_arg(argv[i], &i, argc, argv, &opt, err, sizeof(err));
+            if (r == 0) { printf("ERROR:%s", err); return 0; }
+            if (r == 2) { printf("ERROR:unmatched %s", argv[i]); return 0; }
+        }
+        if (oracle_validate(&opt, err, sizeof(err)) != 0 ||
+            oracle_validate_layers(&opt, n_layers, err, sizeof(err)) != 0) {
+            printf("ERROR:%s", err);
+        } else {
+            printf("OK");
+        }
     } else {
         die("unknown command");
     }

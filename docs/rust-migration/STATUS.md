@@ -19,7 +19,7 @@ C golden baseline: `v0.6.3-dfm`
 | KV store | yes | yes (envelope + policy) | C | 4-way green | n/a |
 | web utility | yes | yes (blocking I/O) | C (`ds4-agent`) | encode/wire + mock CDP green | n/a |
 | server (four surfaces) | yes | no | C | — | — |
-| distributed runtime | yes | yes (codecs) | C | DS4D integer codecs green | n/a |
+| distributed runtime | yes | yes (codecs + blocking orchestration) | C | codecs + CLI/route/mock hop green | n/a |
 | CLI / bench / agent host | yes | shadow `ds4-rs` / `ds4-bench-rs` | C | — | — |
 | CPU reference backend | yes | no (not a cut-over blocker) | C | — | n/a |
 | Metal backend | native | unchanged | native | — | n/a |
@@ -37,7 +37,7 @@ C golden baseline: `v0.6.3-dfm`
 | 3 | Shadow `ds4-rs` / `ds4-bench-rs` | **linked** (`make ds4-rs`); same-model token/perf gate pending |
 | 4 | KV store port + 4-way matrix | **format/policy green** (`make test-kv-parity`); live session payload still C |
 | 5 | Web utility port | **done** (`make test-web-parity`); `ds4-agent` still links C `ds4_web.c` |
-| 6 | Distributed runtime port | **codecs green** (`make test-dist-parity`); socket/runtime still C |
+| 6 | Distributed runtime port | **blocking runtime green** (`make test-dist-parity`); C still owns pipelined prefetch, snapshot, `ds4_dist_session_*` |
 | 7 | Server shadow by feature | not started |
 | 8 | `ds4.c` decomposition | not started |
 | 9 | Promote Rust binaries to default names | not started |

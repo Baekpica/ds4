@@ -96,7 +96,7 @@ help:
 	@echo "  make rust-bridge  Compile native/bridge/ds4_bridge.o (Rust FFI skeleton)"
 	@echo "  make test-kv-parity  C↔Rust KVC 4-way matrix (Phase 4)"
 	@echo "  make test-web-parity C↔Rust web encode/wire + mock CDP (Phase 5)"
-	@echo "  make test-dist-parity C↔Rust DS4D integer codecs (Phase 6)"
+	@echo "  make test-dist-parity C↔Rust DS4D codecs + blocking runtime (Phase 6)"
 	@echo "  make ds4-rs       Build Rust shadow ./ds4-rs (same C core)"
 	@echo "  make ds4-bench-rs Build Rust shadow ./ds4-bench-rs"
 	@echo "  make clean        Remove build outputs"
@@ -143,7 +143,7 @@ help:
 	@echo "  make ds4-bench-rs        Build Rust shadow ./ds4-bench-rs"
 	@echo "  make test-kv-parity      C↔Rust KVC 4-way matrix (Phase 4)"
 	@echo "  make test-web-parity     C↔Rust web encode/wire + mock CDP (Phase 5)"
-	@echo "  make test-dist-parity    C↔Rust DS4D integer codecs (Phase 6)"
+	@echo "  make test-dist-parity    C↔Rust DS4D codecs + blocking runtime (Phase 6)"
 	@echo "  make clean               Remove build outputs (keeps the recorded cuda configuration)"
 
 # GB10 / DGX Spark is compute capability 12.1. Without an explicit -arch,
