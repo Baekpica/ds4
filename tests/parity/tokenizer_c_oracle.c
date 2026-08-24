@@ -12,7 +12,7 @@ static void die_usage(void)
     fprintf(stderr,
             "usage: tokenizer_c_oracle FAMILY GGUF CMD [ARG]\n"
             "  FAMILY: deepseek4|motif3|solar-open2|exaone-moe|dots3-note\n"
-            "  CMD: specials | encode HEX | render HEX | decode ID | stop ID\n");
+            "  CMD: specials | encode HEX | render HEX | decode ID | stop ID | chat MODE\n");
     exit(2);
 }
 
@@ -120,6 +120,35 @@ int main(int argc, char **argv)
     } else if (strcmp(argv[3], "stop") == 0 && argc == 5) {
         int id = atoi(argv[4]);
         printf("STOP %d\n", vocab_token_is_generation_stop(&vocab, id) ? 1 : 0);
+    } else if (strcmp(argv[3], "chat") == 0 && argc == 5) {
+        ds4_engine engine = {0};
+        engine.vocab = vocab;
+        ds4_think_mode mode = (ds4_think_mode)atoi(argv[4]);
+        ds4_chat_begin(&engine, &tv);
+        ds4_chat_append_effort_prefix(&engine, &tv, mode);
+        ds4_chat_append_message(&engine, &tv, "system",
+                                "Policy <think>system</think>.");
+        ds4_chat_append_message(&engine, &tv, "developer", "Developer policy.");
+        ds4_chat_append_message(&engine, &tv, "user", "hello");
+        ds4_chat_append_message(
+            &engine, &tv, "assistant",
+            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2
+                ? "<|think:start|>trace<|think:end|>answer"
+                : "<think>trace</think>answer");
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2)
+            token_vec_push(&tv, vocab.im_end_id);
+        ds4_chat_append_message(
+            &engine, &tv, "tool",
+            "A </tool_response> B </dots_function_response> C "
+            "<|tool_response:end|> D");
+        ds4_chat_append_message(
+            &engine, &tv, "function",
+            "raw:\xff A </tool_response> B </dots_function_response> C "
+            "<|tool_response:end|> D");
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2)
+            token_vec_push(&tv, vocab.im_end_id);
+        ds4_chat_append_assistant_prefix(&engine, &tv, mode);
+        print_tokens(&tv);
     } else {
         die_usage();
     }

@@ -10,6 +10,33 @@ use std::path::Path;
 
 use crate::gguf::{GgufError, GgufFile, GGUF_VALUE_INT32, GGUF_VALUE_STRING, GGUF_VALUE_UINT32};
 use crate::shape::ModelFamily;
+use crate::TokenBuffer;
+
+const REASONING_EFFORT_HIGH_PREFIX: &str = concat!(
+    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n",
+    "You MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\n",
+    "Explicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n",
+);
+
+const REASONING_EFFORT_MAX_PREFIX: &str = concat!(
+    "Reasoning Effort: Beyond maximum — exhaustive, relentless, and uncompromising.\n",
+    "You MUST reason with the utmost depth and rigor, leaving absolutely nothing to chance: exhaustively decompose the problem into its most fundamental components, trace every causal chain to its root, and resolve the underlying cause rather than any surface symptom.\n",
+    "Do not stop reasoning until you have independently verified the solution from multiple angles and are certain that no assumption remains unchecked and no error remains undiscovered.\n\n",
+);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatThinkMode {
+    None = 0,
+    Low = 1,
+    High = 2,
+    Max = 3,
+}
+
+impl ChatThinkMode {
+    fn enabled(self) -> bool {
+        self != Self::None
+    }
+}
 
 #[derive(Debug)]
 pub enum TokError {
@@ -17,6 +44,7 @@ pub enum TokError {
     MissingTable(&'static str),
     MissingToken(String),
     SolarMissingControl,
+    EmbeddedNul,
 }
 
 impl std::fmt::Display for TokError {
@@ -26,6 +54,7 @@ impl std::fmt::Display for TokError {
             TokError::MissingTable(k) => write!(f, "missing-table {k}"),
             TokError::MissingToken(t) => write!(f, "missing-token {t}"),
             TokError::SolarMissingControl => write!(f, "solar-missing-control"),
+            TokError::EmbeddedNul => write!(f, "embedded-nul"),
         }
     }
 }
@@ -435,6 +464,258 @@ impl Vocab {
         let mut out = Vec::new();
         tokenize_rendered_chat(self, text, &mut out);
         out
+    }
+
+    pub fn chat_begin(&self, tokens: &mut TokenBuffer) -> Result<(), TokError> {
+        if self.family == ModelFamily::ExaoneMoe {
+            self.require_chat_ids(&[(self.bos_id, "[BOS]")])?;
+        }
+        if !matches!(
+            self.family,
+            ModelFamily::SolarOpen2 | ModelFamily::Dots3Note
+        ) {
+            tokens.push(self.bos_id);
+        }
+        Ok(())
+    }
+
+    pub fn chat_append_effort_prefix(&self, tokens: &mut TokenBuffer, mode: ChatThinkMode) {
+        if matches!(
+            self.family,
+            ModelFamily::Motif3 | ModelFamily::SolarOpen2 | ModelFamily::Dots3Note
+        ) {
+            return;
+        }
+        let prefix = match mode {
+            ChatThinkMode::High => REASONING_EFFORT_HIGH_PREFIX,
+            ChatThinkMode::Max => REASONING_EFFORT_MAX_PREFIX,
+            ChatThinkMode::None | ChatThinkMode::Low => "",
+        };
+        bpe_tokenize_text(self, prefix.as_bytes(), &mut tokens.tokens);
+    }
+
+    pub fn chat_append_message(
+        &self,
+        tokens: &mut TokenBuffer,
+        role: &str,
+        content: &[u8],
+    ) -> Result<(), TokError> {
+        if role.as_bytes().contains(&0) || content.contains(&0) {
+            return Err(TokError::EmbeddedNul);
+        }
+
+        match self.family {
+            ModelFamily::Motif3 => {
+                tokens.push(self.start_of_turn_id);
+                if role == "system" || role == "developer" {
+                    tokens.push(self.system_id);
+                    bpe_tokenize_text(self, content, &mut tokens.tokens);
+                } else if role == "assistant" {
+                    tokens.push(self.assistant_id);
+                    tokenize_rendered_chat(self, content, &mut tokens.tokens);
+                } else if role == "tool" || role == "function" {
+                    tokens.push(self.tool_id);
+                    tokens.push(self.tool_response_start_id);
+                    self.chat_append_wrapped_payload(tokens, content, b"</tool_response>");
+                    tokens.push(self.tool_response_end_id);
+                } else {
+                    tokens.push(self.user_id);
+                    bpe_tokenize_text(self, content, &mut tokens.tokens);
+                }
+                tokens.push(self.end_of_turn_id);
+            }
+            ModelFamily::Dots3Note => {
+                if role == "system" || role == "developer" {
+                    tokens.push(self.system_id);
+                    bpe_tokenize_text(self, content, &mut tokens.tokens);
+                    tokens.push(self.dots3_endofsystem_id);
+                } else if role == "assistant" {
+                    tokens.push(self.assistant_id);
+                    tokenize_rendered_chat(self, content, &mut tokens.tokens);
+                    tokens.push(self.eos_id);
+                } else if role == "tool" || role == "function" {
+                    tokens.push(self.user_id);
+                    bpe_tokenize_text(self, b"\n", &mut tokens.tokens);
+                    tokens.push(self.tool_response_start_id);
+                    bpe_tokenize_text(self, b"\n", &mut tokens.tokens);
+                    self.chat_append_wrapped_payload(tokens, content, b"</dots_function_response>");
+                    bpe_tokenize_text(self, b"\n", &mut tokens.tokens);
+                    tokens.push(self.tool_response_end_id);
+                    tokens.push(self.dots3_endofuser_id);
+                } else {
+                    tokens.push(self.user_id);
+                    bpe_tokenize_text(self, content, &mut tokens.tokens);
+                    tokens.push(self.dots3_endofuser_id);
+                }
+            }
+            ModelFamily::SolarOpen2 => {
+                if role == "tool" || role == "function" {
+                    self.require_chat_ids(&[
+                        (self.tool_response_start_id, "<|tool_response:start|>"),
+                        (self.tool_response_end_id, "<|tool_response:end|>"),
+                    ])?;
+                }
+
+                if tokens.as_slice().last() == Some(&self.im_end_id) {
+                    self.chat_push_fragment(tokens, b"\n", b"");
+                }
+                if role == "system" || role == "developer" {
+                    self.solar_chat_open_role(tokens, b"system");
+                    self.chat_push_fragment(tokens, b"## System Prompt\n\n", content);
+                    self.solar_chat_close_role(tokens);
+                } else if role == "assistant" {
+                    self.solar_chat_open_role(tokens, b"assistant");
+                    if !content.starts_with(b"<|think:start|>") {
+                        tokens.push(self.think_start_id);
+                        tokens.push(self.think_end_id);
+                    }
+                    tokenize_rendered_chat(self, content, &mut tokens.tokens);
+                    self.solar_chat_close_role(tokens);
+                } else if role == "tool" || role == "function" {
+                    self.solar_chat_open_role(tokens, b"tool");
+                    tokens.push(self.tool_response_start_id);
+                    self.chat_append_wrapped_payload(tokens, content, b"<|tool_response:end|>");
+                    tokens.push(self.tool_response_end_id);
+                    self.solar_chat_close_role(tokens);
+                } else {
+                    self.solar_chat_open_role(tokens, b"user");
+                    tokenize_rendered_chat(self, content, &mut tokens.tokens);
+                    self.solar_chat_close_role(tokens);
+                }
+            }
+            _ => {
+                if role == "system" || role == "developer" {
+                    bpe_tokenize_text(self, content, &mut tokens.tokens);
+                } else if role == "assistant" {
+                    if self.family == ModelFamily::ExaoneMoe {
+                        self.require_chat_ids(&[(self.assistant_id, "<|assistant|>")])?;
+                        if !content.starts_with(b"<think>") && !content.starts_with(b"</think>") {
+                            self.require_chat_ids(&[(self.think_end_id, "</think>")])?;
+                        }
+                    }
+
+                    tokens.push(self.assistant_id);
+                    if !content.starts_with(b"<think>") && !content.starts_with(b"</think>") {
+                        tokens.push(self.think_end_id);
+                    }
+                    bpe_tokenize_text(self, content, &mut tokens.tokens);
+                } else {
+                    if self.family == ModelFamily::ExaoneMoe {
+                        self.require_chat_ids(&[(self.user_id, "<|user|>")])?;
+                    }
+                    tokens.push(self.user_id);
+                    if role == "tool" || role == "function" {
+                        bpe_tokenize_text(self, b"Tool: ", &mut tokens.tokens);
+                    }
+                    bpe_tokenize_text(self, content, &mut tokens.tokens);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn chat_append_assistant_prefix(
+        &self,
+        tokens: &mut TokenBuffer,
+        mode: ChatThinkMode,
+    ) -> Result<(), TokError> {
+        let thinking = mode.enabled();
+        match self.family {
+            ModelFamily::Dots3Note => {
+                tokens.push(self.assistant_id);
+                if !thinking {
+                    tokens.push(self.think_start_id);
+                    bpe_tokenize_text(self, b"\n\n", &mut tokens.tokens);
+                    tokens.push(self.think_end_id);
+                    bpe_tokenize_text(self, b"\n\n", &mut tokens.tokens);
+                }
+            }
+            ModelFamily::Motif3 => {
+                tokens.push(self.start_of_turn_id);
+                tokens.push(self.assistant_id);
+                tokens.push(self.think_start_id);
+                if !thinking {
+                    tokens.push(self.think_end_id);
+                }
+            }
+            ModelFamily::SolarOpen2 => {
+                if tokens.as_slice().last() == Some(&self.im_end_id) {
+                    self.chat_push_fragment(tokens, b"\n", b"");
+                }
+                self.solar_chat_open_role(tokens, b"assistant");
+                tokens.push(self.think_start_id);
+                if !thinking {
+                    tokens.push(self.think_end_id);
+                }
+            }
+            _ => {
+                if self.family == ModelFamily::ExaoneMoe {
+                    self.require_chat_ids(&[
+                        (self.assistant_id, "<|assistant|>"),
+                        (
+                            if thinking {
+                                self.think_start_id
+                            } else {
+                                self.think_end_id
+                            },
+                            if thinking { "<think>" } else { "</think>" },
+                        ),
+                    ])?;
+                }
+                tokens.push(self.assistant_id);
+                tokens.push(if thinking {
+                    self.think_start_id
+                } else {
+                    self.think_end_id
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn require_chat_ids(&self, ids: &[(i32, &str)]) -> Result<(), TokError> {
+        for &(id, token) in ids {
+            if id < 0 {
+                return Err(TokError::MissingToken(token.into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn chat_push_fragment(&self, tokens: &mut TokenBuffer, prefix: &[u8], text: &[u8]) {
+        let mut fragment = Vec::with_capacity(prefix.len() + text.len());
+        fragment.extend_from_slice(prefix);
+        fragment.extend_from_slice(text);
+        bpe_tokenize_text(self, &fragment, &mut tokens.tokens);
+    }
+
+    fn solar_chat_open_role(&self, tokens: &mut TokenBuffer, role: &[u8]) {
+        tokens.push(self.im_start_id);
+        bpe_tokenize_text(self, role, &mut tokens.tokens);
+        tokens.push(self.im_content_id);
+    }
+
+    fn solar_chat_close_role(&self, tokens: &mut TokenBuffer) {
+        tokens.push(self.im_end_id);
+        self.chat_push_fragment(tokens, b"\n", b"");
+    }
+
+    fn chat_append_wrapped_payload(
+        &self,
+        tokens: &mut TokenBuffer,
+        content: &[u8],
+        end_marker: &[u8],
+    ) {
+        let mut span = content;
+        while let Some(pos) = span
+            .windows(end_marker.len())
+            .position(|window| window == end_marker)
+        {
+            bpe_tokenize_text(self, &span[..pos], &mut tokens.tokens);
+            bpe_tokenize_text(self, b"&lt;", &mut tokens.tokens);
+            span = &span[pos + 1..];
+        }
+        bpe_tokenize_text(self, span, &mut tokens.tokens);
     }
 
     pub fn token_text(&self, token: i32) -> Vec<u8> {
@@ -1802,4 +2083,3 @@ pub fn dump_vocab_apply_tapes() -> String {
     out.push_str("ok-row n_vocab=2 n_merges=1 n_ud=1 max_ud=2 bos=0 eos=1 token0=61 token1=6262 merge0=612062 ud=1\n");
     out
 }
-

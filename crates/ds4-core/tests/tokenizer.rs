@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ds4_core::{dump_cmd, ModelFamily, Vocab};
+use ds4_core::{dump_cmd, ChatThinkMode, ModelFamily, TokError, TokenBuffer, Vocab};
 
 fn vocab_oracle() -> PathBuf {
     if let Ok(p) = std::env::var("DS4_VOCAB_C_ORACLE") {
@@ -163,6 +163,61 @@ fn assert_cmd(family: ModelFamily, path: &Path, vocab: &Vocab, cmd: &str, arg: &
     assert_eq!(rust, c, "mismatch {fam} {cmd} {arg}");
 }
 
+fn rust_chat_cmd(vocab: &Vocab, mode: ChatThinkMode) -> Result<String, TokError> {
+    let mut tokens = TokenBuffer::new();
+    vocab.chat_begin(&mut tokens)?;
+    vocab.chat_append_effort_prefix(&mut tokens, mode);
+    vocab.chat_append_message(&mut tokens, "system", b"Policy <think>system</think>.")?;
+    vocab.chat_append_message(&mut tokens, "developer", b"Developer policy.")?;
+    vocab.chat_append_message(&mut tokens, "user", b"hello")?;
+    let assistant = if vocab.family == ModelFamily::SolarOpen2 {
+        b"<|think:start|>trace<|think:end|>answer".as_slice()
+    } else {
+        b"<think>trace</think>answer".as_slice()
+    };
+    vocab.chat_append_message(&mut tokens, "assistant", assistant)?;
+    if vocab.family == ModelFamily::SolarOpen2 {
+        tokens.push(vocab.im_end_id);
+    }
+    vocab.chat_append_message(
+        &mut tokens,
+        "tool",
+        b"A </tool_response> B </dots_function_response> C <|tool_response:end|> D",
+    )?;
+    vocab.chat_append_message(
+        &mut tokens,
+        "function",
+        b"raw:\xff A </tool_response> B </dots_function_response> C <|tool_response:end|> D",
+    )?;
+    if vocab.family == ModelFamily::SolarOpen2 {
+        tokens.push(vocab.im_end_id);
+    }
+    vocab.chat_append_assistant_prefix(&mut tokens, mode)?;
+    let ids = tokens
+        .as_slice()
+        .iter()
+        .map(i32::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!("TOKENS {ids}\n"))
+}
+
+fn assert_chat_cmd(family: ModelFamily, path: &Path, vocab: &Vocab, mode: ChatThinkMode) {
+    let c = c_cmd(
+        family.oracle_name(),
+        path,
+        "chat",
+        &(mode as i32).to_string(),
+    );
+    let rust = rust_chat_cmd(vocab, mode).expect("rust chat");
+    assert_eq!(
+        rust,
+        c,
+        "mismatch {} chat mode={mode:?}",
+        family.oracle_name()
+    );
+}
+
 struct Builder {
     tokens: Vec<Vec<u8>>,
     types: Vec<u32>,
@@ -292,6 +347,8 @@ fn write_family(family: ModelFamily) -> PathBuf {
             b.push_str("<|tool:end|>", 3);
             b.push_str("<|tool_call:start|>", 3);
             b.push_str("<|tool_call:end|>", 3);
+            b.push_str("<|tool_response:start|>", 3);
+            b.push_str("<|tool_response:end|>", 3);
             b.push_str("<ud>", 4);
             b.write(&path, "solar-open2");
         }
@@ -416,6 +473,59 @@ fn family_cases(family: ModelFamily) {
     for id in stops {
         assert_cmd(family, &path, &vocab, "stop", &id.to_string());
     }
+    for mode in [
+        ChatThinkMode::None,
+        ChatThinkMode::Low,
+        ChatThinkMode::High,
+        ChatThinkMode::Max,
+    ] {
+        assert_chat_cmd(family, &path, &vocab, mode);
+    }
+
+    let mut tokens = TokenBuffer::from_tokens(vec![7]);
+    match family {
+        ModelFamily::SolarOpen2 => {
+            let mut missing = vocab.clone();
+            missing.tool_response_start_id = -1;
+            let err = missing
+                .chat_append_message(&mut tokens, "tool", b"result")
+                .unwrap_err();
+            assert!(
+                matches!(err, TokError::MissingToken(ref token) if token == "<|tool_response:start|>")
+            );
+        }
+        ModelFamily::ExaoneMoe => {
+            let mut missing = vocab.clone();
+            missing.bos_id = -1;
+            let err = missing.chat_begin(&mut tokens).unwrap_err();
+            assert!(matches!(err, TokError::MissingToken(ref token) if token == "[BOS]"));
+
+            missing.bos_id = vocab.bos_id;
+            missing.assistant_id = -1;
+            let err = missing
+                .chat_append_assistant_prefix(&mut tokens, ChatThinkMode::Low)
+                .unwrap_err();
+            assert!(matches!(err, TokError::MissingToken(ref token) if token == "<|assistant|>"));
+
+            missing.user_id = -1;
+            let err = missing
+                .chat_append_message(&mut tokens, "user", b"hello")
+                .unwrap_err();
+            assert!(matches!(err, TokError::MissingToken(ref token) if token == "<|user|>"));
+        }
+        ModelFamily::DeepSeek4 => {
+            let err = vocab
+                .chat_append_message(&mut tokens, "user", b"before\0after")
+                .unwrap_err();
+            assert!(matches!(err, TokError::EmbeddedNul));
+            let err = vocab
+                .chat_append_message(&mut tokens, "user\0assistant", b"hello")
+                .unwrap_err();
+            assert!(matches!(err, TokError::EmbeddedNul));
+        }
+        ModelFamily::Motif3 | ModelFamily::Dots3Note => {}
+    }
+    assert_eq!(tokens.as_slice(), &[7]);
 }
 
 #[test]
@@ -438,11 +548,15 @@ fn host_vocab_apply_matches_c() {
 
 #[test]
 fn tokenizer_families_match_c_oracle() {
-    family_cases(ModelFamily::DeepSeek4);
-    family_cases(ModelFamily::Motif3);
-    family_cases(ModelFamily::SolarOpen2);
-    family_cases(ModelFamily::ExaoneMoe);
-    family_cases(ModelFamily::Dots3Note);
+    for family in [
+        ModelFamily::DeepSeek4,
+        ModelFamily::Motif3,
+        ModelFamily::SolarOpen2,
+        ModelFamily::ExaoneMoe,
+        ModelFamily::Dots3Note,
+    ] {
+        family_cases(family);
+    }
 }
 
 #[test]

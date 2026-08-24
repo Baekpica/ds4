@@ -58,7 +58,7 @@ pub use shape::{
 pub use session::{
     dump_cmd as session_dump_cmd, RewriteKind, SessionBackend, SessionLedger, SyncPlan,
 };
-pub use tok::{dump_cmd, dump_vocab_apply_tapes, TokError, Vocab};
+pub use tok::{dump_cmd, dump_vocab_apply_tapes, ChatThinkMode, TokError, Vocab};
 pub use validate::{
     dump_validate, host_compress_ratios, validate_file, validate_gguf, ValidateError,
 };
