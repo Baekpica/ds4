@@ -18,7 +18,7 @@ C golden baseline: `v0.6.3-dfm`
 | session lifecycle | yes | wrapper | C | — | — |
 | KV store | yes | yes (envelope + policy) | C | 4-way green | n/a |
 | web utility | yes | yes (blocking I/O) | C (`ds4-agent`) | encode/wire + mock CDP green | n/a |
-| server (four surfaces) | yes | no | C | — | — |
+| server (four surfaces) | yes | yes (`route_decide`) | C | reason table + needs green | n/a |
 | distributed runtime | yes | yes (codecs + blocking orchestration) | C | codecs + CLI/route/mock hop green | n/a |
 | CLI / bench / agent host | yes | shadow `ds4-rs` / `ds4-bench-rs` | C | — | — |
 | CPU reference backend | yes | no (not a cut-over blocker) | C | — | n/a |
@@ -38,7 +38,7 @@ C golden baseline: `v0.6.3-dfm`
 | 4 | KV store port + 4-way matrix | **format/policy green** (`make test-kv-parity`); live session payload still C |
 | 5 | Web utility port | **done** (`make test-web-parity`); `ds4-agent` still links C `ds4_web.c` |
 | 6 | Distributed runtime port | **blocking runtime green** (`make test-dist-parity`); C still owns pipelined prefetch, snapshot, `ds4_dist_session_*` |
-| 7 | Server shadow by feature | not started |
+| 7 | Server shadow by feature | **route_decide / compute_needs green** (`make test-route-parity`); HTTP/wire still C |
 | 8 | `ds4.c` decomposition | not started |
 | 9 | Promote Rust binaries to default names | not started |
 | split | `SPLIT_READINESS.md` + `dfm-rs` genesis | blocked on 9 |
@@ -71,4 +71,5 @@ non-blocking compile).
   list is evidence-green.
 - Unsafe-audit command: `rg -n 'unsafe \{' crates/`
   Current hits are only `crates/ds4-core` FFI adapters. `ds4-sys` is
-  `extern "C"` declarations. `ds4-kv`, `ds4-web`, and `ds4-dist` have none.
+  `extern "C"` declarations. `ds4-kv`, `ds4-web`, `ds4-dist`, and
+  `ds4-server` have none.

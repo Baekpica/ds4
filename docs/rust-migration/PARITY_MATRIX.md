@@ -79,6 +79,10 @@ SNAPSHOT_* / DSV4 gather, `ds4_dist_session_*` wired through `ds4.c`.
 
 ### Phase 7 — server shadow
 
+`route_decide` + `request_compute_needs` are the routing oracle
+(`make test-route-parity`). Remaining: parsers, four wire surfaces,
+continuation registry, enqueue/shed. Do not improve the table.
+
 All four surfaces:
 
 ```text

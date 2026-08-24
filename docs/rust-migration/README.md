@@ -14,7 +14,7 @@ the later independent `dfm-rs` repository, not to this branch.
 |---|---|
 | Branch | `rust-host` |
 | C golden baseline | `v0.6.3-dfm` (`516456fe35510e4fb8350396c9d88807ac1f760b`) |
-| Current phase | Phase 6 blocking coordinator/worker runtime ported. C still default; pipelined prefetch + snapshot still C. |
+| Current phase | Phase 7 started: `route_decide` ported. Four HTTP surfaces and default binaries still C. |
 | Default production path | C (`ds4`, `ds4-server`, `ds4-bench`, `ds4-agent`) |
 | Target production path | Rust host + unchanged native CUDA/MMQ backend |
 | Repo split | **not started**. Requires `SPLIT_READINESS.md` green. |
