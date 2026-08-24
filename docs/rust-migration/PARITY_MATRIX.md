@@ -36,7 +36,7 @@ C core:
 
 | Check | Pass |
 |---|---|
-| Token output | Fixed-seed sampled C/Rust stdout is byte-identical (`ae12f463...`); post-port greedy stdout is also exact (`a12b7cb4...`). Same-prompt server pair returned `Hi.` / stop / 13+2 |
+| Token output | Fixed-seed sampled C/Rust stdout is byte-identical (`ae12f463...`); post-port greedy stdout is also exact (`a12b7cb4...`). Fixed-seed non-TTY thinking output is exact in both modes (`--think`: 292 bytes, `ad6d107f...`; `--nothink`: 52 bytes, `ae12f463...`). Same-prompt server pair returned `Hi.` / stop / 13+2 |
 | KV behavior | save/load round-trip matches C (synthetic). Live Rust benchmark restored the 64-token frontier before incrementally syncing to 128; checkpoint sizes were 18,632,800 and 24,556,624 bytes |
 | Prefill / decode tok/s | Local C/Rust benchmark ABBA is green below; full production-path performance remains pending |
 | Memory | sequential; C server peak `nvidia-smi` 102833 MiB, Rust server 99077 MiB; teardown + `clear_cache` returned ~115 GiB available |

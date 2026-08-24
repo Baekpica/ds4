@@ -20,12 +20,12 @@ C golden baseline: `v0.6.3-dfm`
 | web utility | yes | isolated blocking-I/O crate; not production-integrated | C (`ds4-agent`) | encode/wire + mock CDP green | n/a |
 | server (four surfaces) | yes | partial (`route_decide` + HTTP door + parsers + projectors + admission + metrics + render/tool/continuation machinery + scripted/FFI decode) | C | fixtures and live Motif serial/width-1 continuous green; static lane, multi-client continuous, and Anthropic/Responses continuous are not implemented | n/a |
 | distributed runtime | yes | isolated codecs + blocking orchestration crate; not production-integrated | C | codecs + CLI/route/mock hop green | n/a |
-| CLI / bench / agent host | yes | partial: greedy/seeded-sampling `ds4-rs`, local non-MTP/non-distributed `ds4-bench-rs`, and `ds4-server-rs`; no `ds4-agent-rs` | C | one-shot CLI and local benchmark ABBA green; thinking/MTP/REPL/batch/distributed CLI, advanced benchmark modes, and agent parity not established | local benchmark green; full gate pending |
+| CLI / bench / agent host | yes | partial: greedy/seeded-sampling `ds4-rs` with non-TTY thinking formatting, local non-MTP/non-distributed `ds4-bench-rs`, and `ds4-server-rs`; no `ds4-agent-rs` | C | greedy, fixed-seed sampled, and fixed-seed thinking/non-thinking one-shot stdout match C byte-for-byte; local benchmark ABBA green. TTY color, MTP/REPL/batch/distributed CLI, advanced benchmark modes, and agent parity are not established | local benchmark green; full gate pending |
 | CPU reference backend | yes | no (not a cut-over blocker) | C | — | n/a |
 | Metal backend | native | unchanged | native | — | n/a |
 | CUDA / MMQ / VMM | native | unchanged | native | green (C baseline) | green (published band) |
 | FFI bridge (`ds4_bridge`) | n/a | broad C-host bridge; not the final narrow CUDA ABI | n/a | FFI error path green | — |
-| proof harness on Rust path | C binaries | partial | C | Rust smoke 2/2 and long 6/6 green; same-host C→Rust OPP-C 5/5 green after rendered-prompt parity fix. The committed OPP-C snapshot is stale (three profiles, old token MD5/plan), so the architecture-specific drift gate is not yet green | — |
+| proof harness on Rust path | C binaries | partial | C | Rust smoke 2/2 and long 6/6 green; same-host C→Rust OPP-C 5/5 green. The GB10 `sm_121a` native snapshot is frozen separately: detached `v0.6.3-dfm` and current C both pass 5/5 with the same stable plan/token oracle | — |
 
 Rust entries above describe isolated ownership/parity unless `Default` is
 Rust. They must not be read as production-path integration.
@@ -37,7 +37,7 @@ Rust. They must not be read as production-path integration.
 | 0 | Freeze baseline + this document set | **done** (docs-only commit) |
 | 1 | Cargo workspace + FFI skeleton | **done** (`cargo check --workspace`, `make rust-bridge`) |
 | 2 | `ds4-core` safe wrappers | **wrapper layer green**; production model/session ownership remains native |
-| 3 | Shadow `ds4-rs` / `ds4-bench-rs` | **linked + live CUDA/ABBA green** (`make ds4-rs ds4-bench-rs`). Greedy and fixed-seed sampled one-shot stdout match C exactly. The benchmark completed snapshot/restore smoke and a C→Rust→Rust→C local sweep inside prefill/decode/RSS thresholds; advanced modes and full production performance remain pending |
+| 3 | Shadow `ds4-rs` / `ds4-bench-rs` | **linked + live CUDA/ABBA green** (`make ds4-rs ds4-bench-rs`). Greedy, fixed-seed sampled, and fixed-seed thinking/non-thinking one-shot stdout match C exactly. The benchmark completed snapshot/restore smoke and a C→Rust→Rust→C local sweep inside prefill/decode/RSS thresholds; TTY color, advanced modes, and full production performance remain pending |
 | 4 | KV store port + 4-way matrix | **format/policy green** (`make test-kv-parity`); live session payload still C |
 | 5 | Web utility port | **isolated parity green** (`make test-web-parity`); production `ds4-agent` still uses C `ds4_web.c` |
 | 6 | Distributed runtime port | **isolated parity green** (`make test-dist-parity`); production still uses C pipelined prefetch, snapshot, and `ds4_dist_session_*` |
@@ -55,7 +55,7 @@ Rust. They must not be read as production-path integration.
 | `ds4-bench` | C |
 | `ds4-eval` | C |
 | `ds4-agent` | C |
-| `ds4-rs` | Partial Rust CLI host, same C CUDA core (`make ds4-rs`); diagnostics plus greedy and seeded-sampling one-shot paths are host-owned. Thinking formatting, MTP, REPL, batch, and distributed CLI remain C-only |
+| `ds4-rs` | Partial Rust CLI host, same C CUDA core (`make ds4-rs`); diagnostics plus greedy, seeded-sampling, and non-TTY thinking-output one-shot paths are host-owned. TTY color, MTP, REPL, batch, and distributed CLI remain C-only |
 | `ds4-bench-rs` | Local raw-prompt benchmark shadow with the C incremental sync, snapshot/decode/restore timing, and 8-column CSV contract. Live CUDA two-frontier smoke is green; MTP, distributed, chat prompt, logits dump, output-head, warm, quality, and power modes remain C-only |
 | `ds4-server-rs` | Partial Rust HTTP host over the native model/session/scheduler bridge. Serial and width-1 OpenAI continuous paths exist; static, multi-client continuous, and Anthropic/Responses continuous do not |
 | `ds4_weight_server` | native CUDA (unchanged) |
@@ -65,6 +65,8 @@ Phase 3/7 live Motif evidence is in `scratch/rust-host-live/` (tmux + workspace-
 The Rust benchmark smoke is in `scratch/rust-host-live/bench-rs-two-frontier.log` (GB10, DeepSeek-V4-Flash IQ2XXS, binary SHA-256 `a66d97c4...`). It completed 64 and 128 token frontiers with four decode tokens each, nonzero checkpoint sizes, exit 0, and post-run cache cleanup. These two rows prove execution and restore flow only; they are not a performance comparison.
 
 CLI sampling evidence is under `scratch/rust-host-live/cli-sampling-parity/` (Rust binary SHA-256 `1287e404...`): C and Rust fixed-seed stdout both produced 52 bytes with SHA-256 `ae12f463...`. The post-change greedy rerun under `cli-greedy-post-sampling/` produced byte-identical `OK\n` (`a12b7cb4...`). Both pairs exited 0 with teardown and cache cleanup between model loads.
+
+CLI thinking evidence is under `scratch/rust-host-live/cli-thinking-parity-20260825/`: with the same fixed-seed DeepSeek V4 Flash workload, C and Rust `--think` stdout are both 292 bytes (`ad6d107f...`) and C and Rust `--nothink` stdout are both 52 bytes (`ae12f463...`). All four runs exited 0; each sequential teardown and cache clear left no GPU application.
 
 Rust proof evidence after the rendered-prompt fix is in `scratch/rust-host-live/proof-{smoke,long}-fixed.log`, `proof-oppc-{c-oracle,rust-fixed}.log`, and `proof-oppc-rust-current.log`: smoke 2/2, long 6/6, and same-host OPP-C C/Rust 5/5 all pass. The final Rust proof used one fixed binary SHA (`056dbdf6...`). The GB10 native gate is also green: detached `v0.6.3-dfm@516456f` matched the current C oracle 5/5, and `CUDA_ARCH=sm_121` now selects the separately tracked `sm_121a` golden; the older generic golden is unchanged. Remaining before Phase 9 includes full user-binary parity, the family regression set, multi-client/server surface follow-ups, and pre-split performance/soak evidence. After Phase 9 + `SPLIT_READINESS.md`, follow [DFM_RS_SPLIT_PLAN.md](DFM_RS_SPLIT_PLAN.md).
 
@@ -90,6 +92,7 @@ a non-blocking compile).
   drift and clippy warnings. This blocks the post-split release gate in
   `DFM_RS_SPLIT_PLAN.md` §26; it is not by itself a pre-split readiness gate.
 - Unsafe-audit command: `rg -n 'unsafe \{' crates/`
-  Current hits are `crates/ds4-core` FFI adapters plus the GGUF mmap
-  adapter (`mapped.rs`). `ds4-sys` is `extern "C"` declarations.
+  Current count is 37, all in `crates/ds4-core`: 25 in `lib.rs`, 5 in
+  `batch.rs`, 4 in the GGUF mmap adapter (`mapped.rs`), and 3 in `mem.rs`.
+  `ds4-sys` is `extern "C"` declarations.
   `ds4-kv`, `ds4-web`, `ds4-dist`, and `ds4-server` have none.
