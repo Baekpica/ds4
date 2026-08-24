@@ -17,6 +17,7 @@
 unsigned bridge_payload_load_calls;
 int64_t bridge_payload_load_offset;
 uint64_t bridge_payload_load_bytes;
+int bridge_routed_quant_bits;
 
 void ds4_host_tensor_dir_install(const ds4_host_tensor_dir *d) { (void)d; }
 void ds4_host_tensor_dir_clear(void) {}
@@ -36,6 +37,10 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 }
 void ds4_engine_close(ds4_engine *e) { (void)e; STUB("ds4_engine_close"); }
 int ds4_engine_model_id(ds4_engine *e) { (void)e; STUB("ds4_engine_model_id"); }
+int ds4_engine_routed_quant_bits(ds4_engine *e) {
+    if (!e) STUB("ds4_engine_routed_quant_bits");
+    return bridge_routed_quant_bits;
+}
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     (void)out; (void)e; (void)ctx_size; STUB("ds4_session_create");
 }

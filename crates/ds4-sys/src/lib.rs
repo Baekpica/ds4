@@ -414,6 +414,8 @@ extern "C" {
 
     pub fn ds4_bridge_model_id(m: *mut ds4_bridge_model) -> c_int;
 
+    pub fn ds4_bridge_model_routed_quant_bits(m: *mut ds4_bridge_model) -> c_int;
+
     pub fn ds4_bridge_encode_chat_prompt(
         m: *mut ds4_bridge_model,
         system: *const c_char,

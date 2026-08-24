@@ -150,6 +150,7 @@ int ds4_bridge_token_text(ds4_bridge_model *m, int32_t token,
 int ds4_bridge_token_eos(ds4_bridge_model *m);
 int ds4_bridge_token_is_stop(ds4_bridge_model *m, int32_t token);
 int ds4_bridge_model_id(ds4_bridge_model *m);
+int ds4_bridge_model_routed_quant_bits(ds4_bridge_model *m);
 
 /* CLI chat-template encode (ds4_encode_chat_prompt): system may be NULL,
  * think_mode is ds4_think_mode 0..3.  Same buffer contract as tokenize. */

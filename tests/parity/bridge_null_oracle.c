@@ -12,6 +12,11 @@
 extern unsigned bridge_payload_load_calls;
 extern int64_t bridge_payload_load_offset;
 extern uint64_t bridge_payload_load_bytes;
+extern int bridge_routed_quant_bits;
+
+struct ds4_bridge_model {
+    ds4_engine *engine;
+};
 
 struct ds4_bridge_session {
     ds4_bridge_model *model;
@@ -51,6 +56,16 @@ int main(void) {
     if (ds4_bridge_token_eos(NULL) != -1) fail("token_eos");
     if (ds4_bridge_token_is_stop(NULL, 1) != 0) fail("token_is_stop");
     if (ds4_bridge_model_id(NULL) != -1) fail("model_id");
+    if (ds4_bridge_model_routed_quant_bits(NULL) != 0) fail("routed_quant_bits NULL");
+    {
+        ds4_engine *fake_native = malloc(1);
+        struct ds4_bridge_model fake = {fake_native};
+        if (!fake_native) fail("routed_quant_bits fake model");
+        bridge_routed_quant_bits = 4;
+        if (ds4_bridge_model_routed_quant_bits(&fake) != 4)
+            fail("routed_quant_bits delegation");
+        free(fake_native);
+    }
     if (ds4_bridge_session_sample(NULL, 1.0f, 0, 1.0f, 0.05f, &rng) != -1)
         fail("sample");
     if (ds4_bridge_session_ctx(NULL) != -1) fail("ctx");

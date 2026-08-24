@@ -676,6 +676,12 @@ int ds4_bridge_model_id(ds4_bridge_model *m)
     return ds4_engine_model_id(m->engine);
 }
 
+int ds4_bridge_model_routed_quant_bits(ds4_bridge_model *m)
+{
+    if (!m || !m->engine) return 0;
+    return ds4_engine_routed_quant_bits(m->engine);
+}
+
 int ds4_bridge_encode_chat_prompt(ds4_bridge_model *m, const char *system,
                                   const char *prompt, int think_mode,
                                   int32_t *out, int cap, int *n_out,

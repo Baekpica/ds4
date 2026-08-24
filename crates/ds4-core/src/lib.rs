@@ -77,7 +77,7 @@ use std::ptr::{self, NonNull};
 use ds4_sys::{
     ds4_bridge_bind_plan, ds4_bridge_bind_plan_check, ds4_bridge_bind_slot,
     ds4_bridge_encode_chat_prompt, ds4_bridge_eval, ds4_bridge_model, ds4_bridge_model_free,
-    ds4_bridge_model_id,
+    ds4_bridge_model_id, ds4_bridge_model_routed_quant_bits,
     ds4_bridge_model_open, ds4_bridge_model_open_options, ds4_bridge_session,
     ds4_bridge_session_argmax, ds4_bridge_session_argmax_excluding,
     ds4_bridge_session_create,
@@ -795,6 +795,10 @@ impl Model {
 
     pub fn model_id(&self) -> i32 {
         unsafe { ds4_bridge_model_id(self.raw.as_ptr()) }
+    }
+
+    pub fn routed_quant_bits(&self) -> i32 {
+        unsafe { ds4_bridge_model_routed_quant_bits(self.raw.as_ptr()) }
     }
 
     pub fn token_eos(&self) -> i32 {
