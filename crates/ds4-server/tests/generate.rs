@@ -1,9 +1,9 @@
 //! Scripted decode + HTTP generate path. No GGUF.
 
 use ds4_server::{
-    generate_and_write, handle_client_inner, generation_blocked, stop_list_find_from, ParseEnv,
-    ParsedRequest, ScriptedDecode, ScriptedStep, ServerConfig, ServerInner, ThinkMode,
-    CREATED_TEST, TAPE_PLAIN,
+    generate_and_write, handle_client_inner, generation_blocked, stop_list_find_from, ContStepper,
+    ParseEnv, ParsedRequest, ReqTimings, ScriptedDecode, ScriptedStep, ServerConfig, ServerInner,
+    ThinkMode, CREATED_TEST, TAPE_PLAIN,
 };
 use ds4_server::parse::parse_request;
 use ds4_server::route::WireSurface;
@@ -103,7 +103,7 @@ fn scripted_http_door_generates() {
         let (mut s, _) = listener.accept().unwrap();
         let inner = Mutex::new(ServerInner::from_cfg(&cfg));
         let mut engine = ScriptedDecode::from_pieces(&[b"ok"]);
-        handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine));
+        handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine), None);
     });
     let mut c = TcpStream::connect(addr).unwrap();
     let body = r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#;
@@ -136,7 +136,7 @@ fn scripted_motif_generates_over_http() {
             model_id: 3,
             ..ScriptedDecode::from_pieces(&[b"ok"])
         };
-        handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine));
+        handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine), None);
     });
     let mut c = TcpStream::connect(addr).unwrap();
     let body = r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#;
@@ -152,6 +152,70 @@ fn scripted_motif_generates_over_http() {
     let s = String::from_utf8_lossy(&out);
     assert!(s.starts_with("HTTP/1.1 200 OK"), "{s}");
     assert!(s.contains("ok"), "{s}");
+}
+
+#[test]
+fn cont_stepper_buffered_matches_serial_shape() {
+    let mut parsed = user_req();
+    parsed.stream = false;
+    let (mut st, head) = ContStepper::new(
+        &parsed,
+        0,
+        "chatcmpl-1",
+        CREATED_TEST,
+        false,
+        16,
+        b"prompt".to_vec(),
+        1,
+        8192,
+    );
+    assert!(head.is_empty(), "buffered request must not stream a head");
+    for p in TAPE_PLAIN {
+        let step = st.feed(p.as_bytes());
+        assert!(step.bytes.is_empty());
+        assert!(!step.done);
+    }
+    let (bytes, outcome) = st.finalize(true, 0, 1, ReqTimings::default(), false);
+    let s = String::from_utf8_lossy(&bytes);
+    assert!(s.starts_with("HTTP/1.1 200 OK"), "{s}");
+    assert!(s.contains("Hello world."), "{s}");
+    assert!(s.contains("\"finish_reason\":\"stop\""), "{s}");
+    assert!(
+        s.contains("\"cached_tokens\":0,\"cache_write_tokens\":1"),
+        "engine split maps into the client frame: {s}"
+    );
+    assert_eq!(outcome.finish, "stop");
+}
+
+#[test]
+fn cont_stepper_streams_and_stops_on_budget() {
+    let mut parsed = user_req();
+    parsed.stream = true;
+    parsed.max_tokens = 2;
+    parsed.max_tokens_set = true;
+    let (mut st, head) = ContStepper::new(
+        &parsed,
+        0,
+        "chatcmpl-2",
+        CREATED_TEST,
+        false,
+        16,
+        b"prompt".to_vec(),
+        1,
+        8192,
+    );
+    let h = String::from_utf8_lossy(&head);
+    assert!(h.contains("text/event-stream"), "{h}");
+    assert!(h.contains("chat.completion.chunk"), "{h}");
+    let first = st.feed(TAPE_PLAIN[0].as_bytes());
+    assert!(!first.done);
+    let second = st.feed(TAPE_PLAIN[1].as_bytes());
+    assert!(second.done, "host budget must stop the sequence");
+    let (bytes, outcome) = st.finalize(false, 0, 1, ReqTimings::default(), false);
+    let s = String::from_utf8_lossy(&bytes);
+    assert!(s.contains("\"finish_reason\":\"length\""), "{s}");
+    assert!(s.contains("data: [DONE]"), "{s}");
+    assert_eq!(outcome.finish, "length");
 }
 
 #[test]

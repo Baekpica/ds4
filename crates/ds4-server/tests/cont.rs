@@ -104,7 +104,7 @@ fn serial_hold_sheds_unrelated_with_retry_after() {
             g.creg.publish_serial(Api::Anthropic, &["toolu_hold".into()], 4, 70, now);
         }
         let mut engine = ScriptedDecode::from_pieces(&[b"ok"]);
-        handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine));
+        handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine), None);
     });
     let body = r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#;
     let s = http_post(addr, "/v1/chat/completions", body);
@@ -133,7 +133,7 @@ fn live_only_tool_result_conflicts_when_reference_moved() {
                 .publish_serial(Api::Anthropic, &["toolu_x".into()], 7, 100, now);
         }
         let mut engine = ScriptedDecode::from_pieces(&[b"ok"]);
-        handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine));
+        handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine), None);
     });
     let body = r#"{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_x","content":"ok"}]}],"max_tokens":8}"#;
     let s = http_post(addr, "/v1/messages", body);
@@ -164,7 +164,7 @@ fn anthropic_tool_turn_publishes_and_holds_next_seat() {
         .as_bytes()]);
         for _ in 0..2 {
             let (mut s, _) = listener.accept().unwrap();
-            handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine));
+            handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine), None);
         }
         let mut g = inner.lock().unwrap();
         assert_eq!(g.creg.n_live(), 1);

@@ -21,7 +21,8 @@ use crate::metrics::{
 use crate::metrics::MemCell;
 use crate::models::{model_id_known, model_one_json, models_list_json};
 use crate::parse::{parse_request, ParseEnv};
-use crate::route::{route_decide, Api, RouteEnv, ThinkMode, WireSurface};
+use crate::route::{route_decide, Api, RouteEnv, ThinkMode, WireSurface, LANE_CONTINUOUS};
+use crate::serve_cont::{cont_prompt_tokens, ContExec};
 use crate::stream::unix_now;
 
 #[derive(Debug, Clone)]
@@ -150,7 +151,7 @@ fn continuation_conflict_msg(api: Api) -> &'static str {
 
 pub fn handle_client(cfg: &ServerConfig, stream: &mut TcpStream) {
     let inner = Mutex::new(ServerInner::from_cfg(cfg));
-    handle_client_inner(cfg, &inner, stream, None);
+    handle_client_inner(cfg, &inner, stream, None, None);
 }
 
 fn lock_inner(inner: &Mutex<ServerInner>) -> std::sync::MutexGuard<'_, ServerInner> {
@@ -162,6 +163,7 @@ pub fn handle_client_inner(
     inner: &Mutex<ServerInner>,
     stream: &mut TcpStream,
     engine: Option<&mut dyn DecodeIo>,
+    mut cont: Option<&mut dyn ContExec>,
 ) {
     let req = match read_http_request(stream, chunked_enabled()) {
         Some(r) => r,
@@ -284,15 +286,25 @@ pub fn handle_client_inner(
                         );
                         return;
                     }
+                    /* The continuous gate needs the tokenized prompt length
+                     * (the C server tokenizes during job prep, before
+                     * route_decide). Without a cont lane the env keeps the
+                     * serial-only shape the oracle tests pin. */
+                    let cont_gate = match (cont.as_deref(), engine.is_some()) {
+                        (Some(exec), true) => cont_prompt_tokens(exec, &parsed)
+                            .ok()
+                            .map(|(_, toks)| (toks.len() as i32, exec.seq_cap())),
+                        _ => None,
+                    };
                     let route_env = RouteEnv {
-                        coalesce: false,
-                        have_cont: false,
+                        coalesce: cont_gate.is_some(),
+                        have_cont: cont_gate.is_some(),
                         cont_anthropic: false,
                         cont_responses: false,
                         cont_tools_anthropic: false,
                         cont_tools_responses: false,
-                        seq_cap: cfg.ctx,
-                        prompt_len: 0,
+                        seq_cap: cont_gate.map_or(cfg.ctx, |(_, cap)| cap),
+                        prompt_len: cont_gate.map_or(0, |(len, _)| len),
                     };
                     let dec = route_decide(parsed.needs, surf, &route_env);
                     let id = {
@@ -365,15 +377,51 @@ pub fn handle_client_inner(
                             return;
                         }
                         let created = unix_now();
-                        let result = generate_and_write(
-                            engine,
-                            &parsed,
-                            &id,
-                            created,
-                            cfg.cors,
-                            cfg.default_tokens,
-                            stream,
-                        );
+                        let result = if dec.lane == LANE_CONTINUOUS {
+                            match cont.as_mut() {
+                                Some(exec) => match exec.generate(
+                                    &parsed,
+                                    &id,
+                                    created,
+                                    cfg.cors,
+                                    cfg.default_tokens,
+                                    stream,
+                                ) {
+                                    /* Rejected before any bytes: the C
+                                     * fallback runs the job on the single
+                                     * path once the cont loop is free. */
+                                    Err(GenerateError::Unsupported(_)) => generate_and_write(
+                                        engine,
+                                        &parsed,
+                                        &id,
+                                        created,
+                                        cfg.cors,
+                                        cfg.default_tokens,
+                                        stream,
+                                    ),
+                                    r => r,
+                                },
+                                None => generate_and_write(
+                                    engine,
+                                    &parsed,
+                                    &id,
+                                    created,
+                                    cfg.cors,
+                                    cfg.default_tokens,
+                                    stream,
+                                ),
+                            }
+                        } else {
+                            generate_and_write(
+                                engine,
+                                &parsed,
+                                &id,
+                                created,
+                                cfg.cors,
+                                cfg.default_tokens,
+                                stream,
+                            )
+                        };
                         {
                             let mut g = lock_inner(inner);
                             if let Some(ref pid) = pin_id {
@@ -447,7 +495,7 @@ pub fn accept_loop(listener: TcpListener, cfg: ServerConfig) {
         let inner = Arc::clone(&inner);
         thread::spawn(move || {
             let _ = stream.set_nodelay(true);
-            handle_client_inner(&cfg, &inner, &mut stream, None);
+            handle_client_inner(&cfg, &inner, &mut stream, None, None);
         });
     }
 }
@@ -463,7 +511,24 @@ pub fn accept_loop_with_engine(
     for incoming in listener.incoming() {
         let Ok(mut stream) = incoming else { continue };
         let _ = stream.set_nodelay(true);
-        handle_client_inner(&cfg, &inner, &mut stream, Some(engine));
+        handle_client_inner(&cfg, &inner, &mut stream, Some(engine), None);
+    }
+}
+
+/// Serial accept with a continuous lane attached: requests whose needs
+/// word fits the continuous mask run on the engine's rolling scheduler
+/// (width-1 today), everything else stays on the serial path.
+pub fn accept_loop_with_engine_cont(
+    listener: TcpListener,
+    cfg: ServerConfig,
+    engine: &mut dyn DecodeIo,
+    cont: &mut dyn ContExec,
+) {
+    let inner = Mutex::new(ServerInner::from_cfg(&cfg));
+    for incoming in listener.incoming() {
+        let Ok(mut stream) = incoming else { continue };
+        let _ = stream.set_nodelay(true);
+        handle_client_inner(&cfg, &inner, &mut stream, Some(engine), Some(cont));
     }
 }
 

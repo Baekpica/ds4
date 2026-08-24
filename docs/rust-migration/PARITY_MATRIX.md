@@ -204,10 +204,30 @@ teardown + `clear_cache` between cells:
 
 All four completions are byte-identical greedy text (SHA1
 `4d34f24352e7`) — the Token axis passes across hosts and lanes.
-Pair spreads are ≤0.4%. The −8.6% prefill / +4.4% decode delta is
-attributed to the lane difference (Rust has no continuous lane yet),
-not to FFI overhead; the same-lane ABBA re-run is required after the
-continuous port before Phase 9.
+Pair spreads are ≤0.4%. The −8.6% prefill / +4.4% decode delta was
+attributed to the lane difference and re-measured after the
+continuous port (below).
+
+### Recorded ABBA (2026-08-24, same lane: both continuous)
+
+Same protocol, `ds4-server-rs --cont-width 2` routing
+`openai_chat_continuous`, all four completions byte-identical
+(same SHA1 `4d34f24352e7`):
+
+| Cell | Lane | prefill tok/s | decode tok/s | ttft ms |
+|---|---|---|---|---|
+| C #1 | continuous | 579.2 | 14.9 | 11767 |
+| Rust #1 | continuous | 590.8 | 14.8 | 11521 |
+| Rust #2 | continuous | 592.9 | 14.7 | 11480 |
+| C #2 | continuous | 633.9 | 14.9 | 10751 |
+
+Rust pair spread 0.4%; the C pair spread is 9.0% (579/634 — the
+cross-lane run's C pair sat at 633.4/633.0), so the −2.4% Rust mean
+prefill delta is inside the C cell noise; decode is within 1%. No
+unexplained regression. Rust continuous is width-1 today (serial
+accept): the rolling scheduler, bank admit, per-seq eos and engine
+usage split are the same native path; multi-client width and the
+Anthropic/Responses cont promotion are follow-ups.
 
 ## Status of this matrix
 

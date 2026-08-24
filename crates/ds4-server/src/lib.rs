@@ -15,6 +15,7 @@ pub mod render;
 pub mod retry;
 pub mod route;
 pub mod serve;
+pub mod serve_cont;
 pub mod stream;
 pub mod tool_stream;
 pub mod tools;
@@ -91,9 +92,12 @@ pub use render::{
     DSML_EOS, DSML_USER, THINK_HIGH_PREFIX, THINK_MAX_PREFIX,
 };
 pub use serve::{
-    accept_loop, accept_loop_with_engine, handle_client, handle_client_inner, listen, ServerConfig,
-    ServerInner,
+    accept_loop, accept_loop_with_engine, accept_loop_with_engine_cont, handle_client,
+    handle_client_inner, listen, ServerConfig, ServerInner,
 };
+pub use serve_cont::{cont_prompt_tokens, ContExec, ContStep, ContStepper};
+#[cfg(feature = "native")]
+pub use serve_cont::ContLane;
 pub use stream::{
     anthropic_final_response, anthropic_sse_finish_live, anthropic_sse_start_live,
     anthropic_sse_stream_update, append_tool_call_deltas_json, append_tool_calls_json,
