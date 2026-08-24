@@ -70,6 +70,7 @@ widen the existing ones to dump internals.
 | `ds4_bridge_bind_plan_check` | host inventory + required-name table; 0 if native can consume it |
 | `ds4_bridge_bind_plan_match` | host vs native slot identity (name/need/found/type/dims/offsets/bytes/shard + remap) |
 | `ds4_bridge_model_open` | mmap-backed `ds4_engine_open`; optional `opt->plan` is checked first; optional `opt->tensors` replaces `parse_tensors` (owned name copies); optional `opt->shape` applies the pinned C literal + DeepSeek compress table and skips `config_validate_model`; optional `opt->vocab` applies host token/merge/specials and skips `vocab_load`; optional `opt->bind` is the host name→tensor-dir index so `model_find_tensor` skips the C name walk and the main-model `weights_validate_layout` |
+| `ds4_bridge_model_boot_prewarm` | idempotent `ds4_engine_boot_prewarm`; server calls it after batch placement and before listen/accept |
 | `ds4_bridge_model_free` | `ds4_engine_close` |
 | `ds4_bridge_session_create` | `ds4_session_create` |
 | `ds4_bridge_session_free` | `ds4_session_free` |

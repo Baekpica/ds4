@@ -102,16 +102,34 @@ timing porcelain so a live Rust cache hit now reports
 `prefill_tokens=15` and `prefill_cached_tokens=6896`, matching C (post-fix
 binary `52471e49c4c22bde2f1abb063755847ff5d738da705896e925e8b7468b8ec197`).
 
+The initial comparable single cells exposed a real lifecycle regression: C was
+879--934 ms TTFT while Rust was 1,590--1,715 ms because the Rust server opened
+with deferred boot prewarm and never called it. Commit `f4a632e` added the
+opaque prewarm call after batch placement, preserving C's placement contract.
+The same model, request C, KVC, serial lane, and cache-clear protocol then gave:
+
+```text
+C     880.9 ms
+Rust  836.0 ms
+Rust  860.4 ms
+C     897.5 ms
+```
+
+C mean was 889.2 ms and Rust mean 848.2 ms (-4.61%), so the scoped restore TTFT
+gate is green. All four cells returned `RESTORED_OK`, 6,896 cached tokens, and
+15 computed tokens. Commit `4fc8ef4` then matched C's reported prefill timing
+scope (computed suffix sync only): live Rust was 69.2 tok/s versus C
+68.2--69.0, with TTFT still 840.4 ms. The ABBA binary SHA-256 was
+`00da345a5e09887d82b514c80b4674aa37311e0903ad50ff9cae82b1db3a34b3`;
+the timing-scope binary was
+`ea714d4d7ae4e2618bf052aa842d40e290cd978ac404ac1f39aa15f5d76779f9`.
+
 This is not the whole Phase 4 gate. C defaults to cold/continued checkpoints
 (`cold_max=30000`, `continued=10000`), while the Rust shadow does not expose or
 execute those policies yet. The old 6,782-token Motif fixture demonstrates why
 the omission matters: C's 6,144-token cold checkpoint changes the native
 prefill partition and produced a different greedy continuation than the
 shared cold-disabled path. Tool-call checkpoint replay is also missing.
-Restore performance is still yellow: the first comparable single-cell samples
-were C 879--934 ms TTFT versus Rust 1,590--1,715 ms; this is not an ABBA result
-and cannot satisfy the +5% TTFT gate. Diagnose and remeasure before marking
-Phase 4 performance green.
 
 ### Phase 5 — web utility
 
