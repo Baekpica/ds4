@@ -1,0 +1,180 @@
+//! Host weights_validate_layout vs C layout_c_oracle.
+
+use ds4_core::{
+    bind_dspark_names, bind_mtp_names, bind_names, dump_expected_layouts, dump_expected_support,
+    dump_layout_check_tapes, expected_dspark_layouts, expected_layouts, expected_mtp_layouts,
+    shape_for_variant, validate_dspark_layouts, validate_mtp_layouts, validate_support_layouts,
+    BindNeed, BindPlan, BindSlot, SupportCatalog,
+    LayoutSpec, TensorInfo, TypeClass, DSPARK_MARKOV_RANK, SHAPE_FLASH, Variant,
+};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::process::Command;
+
+fn oracle() -> PathBuf {
+    if let Ok(p) = std::env::var("DS4_LAYOUT_C_ORACLE") {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/parity/layout_c_oracle")
+}
+
+fn require_oracle() -> PathBuf {
+    let p = oracle();
+    assert!(
+        p.exists(),
+        "build the C oracle first: make tests/parity/layout_c_oracle (missing {})",
+        p.display()
+    );
+    p
+}
+
+fn c_out(args: &[&str]) -> String {
+    let out = Command::new(require_oracle())
+        .args(args)
+        .output()
+        .expect("run layout_c_oracle");
+    assert!(
+        out.status.success(),
+        "oracle {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("oracle utf8")
+}
+
+#[test]
+fn dump_matches_c_oracle() {
+    assert_eq!(c_out(&[]), dump_expected_layouts());
+}
+
+#[test]
+fn check_tapes_match_c_oracle() {
+    assert_eq!(c_out(&["check"]), dump_layout_check_tapes());
+}
+
+#[test]
+fn support_dump_matches_c_oracle() {
+    assert_eq!(c_out(&["support"]), dump_expected_support());
+}
+
+fn fake_tensor(name: &str, typ: u32, ndim: u32, dim4: [u64; 4]) -> TensorInfo {
+    let mut dim = [0u64; 8];
+    dim[..4].copy_from_slice(&dim4);
+    TensorInfo {
+        name: name.into(),
+        ndim,
+        dim,
+        typ,
+        rel_offset: 0,
+        abs_offset: 0,
+        elements: 0,
+        bytes: 0,
+        shard: 0,
+    }
+}
+
+fn class_type(class: TypeClass, name: &str, routed_up: u32) -> u32 {
+    match class {
+        TypeClass::Exact(t) | TypeClass::OptionalExact(t) => t,
+        TypeClass::Plain => 1,
+        TypeClass::Routed => {
+            if name.contains("ffn_up_exps") {
+                routed_up
+            } else {
+                16
+            }
+        }
+        _ => 8,
+    }
+}
+
+fn plan_from_specs(specs: &[LayoutSpec], routed_up: u32) -> BindPlan {
+    let slots = specs
+        .iter()
+        .map(|s| BindSlot {
+            name: s.name.clone(),
+            need: BindNeed::Required,
+            tensor: Some(fake_tensor(
+                &s.name,
+                class_type(s.class, &s.name, routed_up),
+                s.ndim,
+                s.dim,
+            )),
+            index: Some(0),
+        })
+        .collect();
+    BindPlan {
+        shape: SHAPE_FLASH,
+        slots,
+        n_shards: 1,
+        data_pos: 0,
+        alignment: 32,
+        page: 4096,
+    }
+}
+
+#[test]
+fn validate_mtp_accepts_matching_plan() {
+    let specs = expected_mtp_layouts(&SHAPE_FLASH);
+    let plan = plan_from_specs(&specs, 16);
+    validate_mtp_layouts(&plan).expect("mtp layout ok");
+}
+
+#[test]
+fn validate_mtp_rejects_gate_up_mismatch() {
+    let specs = expected_mtp_layouts(&SHAPE_FLASH);
+    let plan = plan_from_specs(&specs, 10);
+    let err = validate_mtp_layouts(&plan).expect_err("gate/up type mismatch");
+    assert_eq!(err.token(), "gate-up 0");
+}
+
+#[test]
+fn validate_dspark_accepts_matching_plan() {
+    let specs = expected_dspark_layouts(&SHAPE_FLASH, DSPARK_MARKOV_RANK);
+    let plan = plan_from_specs(&specs, 16);
+    validate_dspark_layouts(&plan, DSPARK_MARKOV_RANK).expect("dspark layout ok");
+    validate_support_layouts(&plan, Some(SupportCatalog::Dspark)).expect("support dispatch");
+}
+
+#[test]
+fn support_layout_covers_bind_catalog() {
+    for v in [Variant::Flash, Variant::Pro] {
+        let shape = shape_for_variant(v);
+        let mtp_bind: HashSet<String> = bind_mtp_names().into_iter().map(|n| n.name).collect();
+        let mtp_layout: HashSet<String> =
+            expected_mtp_layouts(&shape).into_iter().map(|s| s.name).collect();
+        assert_eq!(mtp_bind, mtp_layout, "{v:?} MTP bind/layout name set");
+        let ds_bind: HashSet<String> = bind_dspark_names().into_iter().map(|n| n.name).collect();
+        let ds_layout: HashSet<String> = expected_dspark_layouts(&shape, DSPARK_MARKOV_RANK)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(ds_bind, ds_layout, "{v:?} DSpark bind/layout name set");
+    }
+}
+
+#[test]
+fn layout_covers_bind_catalog() {
+    for v in [
+        Variant::Flash,
+        Variant::Pro,
+        Variant::SolarOpen2_250B,
+        Variant::Motif3,
+        Variant::Kexaone236B,
+        Variant::Dots3NotePrev,
+    ] {
+        let shape = shape_for_variant(v);
+        let bind: HashSet<String> = bind_names(&shape).into_iter().map(|n| n.name).collect();
+        let layout: HashSet<String> = expected_layouts(&shape).into_iter().map(|s| s.name).collect();
+        let missing: Vec<_> = bind.difference(&layout).cloned().collect();
+        let extra: Vec<_> = layout.difference(&bind).cloned().collect();
+        assert!(
+            missing.is_empty(),
+            "{v:?} bind names without layout: {missing:?}"
+        );
+        assert!(
+            extra.is_empty(),
+            "{v:?} layout names without bind: {extra:?}"
+        );
+    }
+}

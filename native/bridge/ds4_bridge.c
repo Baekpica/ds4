@@ -2,9 +2,11 @@
 
 #include "ds4.h"
 
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 
 /* Thin wrappers over the existing engine/session API.  No inference logic
  * lives here; this file exists so Rust never includes ds4.h. */
@@ -42,6 +44,108 @@ static int map_backend(int bridge_backend, ds4_backend *out, char *err, size_t e
     }
 }
 
+int ds4_bridge_bind_plan_check(const ds4_bridge_bind_plan *plan,
+                               char *err, size_t errlen)
+{
+    uint32_t i;
+
+    if (!plan) {
+        set_err(err, errlen, "plan-null");
+        return 1;
+    }
+    if (plan->n_slots > 0 && !plan->slots) {
+        set_err(err, errlen, "slots-null");
+        return 1;
+    }
+    if (plan->n_shards > 0 && !plan->shards) {
+        set_err(err, errlen, "shards-null");
+        return 1;
+    }
+    for (i = 0; i < plan->n_slots; i++) {
+        const ds4_bridge_bind_slot *s = &plan->slots[i];
+        if (!s->name || !s->name[0]) {
+            set_err(err, errlen, "name-empty");
+            return 1;
+        }
+        if (s->required && !s->found) {
+            if (err && errlen) snprintf(err, errlen, "missing %s", s->name);
+            return 1;
+        }
+        if (s->found && (s->ndim == 0 || s->ndim > DS4_BRIDGE_MAX_DIMS)) {
+            set_err(err, errlen, "bad-ndim");
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int ds4_bridge_bind_plan_match(const ds4_bridge_bind_plan *host,
+                               const ds4_bridge_bind_plan *native,
+                               char *err, size_t errlen)
+{
+    uint32_t i, d;
+
+    if (!host || !native) {
+        set_err(err, errlen, "plan-null");
+        return 1;
+    }
+    if (host->n_slots != native->n_slots) {
+        set_err(err, errlen, "count-mismatch");
+        return 1;
+    }
+    for (i = 0; i < host->n_slots; i++) {
+        const ds4_bridge_bind_slot *h = &host->slots[i];
+        const ds4_bridge_bind_slot *n = &native->slots[i];
+        if (!h->name || !n->name || strcmp(h->name, n->name) != 0) {
+            set_err(err, errlen, "name-mismatch");
+            return 1;
+        }
+        if (h->required != n->required) {
+            set_err(err, errlen, "need-mismatch");
+            return 1;
+        }
+        if (h->found != n->found) {
+            set_err(err, errlen, "found-mismatch");
+            return 1;
+        }
+        if (!h->found) continue;
+        if (h->type != n->type) {
+            set_err(err, errlen, "type-mismatch");
+            return 1;
+        }
+        if (h->ndim != n->ndim) {
+            set_err(err, errlen, "dim-mismatch");
+            return 1;
+        }
+        for (d = 0; d < h->ndim && d < DS4_BRIDGE_MAX_DIMS; d++) {
+            if (h->dim[d] != n->dim[d]) {
+                set_err(err, errlen, "dim-mismatch");
+                return 1;
+            }
+        }
+        if (h->rel_offset != n->rel_offset || h->abs_offset != n->abs_offset) {
+            set_err(err, errlen, "offset-mismatch");
+            return 1;
+        }
+        if (h->bytes != n->bytes) {
+            set_err(err, errlen, "bytes-mismatch");
+            return 1;
+        }
+        if (h->shard != n->shard) {
+            set_err(err, errlen, "shard-mismatch");
+            return 1;
+        }
+    }
+    if (host->n_shards != native->n_shards ||
+        host->data_pos != native->data_pos ||
+        host->alignment != native->alignment ||
+        host->page != native->page) {
+        set_err(err, errlen, "data-mismatch");
+        return 1;
+    }
+    return 0;
+}
+
 int ds4_bridge_model_open(ds4_bridge_model **out,
                           const ds4_bridge_model_open_options *opt,
                           char *err, size_t errlen)
@@ -60,14 +164,35 @@ int ds4_bridge_model_open(ds4_bridge_model **out,
         set_err(err, errlen, "model_path is required");
         return 1;
     }
+    if (opt->plan && ds4_bridge_bind_plan_check(opt->plan, err, errlen) != 0) {
+        return 1;
+    }
 
     memset(&eopt, 0, sizeof(eopt));
     eopt.model_path = opt->model_path;
     eopt.n_threads = opt->n_threads;
     eopt.defer_boot_prewarm = opt->defer_boot_prewarm != 0;
+    eopt.mtp_path = opt->mtp_path;
+    eopt.dspark_path = opt->dspark_path;
     if (map_backend(opt->backend, &eopt.backend, err, errlen) != 0) return 1;
 
+    if (opt->tensors) ds4_host_tensor_dir_install(opt->tensors);
+    if (opt->shape) ds4_host_shape_install(opt->shape);
+    if (opt->vocab) ds4_host_vocab_install(opt->vocab);
+    if (opt->bind) ds4_host_bind_map_install(opt->bind);
+    /* Sibling maps index the sibling's own tensor dir; only meaningful
+     * when the matching path rides the same open. */
+    if (opt->mtp_bind && opt->mtp_path && opt->mtp_path[0])
+        ds4_host_mtp_bind_map_install(opt->mtp_bind);
+    if (opt->dspark_bind && opt->dspark_path && opt->dspark_path[0])
+        ds4_host_dspark_bind_map_install(opt->dspark_bind);
     rc = ds4_engine_open(&engine, &eopt);
+    ds4_host_dspark_bind_map_clear();
+    ds4_host_mtp_bind_map_clear();
+    ds4_host_bind_map_clear();
+    ds4_host_vocab_clear();
+    ds4_host_shape_clear();
+    ds4_host_tensor_dir_clear();
     if (rc != 0 || !engine) {
         set_err(err, errlen, "ds4_engine_open failed");
         return rc != 0 ? rc : 1;
@@ -186,4 +311,330 @@ int ds4_bridge_session_pos(ds4_bridge_session *s)
 {
     if (!s || !s->session) return -1;
     return ds4_session_pos(s->session);
+}
+
+int ds4_bridge_session_ctx(ds4_bridge_session *s)
+{
+    if (!s || !s->session) return -1;
+    return ds4_session_ctx(s->session);
+}
+
+void ds4_bridge_session_rewind(ds4_bridge_session *s, int pos)
+{
+    if (!s || !s->session) return;
+    ds4_session_rewind(s->session, pos);
+}
+
+void ds4_bridge_session_invalidate(ds4_bridge_session *s)
+{
+    if (!s || !s->session) return;
+    ds4_session_invalidate(s->session);
+}
+
+uint64_t ds4_bridge_session_generation(ds4_bridge_session *s)
+{
+    if (!s || !s->session) return 0;
+    return ds4_session_generation(s->session);
+}
+
+int ds4_bridge_session_prefill_cap(ds4_bridge_session *s)
+{
+    if (!s || !s->session) return 0;
+    return ds4_session_prefill_cap(s->session);
+}
+
+int ds4_bridge_session_exaone_rewind_span(ds4_bridge_session *s)
+{
+    if (!s || !s->session) return 0;
+    return ds4_session_exaone_rewind_span(s->session);
+}
+
+int ds4_bridge_session_sample(ds4_bridge_session *s,
+                              float temperature, int top_k, float top_p, float min_p,
+                              uint64_t *rng)
+{
+    if (!s || !s->session) return -1;
+    return ds4_session_sample(s->session, temperature, top_k, top_p, min_p, rng);
+}
+
+int ds4_bridge_session_save_payload(ds4_bridge_session *s, const char *path,
+                                    char *err, size_t errlen)
+{
+    FILE *fp;
+    int rc;
+
+    if (!s || !s->session) {
+        set_err(err, errlen, "session is NULL");
+        return 1;
+    }
+    if (!path || !path[0]) {
+        set_err(err, errlen, "payload path is required");
+        return 1;
+    }
+    fp = fopen(path, "wb");
+    if (!fp) {
+        set_err(err, errlen, "failed to open session payload for write");
+        return 1;
+    }
+    rc = ds4_session_save_payload(s->session, fp, err, errlen);
+    if (fclose(fp) != 0 && rc == 0) {
+        set_err(err, errlen, "failed to close session payload");
+        return 1;
+    }
+    return rc;
+}
+
+int ds4_bridge_session_load_payload(ds4_bridge_session *s, const char *path,
+                                    char *err, size_t errlen)
+{
+    FILE *fp;
+    int rc;
+    off_t sz;
+    uint64_t payload_bytes;
+
+    if (!s || !s->session) {
+        set_err(err, errlen, "session is NULL");
+        return 1;
+    }
+    if (!path || !path[0]) {
+        set_err(err, errlen, "payload path is required");
+        return 1;
+    }
+    fp = fopen(path, "rb");
+    if (!fp) {
+        set_err(err, errlen, "failed to open session payload for read");
+        return 1;
+    }
+    if (fseeko(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        set_err(err, errlen, "failed to measure session payload");
+        return 1;
+    }
+    sz = ftello(fp);
+    if (sz < 0) {
+        fclose(fp);
+        set_err(err, errlen, "failed to measure session payload");
+        return 1;
+    }
+    payload_bytes = (uint64_t)sz;
+    if (fseeko(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        set_err(err, errlen, "failed to rewind session payload");
+        return 1;
+    }
+    rc = ds4_session_load_payload(s->session, fp, payload_bytes, err, errlen);
+    if (fclose(fp) != 0 && rc == 0) {
+        set_err(err, errlen, "failed to close session payload");
+        return 1;
+    }
+    return rc;
+}
+
+static int copy_tokens(ds4_tokens *tv, int32_t *out, int cap, int *n_out,
+                       char *err, size_t errlen)
+{
+    if (!n_out) {
+        ds4_tokens_free(tv);
+        set_err(err, errlen, "n_out is NULL");
+        return 1;
+    }
+    *n_out = tv->len;
+    if (tv->len > cap) {
+        ds4_tokens_free(tv);
+        set_err(err, errlen, "token buffer too small");
+        return 1;
+    }
+    if (tv->len > 0 && !out) {
+        ds4_tokens_free(tv);
+        set_err(err, errlen, "tokens is NULL");
+        return 1;
+    }
+    if (tv->len > 0) {
+        memcpy(out, tv->v, (size_t)tv->len * sizeof(int32_t));
+    }
+    ds4_tokens_free(tv);
+    return 0;
+}
+
+int ds4_bridge_tokenize_text(ds4_bridge_model *m, const char *text,
+                             int32_t *out, int cap, int *n_out,
+                             char *err, size_t errlen)
+{
+    ds4_tokens tv;
+
+    if (!m || !m->engine) {
+        if (n_out) *n_out = 0;
+        set_err(err, errlen, "model is NULL");
+        return 1;
+    }
+    if (cap < 0) {
+        if (n_out) *n_out = 0;
+        set_err(err, errlen, "cap is negative");
+        return 1;
+    }
+    memset(&tv, 0, sizeof(tv));
+    ds4_tokenize_text(m->engine, text ? text : "", &tv);
+    return copy_tokens(&tv, out, cap, n_out, err, errlen);
+}
+
+int ds4_bridge_tokenize_rendered_chat(ds4_bridge_model *m, const char *text,
+                                      int32_t *out, int cap, int *n_out,
+                                      char *err, size_t errlen)
+{
+    ds4_tokens tv;
+
+    if (!m || !m->engine) {
+        if (n_out) *n_out = 0;
+        set_err(err, errlen, "model is NULL");
+        return 1;
+    }
+    if (cap < 0) {
+        if (n_out) *n_out = 0;
+        set_err(err, errlen, "cap is negative");
+        return 1;
+    }
+    memset(&tv, 0, sizeof(tv));
+    ds4_tokenize_rendered_chat(m->engine, text ? text : "", &tv);
+    return copy_tokens(&tv, out, cap, n_out, err, errlen);
+}
+
+int ds4_bridge_token_text(ds4_bridge_model *m, int32_t token,
+                          char *out, size_t cap, size_t *n_out,
+                          char *err, size_t errlen)
+{
+    size_t len = 0;
+    char *piece;
+
+    if (!m || !m->engine) {
+        if (n_out) *n_out = 0;
+        set_err(err, errlen, "model is NULL");
+        return 1;
+    }
+    piece = ds4_token_text(m->engine, (int)token, &len);
+    if (!piece) {
+        if (n_out) *n_out = 0;
+        if (out && cap > 0) out[0] = '\0';
+        return 0;
+    }
+    if (n_out) *n_out = len;
+    if (len >= cap) {
+        free(piece);
+        set_err(err, errlen, "token text buffer too small");
+        return 1;
+    }
+    if (out) {
+        memcpy(out, piece, len);
+        out[len] = '\0';
+    }
+    free(piece);
+    return 0;
+}
+
+int ds4_bridge_token_eos(ds4_bridge_model *m)
+{
+    if (!m || !m->engine) return -1;
+    return ds4_token_eos(m->engine);
+}
+
+int ds4_bridge_token_is_stop(ds4_bridge_model *m, int32_t token)
+{
+    if (!m || !m->engine) return 0;
+    return ds4_token_is_stop(m->engine, (int)token) ? 1 : 0;
+}
+
+int ds4_bridge_model_id(ds4_bridge_model *m)
+{
+    if (!m || !m->engine) return -1;
+    return ds4_engine_model_id(m->engine);
+}
+
+/* Declared in ds4_gpu.h; the bridge does not include that header. */
+uint64_t ds4_gpu_substrate_outstanding(void);
+
+/* Seqlock snapshot + last-stable cache, copied from ds4_server.c
+ * mem_census_snapshot.  Do not include ds4_mem_census.h from Rust. */
+typedef char ds4_bridge_memc_count_ok[
+    (DS4_MEMC__COUNT == DS4_BRIDGE_MEMC_COUNT) ? 1 : -1];
+typedef char ds4_bridge_memd_count_ok[
+    (DS4_MEMD__COUNT == DS4_BRIDGE_MEMD_COUNT) ? 1 : -1];
+
+static pthread_mutex_t mem_census_snap_mu = PTHREAD_MUTEX_INITIALIZER;
+static ds4_bridge_mem_census mem_census_last_stable;
+static int mem_census_last_stable_valid;
+static uint64_t mem_census_torn_fallbacks;
+
+static void copy_mem_cell(ds4_bridge_mem_cell *dst, const ds4_mem_cell *src)
+{
+    dst->requested = src->requested;
+    dst->committed = src->committed;
+    dst->freed_requested = src->freed_requested;
+    dst->freed_committed = src->freed_committed;
+    dst->alloc_calls = src->alloc_calls;
+    dst->free_calls = src->free_calls;
+}
+
+int ds4_bridge_mem_census_snap(ds4_bridge_mem_census *out)
+{
+    int c, d, attempt;
+
+    if (!out) return 1;
+    memset(out, 0, sizeof(*out));
+    for (attempt = 0; attempt < 8; attempt++) {
+        const uint64_t began = ds4_gpu_mem_census_epoch_begin();
+        if (began & 1u)
+            continue;
+        for (c = 0; c < DS4_BRIDGE_MEMC_COUNT; c++) {
+            for (d = 0; d < DS4_BRIDGE_MEMD_COUNT; d++) {
+                ds4_mem_cell cell;
+                memset(&cell, 0, sizeof(cell));
+                if (ds4_gpu_mem_census_read(c, d, &cell) != 0)
+                    return 0;      /* backend keeps no census: supported=0 */
+                copy_mem_cell(&out->cells[c][d], &cell);
+            }
+        }
+        out->faults = ds4_gpu_mem_census_faults();
+        if (ds4_gpu_mem_census_epoch_verify(began)) {
+            out->epoch = began;
+            out->supported = 1;
+            pthread_mutex_lock(&mem_census_snap_mu);
+            mem_census_last_stable = *out;
+            mem_census_last_stable_valid = 1;
+            out->torn_fallbacks = mem_census_torn_fallbacks;
+            pthread_mutex_unlock(&mem_census_snap_mu);
+            return 0;
+        }
+    }
+    pthread_mutex_lock(&mem_census_snap_mu);
+    mem_census_torn_fallbacks++;
+    if (mem_census_last_stable_valid)
+        *out = mem_census_last_stable;
+    out->torn_fallbacks = mem_census_torn_fallbacks;
+    pthread_mutex_unlock(&mem_census_snap_mu);
+    return 0;
+}
+
+int ds4_bridge_mem_observe_snap(ds4_bridge_mem_observe *out)
+{
+    ds4_mem_observation o;
+
+    if (!out) return 1;
+    memset(&o, 0, sizeof(o));
+    o.status = DS4_MEMOBS_UNSUPPORTED;
+    (void)ds4_gpu_mem_observe(&o);
+    if (o.status < 0 || o.status > DS4_MEMOBS_QUERY_ERROR)
+        o.status = DS4_MEMOBS_QUERY_ERROR;
+    if (o.source < 0 || o.source > DS4_MEMOBS_SRC_MEMINFO_AVAILABLE)
+        o.source = DS4_MEMOBS_SRC_NONE;
+    out->status = (int32_t)o.status;
+    out->source = (int32_t)o.source;
+    out->free_bytes = o.free_bytes;
+    out->total_bytes = o.total_bytes;
+    out->cuda_free_bytes = o.cuda_free_bytes;
+    out->meminfo_avail_bytes = o.meminfo_avail_bytes;
+    return 0;
+}
+
+uint64_t ds4_bridge_mem_substrate_outstanding(void)
+{
+    return ds4_gpu_substrate_outstanding();
 }

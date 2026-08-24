@@ -27,6 +27,9 @@ version = "0.6.3"
 [[package]]
 name = "ds4-server"
 version = "0.6.3"
+dependencies = [
+ "ds4-core",
+]
 
 [[package]]
 name = "ds4-sys"

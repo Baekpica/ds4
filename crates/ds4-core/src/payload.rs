@@ -1,0 +1,455 @@
+//! Host-owned DSV4 session payload prefix: 13×u32 LE header + token ids.
+//! GPU / logits / family tensor tails stay native (`ds4_session_save_payload`).
+//!
+//! Copied from `ds4.c` / `ds4.h` at v0.6.3-dfm. Little-endian `payload_put_u32`.
+
+use crate::session::SessionLedger;
+use crate::shape::ModelFamily;
+
+pub const MAGIC: u32 = 0x3456_5344; /* "DSV4" */
+pub const VERSION: u32 = 3;
+pub const U32_FIELDS: usize = 13;
+pub const HEADER_BYTES: usize = U32_FIELDS * 4;
+
+pub const LAYOUT_SOLAR: u32 = 0x3352_4C53; /* "SLR3" */
+pub const LAYOUT_EXAONE: u32 = 0x3341_5845; /* "EXA3" */
+pub const LAYOUT_MOTIF3: u32 = 0x3346_544D; /* "MTF3" */
+pub const LAYOUT_DOTS3: u32 = 0x3353_5444; /* "DTS3" */
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PayloadLayout {
+    DeepSeek,
+    Solar,
+    Exaone,
+    Motif3,
+    Dots3,
+}
+
+impl PayloadLayout {
+    pub fn from_fields(h: &[u32; U32_FIELDS]) -> Self {
+        match h[5] {
+            LAYOUT_SOLAR => Self::Solar,
+            LAYOUT_EXAONE => Self::Exaone,
+            LAYOUT_MOTIF3 => Self::Motif3,
+            LAYOUT_DOTS3 => Self::Dots3,
+            _ => Self::DeepSeek,
+        }
+    }
+
+    pub fn family(self) -> ModelFamily {
+        match self {
+            Self::DeepSeek => ModelFamily::DeepSeek4,
+            Self::Solar => ModelFamily::SolarOpen2,
+            Self::Exaone => ModelFamily::ExaoneMoe,
+            Self::Motif3 => ModelFamily::Motif3,
+            Self::Dots3 => ModelFamily::Dots3Note,
+        }
+    }
+
+    pub fn oracle_name(self) -> &'static str {
+        self.family().oracle_name()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostPrefix {
+    pub fields: [u32; U32_FIELDS],
+    pub tokens: Vec<u32>,
+}
+
+impl HostPrefix {
+    pub fn layout(&self) -> PayloadLayout {
+        PayloadLayout::from_fields(&self.fields)
+    }
+
+    pub fn token_count(&self) -> u32 {
+        self.fields[7]
+    }
+
+    pub fn ctx(&self) -> u32 {
+        self.fields[2]
+    }
+
+    pub fn version(&self) -> u32 {
+        self.fields[1]
+    }
+
+    pub fn prefix_len(&self) -> usize {
+        HEADER_BYTES + self.tokens.len() * 4
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.prefix_len());
+        for f in self.fields {
+            out.extend_from_slice(&put_u32(f));
+        }
+        for t in &self.tokens {
+            out.extend_from_slice(&put_u32(*t));
+        }
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PayloadError {
+    pub message: &'static str,
+}
+
+impl std::fmt::Display for PayloadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for PayloadError {}
+
+fn err(message: &'static str) -> PayloadError {
+    PayloadError { message }
+}
+
+pub fn put_u32(v: u32) -> [u8; 4] {
+    v.to_le_bytes()
+}
+
+pub fn get_u32(in4: &[u8]) -> u32 {
+    u32::from_le_bytes([in4[0], in4[1], in4[2], in4[3]])
+}
+
+pub fn encode_fields(fields: &[u32; U32_FIELDS], tokens: &[u32]) -> Vec<u8> {
+    HostPrefix {
+        fields: *fields,
+        tokens: tokens.to_vec(),
+    }
+    .encode()
+}
+
+pub fn parse_prefix(bytes: &[u8]) -> Result<HostPrefix, PayloadError> {
+    if bytes.len() < HEADER_BYTES {
+        return Err(err("truncated session payload"));
+    }
+    let mut fields = [0u32; U32_FIELDS];
+    for i in 0..U32_FIELDS {
+        let off = i * 4;
+        fields[i] = get_u32(&bytes[off..off + 4]);
+    }
+    if fields[0] != MAGIC || fields[1] == 0 || fields[1] > VERSION {
+        return Err(err("unsupported session payload version"));
+    }
+    let n = fields[7] as usize;
+    let need = HEADER_BYTES.saturating_add(n.saturating_mul(4));
+    if bytes.len() < need {
+        return Err(err("truncated session payload"));
+    }
+    let mut tokens = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = HEADER_BYTES + i * 4;
+        tokens.push(get_u32(&bytes[off..off + 4]));
+    }
+    let prefix = HostPrefix { fields, tokens };
+    validate_layout(&prefix)?;
+    Ok(prefix)
+}
+
+fn validate_layout(p: &HostPrefix) -> Result<(), PayloadError> {
+    match p.layout() {
+        PayloadLayout::Solar | PayloadLayout::Exaone | PayloadLayout::Motif3 | PayloadLayout::Dots3 => {
+            if p.fields[12] != p.fields[7] {
+                return Err(err("session payload token count does not match live rows"));
+            }
+        }
+        PayloadLayout::DeepSeek => {}
+    }
+    Ok(())
+}
+
+pub fn tail(bytes: &[u8]) -> Result<&[u8], PayloadError> {
+    let p = parse_prefix(bytes)?;
+    Ok(&bytes[p.prefix_len()..])
+}
+
+impl SessionLedger {
+    pub fn apply_payload(&mut self, prefix: &HostPrefix) -> Result<(), PayloadError> {
+        if prefix.layout().family() != self.family {
+            return Err(err("session payload was written for a different model family"));
+        }
+        if prefix.tokens.len() >= self.ctx.max(0) as usize {
+            return Err(err("session payload exceeds context"));
+        }
+        let tokens: Vec<i32> = prefix.tokens.iter().map(|&t| t as i32).collect();
+        self.replace_checkpoint(&tokens);
+        Ok(())
+    }
+}
+
+fn fixture_deepseek() -> HostPrefix {
+    HostPrefix {
+        fields: [
+            MAGIC,
+            VERSION,
+            8192,
+            64,
+            8192,
+            512,
+            2048,
+            3,
+            61,
+            128,
+            64,
+            129280,
+            3,
+        ],
+        tokens: vec![10, 20, 30],
+    }
+}
+
+fn fixture_cpu() -> HostPrefix {
+    HostPrefix {
+        fields: [
+            MAGIC,
+            VERSION,
+            8192,
+            64,
+            8192,
+            8192,
+            2048,
+            2,
+            61,
+            128,
+            64,
+            129280,
+            2,
+        ],
+        tokens: vec![1, 2],
+    }
+}
+
+fn fixture_solar() -> HostPrefix {
+    HostPrefix {
+        fields: [
+            MAGIC,
+            VERSION,
+            4096,
+            1,
+            4096,
+            LAYOUT_SOLAR,
+            1000,
+            2,
+            48,
+            256,
+            12,
+            200064,
+            2,
+        ],
+        tokens: vec![7, 8],
+    }
+}
+
+fn fixture_exaone() -> HostPrefix {
+    HostPrefix {
+        fields: [
+            MAGIC,
+            VERSION,
+            8192,
+            64,
+            48,
+            LAYOUT_EXAONE,
+            512,
+            2,
+            49,
+            128,
+            128,
+            153088,
+            2,
+        ],
+        tokens: vec![1, 2],
+    }
+}
+
+fn fixture_motif3() -> HostPrefix {
+    HostPrefix {
+        fields: [
+            MAGIC,
+            VERSION,
+            8192,
+            2048,
+            512,
+            LAYOUT_MOTIF3,
+            1024,
+            2,
+            53,
+            64,
+            128,
+            151936,
+            2,
+        ],
+        tokens: vec![3, 4],
+    }
+}
+
+fn fixture_dots3() -> HostPrefix {
+    HostPrefix {
+        fields: [
+            MAGIC,
+            VERSION,
+            8192,
+            2048,
+            512,
+            LAYOUT_DOTS3,
+            1024,
+            2,
+            46,
+            64,
+            128,
+            152064,
+            2,
+        ],
+        tokens: vec![5, 6],
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2 + 1);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s.push('\n');
+    s
+}
+
+fn inspect_text(p: &HostPrefix) -> String {
+    format!(
+        "layout={} version={} ctx={} ntok={} prefix={}\ntokens={}\n",
+        p.layout().oracle_name(),
+        p.version(),
+        p.ctx(),
+        p.token_count(),
+        p.prefix_len(),
+        p.tokens
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn parse_hex(s: &str) -> Result<Vec<u8>, PayloadError> {
+    let raw: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+    if raw.len() % 2 != 0 {
+        return Err(err("truncated session payload"));
+    }
+    let mut out = Vec::with_capacity(raw.len() / 2);
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let hi = hex_nibble(bytes[i])?;
+        let lo = hex_nibble(bytes[i + 1])?;
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    Ok(out)
+}
+
+fn hex_nibble(b: u8) -> Result<u8, PayloadError> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(err("truncated session payload")),
+    }
+}
+
+fn flip_magic(mut bytes: Vec<u8>) -> Vec<u8> {
+    if !bytes.is_empty() {
+        bytes[0] ^= 0xff;
+    }
+    bytes
+}
+
+fn set_version(mut bytes: Vec<u8>, v: u32) -> Vec<u8> {
+    if bytes.len() >= 8 {
+        bytes[4..8].copy_from_slice(&v.to_le_bytes());
+    }
+    bytes
+}
+
+/// Tape matching `tests/parity/payload_c_oracle`.
+pub fn dump_script(name: &str) -> String {
+    match name {
+        "encode-deepseek" => hex(&fixture_deepseek().encode()),
+        "encode-cpu" => hex(&fixture_cpu().encode()),
+        "encode-solar" => hex(&fixture_solar().encode()),
+        "encode-exaone" => hex(&fixture_exaone().encode()),
+        "encode-motif3" => hex(&fixture_motif3().encode()),
+        "encode-dots3" => hex(&fixture_dots3().encode()),
+        "inspect-deepseek" => inspect_text(&fixture_deepseek()),
+        "inspect-solar" => inspect_text(&fixture_solar()),
+        "inspect-exaone" => inspect_text(&fixture_exaone()),
+        "inspect-motif3" => inspect_text(&fixture_motif3()),
+        "inspect-dots3" => inspect_text(&fixture_dots3()),
+        "tail-offset" => format!("prefix={}\n", fixture_deepseek().prefix_len()),
+        "reject-trunc" => match parse_prefix(&[0u8; 10]) {
+            Ok(_) => "ok\n".into(),
+            Err(e) => format!("ERROR {}\n", e.message),
+        },
+        "reject-magic" => match parse_prefix(&flip_magic(fixture_deepseek().encode())) {
+            Ok(_) => "ok\n".into(),
+            Err(e) => format!("ERROR {}\n", e.message),
+        },
+        "reject-version-0" => match parse_prefix(&set_version(fixture_deepseek().encode(), 0)) {
+            Ok(_) => "ok\n".into(),
+            Err(e) => format!("ERROR {}\n", e.message),
+        },
+        "reject-version-4" => match parse_prefix(&set_version(fixture_deepseek().encode(), 4)) {
+            Ok(_) => "ok\n".into(),
+            Err(e) => format!("ERROR {}\n", e.message),
+        },
+        "apply-deepseek" => {
+            let p = fixture_deepseek();
+            let mut host = SessionLedger::new(
+                ModelFamily::DeepSeek4,
+                crate::session::SessionBackend::Cuda,
+                8192,
+                64,
+            );
+            match host.apply_payload(&p) {
+                Ok(()) => format!(
+                    "APPLY valid={} pos={} tokens={}\n",
+                    u32::from(host.valid),
+                    host.pos(),
+                    host.tokens()
+                        .iter()
+                        .map(|t| t.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                Err(e) => format!("ERROR {}\n", e.message),
+            }
+        }
+        "apply-family-miss" => {
+            let p = fixture_solar();
+            let mut host = SessionLedger::new(
+                ModelFamily::DeepSeek4,
+                crate::session::SessionBackend::Cuda,
+                8192,
+                64,
+            );
+            match host.apply_payload(&p) {
+                Ok(()) => "ok\n".into(),
+                Err(e) => format!("ERROR {}\n", e.message),
+            }
+        }
+        _ => "ERROR unknown-script\n".into(),
+    }
+}
+
+pub fn dump_cmd(cmd: &str, args: &[&str]) -> String {
+    if cmd == "inspect" {
+        if let Some(hexs) = args.first() {
+            return match parse_hex(hexs).and_then(|b| parse_prefix(&b)) {
+                Ok(p) => inspect_text(&p),
+                Err(e) => format!("ERROR {}\n", e.message),
+            };
+        }
+    }
+    dump_script(cmd)
+}

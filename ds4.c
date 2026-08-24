@@ -38,6 +38,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "native/bridge/ds4_host_load.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -1619,6 +1620,7 @@ typedef struct {
 
     ds4_kv *kv;
     ds4_tensor *tensors;
+    int host_names_owned; /* 1 when names were strdup'd from a host dir */
 
     /* Split GGUF shards are mapped into one reserved virtual range.  Keeping
      * one map base preserves the engine-wide map + abs_offset tensor contract
@@ -1630,6 +1632,188 @@ typedef struct {
      * knowledge.  Consumers index it in tensor order. */
     uint8_t *tensor_traits;
 } ds4_model;
+
+/* Borrowed for one ds4_engine_open.  The C CLI/server leave these NULL so
+ * parse_tensors, config_validate_model, and vocab_load stay the
+ * production path.  Rust Model::open installs the host inventory,
+ * validated shape, Vocab, and bind map; model_open skips parse_tensors
+ * and ds4_engine_open applies the pinned literal + host vocab (token
+ * strings stay borrowed from Rust Vocab).  weights_bind resolves
+ * names through the host bind map when installed, and skips the
+ * main-model weights_validate_layout (host already ran it).
+ * MTP/DSpark sibling layout checks stay C.  CUDA upload stays
+ * inside ds4_engine_open. */
+static const ds4_host_tensor_dir *g_host_tensor_dir;
+static const ds4_host_shape *g_host_shape;
+static const ds4_host_vocab *g_host_vocab;
+static const ds4_host_bind_map *g_host_bind_map;
+
+void ds4_host_tensor_dir_install(const ds4_host_tensor_dir *d) {
+    g_host_tensor_dir = d;
+}
+
+void ds4_host_tensor_dir_clear(void) {
+    g_host_tensor_dir = NULL;
+}
+
+void ds4_host_shape_install(const ds4_host_shape *s) {
+    g_host_shape = s;
+}
+
+void ds4_host_shape_clear(void) {
+    g_host_shape = NULL;
+}
+
+void ds4_host_vocab_install(const ds4_host_vocab *v) {
+    g_host_vocab = v;
+}
+
+void ds4_host_vocab_clear(void) {
+    g_host_vocab = NULL;
+}
+
+void ds4_host_bind_map_install(const ds4_host_bind_map *m) {
+    g_host_bind_map = m;
+}
+
+void ds4_host_bind_map_clear(void) {
+    g_host_bind_map = NULL;
+}
+
+/* MTP/DSpark sibling bind maps live in their own slots: the base map is
+ * cleared after base weights_bind, and ds4_engine_open swaps each sibling
+ * map into the active slot only around that sibling's own open+bind
+ * window, so a base-model name can never resolve through sibling indices
+ * (and vice versa). */
+static const ds4_host_bind_map *g_host_mtp_bind_map;
+static const ds4_host_bind_map *g_host_dspark_bind_map;
+
+void ds4_host_mtp_bind_map_install(const ds4_host_bind_map *m) {
+    g_host_mtp_bind_map = m;
+}
+
+void ds4_host_mtp_bind_map_clear(void) {
+    g_host_mtp_bind_map = NULL;
+}
+
+void ds4_host_dspark_bind_map_install(const ds4_host_bind_map *m) {
+    g_host_dspark_bind_map = m;
+}
+
+void ds4_host_dspark_bind_map_clear(void) {
+    g_host_dspark_bind_map = NULL;
+}
+
+/* Host already ran config_validate.  Apply the pinned literal + the
+ * verified DeepSeek compress table so CUDA bind sees the same globals. */
+static void model_apply_host_shape(void) {
+    const ds4_host_shape *s = g_host_shape;
+
+    if (!s) ds4_die("dir-null");
+    switch (s->variant) {
+    case DS4_VARIANT_FLASH:
+        g_ds4_shape = DS4_SHAPE_FLASH;
+        break;
+    case DS4_VARIANT_PRO:
+        g_ds4_shape = DS4_SHAPE_PRO;
+        break;
+    case DS4_VARIANT_SOLAR_OPEN2_250B:
+        g_ds4_shape = DS4_SHAPE_SOLAR_OPEN2_250B;
+        break;
+    case DS4_VARIANT_MOTIF3:
+        g_ds4_shape = DS4_SHAPE_MOTIF3;
+        break;
+    case DS4_VARIANT_KEXAONE_236B:
+        g_ds4_shape = DS4_SHAPE_KEXAONE_236B;
+        break;
+    case DS4_VARIANT_DOTS3_NOTE_PREV:
+        g_ds4_shape = DS4_SHAPE_DOTS3_NOTE_PREV;
+        break;
+    default:
+        ds4_die("unsupported");
+    }
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4) {
+        if (s->n_compress != DS4_N_LAYER || !s->compress) {
+            ds4_die("data-mismatch");
+        }
+        memcpy(g_ds4_compress_ratios, s->compress,
+               (size_t)s->n_compress * sizeof(s->compress[0]));
+    } else if (s->n_compress != 0) {
+        ds4_die("data-mismatch");
+    }
+}
+
+static void model_free_owned_tensor_names(ds4_model *m) {
+    uint64_t i;
+
+    if (!m || !m->host_names_owned || !m->tensors) return;
+    for (i = 0; i < m->n_tensors; i++) {
+        free((void *)m->tensors[i].name.ptr);
+        m->tensors[i].name.ptr = NULL;
+        m->tensors[i].name.len = 0;
+    }
+    m->host_names_owned = 0;
+}
+
+/* Host inventory is the tensor table.  Names are copied because the
+ * Rust CString backing dies when Model::open returns. */
+static void model_apply_host_tensors(ds4_model *m) {
+    const ds4_host_tensor_dir *dir = g_host_tensor_dir;
+    ds4_host_native_tensor *view = NULL;
+    char herr[256];
+    uint64_t i;
+
+    if (!dir) ds4_die("dir-null");
+    if (dir->alignment != m->alignment) ds4_die("data-mismatch");
+    if (dir->n > 0) {
+        view = xmalloc((size_t)dir->n * sizeof(*view));
+    }
+    if (ds4_host_tensor_dir_apply(view, dir->n, dir, herr, sizeof herr) != 0) {
+        ds4_die(herr);
+    }
+
+    m->tensors = calloc((size_t)dir->n, sizeof(m->tensors[0]));
+    if (dir->n != 0 && !m->tensors) {
+        ds4_die("out of memory while allocating tensor table");
+    }
+    m->n_tensors = dir->n;
+    m->tensor_data_pos = dir->data_pos;
+    m->host_names_owned = 1;
+    m->max_tensor_bytes = 0;
+
+    for (i = 0; i < dir->n; i++) {
+        ds4_tensor *t = &m->tensors[i];
+        const ds4_host_native_tensor *n = &view[i];
+        uint32_t d;
+
+        t->name.ptr = ds4_strdup(n->name);
+        t->name.len = n->name_len;
+        t->ndim = n->ndim;
+        memcpy(t->dim, n->dim, sizeof(t->dim));
+        t->type = n->type;
+        t->rel_offset = n->rel_offset;
+        t->abs_offset = n->abs_offset;
+        t->bytes = n->bytes;
+
+        t->elements = 1;
+        for (d = 0; d < t->ndim; d++) {
+            if (t->dim[d] != 0 && t->elements > UINT64_MAX / t->dim[d]) {
+                ds4_die("tensor element count overflow");
+            }
+            t->elements *= t->dim[d];
+        }
+        if (t->bytes != 0 &&
+            (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset))
+        {
+            ds4_die("tensor points outside GGUF file");
+        }
+        if (t->bytes > m->max_tensor_bytes) {
+            m->max_tensor_bytes = t->bytes;
+        }
+    }
+    free(view);
+}
 
 static uint64_t scalar_value_size(uint32_t type) {
     switch (type) {
@@ -1871,6 +2055,7 @@ static bool model_get_array(const ds4_model *m, const char *key, ds4_array_ref *
 static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
+    model_free_owned_tensor_names(m);
     free(m->tensors);
     free(m->tensor_traits);
     if (m->map) munmap((void *)m->map, (size_t)m->size);
@@ -2228,7 +2413,6 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     if (m->version != 3) ds4_die("only GGUF v3 is supported");
 
     parse_metadata(m, &c);
-    parse_tensors(m, &c);
 
     uint16_t split_count16 = 0;
     uint32_t split_count = 0;
@@ -2238,7 +2422,12 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
         (void)model_get_u32(m, "split.count", &split_count);
     }
     if (split_count > 1u) {
+        /* C default still walks the first-file tensor directory before
+         * discarding it (bit-identical error timing).  A host directory
+         * already has the remapped table, so skip that wasted parse. */
+        if (!g_host_tensor_dir) parse_tensors(m, &c);
         free(m->kv);
+        model_free_owned_tensor_names(m);
         free(m->tensors);
         m->kv = NULL;
         m->tensors = NULL;
@@ -2247,6 +2436,13 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
         close(m->fd);
         m->fd = -1;
         model_open_split(m, path, split_count, mmap_flags);
+    } else if (g_host_tensor_dir) {
+        if ((uint64_t)g_host_tensor_dir->n != m->n_tensors) {
+            ds4_die("count-mismatch");
+        }
+        model_apply_host_tensors(m);
+    } else {
+        parse_tensors(m, &c);
     }
     /* memgov D1a-2: build the semantic catalog after tensors are final
      * (including after a split remap). */
@@ -2343,41 +2539,48 @@ static void model_open_split(ds4_model *m, const char *path, uint32_t count,
     if (!cursor_u64(&c, &m->n_kv)) ds4_die(c.error);
     if (m->version != 3) ds4_die("only GGUF v3 is supported");
     parse_metadata(m, &c);
-    parse_tensors(m, &c);
+    if (g_host_tensor_dir) {
+        /* Host table is already remapped across shards.  First-shard
+         * n_tensors is not the full count; apply overwrites it. */
+        model_apply_host_tensors(m);
+    } else {
+        parse_tensors(m, &c);
+
+        uint64_t total_tensors = m->n_tensors;
+        ds4_model *shards = xcalloc(count, sizeof(*shards));
+        for (uint32_t k = 1; k < count; k++) {
+            model_parse_shard(&shards[k],
+                              (const uint8_t *)region + bases[k],
+                              sizes[k], path);
+            if (shards[k].n_tensors > UINT64_MAX - total_tensors) {
+                ds4_die("split GGUF tensor count overflow");
+            }
+            total_tensors += shards[k].n_tensors;
+        }
+        if (total_tensors > SIZE_MAX / sizeof(ds4_tensor)) {
+            ds4_die("split GGUF tensor table is too large");
+        }
+
+        ds4_tensor *all = xcalloc((size_t)total_tensors, sizeof(*all));
+        memcpy(all, m->tensors, (size_t)m->n_tensors * sizeof(*all));
+        uint64_t at = m->n_tensors;
+        for (uint32_t k = 1; k < count; k++) {
+            for (uint64_t i = 0; i < shards[k].n_tensors; i++) {
+                ds4_tensor t = shards[k].tensors[i];
+                t.abs_offset += bases[k];
+                if (t.bytes > m->max_tensor_bytes) m->max_tensor_bytes = t.bytes;
+                all[at++] = t;
+            }
+            free(shards[k].kv);
+            free(shards[k].tensors);
+        }
+        free(shards);
+        free(m->tensors);
+        m->tensors = all;
+        m->n_tensors = total_tensors;
+    }
 
     uint64_t total_tensors = m->n_tensors;
-    ds4_model *shards = xcalloc(count, sizeof(*shards));
-    for (uint32_t k = 1; k < count; k++) {
-        model_parse_shard(&shards[k],
-                          (const uint8_t *)region + bases[k],
-                          sizes[k], path);
-        if (shards[k].n_tensors > UINT64_MAX - total_tensors) {
-            ds4_die("split GGUF tensor count overflow");
-        }
-        total_tensors += shards[k].n_tensors;
-    }
-    if (total_tensors > SIZE_MAX / sizeof(ds4_tensor)) {
-        ds4_die("split GGUF tensor table is too large");
-    }
-
-    ds4_tensor *all = xcalloc((size_t)total_tensors, sizeof(*all));
-    memcpy(all, m->tensors, (size_t)m->n_tensors * sizeof(*all));
-    uint64_t at = m->n_tensors;
-    for (uint32_t k = 1; k < count; k++) {
-        for (uint64_t i = 0; i < shards[k].n_tensors; i++) {
-            ds4_tensor t = shards[k].tensors[i];
-            t.abs_offset += bases[k];
-            if (t.bytes > m->max_tensor_bytes) m->max_tensor_bytes = t.bytes;
-            all[at++] = t;
-        }
-        free(shards[k].kv);
-        free(shards[k].tensors);
-    }
-    free(shards);
-    free(m->tensors);
-    m->tensors = all;
-    m->n_tensors = total_tensors;
-
     uint32_t expected_tensors = 0;
     ds4_kv *count_kv = model_find_kv(m, "split.tensors.count");
     if (count_kv && (count_kv->type == GGUF_VALUE_INT32 ||
@@ -2519,6 +2722,22 @@ static void model_summary(const ds4_model *m) {
 }
 
 static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
+    if (g_host_bind_map) {
+        uint32_t idx = DS4_HOST_BIND_MISS;
+        char herr[256];
+        int rc = ds4_host_bind_lookup(g_host_bind_map, name,
+                                      (uint32_t)m->n_tensors, &idx,
+                                      herr, sizeof herr);
+        if (rc == 0) {
+            if (idx == DS4_HOST_BIND_MISS) return NULL;
+            return &m->tensors[idx];
+        }
+        if (rc != 2) {
+            if (strncmp(herr, "missing ", 8) == 0) return NULL;
+            ds4_die(herr);
+        }
+        /* unknown: MTP/DSpark sibling names stay on the C walk */
+    }
     const size_t len = strlen(name);
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         if (m->tensors[i].name.len == len &&
@@ -6021,7 +6240,7 @@ static void weights_bind(
             weights_bind_motif3_layer(&w->layer[il], m, il);
         }
         weights_bind_motif3_mtp(w, m);
-        weights_validate_layout(w);
+        if (!g_host_bind_map) weights_validate_layout(w);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) {
@@ -6032,7 +6251,7 @@ static void weights_bind(
             weights_bind_dots3_note_layer(&w->layer[il], m, il);
         }
         w->dots3_token_embd_mtp = required_tensor(m, "token_embd_mtp.weight");
-        weights_validate_layout(w);
+        if (!g_host_bind_map) weights_validate_layout(w);
         return;
     }
     w->token_embd       = required_tensor(m, "token_embd.weight");
@@ -6100,7 +6319,7 @@ static void weights_bind(
         }
     }
 
-    weights_validate_layout(w);
+    if (!g_host_bind_map) weights_validate_layout(w);
 }
 
 typedef struct {
@@ -6293,7 +6512,9 @@ static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
     l->ffn_up_shexp    = required_tensor(m, "mtp.0.ffn_up_shexp.weight");
     l->ffn_down_shexp  = required_tensor(m, "mtp.0.ffn_down_shexp.weight");
 
-    mtp_weights_validate_layout(w);
+    /* Host sibling bind map installed => the host already validated the
+     * MTP expected-layout table (the base weights_bind skip, mirrored). */
+    if (!g_host_bind_map) mtp_weights_validate_layout(w);
 }
 
 /* Validate one DSpark MoE layer. The drafter layers are dense (SWA-128, no
@@ -6396,7 +6617,10 @@ static void dspark_weights_bind(ds4_dspark_weights *w, const ds4_model *m) {
         l->ffn_down_shexp  = required_tensorf(m, "dspark.%u.ffn_down_shexp.weight", L);
     }
 
-    dspark_weights_validate_layout(w, m);
+    /* Host sibling bind map installed => host already ran the DSpark
+     * expected-layout table; the standalone ds4_dspark_validate gate
+     * never installs a map and keeps the strict C check. */
+    if (!g_host_bind_map) dspark_weights_validate_layout(w, m);
 }
 
 /*
@@ -29425,6 +29649,79 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     vocab->latent_pad_id = -1;
     vocab->latent_end_id = -1;
     vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
+}
+
+/* Host already ran vocab_load.  Copy borrowed token/merge strings and
+ * rebuild the C hash tables so encode/decode/stop stay inside ds4.c. */
+static void model_apply_host_vocab(ds4_vocab *vocab) {
+    const ds4_host_vocab *h = g_host_vocab;
+    char err[64];
+    uint32_t i;
+
+    if (ds4_host_vocab_apply(h, err, sizeof err) != 0) ds4_die(err);
+    memset(vocab, 0, sizeof(*vocab));
+    vocab->n_vocab = (int)h->n_vocab;
+    if (h->n_vocab > 0) {
+        vocab->token = xcalloc((size_t)h->n_vocab, sizeof(vocab->token[0]));
+    }
+    table_init(&vocab->token_to_id, h->n_vocab);
+    for (i = 0; i < h->n_vocab; i++) {
+        vocab->token[i].ptr = h->tokens[i].ptr;
+        vocab->token[i].len = h->tokens[i].len;
+        table_put(&vocab->token_to_id, vocab->token[i], (int)i);
+    }
+    table_init(&vocab->user_defined, h->n_user_defined ? h->n_user_defined : 64);
+    for (i = 0; i < h->n_user_defined; i++) {
+        int32_t id = h->user_defined[i];
+        table_put(&vocab->user_defined, vocab->token[id], id);
+    }
+    vocab->user_defined_max_len = h->user_defined_max_len;
+    for (i = 0; i < 256; i++) {
+        vocab->user_defined_first[i] = h->user_defined_first[i] != 0;
+        vocab->motif3_added_first[i] = h->motif3_added_first[i] != 0;
+    }
+    table_init(&vocab->merge_rank, h->n_merges);
+    for (i = 0; i < h->n_merges; i++) {
+        ds4_str merge;
+        merge.ptr = h->merges[i].ptr;
+        merge.len = h->merges[i].len;
+        table_put(&vocab->merge_rank, merge, (int)i);
+    }
+    vocab->bos_id = h->bos_id;
+    vocab->eos_id = h->eos_id;
+    vocab->system_id = h->system_id;
+    vocab->eot_id = h->eot_id;
+    vocab->im_start_id = h->im_start_id;
+    vocab->im_content_id = h->im_content_id;
+    vocab->im_end_id = h->im_end_id;
+    vocab->user_id = h->user_id;
+    vocab->assistant_id = h->assistant_id;
+    vocab->start_of_turn_id = h->start_of_turn_id;
+    vocab->end_of_turn_id = h->end_of_turn_id;
+    vocab->tool_id = h->tool_id;
+    vocab->reference_id = h->reference_id;
+    vocab->plan_start_id = h->plan_start_id;
+    vocab->plan_end_id = h->plan_end_id;
+    vocab->observation_id = h->observation_id;
+    vocab->sop_id = h->sop_id;
+    vocab->think_start_id = h->think_start_id;
+    vocab->think_end_id = h->think_end_id;
+    vocab->tool_call_start_id = h->tool_call_start_id;
+    vocab->tool_call_end_id = h->tool_call_end_id;
+    vocab->tool_response_start_id = h->tool_response_start_id;
+    vocab->tool_response_end_id = h->tool_response_end_id;
+    vocab->arg_key_start_id = h->arg_key_start_id;
+    vocab->arg_key_end_id = h->arg_key_end_id;
+    vocab->arg_value_start_id = h->arg_value_start_id;
+    vocab->latent_start_id = h->latent_start_id;
+    vocab->latent_pad_id = h->latent_pad_id;
+    vocab->latent_end_id = h->latent_end_id;
+    vocab->tool_schema_start_id = h->tool_schema_start_id;
+    vocab->tool_schema_end_id = h->tool_schema_end_id;
+    vocab->dsml_id = h->dsml_id;
+    vocab->dots3_endofsystem_id = h->dots3_endofsystem_id;
+    vocab->dots3_endofuser_id = h->dots3_endofuser_id;
+    vocab->dots3_endoftext_id = h->dots3_endoftext_id;
 }
 
 static void vocab_free(ds4_vocab *vocab) {
@@ -55396,8 +55693,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
-    config_validate_model(&e->model);
-    if (!opt->inspect_only) vocab_load(&e->vocab, &e->model);
+    if (g_host_shape) model_apply_host_shape();
+    else config_validate_model(&e->model);
+    if (!opt->inspect_only) {
+        if (g_host_vocab) model_apply_host_vocab(&e->vocab);
+        else vocab_load(&e->vocab, &e->model);
+    }
     weights_bind(&e->weights,
                  &e->model,
                  load_slice,
@@ -55405,6 +55706,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                  load_layer_end,
                  load_output,
                  false);
+    /* Host tables describe the base GGUF only.  MTP/DSpark sibling
+     * model_open must walk its own tensor directory.  Shape/vocab are
+     * already applied to g_ds4_shape / e->vocab. */
+    ds4_host_bind_map_clear();
+    ds4_host_vocab_clear();
+    ds4_host_shape_clear();
+    ds4_host_tensor_dir_clear();
     if (opt->inspect_only) {
         *out = e;
         return 0;
@@ -55431,8 +55739,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+        /* Host-resolved sibling map: swapped into the active slot only for
+         * this window so mtp names resolve by index and the layout check
+         * above skips (the host already ran the expected-layout table). */
+        if (g_host_mtp_bind_map) ds4_host_bind_map_install(g_host_mtp_bind_map);
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
+        ds4_host_bind_map_clear();
         e->mtp_ready = true;
         /* v0.5.1 inc4: nothing in the gguf identifies which base checkpoint
          * this module was extracted for (see the engine fields) -- arm the
@@ -55457,8 +55770,14 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         if (!dspark_path || !dspark_path[0]) dspark_path = getenv("DS4_DSPARK_MODEL");
         if (dspark_path && dspark_path[0] &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE) {
+            /* The host dspark map indexes the flag path's tensor dir; an
+             * env-fallback path could be a different file, so only the
+             * explicit-path case installs it (the bridge sets both). */
+            if (g_host_dspark_bind_map && opt->dspark_path && opt->dspark_path[0])
+                ds4_host_bind_map_install(g_host_dspark_bind_map);
             model_open(&e->dspark_model, dspark_path, graph_backend, true);
             dspark_weights_bind(&e->dspark_weights, &e->dspark_model);
+            ds4_host_bind_map_clear();
             e->dspark_ready = true;
             fprintf(stderr, "ds4: DSpark drafter loaded: %s (%u layers)\n",
                     dspark_path, (unsigned)DS4_DSPARK_N_LAYER);

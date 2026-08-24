@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Safe host wrappers around ds4-sys (Phase 2)"
+description = "Safe host wrappers around ds4-sys plus GGUF shape catalog"
 
 [lib]
 path = "src/lib.rs"
