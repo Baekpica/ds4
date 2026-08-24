@@ -6,7 +6,7 @@ use ds4_server::{
     ReqTimings, ScriptedDecode, ScriptedStep, ServerConfig, ServerInner, ThinkMode, CREATED_TEST,
     TAPE_PLAIN,
 };
-use ds4_server::parse::parse_request;
+use ds4_server::parse::{parse_request, ChatMsg, ToolCall};
 use ds4_server::route::WireSurface;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -52,6 +52,9 @@ struct PromptSyncDecode {
     continued_positions: Vec<i32>,
     fail_continued: bool,
     events: Vec<&'static str>,
+    replay_raw: Option<String>,
+    replay_prompts: Vec<Vec<u8>>,
+    remembered_tools: Vec<(Vec<String>, String)>,
 }
 
 impl PromptSyncDecode {
@@ -70,6 +73,9 @@ impl PromptSyncDecode {
             continued_positions: Vec::new(),
             fail_continued: false,
             events: Vec::new(),
+            replay_raw: None,
+            replay_prompts: Vec::new(),
+            remembered_tools: Vec::new(),
         }
     }
 }
@@ -123,6 +129,38 @@ impl DecodeIo for PromptSyncDecode {
 
     fn prompt_sync_elapsed(&self) -> Option<Duration> {
         self.prompt_sync_elapsed
+    }
+
+    fn restore_tool_replay(&mut self, messages: &mut [ChatMsg]) {
+        self.events.push("restore");
+        let Some(raw) = &self.replay_raw else {
+            return;
+        };
+        for message in messages {
+            if !message.calls.is_empty() {
+                message.raw_dsml = raw.clone();
+            }
+        }
+    }
+
+    fn sync_tool_replay_prompt(
+        &mut self,
+        prompt: &[u8],
+        tokens: &[i32],
+    ) -> Result<i32, GenerateError> {
+        self.events.push("tool-sync");
+        self.replay_prompts.push(prompt.to_vec());
+        self.inner.live = tokens.to_vec();
+        self.inner.pos = self.effective_prompt_pos;
+        Ok(self.cached_tokens)
+    }
+
+    fn remember_tool_replay(&mut self, calls: &[ToolCall], raw_dsml: &str) {
+        self.events.push("remember-tool");
+        self.remembered_tools.push((
+            calls.iter().map(|call| call.id.clone()).collect(),
+            raw_dsml.to_string(),
+        ));
     }
 
     fn eval(&mut self, token: i32) -> Result<(), GenerateError> {
@@ -716,6 +754,93 @@ fn scripted_dsml_tools_emit_tool_calls() {
         "{s}"
     );
     assert!(s.contains("ls"), "{s}");
+}
+
+#[test]
+fn tool_replay_restores_raw_dsml_before_render_and_uses_scoped_sync() {
+    let parsed = parse_request(
+        WireSurface::OpenaiChat,
+        &env(),
+        r#"{"messages":[{"role":"user","content":"run"},{"role":"assistant","tool_calls":[{"id":"call_saved","type":"function","function":{"name":"bash","arguments":"{\"a\":1,\"b\":2}"}}]},{"role":"tool","tool_call_id":"call_saved","content":"ok"},{"role":"assistant","content":"finished"},{"role":"user","content":"next"}],"thinking":{"type":"disabled"},"tools":[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}}}}}]}"#,
+    )
+    .unwrap();
+    assert!(!parsed.has_tool_results);
+    let canonical = render_prompt(&parsed, 0).unwrap();
+    let raw = concat!(
+        "\n\n<｜DSML｜tool_calls>\n",
+        "<｜DSML｜invoke name=\"bash\">\n",
+        "<｜DSML｜parameter name=\"b\" string=\"false\">2</｜DSML｜parameter>\n",
+        "<｜DSML｜parameter name=\"a\" string=\"false\">1</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n",
+        "</｜DSML｜tool_calls>"
+    );
+    assert!(!canonical.windows(raw.len()).any(|window| window == raw.as_bytes()));
+    let inner = ScriptedDecode::from_pieces(&[b"done"]);
+    let mut engine = PromptSyncDecode::new(inner, 1, 1);
+    engine.replay_raw = Some(raw.into());
+    let mut out = Vec::new();
+    generate_and_write(
+        &mut engine,
+        &parsed,
+        "chatcmpl-replay",
+        CREATED_TEST,
+        false,
+        8,
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(engine.replay_prompts.len(), 1);
+    assert!(engine.replay_prompts[0]
+        .windows(raw.len())
+        .any(|window| window == raw.as_bytes()));
+    let restore = engine.events.iter().position(|event| *event == "restore").unwrap();
+    let sync = engine
+        .events
+        .iter()
+        .position(|event| *event == "tool-sync")
+        .unwrap();
+    let sample = engine.events.iter().position(|event| *event == "sample").unwrap();
+    assert!(restore < sync && sync < sample);
+}
+
+#[test]
+fn tool_producer_remembers_final_wire_ids_with_sampled_dsml() {
+    let parsed = tools_req();
+    let raw = concat!(
+        "<｜DSML｜tool_calls>\n",
+        "<｜DSML｜invoke name=\"bash\">\n",
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls",
+        "</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n",
+        "</｜DSML｜tool_calls>"
+    );
+    let inner = ScriptedDecode::from_pieces(&[raw.as_bytes()]);
+    let mut engine = PromptSyncDecode::new(inner, 0, 1);
+    let mut out = Vec::new();
+    generate_and_write(
+        &mut engine,
+        &parsed,
+        "chatcmpl-producer",
+        CREATED_TEST,
+        false,
+        16,
+        &mut out,
+    )
+    .unwrap();
+
+    assert_eq!(engine.remembered_tools.len(), 1);
+    let (ids, remembered) = &engine.remembered_tools[0];
+    assert_eq!(ids.len(), 1);
+    assert!(ids[0].starts_with("call_"));
+    assert_eq!(remembered, raw);
+    let remember = engine
+        .events
+        .iter()
+        .position(|event| *event == "remember-tool")
+        .unwrap();
+    let sample = engine.events.iter().position(|event| *event == "sample").unwrap();
+    assert!(sample < remember);
 }
 
 fn tools_req() -> ParsedRequest {

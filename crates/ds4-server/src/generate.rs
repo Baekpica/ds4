@@ -18,11 +18,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ds4_kv::{
     chat_anchor_pos as kv_chat_anchor_pos, continued_store_target as kv_continued_store_target,
     store_len as kv_store_len, Header as KvHeader, Reason as KvReason, Store as KvStore,
-    EXT_THINKING_VISIBLE,
+    EXT_THINKING_VISIBLE, EXT_TOOL_MAP,
 };
 
 use crate::dsml::{SampleOverride, SamplePolicy};
-use crate::parse::{ParsedRequest, ToolChoice};
+use crate::parse::{ChatMsg, ParsedRequest, ToolCall, ToolChoice};
 use crate::retry::{
     build_invalid_tool_error_suffix, parse_failure_should_retry, terminal_finish,
     truncation_outcome, TruncationOutcome,
@@ -43,6 +43,8 @@ use crate::stream::{
 use crate::tools::{
     assign_tool_ids, parse_generated_for_response, SemAccum,
 };
+#[cfg(feature = "native")]
+use crate::tool_memory::ToolMemory;
 
 #[derive(Debug)]
 pub enum GenerateError {
@@ -90,6 +92,15 @@ pub trait DecodeIo {
     fn prompt_sync_elapsed(&self) -> Option<Duration> {
         None
     }
+    fn restore_tool_replay(&mut self, _messages: &mut [ChatMsg]) {}
+    fn sync_tool_replay_prompt(
+        &mut self,
+        prompt: &[u8],
+        tokens: &[i32],
+    ) -> Result<i32, GenerateError> {
+        self.sync_prompt(prompt, tokens, true, false)
+    }
+    fn remember_tool_replay(&mut self, _calls: &[ToolCall], _raw_dsml: &str) {}
     fn maybe_store_continued(&mut self) -> Result<(), GenerateError> {
         Ok(())
     }
@@ -138,6 +149,9 @@ trait SerialKvIo {
     fn live_len(&self) -> i32;
     fn live_tokens(&self) -> Vec<i32>;
     fn render_tokens(&self, tokens: &[i32]) -> Result<Vec<u8>, GenerateError>;
+    fn checkpoint_trailer(&self, _text: &[u8]) -> Option<Vec<u8>> {
+        Some(Vec::new())
+    }
     fn tokenize_suffix(&mut self, suffix: &[u8]) -> Result<Vec<i32>, GenerateError>;
     fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError>;
     fn save_payload(&mut self, path: &Path) -> Result<(), GenerateError>;
@@ -196,10 +210,10 @@ fn try_store_live(
     ctx: u32,
     reason: KvReason,
     checkpoint: Option<&ThinkingVisibleCheckpoint>,
-) -> Result<(), GenerateError> {
+) -> Result<bool, GenerateError> {
     let live = io.live_tokens();
     if live.len() < store.opt.min_tokens.max(0) as usize {
-        return Ok(());
+        return Ok(false);
     }
     let tokens = u32::try_from(live.len())
         .map_err(|_| GenerateError::Engine("KVC token count exceeds u32".into()))?;
@@ -209,24 +223,32 @@ fn try_store_live(
         }
         _ => (io.render_tokens(&live)?, 0),
     };
+    let trailer = if ext_flags == 0 {
+        let Some(trailer) = io.checkpoint_trailer(&text) else {
+            return Ok(false);
+        };
+        trailer
+    } else {
+        Vec::new()
+    };
     let mut header = kv_header(model_id, quant_bits, ctx, tokens);
     header.reason = reason;
     header.ext_flags = ext_flags;
     if store
-        .reuse_compatible(header.clone(), &text, b"")
+        .reuse_compatible(header.clone(), &text, &trailer)
         .map_err(|error| GenerateError::Engine(error.to_string()))?
         .is_some()
     {
-        return Ok(());
+        return Ok(true);
     }
     let payload = store
         .payload_temp()
         .map_err(|error| GenerateError::Engine(error.to_string()))?;
     io.save_payload(payload.path())?;
     store
-        .write_payload_file(header, &text, payload.path(), b"")
+        .write_payload_file(header, &text, payload.path(), &trailer)
         .map_err(|error| GenerateError::Engine(error.to_string()))?;
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(any(feature = "native", test))]
@@ -244,7 +266,7 @@ fn try_store_continued(
         return Ok(false);
     }
     let (model_id, quant_bits, ctx) = identity;
-    try_store_live(
+    if !try_store_live(
         io,
         store,
         model_id,
@@ -252,7 +274,9 @@ fn try_store_continued(
         ctx,
         KvReason::Continued,
         None,
-    )?;
+    )? {
+        return Ok(false);
+    }
     store.continued_last_store_tokens = store.continued_last_store_tokens.max(target);
     Ok(true)
 }
@@ -306,7 +330,7 @@ fn cold_sync_and_store(
     } else {
         io.sync(tokens)?;
     }
-    if try_store_live(
+    if matches!(try_store_live(
         io,
         store,
         model_id,
@@ -314,8 +338,7 @@ fn cold_sync_and_store(
         ctx,
         KvReason::Cold,
         None,
-    )
-    .is_ok()
+    ), Ok(true))
     {
         store.continued_last_store_tokens = store
             .continued_last_store_tokens
@@ -345,6 +368,57 @@ fn disk_sync_prompt(
     checkpoint: Option<&ThinkingVisibleCheckpoint>,
     thinking_visible_eligible: bool,
     policy: DiskSyncPolicy,
+) -> Result<i32, GenerateError> {
+    disk_sync_prompt_impl(
+        io,
+        store,
+        model_id,
+        quant_bits,
+        prompt,
+        canonical_tokens,
+        checkpoint,
+        thinking_visible_eligible,
+        policy,
+        false,
+    )
+}
+
+#[cfg(any(feature = "native", test))]
+fn disk_sync_tool_replay(
+    io: &mut impl SerialKvIo,
+    store: Option<&mut KvStore>,
+    model_id: i32,
+    quant_bits: i32,
+    prompt: &[u8],
+    canonical_tokens: &[i32],
+    policy: DiskSyncPolicy,
+) -> Result<i32, GenerateError> {
+    disk_sync_prompt_impl(
+        io,
+        store,
+        model_id,
+        quant_bits,
+        prompt,
+        canonical_tokens,
+        None,
+        false,
+        policy,
+        true,
+    )
+}
+
+#[cfg(any(feature = "native", test))]
+fn disk_sync_prompt_impl(
+    io: &mut impl SerialKvIo,
+    store: Option<&mut KvStore>,
+    model_id: i32,
+    quant_bits: i32,
+    prompt: &[u8],
+    canonical_tokens: &[i32],
+    checkpoint: Option<&ThinkingVisibleCheckpoint>,
+    thinking_visible_eligible: bool,
+    policy: DiskSyncPolicy,
+    allow_tool_map: bool,
 ) -> Result<i32, GenerateError> {
     let live = io.live_tokens();
     if !live.is_empty() && canonical_tokens.starts_with(&live) {
@@ -407,9 +481,13 @@ fn disk_sync_prompt(
     let Some((path, envelope)) = candidate else {
         return cold_sync_and_store(io, store, (model_id, quant_bits, ctx), canonical_tokens);
     };
-    if (envelope.header.ext_flags != 0 && envelope.header.ext_flags != EXT_THINKING_VISIBLE)
-        || envelope.trailer_bytes != 0
-    {
+    let extension_ok = match envelope.header.ext_flags {
+        0 => envelope.trailer_bytes == 0,
+        EXT_THINKING_VISIBLE => envelope.trailer_bytes == 0,
+        EXT_TOOL_MAP => allow_tool_map && envelope.trailer_bytes > 0,
+        _ => false,
+    };
+    if !extension_ok {
         return cold_sync_and_store(io, store, (model_id, quant_bits, ctx), canonical_tokens);
     }
     if io
@@ -507,6 +585,27 @@ fn ordinary_disk_cache_eligible(parsed: &ParsedRequest) -> bool {
         && !parsed.has_tools
         && !parsed.has_tool_results
         && parsed.live_call_ids.is_empty()
+}
+
+fn tool_replay_scope(parsed: &ParsedRequest, syntax: ModelSyntax) -> bool {
+    parsed.kind == ReqKind::Chat
+        && parsed.api == Api::Openai
+        && !think_mode_enabled(parsed.think_mode)
+        && parsed.live_call_ids.is_empty()
+        && matches!(syntax, ModelSyntax::DeepSeek | ModelSyntax::SolarOpen2)
+}
+
+fn tool_replay_disk_cache_eligible(parsed: &ParsedRequest, syntax: ModelSyntax) -> bool {
+    tool_replay_scope(parsed, syntax)
+        && parsed.messages.iter().any(|message| {
+            !message.calls.is_empty()
+                || !message.tool_call_id.is_empty()
+                || !message.tool_call_ids.is_empty()
+        })
+}
+
+fn tool_replay_producer_eligible(parsed: &ParsedRequest, syntax: ModelSyntax) -> bool {
+    tool_replay_scope(parsed, syntax) && parsed.has_tools
 }
 
 fn thinking_visible_cache_eligible(parsed: &ParsedRequest) -> bool {
@@ -838,6 +937,11 @@ pub(crate) fn generate_terminal_at(
     }
 
     let mut parsed = parsed.clone();
+    let syntax = syntax_for_model_id(engine.model_id());
+    let tool_replay = tool_replay_disk_cache_eligible(&parsed, syntax);
+    if tool_replay {
+        engine.restore_tool_replay(&mut parsed.messages);
+    }
     prepare_required_prefixes(engine, &mut parsed, chat_format_for_syntax(syntax_for_model_id(engine.model_id())))?;
 
     let prompt = render_prompt(&parsed, engine.model_id())?;
@@ -849,12 +953,16 @@ pub(crate) fn generate_terminal_at(
         ReqKind::Chat => engine.tokenize_rendered_chat(&prompt)?,
     };
     let t_prefill = Instant::now();
-    let cached = engine.sync_prompt(
-        &prompt,
-        &tokens,
-        ordinary_disk_cache_eligible(&parsed),
-        thinking_visible_cache_eligible(&parsed),
-    )?;
+    let cached = if tool_replay {
+        engine.sync_tool_replay_prompt(&prompt, &tokens)?
+    } else {
+        engine.sync_prompt(
+            &prompt,
+            &tokens,
+            ordinary_disk_cache_eligible(&parsed),
+            thinking_visible_cache_eligible(&parsed),
+        )?
+    };
     store_continued_best_effort(engine);
     let decode_t0 = Instant::now();
     let prefill_elapsed = engine
@@ -868,7 +976,6 @@ pub(crate) fn generate_terminal_at(
     let mut req = stream_req_from_parsed(&parsed, engine.model_id());
     req.cache_read_tokens = cached.clamp(0, prompt_n);
     req.cache_write_tokens = prompt_n - req.cache_read_tokens;
-    let syntax = syntax_for_model_id(engine.model_id());
     let mut acc;
     let mut finish;
     let mut recovery_attempted = false;
@@ -1068,6 +1175,9 @@ pub(crate) fn generate_terminal_at(
                 "call_"
             },
         );
+        if tool_replay_producer_eligible(&parsed, syntax) {
+            engine.remember_tool_replay(&parsed_gen.calls, &parsed_gen.raw_dsml);
+        }
         finish = "tool_calls";
     }
     if let Some(visible) = motif3_no_think_visible_checkpoint(
@@ -1348,14 +1458,15 @@ impl DecodeIo for ScriptedDecode {
 }
 
 #[cfg(feature = "native")]
-struct NativeSerialKvIo<'s, 'm, 'v> {
+struct NativeSerialKvIo<'s, 'm, 'v, 't> {
     session: &'s mut ds4_core::Session<'m>,
     vocab: &'v ds4_core::Vocab,
+    tool_memory: &'t ToolMemory,
     sync_elapsed: Duration,
 }
 
 #[cfg(feature = "native")]
-impl SerialKvIo for NativeSerialKvIo<'_, '_, '_> {
+impl SerialKvIo for NativeSerialKvIo<'_, '_, '_, '_> {
     fn ctx(&self) -> i32 {
         self.session.ctx()
     }
@@ -1382,6 +1493,10 @@ impl SerialKvIo for NativeSerialKvIo<'_, '_, '_> {
             text.extend(self.vocab.token_text(token));
         }
         Ok(text)
+    }
+
+    fn checkpoint_trailer(&self, text: &[u8]) -> Option<Vec<u8>> {
+        self.tool_memory.checkpoint(text)
     }
 
     fn tokenize_suffix(&mut self, suffix: &[u8]) -> Result<Vec<i32>, GenerateError> {
@@ -1429,6 +1544,7 @@ pub struct NativeDecode<'a> {
     store: Option<KvStore>,
     session_disk_storable: bool,
     thinking_visible: Option<ThinkingVisibleCheckpoint>,
+    tool_memory: ToolMemory,
     prompt_sync_elapsed: Option<Duration>,
     ctx: i32,
 }
@@ -1443,6 +1559,7 @@ impl<'a> NativeDecode<'a> {
             store: None,
             session_disk_storable: false,
             thinking_visible: None,
+            tool_memory: ToolMemory::default(),
             prompt_sync_elapsed: None,
             ctx,
         }
@@ -1456,6 +1573,71 @@ impl<'a> NativeDecode<'a> {
     pub fn with_store(mut self, store: KvStore) -> Self {
         self.store = Some(store);
         self
+    }
+
+    fn sync_prompt_inner(
+        &mut self,
+        prompt: &[u8],
+        tokens: &[i32],
+        disk_eligible: bool,
+        thinking_visible_eligible: bool,
+        tool_replay: bool,
+    ) -> Result<i32, GenerateError> {
+        self.prompt_sync_elapsed = None;
+        let model_id = self.model.model_id();
+        let quant_bits = self.model.routed_quant_bits();
+        let vocab = self.vocab.unwrap_or_else(|| self.model.vocab());
+        let save_current = self.session_disk_storable;
+        let has_store = self.store.is_some();
+        self.session()?;
+        let (session, store, checkpoint, tool_memory) = (
+            &mut self.session,
+            &mut self.store,
+            &self.thinking_visible,
+            &self.tool_memory,
+        );
+        let session = session.as_mut().ok_or_else(|| {
+            GenerateError::Engine("native session was not created".into())
+        })?;
+        let mut io = NativeSerialKvIo {
+            session,
+            vocab,
+            tool_memory,
+            sync_elapsed: Duration::ZERO,
+        };
+        let policy = DiskSyncPolicy {
+            save_current,
+            load: disk_eligible,
+        };
+        let result = if tool_replay {
+            disk_sync_tool_replay(
+                &mut io,
+                store.as_mut(),
+                model_id,
+                quant_bits,
+                prompt,
+                tokens,
+                policy,
+            )
+        } else {
+            disk_sync_prompt(
+                &mut io,
+                store.as_mut(),
+                model_id,
+                quant_bits,
+                prompt,
+                tokens,
+                checkpoint.as_ref(),
+                thinking_visible_eligible,
+                policy,
+            )
+        };
+        if result.is_ok() {
+            self.prompt_sync_elapsed = Some(io.sync_elapsed);
+        }
+        self.session_disk_storable = result.is_ok() && disk_eligible && has_store;
+        settle_thinking_visible_checkpoint(&mut self.thinking_visible, result.is_ok());
+        result
     }
 
     fn session(&mut self) -> Result<&mut ds4_core::Session<'a>, GenerateError> {
@@ -1527,50 +1709,41 @@ impl DecodeIo for NativeDecode<'_> {
         disk_eligible: bool,
         thinking_visible_eligible: bool,
     ) -> Result<i32, GenerateError> {
-        self.prompt_sync_elapsed = None;
-        let model_id = self.model.model_id();
-        let quant_bits = self.model.routed_quant_bits();
-        let vocab = self.vocab.unwrap_or_else(|| self.model.vocab());
-        let save_current = self.session_disk_storable;
-        let has_store = self.store.is_some();
-        self.session()?;
-        let (session, store, checkpoint) = (
-            &mut self.session,
-            &mut self.store,
-            &self.thinking_visible,
-        );
-        let session = session.as_mut().ok_or_else(|| {
-            GenerateError::Engine("native session was not created".into())
-        })?;
-        let mut io = NativeSerialKvIo {
-            session,
-            vocab,
-            sync_elapsed: Duration::ZERO,
-        };
-        let result = disk_sync_prompt(
-            &mut io,
-            store.as_mut(),
-            model_id,
-            quant_bits,
+        self.sync_prompt_inner(
             prompt,
             tokens,
-            checkpoint.as_ref(),
+            disk_eligible,
             thinking_visible_eligible,
-            DiskSyncPolicy {
-                save_current,
-                load: disk_eligible,
-            },
-        );
-        if result.is_ok() {
-            self.prompt_sync_elapsed = Some(io.sync_elapsed);
-        }
-        self.session_disk_storable = result.is_ok() && disk_eligible && has_store;
-        settle_thinking_visible_checkpoint(&mut self.thinking_visible, result.is_ok());
-        result
+            false,
+        )
     }
 
     fn prompt_sync_elapsed(&self) -> Option<Duration> {
         self.prompt_sync_elapsed
+    }
+
+    fn restore_tool_replay(&mut self, messages: &mut [ChatMsg]) {
+        let Ok(model_id) = u8::try_from(self.model.model_id()) else {
+            return;
+        };
+        if let Some(store) = &self.store {
+            self.tool_memory.restore_store(store, model_id, messages);
+        }
+        self.tool_memory.attach(messages);
+    }
+
+    fn sync_tool_replay_prompt(
+        &mut self,
+        prompt: &[u8],
+        tokens: &[i32],
+    ) -> Result<i32, GenerateError> {
+        self.sync_prompt_inner(prompt, tokens, true, false, true)
+    }
+
+    fn remember_tool_replay(&mut self, calls: &[ToolCall], raw_dsml: &str) {
+        if self.tool_memory.remember(calls, raw_dsml) > 0 && self.store.is_some() {
+            self.session_disk_storable = true;
+        }
     }
 
     fn maybe_store_continued(&mut self) -> Result<(), GenerateError> {
@@ -1585,12 +1758,17 @@ impl DecodeIo for NativeDecode<'_> {
             return Ok(());
         };
         let vocab = self.vocab.unwrap_or_else(|| self.model.vocab());
-        let (Some(session), Some(store)) = (&mut self.session, &mut self.store) else {
+        let (Some(session), Some(store), tool_memory) = (
+            &mut self.session,
+            &mut self.store,
+            &self.tool_memory,
+        ) else {
             return Ok(());
         };
         let mut io = NativeSerialKvIo {
             session,
             vocab,
+            tool_memory,
             sync_elapsed: Duration::ZERO,
         };
         try_store_continued(&mut io, store, identity)?;
@@ -1654,17 +1832,21 @@ impl DecodeIo for NativeDecode<'_> {
 #[cfg(test)]
 mod disk_sync_tests {
     use super::{
-        continued_decode_allowed, discard_loaded, disk_sync_prompt, ordinary_disk_cache_eligible,
-        settle_thinking_visible_checkpoint, thinking_visible_cache_eligible,
-        try_store_continued, DiskSyncPolicy, GenerateError, SerialKvIo,
-        ThinkingVisibleCheckpoint,
+        continued_decode_allowed, discard_loaded, disk_sync_prompt, disk_sync_tool_replay,
+        ordinary_disk_cache_eligible, settle_thinking_visible_checkpoint,
+        thinking_visible_cache_eligible, tool_replay_disk_cache_eligible,
+        tool_replay_producer_eligible, try_store_continued, try_store_live, DiskSyncPolicy,
+        GenerateError, SerialKvIo, ThinkingVisibleCheckpoint,
     };
-    use crate::parse::{parse_request, ChatMsg, ParseEnv};
-    use crate::render::render_motif3_chat_ex;
+    use crate::parse::{parse_request, ChatMsg, ParseEnv, ToolCall};
+    use crate::render::{render_motif3_chat_ex, ModelSyntax};
     use crate::route::{Api, ThinkMode, WireSurface};
     use crate::stream::ChatFormat;
     use crate::tools::SemAccum;
-    use ds4_kv::{read_envelope, Header, Options, Reason, Record, Store, EXT_THINKING_VISIBLE};
+    use ds4_kv::{
+        read_envelope, Header, Options, Reason, Record, Store, EXT_THINKING_VISIBLE,
+        EXT_TOOL_MAP,
+    };
     use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1674,6 +1856,7 @@ mod disk_sync_tests {
         ctx: i32,
         live: Vec<i32>,
         rendered_live: Vec<u8>,
+        trailer: Option<Vec<u8>>,
         suffix_tokens: Vec<i32>,
         loaded_tokens: Vec<i32>,
         fail_load: bool,
@@ -1696,6 +1879,7 @@ mod disk_sync_tests {
                 ctx: 4096,
                 live: live.to_vec(),
                 rendered_live: rendered_live.to_vec(),
+                trailer: Some(Vec::new()),
                 suffix_tokens: Vec::new(),
                 loaded_tokens: Vec::new(),
                 fail_load: false,
@@ -1734,6 +1918,10 @@ mod disk_sync_tests {
 
         fn render_tokens(&self, _tokens: &[i32]) -> Result<Vec<u8>, GenerateError> {
             Ok(self.rendered_live.clone())
+        }
+
+        fn checkpoint_trailer(&self, _text: &[u8]) -> Option<Vec<u8>> {
+            self.trailer.clone()
         }
 
         fn tokenize_suffix(&mut self, suffix: &[u8]) -> Result<Vec<i32>, GenerateError> {
@@ -2479,6 +2667,7 @@ mod disk_sync_tests {
             frontier: 2,
         };
         let mut saving = FakeSerial::new(&[41, 42], b"generation <think></think> assistant");
+        saving.trailer = Some(b"must-not-mix".to_vec());
 
         disk_sync_prompt(
             &mut saving,
@@ -2502,6 +2691,7 @@ mod disk_sync_tests {
             .unwrap()
             .expect("canonical visible checkpoint");
         assert_eq!(envelope.header.ext_flags, EXT_THINKING_VISIBLE);
+        assert_eq!(envelope.trailer_bytes, 0);
         assert_eq!(envelope.header.tokens, 2);
         assert_eq!(envelope.text, checkpoint.text);
 
@@ -2529,6 +2719,171 @@ mod disk_sync_tests {
         assert_eq!(loading.syncs, [vec![41, 42, 6, 43]]);
         assert_eq!(store.read(&path).unwrap().header.hits, 1);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn live_store_writes_tool_map_trailer_only_for_plain_checkpoints() {
+        let (dir, mut store) = store("tool-map-write");
+        let mut io = FakeSerial::new(&[41, 42], b"plain sampled tool block");
+        io.trailer = Some(b"KTM\x01\0\0\0\0".to_vec());
+
+        try_store_live(
+            &mut io,
+            &mut store,
+            0,
+            2,
+            4096,
+            Reason::Evict,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(store.entries().len(), 1);
+        let record = store.read(&store.entries()[0].path).unwrap();
+        assert_eq!(record.header.ext_flags, EXT_TOOL_MAP);
+        assert_eq!(Some(record.trailer), io.trailer);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn live_store_skips_checkpoint_when_tool_map_exceeds_its_bound() {
+        let (dir, mut store) = store("tool-map-overflow");
+        let mut io = FakeSerial::new(&[1, 2, 3, 4, 5, 6, 7, 8], b"plain sampled tool block");
+        io.trailer = None;
+
+        assert!(!try_store_live(
+            &mut io,
+            &mut store,
+            0,
+            2,
+            4096,
+            Reason::Evict,
+            None,
+        )
+        .unwrap());
+        assert!(!try_store_continued(&mut io, &mut store, (0, 2, 4096)).unwrap());
+
+        assert!(store.entries().is_empty());
+        assert_eq!(store.continued_last_store_tokens, 0);
+        assert!(!io.events.contains(&"save"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tool_replay_sync_is_the_only_lane_that_loads_tool_map_records() {
+        fn write_tool_candidate(store: &mut Store, ext_flags: u8, trailer: Vec<u8>) {
+            store
+                .write(Record {
+                    header: Header {
+                        quant_bits: 2,
+                        reason: Reason::Evict,
+                        ext_flags,
+                        model_id: 0,
+                        tokens: 2,
+                        hits: 0,
+                        ctx_size: 4096,
+                        created_at: 1,
+                        last_used: 1,
+                        payload_bytes: 0,
+                        text_bytes: 0,
+                    },
+                    text: b"tool prompt".to_vec(),
+                    payload: b"payload".to_vec(),
+                    trailer,
+                })
+                .unwrap();
+        }
+
+        let (ordinary_dir, mut ordinary_store) = store("tool-map-ordinary-reject");
+        write_tool_candidate(
+            &mut ordinary_store,
+            EXT_TOOL_MAP,
+            b"KTM\x01\0\0\0\0".to_vec(),
+        );
+        let mut ordinary = FakeSerial::new(&[], b"");
+        ordinary.loaded_tokens = vec![41, 42];
+        assert_eq!(
+            disk_sync_prompt(
+                &mut ordinary,
+                Some(&mut ordinary_store),
+                0,
+                2,
+                b"tool prompt tail",
+                &[90, 91],
+                None,
+                false,
+                DiskSyncPolicy {
+                    save_current: false,
+                    load: true,
+                },
+            )
+            .unwrap(),
+            0
+        );
+        assert!(ordinary.loads.is_empty());
+
+        let (tool_dir, mut tool_store) = store("tool-map-scoped-load");
+        write_tool_candidate(
+            &mut tool_store,
+            EXT_TOOL_MAP,
+            b"KTM\x01\0\0\0\0".to_vec(),
+        );
+        let mut tool = FakeSerial::new(&[], b"");
+        tool.loaded_tokens = vec![41, 42];
+        tool.suffix_tokens = vec![43];
+        assert_eq!(
+            disk_sync_tool_replay(
+                &mut tool,
+                Some(&mut tool_store),
+                0,
+                2,
+                b"tool prompt tail",
+                &[90, 91, 92],
+                DiskSyncPolicy {
+                    save_current: false,
+                    load: true,
+                },
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(tool.loads.len(), 1);
+
+        for (tag, flags, trailer) in [
+            ("empty", EXT_TOOL_MAP, Vec::new()),
+            (
+                "combined",
+                EXT_TOOL_MAP | EXT_THINKING_VISIBLE,
+                b"KTM\x01\0\0\0\0".to_vec(),
+            ),
+            ("unknown", 1 << 7, b"KTM\x01\0\0\0\0".to_vec()),
+        ] {
+            let (bad_dir, mut bad_store) = store(&format!("tool-map-{tag}-reject"));
+            write_tool_candidate(&mut bad_store, flags, trailer);
+            let mut bad = FakeSerial::new(&[], b"");
+            bad.loaded_tokens = vec![41, 42];
+            assert_eq!(
+                disk_sync_tool_replay(
+                    &mut bad,
+                    Some(&mut bad_store),
+                    0,
+                    2,
+                    b"tool prompt tail",
+                    &[90, 91],
+                    DiskSyncPolicy {
+                        save_current: false,
+                        load: true,
+                    },
+                )
+                .unwrap(),
+                0
+            );
+            assert!(bad.loads.is_empty());
+            let _ = fs::remove_dir_all(bad_dir);
+        }
+
+        let _ = fs::remove_dir_all(ordinary_dir);
+        let _ = fs::remove_dir_all(tool_dir);
     }
 
     #[test]
@@ -2609,5 +2964,56 @@ mod disk_sync_tests {
         cases.push(request);
 
         assert!(cases.iter().all(|request| !ordinary_disk_cache_eligible(request)));
+
+        let mut replay = cases[4].clone();
+        replay.api = Api::Openai;
+        replay.think_mode = ThinkMode::None;
+        replay.live_call_ids.clear();
+        replay.has_tools = true;
+        replay.has_tool_results = false;
+        replay.messages = vec![ChatMsg {
+            role: "assistant".into(),
+            calls: vec![ToolCall {
+                id: "call_history".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        assert!(tool_replay_disk_cache_eligible(
+            &replay,
+            ModelSyntax::DeepSeek
+        ));
+        assert!(tool_replay_disk_cache_eligible(
+            &replay,
+            ModelSyntax::SolarOpen2
+        ));
+        assert!(tool_replay_producer_eligible(
+            &replay,
+            ModelSyntax::DeepSeek
+        ));
+        for syntax in [
+            ModelSyntax::Motif3,
+            ModelSyntax::Exaone,
+            ModelSyntax::Dots3,
+        ] {
+            assert!(!tool_replay_disk_cache_eligible(&replay, syntax));
+        }
+        for mutate in 0..4 {
+            let mut rejected = replay.clone();
+            match mutate {
+                0 => rejected.api = Api::Anthropic,
+                1 => rejected.think_mode = ThinkMode::Low,
+                2 => rejected.live_call_ids.push("call_live".into()),
+                _ => rejected.kind = crate::route::ReqKind::Completion,
+            }
+            assert!(!tool_replay_disk_cache_eligible(
+                &rejected,
+                ModelSyntax::DeepSeek
+            ));
+            assert!(!tool_replay_producer_eligible(
+                &rejected,
+                ModelSyntax::DeepSeek
+            ));
+        }
     }
 }

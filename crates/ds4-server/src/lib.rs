@@ -18,7 +18,7 @@ pub mod route;
 pub mod serve;
 pub mod serve_cont;
 pub mod stream;
-#[cfg(test)]
+#[cfg(any(feature = "native", test))]
 mod tool_memory;
 pub mod tool_stream;
 pub mod tools;

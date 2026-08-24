@@ -10,7 +10,7 @@ use crate::render::{
 };
 use crate::dsml::{DsmlDecodeState, DsmlDecodeTracker, SampleOverride, SamplePolicy};
 use crate::stream::{think_end, think_start, ChatFormat};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read as _;
 use std::sync::{Mutex, OnceLock};
@@ -1049,7 +1049,12 @@ pub fn observe_tool_markers(
     (entered, closed)
 }
 
-static TOOL_ID_COUNTER: OnceLock<Mutex<u128>> = OnceLock::new();
+struct ToolIdState {
+    next: u128,
+    blocked: HashMap<(u8, u128), usize>,
+}
+
+static TOOL_ID_STATE: OnceLock<Mutex<ToolIdState>> = OnceLock::new();
 
 fn tool_id_seed() -> u128 {
     let mut bytes = [0u8; 16];
@@ -1066,12 +1071,79 @@ fn tool_id_seed() -> u128 {
     time ^ u128::from(std::process::id())
 }
 
+fn tool_id_kind(prefix: &str) -> u8 {
+    u8::from(prefix == "toolu_")
+}
+
+#[cfg(any(feature = "native", test))]
+fn tool_id_key(id: &str) -> Option<(u8, u128)> {
+    let (kind, hex) = if let Some(hex) = id.strip_prefix("call_") {
+        (0, hex)
+    } else if let Some(hex) = id.strip_prefix("toolu_") {
+        (1, hex)
+    } else {
+        return None;
+    };
+    if hex.len() != 32 {
+        return None;
+    }
+    Some((kind, u128::from_str_radix(hex, 16).ok()?))
+}
+
+fn mint_tool_id_from(state: &mut ToolIdState, prefix: &str) -> String {
+    loop {
+        let value = state.next;
+        state.next = state.next.wrapping_add(1);
+        if !state.blocked.contains_key(&(tool_id_kind(prefix), value)) {
+            return format!("{prefix}{value:032x}");
+        }
+    }
+}
+
 pub(crate) fn mint_tool_id(prefix: &str) -> String {
-    let counter = TOOL_ID_COUNTER.get_or_init(|| Mutex::new(tool_id_seed()));
-    let mut counter = counter.lock().unwrap_or_else(|error| error.into_inner());
-    let value = *counter;
-    *counter = counter.wrapping_add(1);
-    format!("{prefix}{value:032x}")
+    let state = TOOL_ID_STATE.get_or_init(|| {
+        Mutex::new(ToolIdState {
+            next: tool_id_seed(),
+            blocked: HashMap::new(),
+        })
+    });
+    mint_tool_id_from(
+        &mut state.lock().unwrap_or_else(|error| error.into_inner()),
+        prefix,
+    )
+}
+
+#[cfg(any(feature = "native", test))]
+pub(crate) fn reserve_tool_id(id: &str) {
+    let Some(key) = tool_id_key(id) else {
+        return;
+    };
+    let state = TOOL_ID_STATE.get_or_init(|| {
+        Mutex::new(ToolIdState {
+            next: tool_id_seed(),
+            blocked: HashMap::new(),
+        })
+    });
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    *state.blocked.entry(key).or_default() += 1;
+}
+
+#[cfg(any(feature = "native", test))]
+pub(crate) fn release_tool_id(id: &str) {
+    let Some(key) = tool_id_key(id) else {
+        return;
+    };
+    let Some(state) = TOOL_ID_STATE.get() else {
+        return;
+    };
+    let mut state = state.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(refs) = state.blocked.get_mut(&key) {
+        if *refs <= 1 {
+            state.blocked.remove(&key);
+        } else {
+            *refs -= 1;
+        }
+    }
 }
 
 fn assign_tool_ids_with(
@@ -1390,9 +1462,9 @@ fn tail_ends_with(tail: &[u8], s: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tool_id_tests {
-    use super::assign_tool_ids_with;
+    use super::{assign_tool_ids_with, mint_tool_id_from, ToolIdState};
     use crate::parse::ToolCall;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
 
     #[test]
     fn assignment_retries_ids_already_present_in_the_turn() {
@@ -1406,5 +1478,17 @@ mod tool_id_tests {
         let mut minted = VecDeque::from(["call_taken".to_string(), "call_fresh".to_string()]);
         assign_tool_ids_with(&mut calls, "call_", |_| minted.pop_front().unwrap());
         assert_eq!(calls[1].id, "call_fresh");
+    }
+
+    #[test]
+    fn allocator_skips_reserved_checkpoint_ids() {
+        let mut state = ToolIdState {
+            next: 7,
+            blocked: HashMap::from([((0, 7), 1)]),
+        };
+        assert_eq!(
+            mint_tool_id_from(&mut state, "call_"),
+            "call_00000000000000000000000000000008"
+        );
     }
 }

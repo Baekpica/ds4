@@ -1,3 +1,15 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+
+use ds4_kv::{read_trailer, Store as KvStore, EXT_TOOL_MAP};
+
+use crate::parse::{ChatMsg, ToolCall};
+use crate::render::{SOLAR_TOOL_CALLS, SOLAR_TOOL_CALL_END};
+use crate::tools::{
+    release_tool_id, reserve_tool_id, DSML_TOOL_CALLS_END, DSML_TOOL_CALLS_END_SHORT,
+    DSML_TOOL_CALLS_START, DSML_TOOL_CALLS_START_SHORT,
+};
+
 const KTM_HEADER: &[u8; 4] = b"KTM\x01";
 const DEFAULT_MAX_IDS: usize = 100_000;
 const MAX_ID_BYTES: usize = 256;
@@ -13,7 +25,7 @@ fn wire_lengths(id: &[u8], dsml: &[u8]) -> Option<(u32, u32)> {
     ))
 }
 
-pub(crate) fn encode_ktm(entries: &[(&[u8], &[u8])]) -> Option<Vec<u8>> {
+fn encode_ktm_bounded(entries: &[(&[u8], &[u8])], max_bytes: usize) -> Option<Vec<u8>> {
     let mut count = 0u32;
     let mut bytes = 8u64;
     for &(id, dsml) in entries {
@@ -28,6 +40,9 @@ pub(crate) fn encode_ktm(entries: &[(&[u8], &[u8])]) -> Option<Vec<u8>> {
     }
     if count == 0 {
         return Some(Vec::new());
+    }
+    if bytes > u64::try_from(max_bytes).unwrap_or(u64::MAX) {
+        return None;
     }
 
     let mut out = Vec::new();
@@ -44,6 +59,11 @@ pub(crate) fn encode_ktm(entries: &[(&[u8], &[u8])]) -> Option<Vec<u8>> {
         out.extend_from_slice(dsml);
     }
     Some(out)
+}
+
+#[cfg(test)]
+pub(crate) fn encode_ktm(entries: &[(&[u8], &[u8])]) -> Option<Vec<u8>> {
+    encode_ktm_bounded(entries, usize::MAX)
 }
 
 pub(crate) fn decode_ktm<F>(bytes: &[u8], max_ids: usize, mut accept: F) -> usize
@@ -97,6 +117,367 @@ where
         pos = dsml_end;
     }
     loaded
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    Disk,
+    Ram,
+}
+
+struct Entry {
+    block: Arc<str>,
+    source: Source,
+    stamp: u64,
+}
+
+pub(crate) struct ToolMemory {
+    by_id: HashMap<String, Entry>,
+    blocks: HashMap<Arc<str>, VecDeque<String>>,
+    clock: u64,
+    bytes: usize,
+    max_ids: usize,
+    max_bytes: usize,
+}
+
+impl Default for ToolMemory {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_IDS, MAX_DSML_BYTES)
+    }
+}
+
+impl Drop for ToolMemory {
+    fn drop(&mut self) {
+        for id in self.by_id.keys() {
+            release_tool_id(id);
+        }
+    }
+}
+
+impl ToolMemory {
+    pub(crate) fn new(max_ids: usize, max_bytes: usize) -> Self {
+        Self {
+            by_id: HashMap::new(),
+            blocks: HashMap::new(),
+            clock: 0,
+            bytes: 0,
+            max_ids: if max_ids == 0 {
+                DEFAULT_MAX_IDS
+            } else {
+                max_ids
+            },
+            max_bytes: if max_bytes == 0 {
+                MAX_DSML_BYTES
+            } else {
+                max_bytes
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_id(&self, id: &str) -> bool {
+        self.by_id.contains_key(id)
+    }
+
+    pub(crate) fn put(&mut self, id: &str, dsml: &str, source: Source) {
+        if id.is_empty()
+            || id.len() > MAX_ID_BYTES
+            || dsml.is_empty()
+            || dsml.len() > MAX_DSML_BYTES
+            || id.as_bytes().contains(&0)
+            || dsml.as_bytes().contains(&0)
+        {
+            return;
+        }
+
+        self.clock = self.clock.wrapping_add(1);
+        if let Some(entry) = self.by_id.get_mut(id) {
+            if entry.block.as_ref() == dsml {
+                entry.stamp = self.clock;
+                if source == Source::Ram {
+                    entry.source = Source::Ram;
+                }
+                self.prune();
+                return;
+            }
+        }
+        self.remove(id);
+
+        let block = self
+            .blocks
+            .get_key_value(dsml)
+            .map(|(block, _)| Arc::clone(block))
+            .unwrap_or_else(|| {
+                let block: Arc<str> = Arc::from(dsml);
+                self.bytes = self.bytes.saturating_add(block.len() + 1);
+                self.blocks.insert(Arc::clone(&block), VecDeque::new());
+                block
+            });
+        self.blocks
+            .get_mut(block.as_ref())
+            .unwrap()
+            .push_front(id.to_string());
+        self.bytes = self.bytes.saturating_add(id.len() + 1);
+        self.by_id.insert(
+            id.to_string(),
+            Entry {
+                block,
+                source,
+                stamp: self.clock,
+            },
+        );
+        reserve_tool_id(id);
+        self.prune();
+    }
+
+    pub(crate) fn remember(&mut self, calls: &[ToolCall], raw_dsml: &str) -> usize {
+        if raw_dsml.is_empty() {
+            return 0;
+        }
+        let mut remembered = 0;
+        for call in calls {
+            self.put(&call.id, raw_dsml, Source::Ram);
+            if self
+                .by_id
+                .get(&call.id)
+                .map(|entry| entry.block.as_ref() == raw_dsml)
+                .unwrap_or(false)
+            {
+                remembered += 1;
+            }
+        }
+        remembered
+    }
+
+    pub(crate) fn attach(&mut self, messages: &mut [ChatMsg]) -> usize {
+        let mut attached = 0;
+        for message in messages {
+            if message.calls.is_empty() || !message.raw_dsml.is_empty() {
+                continue;
+            }
+            let mut matched: Option<Arc<str>> = None;
+            let mut exact = true;
+            for call in &message.calls {
+                let Some(block) = self.lookup(&call.id) else {
+                    exact = false;
+                    continue;
+                };
+                if let Some(current) = &matched {
+                    if !Arc::ptr_eq(current, &block) {
+                        exact = false;
+                    }
+                } else {
+                    matched = Some(block);
+                }
+            }
+            if exact {
+                if let Some(block) = matched {
+                    message.raw_dsml = block.to_string();
+                    attached += 1;
+                }
+            }
+        }
+        attached
+    }
+
+    pub(crate) fn checkpoint(&self, text: &[u8]) -> Option<Vec<u8>> {
+        let mut entries = Vec::new();
+        let mut seen: HashSet<Arc<str>> = HashSet::new();
+        let mut pos = 0;
+        while let Some((start, end)) = next_tool_block(text, pos) {
+            if let Ok(raw) = std::str::from_utf8(&text[start..end]) {
+                if let Some((block, ids)) = self.blocks.get_key_value(raw) {
+                    if seen.insert(Arc::clone(block)) {
+                        for id in ids {
+                            entries.push((id.as_bytes(), block.as_bytes()));
+                        }
+                    }
+                }
+            }
+            pos = end;
+        }
+        encode_ktm_bounded(&entries, self.max_bytes)
+    }
+
+    pub(crate) fn load_trailer(&mut self, trailer: &[u8], wanted: &HashSet<String>) -> usize {
+        let max_ids = self.max_ids;
+        decode_ktm(trailer, max_ids, |id, dsml| {
+            let Ok(id) = std::str::from_utf8(id) else {
+                return false;
+            };
+            if !wanted.contains(id) {
+                return false;
+            }
+            let Ok(dsml) = std::str::from_utf8(dsml) else {
+                return false;
+            };
+            self.put(id, dsml, Source::Disk);
+            true
+        })
+    }
+
+    pub(crate) fn wanted_ids(messages: &[ChatMsg]) -> HashSet<String> {
+        let mut wanted = HashSet::new();
+        for message in messages {
+            if !message.tool_call_id.is_empty() {
+                wanted.insert(message.tool_call_id.clone());
+            }
+            wanted.extend(
+                message
+                    .tool_call_ids
+                    .iter()
+                    .filter(|id| !id.is_empty())
+                    .cloned(),
+            );
+            wanted.extend(
+                message
+                    .calls
+                    .iter()
+                    .map(|call| &call.id)
+                    .filter(|id| !id.is_empty())
+                    .cloned(),
+            );
+        }
+        wanted
+    }
+
+    pub(crate) fn restore_store(
+        &mut self,
+        store: &KvStore,
+        model_id: u8,
+        messages: &[ChatMsg],
+    ) -> usize {
+        let wanted = Self::wanted_ids(messages);
+        if wanted.is_empty() {
+            return 0;
+        }
+        let paths: Vec<_> = store
+            .entries()
+            .iter()
+            .filter(|entry| {
+                entry.header.model_id == model_id && entry.header.ext_flags & EXT_TOOL_MAP != 0
+            })
+            .map(|entry| entry.path.clone())
+            .collect();
+        let mut loaded = 0;
+        for path in paths {
+            let Ok((header, trailer)) = read_trailer(&path, MAX_DSML_BYTES as u64) else {
+                continue;
+            };
+            if header.model_id == model_id && header.ext_flags & EXT_TOOL_MAP != 0 {
+                loaded += self.load_trailer(&trailer, &wanted);
+            }
+        }
+        loaded
+    }
+
+    fn lookup(&mut self, id: &str) -> Option<Arc<str>> {
+        self.clock = self.clock.wrapping_add(1);
+        let entry = self.by_id.get_mut(id)?;
+        entry.stamp = self.clock;
+        Some(Arc::clone(&entry.block))
+    }
+
+    fn prune(&mut self) {
+        // ponytail: tool calls are rare; replace the O(n) oldest scan only if profiling says so.
+        while self.by_id.len() > self.max_ids || self.bytes > self.max_bytes {
+            let Some(oldest) = self
+                .by_id
+                .iter()
+                .min_by_key(|(_, entry)| entry.stamp)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, id: &str) {
+        let Some(entry) = self.by_id.remove(id) else {
+            return;
+        };
+        release_tool_id(id);
+        self.bytes = self.bytes.saturating_sub(id.len() + 1);
+        let empty = if let Some(ids) = self.blocks.get_mut(entry.block.as_ref()) {
+            ids.retain(|entry_id| entry_id != id);
+            ids.is_empty()
+        } else {
+            false
+        };
+        if empty {
+            self.blocks.remove(entry.block.as_ref());
+            self.bytes = self.bytes.saturating_sub(entry.block.len() + 1);
+        }
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn next_tool_block(text: &[u8], from: usize) -> Option<(usize, usize)> {
+    let forms = [
+        (
+            b"\n\n<\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls>".as_slice(),
+            DSML_TOOL_CALLS_END.as_bytes(),
+            false,
+        ),
+        (
+            DSML_TOOL_CALLS_START.as_bytes(),
+            DSML_TOOL_CALLS_END.as_bytes(),
+            false,
+        ),
+        (
+            b"\n\n<DSML\xef\xbd\x9ctool_calls>".as_slice(),
+            DSML_TOOL_CALLS_END_SHORT.as_bytes(),
+            false,
+        ),
+        (
+            DSML_TOOL_CALLS_START_SHORT.as_bytes(),
+            DSML_TOOL_CALLS_END_SHORT.as_bytes(),
+            false,
+        ),
+        (b"\n\n<tool_calls>".as_slice(), b"</tool_calls>".as_slice(), false),
+        (b"<tool_calls>".as_slice(), b"</tool_calls>".as_slice(), false),
+        (SOLAR_TOOL_CALLS.as_bytes(), SOLAR_TOOL_CALL_END.as_bytes(), true),
+    ];
+    let mut best: Option<(usize, usize, bool)> = None;
+    for (start_marker, end_marker, solar) in forms {
+        let Some(start_rel) = find_bytes(&text[from..], start_marker) else {
+            continue;
+        };
+        let start = from + start_rel;
+        let body = start + start_marker.len();
+        let Some(end_rel) = find_bytes(&text[body..], end_marker) else {
+            continue;
+        };
+        let end = body + end_rel + end_marker.len();
+        if best.map(|current| start < current.0).unwrap_or(true) {
+            best = Some((start, end, solar));
+        }
+    }
+    let (start, mut end, solar) = best?;
+    if solar {
+        loop {
+            let next = text[end..]
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace())
+                .map(|offset| end + offset)
+                .unwrap_or(text.len());
+            if !text[next..].starts_with(SOLAR_TOOL_CALLS.as_bytes()) {
+                break;
+            }
+            let body = next + SOLAR_TOOL_CALLS.len();
+            let Some(end_rel) = find_bytes(&text[body..], SOLAR_TOOL_CALL_END.as_bytes()) else {
+                break;
+            };
+            end = body + end_rel + SOLAR_TOOL_CALL_END.len();
+        }
+    }
+    Some((start, end))
 }
 
 #[cfg(test)]
@@ -266,5 +647,192 @@ mod tests {
             String::from_utf8(output.stdout).unwrap(),
             "61:78\nloaded=1\n"
         );
+    }
+
+    fn dsml(name: &str) -> String {
+        format!(
+            "\n\n{DSML_TOOL_CALLS_START}\n<｜DSML｜invoke name=\"{name}\">\n</｜DSML｜invoke>\n{DSML_TOOL_CALLS_END}"
+        )
+    }
+
+    fn calls(ids: &[&str]) -> Vec<ToolCall> {
+        ids.iter()
+            .map(|id| ToolCall {
+                id: (*id).into(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn memory_shares_blocks_preserves_id_order_and_upgrades_source() {
+        let raw = dsml("bash");
+        let mut memory = ToolMemory::new(10, 4096);
+        memory.put("call_a", &raw, Source::Disk);
+        memory.put("call_b", &raw, Source::Disk);
+        let shared_bytes = memory.bytes;
+        assert_eq!(memory.remember(&calls(&["call_a"]), &raw), 1);
+        assert_eq!(memory.bytes, shared_bytes);
+        assert_eq!(memory.blocks.len(), 1);
+        assert_eq!(memory.by_id["call_a"].source, Source::Ram);
+
+        let trailer = memory.checkpoint(raw.as_bytes()).unwrap();
+        let mut ids = Vec::new();
+        assert_eq!(
+            decode_ktm(&trailer, 10, |id, _| {
+                ids.push(String::from_utf8(id.to_vec()).unwrap());
+                true
+            }),
+            2
+        );
+        assert_eq!(ids, ["call_b", "call_a"]);
+    }
+
+    #[test]
+    fn attach_is_all_or_nothing_for_each_assistant_block() {
+        let first = dsml("first");
+        let second = dsml("second");
+        let mut memory = ToolMemory::new(10, 4096);
+        memory.put("call_a", &first, Source::Ram);
+        memory.put("call_b", &first, Source::Ram);
+        memory.put("call_other", &second, Source::Ram);
+
+        let mut messages = vec![
+            ChatMsg {
+                calls: calls(&["call_a", "call_b"]),
+                ..Default::default()
+            },
+            ChatMsg {
+                calls: calls(&["call_a", "missing"]),
+                ..Default::default()
+            },
+            ChatMsg {
+                calls: calls(&["call_a", "call_other"]),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(memory.attach(&mut messages), 1);
+        assert_eq!(messages[0].raw_dsml, first);
+        assert!(messages[1].raw_dsml.is_empty());
+        assert!(messages[2].raw_dsml.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_filters_complete_blocks_and_deduplicates_solar_span() {
+        let exact = dsml("exact");
+        let absent = dsml("absent");
+        let solar = format!(
+            "{SOLAR_TOOL_CALLS}one{SOLAR_TOOL_CALL_END} \n {SOLAR_TOOL_CALLS}two{SOLAR_TOOL_CALL_END}"
+        );
+        let mut memory = ToolMemory::new(10, 8192);
+        memory.put("call_exact", &exact, Source::Ram);
+        memory.put("call_absent", &absent, Source::Ram);
+        memory.put("call_solar", &solar, Source::Ram);
+
+        let text = format!("prefix{exact} middle {exact} tail {solar}");
+        let trailer = memory.checkpoint(text.as_bytes()).unwrap();
+        let mut got = Vec::new();
+        assert_eq!(
+            decode_ktm(&trailer, 10, |id, dsml| {
+                got.push((id.to_vec(), dsml.to_vec()));
+                true
+            }),
+            2
+        );
+        assert_eq!(got[0], (b"call_exact".to_vec(), exact.into_bytes()));
+        assert_eq!(got[1], (b"call_solar".to_vec(), solar.into_bytes()));
+    }
+
+    #[test]
+    fn memory_prunes_lru_and_counts_shared_dsml_once() {
+        let raw = dsml("shared");
+        let budget = raw.len() + 1 + ("call_a".len() + 1) * 2;
+        let mut memory = ToolMemory::new(2, budget);
+        memory.put("call_a", &raw, Source::Ram);
+        memory.put("call_b", &raw, Source::Ram);
+        assert_eq!(memory.blocks.len(), 1);
+        assert_eq!(memory.bytes, budget);
+        assert!(memory.lookup("call_a").is_some());
+        memory.put("call_c", &raw, Source::Ram);
+        assert!(memory.contains_id("call_a"));
+        assert!(!memory.contains_id("call_b"));
+        assert!(memory.contains_id("call_c"));
+        assert_eq!(memory.bytes, budget);
+    }
+
+    #[test]
+    fn checkpoint_rejects_shared_block_expansion_over_memory_budget() {
+        let raw = dsml("shared-expansion");
+        let budget = raw.len() + 1 + ("call_a".len() + 1) * 3;
+        let mut memory = ToolMemory::new(3, budget);
+        memory.put("call_a", &raw, Source::Ram);
+        memory.put("call_b", &raw, Source::Ram);
+        memory.put("call_c", &raw, Source::Ram);
+
+        assert_eq!(memory.by_id.len(), 3);
+        assert!(memory.checkpoint(raw.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn trailer_load_filters_wanted_ids() {
+        let trailer = encode_ktm(&[(b"skip", b"one"), (b"want", b"two")]).unwrap();
+        let mut memory = ToolMemory::new(10, 4096);
+        assert_eq!(
+            memory.load_trailer(&trailer, &HashSet::from(["want".to_string()])),
+            1
+        );
+        assert!(!memory.contains_id("skip"));
+        assert!(memory.contains_id("want"));
+    }
+
+    #[test]
+    fn store_restore_filters_model_and_requested_ids_before_attach() {
+        use ds4_kv::{Header, Options, Reason, Record, Store, EXT_TOOL_MAP};
+        use std::fs;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ds4-tool-memory-restore-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, true, Options::default()).unwrap();
+        let raw = dsml("restore");
+        let trailer = encode_ktm(&[
+            (b"call_want", raw.as_bytes()),
+            (b"call_skip", b"not requested"),
+        ])
+        .unwrap();
+        store
+            .write(Record {
+                header: Header {
+                    quant_bits: 2,
+                    reason: Reason::Evict,
+                    ext_flags: EXT_TOOL_MAP,
+                    model_id: 2,
+                    tokens: 1,
+                    hits: 0,
+                    ctx_size: 4096,
+                    created_at: 1,
+                    last_used: 1,
+                    payload_bytes: 0,
+                    text_bytes: 0,
+                },
+                text: raw.as_bytes().to_vec(),
+                payload: b"opaque".to_vec(),
+                trailer,
+            })
+            .unwrap();
+        let mut messages = vec![ChatMsg {
+            calls: calls(&["call_want"]),
+            ..Default::default()
+        }];
+        assert_eq!(ToolMemory::wanted_ids(&messages).len(), 1);
+        let mut memory = ToolMemory::new(10, 4096);
+        assert_eq!(memory.restore_store(&store, 1, &messages), 0);
+        assert_eq!(memory.restore_store(&store, 2, &messages), 1);
+        assert!(!memory.contains_id("call_skip"));
+        assert_eq!(memory.attach(&mut messages), 1);
+        assert_eq!(messages[0].raw_dsml, raw);
+        let _ = fs::remove_dir_all(dir);
     }
 }
