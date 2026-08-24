@@ -20,3 +20,4 @@ native = ["dep:ds4-core"]
 
 [dependencies]
 ds4-core = { path = "../ds4-core", optional = true }
+ds4-sys = { path = "../ds4-sys" }

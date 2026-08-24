@@ -7,6 +7,7 @@
 //! by the needs word, so this path never re-decodes.
 
 use std::io::Write;
+use std::time::Instant;
 
 use crate::dsml::{SamplePolicy, SampleOverride};
 use crate::generate::{
@@ -336,6 +337,7 @@ pub trait ContExec {
         created: i64,
         cors: bool,
         default_tokens: i32,
+        t_arrive: Instant,
         out: &mut dyn Write,
     ) -> Result<GenerateOutcome, GenerateError>;
 }
@@ -361,7 +363,6 @@ pub use native::ContLane;
 #[cfg(feature = "native")]
 mod native {
     use super::*;
-    use std::time::Instant;
 
     use ds4_core::{BatchCtx, ContAdmit, ContDriver, Vocab, CONT_SAMPLE_GREEDY, CONT_SAMPLE_NONE};
 
@@ -398,6 +399,13 @@ mod native {
     }
 
     impl<W: Write> OneJob<'_, W> {
+        fn transport_alive(&mut self) -> bool {
+            if !self.io_failed && self.out.flush().is_err() {
+                self.io_failed = true;
+            }
+            !self.io_failed
+        }
+
         fn push(&mut self, bytes: &[u8]) {
             if bytes.is_empty() || self.io_failed {
                 return;
@@ -414,6 +422,10 @@ mod native {
         }
 
         fn on_token(&mut self, _user: usize, token: i32) -> bool {
+            if !self.transport_alive() {
+                self.host_abort = true;
+                return false;
+            }
             if self.t_first.is_none() {
                 self.t_first = Some(Instant::now());
             }
@@ -449,6 +461,10 @@ mod native {
                 SampleOverride::Greedy => CONT_SAMPLE_GREEDY,
                 SampleOverride::Token(t) => ds4_core::cont_sample_token(t),
             }
+        }
+
+        fn alive(&mut self, _user: usize) -> bool {
+            self.transport_alive()
         }
 
         fn on_admitted(&mut self, _user: usize, n_cached: i32, n_computed: i32, _bank: i32) -> bool {
@@ -487,9 +503,9 @@ mod native {
             created: i64,
             cors: bool,
             default_tokens: i32,
+            t_arrive: Instant,
             out: &mut dyn Write,
         ) -> Result<GenerateOutcome, GenerateError> {
-            let t_arrive = Instant::now();
             let prompt = render_prompt(parsed, self.model_id)?;
             let tokens = match parsed.kind {
                 ReqKind::Completion => {

@@ -284,6 +284,7 @@ fn decode_pass(
     decode_steps: &mut i32,
 ) -> Result<(), GenerateError> {
     while acc.completion < max_tokens && engine.pos() < engine.ctx() {
+        out.flush().map_err(|_| GenerateError::Io)?;
         let mut temperature = parsed.temperature;
         let mut top_k = parsed.top_k;
         let mut top_p = parsed.top_p;

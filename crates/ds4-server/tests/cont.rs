@@ -80,7 +80,6 @@ fn http_post(addr: std::net::SocketAddr, path: &str, body: &str) -> String {
         body.len()
     );
     c.write_all(req.as_bytes()).unwrap();
-    let _ = c.shutdown(std::net::Shutdown::Write);
     let mut out = Vec::new();
     c.read_to_end(&mut out).unwrap();
     String::from_utf8_lossy(&out).into_owned()
@@ -166,9 +165,9 @@ fn anthropic_tool_turn_publishes_and_holds_next_seat() {
             let (mut s, _) = listener.accept().unwrap();
             handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine), None);
         }
-        let mut g = inner.lock().unwrap();
+        let g = inner.lock().unwrap();
         assert_eq!(g.creg.n_live(), 1);
-        assert!(g.creg.live_has_id(Api::Anthropic, "chatcmpl-1_tool_0", unix_now() as f64));
+        assert!(g.creg.id_known("chatcmpl-1_tool_0"));
     });
     let tools = r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":16,"thinking":{"type":"disabled"},"tools":[{"name":"bash","input_schema":{"type":"object"}}]}"#;
     let first = http_post(addr, "/v1/messages", tools);

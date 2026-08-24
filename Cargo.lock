@@ -29,6 +29,7 @@ name = "ds4-server"
 version = "0.6.3"
 dependencies = [
  "ds4-core",
+ "ds4-sys",
 ]
 
 [[package]]

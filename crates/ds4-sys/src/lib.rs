@@ -1,10 +1,33 @@
 //! The only unsafe Rust boundary onto the existing ds4 native runtime.
 //!
-//! Bindings cover `native/bridge/ds4_bridge.h` only. Do not bindgen `ds4.h`.
+//! Bindings cover `native/bridge/ds4_bridge.h` plus the platform libc numeric
+//! parsers needed to preserve frozen C environment-variable semantics. Do not
+//! bindgen `ds4.h`.
 
 #![allow(non_camel_case_types)]
 
-use std::os::raw::{c_char, c_int, c_float, c_void};
+use std::ffi::CString;
+use std::os::raw::{c_char, c_float, c_int, c_void};
+
+unsafe extern "C" {
+    fn atoi(value: *const c_char) -> c_int;
+    fn strtoull(value: *const c_char, end: *mut *mut c_char, base: c_int) -> u64;
+    fn atof(value: *const c_char) -> f64;
+}
+
+pub fn libc_atoi(value: &[u8]) -> i32 {
+    CString::new(value).map_or(0, |value| unsafe { atoi(value.as_ptr()) })
+}
+
+pub fn libc_strtoull10(value: &[u8]) -> u64 {
+    CString::new(value).map_or(0, |value| unsafe {
+        strtoull(value.as_ptr(), std::ptr::null_mut(), 10)
+    })
+}
+
+pub fn libc_atof(value: &[u8]) -> f64 {
+    CString::new(value).map_or(0.0, |value| unsafe { atof(value.as_ptr()) })
+}
 
 #[repr(C)]
 pub struct ds4_bridge_model {

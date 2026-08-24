@@ -3,12 +3,19 @@
 //! Native session still executes prefill; this decides reuse vs 409/503.
 
 use crate::route::Api;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 pub const CONT_REGISTRY_MAX_DEFAULT: i32 = 64;
 pub const CONT_GRACE_S: f64 = 60.0;
 pub const CONT_TTL_S: f64 = 300.0;
 pub const CONT_PIN_DEADLINE_S: f64 = 60.0;
 pub const CONT_HOLD_SHED_S: f64 = 5.0;
+
+pub(crate) fn monotonic_now() -> f64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_secs_f64()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContState {
@@ -22,8 +29,12 @@ pub enum ContOwner {
     BatchBank = 1,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContPin(u64);
+
 #[derive(Clone, Debug)]
 pub struct ContRecord {
+    record_id: u64,
     pub state: ContState,
     pub owner: ContOwner,
     pub protocol: u8,
@@ -39,6 +50,7 @@ pub struct ContRecord {
 #[derive(Clone, Debug)]
 pub struct ContRegistry {
     records: Vec<ContRecord>,
+    next_record_id: u64,
     pub max_records: i32,
     pub grace_s: f64,
     pub ttl_s: f64,
@@ -51,6 +63,7 @@ impl Default for ContRegistry {
     fn default() -> Self {
         Self {
             records: Vec::new(),
+            next_record_id: 1,
             max_records: CONT_REGISTRY_MAX_DEFAULT,
             grace_s: CONT_GRACE_S,
             ttl_s: CONT_TTL_S,
@@ -211,7 +224,10 @@ impl ContRegistry {
                 }
             }
         }
+        let record_id = self.next_record_id;
+        self.next_record_id = self.next_record_id.wrapping_add(1).max(1);
         let rec = ContRecord {
+            record_id,
             state: ContState::LiveFrontier,
             owner,
             protocol: proto as u8,
@@ -324,7 +340,7 @@ impl ContRegistry {
         }
     }
 
-    pub fn pin_live(&mut self, proto: Api, id: &str, now: f64) -> Option<usize> {
+    pub fn pin_live(&mut self, proto: Api, id: &str, now: f64) -> Option<ContPin> {
         self.expire(now);
         let i = self.find_idx(proto as u8, id)?;
         if self.records[i].state != ContState::LiveFrontier {
@@ -337,20 +353,18 @@ impl ContRegistry {
                 self.records[i].pin_expiry = expiry;
             }
         }
-        Some(i)
+        Some(ContPin(self.records[i].record_id))
     }
 
-    pub fn unpin(&mut self, pin: usize) {
-        if let Some(rec) = self.records.get_mut(pin) {
+    pub fn unpin(&mut self, pin: ContPin) {
+        if let Some(rec) = self
+            .records
+            .iter_mut()
+            .find(|record| record.record_id == pin.0)
+        {
             if rec.hard_refs > 0 {
                 rec.hard_refs -= 1;
             }
-        }
-    }
-
-    pub fn unpin_id(&mut self, proto: Api, id: &str) {
-        if let Some(i) = self.find_idx(proto as u8, id) {
-            self.unpin(i);
         }
     }
 
@@ -731,4 +745,42 @@ pub fn dump_script(name: &str) -> String {
         _ => out.push_str("ERROR unknown-script\n"),
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_survives_duplicate_id_republish() {
+        let mut registry = ContRegistry::default();
+        let ids = csv(&["toolu_same"]);
+        registry.publish_serial(Api::Anthropic, &ids, 1, 10, 1.0);
+        let pin = registry
+            .pin_live(Api::Anthropic, "toolu_same", 1.0)
+            .expect("live record should pin");
+
+        registry.publish_serial(Api::Anthropic, &ids, 2, 20, 2.0);
+        registry.unpin(pin);
+
+        let old = registry
+            .records
+            .iter()
+            .find(|record| record.owner_gen == 1)
+            .expect("old record remains for replay");
+        let new = registry
+            .records
+            .iter()
+            .find(|record| record.owner_gen == 2)
+            .expect("new record is live");
+        assert_eq!(old.hard_refs, 0, "the originally pinned record is released");
+        assert_eq!(new.hard_refs, 0, "republish is not accidentally unpinned");
+    }
+
+    #[test]
+    fn continuation_clock_is_monotonic() {
+        let first = monotonic_now();
+        let second = monotonic_now();
+        assert!(second >= first);
+    }
 }
