@@ -2660,6 +2660,7 @@ mod owner_tests {
         let (resume_tx, resume_rx) = mpsc::channel();
         let disconnect = thread::spawn(move || {
             started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            client.shutdown(std::net::Shutdown::Both).unwrap();
             drop(client);
             resume_tx.send(()).unwrap();
         });
