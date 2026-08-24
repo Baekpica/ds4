@@ -100,7 +100,7 @@ crates/
 ├── ds4-cli/      ds4 / ds4-bench / later ds4-agent
 ├── ds4-kv/       KVC format + store policy (Phase 4)
 ├── ds4-web/      agent web utility (Phase 5; blocking I/O)
-├── ds4-server/   route_decide + (later) wire / runtime (Phase 7)
+├── ds4-server/   route_decide + HTTP door; parsers/generation still C (Phase 7)
 └── ds4-dist/     distributed codecs + runtime (Phase 6)
 native/
 └── bridge/

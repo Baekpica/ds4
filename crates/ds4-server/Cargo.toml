@@ -8,3 +8,7 @@ description = "HTTP wire surfaces (Phase 7)"
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "ds4-server-rs"
+path = "src/bin/ds4-server-rs.rs"

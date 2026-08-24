@@ -18,9 +18,9 @@ C golden baseline: `v0.6.3-dfm`
 | session lifecycle | yes | wrapper | C | — | — |
 | KV store | yes | yes (envelope + policy) | C | 4-way green | n/a |
 | web utility | yes | yes (blocking I/O) | C (`ds4-agent`) | encode/wire + mock CDP green | n/a |
-| server (four surfaces) | yes | yes (`route_decide`) | C | reason table + needs green | n/a |
+| server (four surfaces) | yes | yes (`route_decide` + HTTP door) | C | reason table + HTTP porcelain green | n/a |
 | distributed runtime | yes | yes (codecs + blocking orchestration) | C | codecs + CLI/route/mock hop green | n/a |
-| CLI / bench / agent host | yes | shadow `ds4-rs` / `ds4-bench-rs` | C | — | — |
+| CLI / bench / agent host | yes | shadow `ds4-rs` / `ds4-bench-rs` / `ds4-server-rs` | C | HTTP door green; generation still C | — |
 | CPU reference backend | yes | no (not a cut-over blocker) | C | — | n/a |
 | Metal backend | native | unchanged | native | — | n/a |
 | CUDA / MMQ / VMM | native | unchanged | native | green (C baseline) | green (published band) |
@@ -38,7 +38,7 @@ C golden baseline: `v0.6.3-dfm`
 | 4 | KV store port + 4-way matrix | **format/policy green** (`make test-kv-parity`); live session payload still C |
 | 5 | Web utility port | **done** (`make test-web-parity`); `ds4-agent` still links C `ds4_web.c` |
 | 6 | Distributed runtime port | **blocking runtime green** (`make test-dist-parity`); C still owns pipelined prefetch, snapshot, `ds4_dist_session_*` |
-| 7 | Server shadow by feature | **route_decide / needs / budget / effort names green** (`make test-route-parity`); HTTP/wire still C |
+| 7 | Server shadow by feature | **route_decide + HTTP door green** (`make test-server-parity`); parsers / generation / `/metrics` `/v1/stats` still C |
 | 8 | `ds4.c` decomposition | not started |
 | 9 | Promote Rust binaries to default names | not started |
 | split | `SPLIT_READINESS.md` + `dfm-rs` genesis | blocked on 9 |
@@ -53,6 +53,7 @@ C golden baseline: `v0.6.3-dfm`
 | `ds4-eval` | C |
 | `ds4-agent` | C |
 | `ds4-rs` / `ds4-bench-rs` | Rust host, same C CUDA core (`make ds4-rs`) |
+| `ds4-server-rs` | Rust HTTP door (`make ds4-server-rs`); generation stays on C `ds4-server` |
 | `ds4_weight_server` | native CUDA (unchanged) |
 
 Phase 3 live parity (same GGUF, token/KV/prefill/decode/memory) has not been run. Do that in tmux + `scripts/guarded-run.sh`; do not load a production GGUF from an interactive agent session.

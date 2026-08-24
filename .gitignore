@@ -5,10 +5,12 @@
 /ds4-agent
 /ds4-rs
 /ds4-bench-rs
+/ds4-server-rs
 /tests/parity/kv_c_oracle
 /tests/parity/web_c_oracle
 /tests/parity/dist_c_oracle
 /tests/parity/route_c_oracle
+/tests/parity/server_c_oracle
 /ds4_native
 /ds4_server_test
 /ds4_test
