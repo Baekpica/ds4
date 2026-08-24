@@ -14,7 +14,7 @@ the later independent `dfm-rs` repository, not to this branch.
 |---|---|
 | Branch | `rust-host` |
 | C golden baseline | `v0.6.3-dfm` (`516456fe35510e4fb8350396c9d88807ac1f760b`) |
-| Current phase | Phase 7: `route_decide` + HTTP door + four JSON parsers. Generation / continuation / `/metrics` `/v1/stats` still C. |
+| Current phase | Phase 8: host-owned shape catalog + mmap GGUF identify + tensor inventory / split remap + `weights_bind` name catalog + bind-plan FFI + host tensor-dir apply (skip `parse_tensors`) + host `config_validate` (skip C validate when shape installed) + host vocab apply (skip `vocab_load` when installed) + host bind map (skip C name walk when installed) + host `weights_validate_layout` (skip C main-model layout when bind map installed) + host MTP/DSpark sibling name/layout catalogs + sibling BindPlan resolve/validate + sibling bind map FFI (skip sibling C layout; live DSpark drafter green) + host-table clear before sibling `model_open` + live memgov census/observe FFI (`make test-catalog-parity`, `make test-tokenizer-parity`, `make test-session-parity`, `make test-server-parity`). Sibling pointer assignment / CUDA weight upload / `ds4_engine_open` still native. Phase 7 incremental live DSML tool stream + required-prefix / structural greedy sampling + corrective retry + continuation registry + host `/metrics` memgov porcelain + live census overlay green; live Motif generate content/finish/usage-count match. Remaining before Phase 9: Motif continuous-lane, proof harness on the Rust path, ABBA performance. |
 | Default production path | C (`ds4`, `ds4-server`, `ds4-bench`, `ds4-agent`) |
 | Target production path | Rust host + unchanged native CUDA/MMQ backend |
 | Repo split | **not started**. Requires `SPLIT_READINESS.md` green. |
@@ -30,6 +30,7 @@ Live subsystem progress lives in [STATUS.md](STATUS.md).
 | [FFI_CONTRACT.md](FFI_CONTRACT.md) | Narrow opaque ABI; what Rust must never see |
 | [PARITY_MATRIX.md](PARITY_MATRIX.md) | Numerical / token / KV / wire / performance gates |
 | [STATUS.md](STATUS.md) | Subsystem matrix (always current) |
+| [DFM_RS_SPLIT_PLAN.md](DFM_RS_SPLIT_PLAN.md) | Post-split work instruction (§0–§60): non-fork `Baekpica/dfm-rs`, lineage/license preservation, v0.1.0 parity release. Execute only after `SPLIT_READINESS.md` is green. |
 | `SPLIT_READINESS.md` | Last artifact before `Baekpica/dfm-rs`. Do not create until green. |
 
 Related frozen oracles outside this directory:

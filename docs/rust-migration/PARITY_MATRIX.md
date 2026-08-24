@@ -36,10 +36,10 @@ C core:
 
 | Check | Pass |
 |---|---|
-| Token output | identical on deterministic path |
-| KV behavior | save/load round-trip matches C |
-| Prefill / decode tok/s | inside BASELINE.md allowances |
-| Memory | host RSS / GPU resident inside allowances |
+| Token output | Motif live: C CLI emitted `hi`; Rust CLI `--tokens 1,8320 --predict 8` emitted 9 ids. Same-prompt server pair both returned `Hi.` / stop / 13+2 |
+| KV behavior | save/load round-trip matches C (synthetic). Live Motif both allocated ctx=2048 latent KV 0.119 GiB |
+| Prefill / decode tok/s | C CLI 60.15 / 7.88; C server 86.3 / 10.6. Rust CLI/server did not print timings |
+| Memory | sequential; C server peak `nvidia-smi` 102833 MiB, Rust server 99077 MiB; teardown + `clear_cache` returned ~115 GiB available |
 
 If FFI alone regresses performance, **stop**. Do not port subsystems
 on a dirty seam.
@@ -81,11 +81,31 @@ SNAPSHOT_* / DSV4 gather, `ds4_dist_session_*` wired through `ds4.c`.
 
 `route_decide` + `request_compute_needs` are the routing oracle.
 The HTTP door (reader, native error envelopes, schema-format refusal,
-`/v1/models` porcelain) and the four JSON parsers (chat / completion /
-Anthropic / Responses, tokenize/render cut off) are
-`make test-server-parity`. Remaining: continuation registry,
-enqueue/shed, stream projectors, generation dispatch. Do not improve
-the table.
+`/v1/models` porcelain), the four JSON parsers (chat / completion /
+Anthropic / Responses, tokenize/render cut off), the four tape
+stream projectors plus buffered finals and incremental live DSML tool stream (OpenAI + Anthropic; Responses has no incremental tool stream in C),
+enqueue/shed + job-id mint, the host-owned `/metrics` `/v1/stats`
+porcelain including the memgov census format (live CUDA census +
+observation via `ds4_bridge_mem_*_snap` when an engine is open;
+absence-not-zero when unsupported), family
+render including tool-schema / invoke reconstruct
+(DSML / Motif / EXAONE / dots3 / Solar C oracle),
+NULL-handle tokenize/sample FFI, the serial decode driver
+(scripted tape, no GGUF), generated-message tool parse
+(DSML / Hermes / dots3 / Solar C goldens), SemAccum stop /
+no-tools cut / DSML `tool_calls` verdict, and finalize
+`tool_calls` / `tool_use` wire, the Inc 5a/5b/5c
+continuation registry (publish / resolve / hold / pin / TTL /
+bank claim + serial 503/409), and corrective recovery retry
+(`decode_again` / model-visible tool error + tag-completion
+repair) are `make test-server-parity`.
+Live Motif generate: content/finish/usage-count/`cache_write_tokens`
+match. Live CUDA census: `census_supported=1` epoch=1636
+weight_artifact 86.07 GiB (`scratch/rust-host-live/`).
+Serial buffered responses emit a C-shaped `timings` object.
+Remaining: Motif continuous-lane on the Rust server; proof harness
+on the Rust execution path.
+Do not improve the table.
 
 All four surfaces:
 
@@ -110,10 +130,10 @@ matrix. Live gates follow that document, not byte dumps.
 
 | Slice | Gate |
 |---|---|
-| Model metadata | enum/shape values match `g_ds4_shape` / catalog |
-| GGUF catalog | mmap; no full-file `Vec<u8>`; split-GGUF identity |
-| Tokenizer | encode/decode/special/template/stop exact token ids |
-| Session | ownership + sync/eval/rewind/payload |
+| Model metadata | enum/shape values match `g_ds4_shape` / catalog — **green** (`make test-catalog-parity`) |
+| GGUF catalog | mmap; no full-file `Vec<u8>`; first-shard `split.count` identity — **green** on synthetic v3; host `weights_bind` name catalog + bind-plan check/match + host tensor-dir apply (skip `parse_tensors` when installed) + host `config_validate` / apply shape+compress (skip C validate when installed) + host bind map (skip C name walk when installed) + host `weights_validate_layout` (skip C main-model layout when bind map installed) + host MTP/DSpark sibling name/layout catalogs + sibling BindPlan resolve/validate + sibling bind map FFI (native swaps the sibling map around its own open+bind window and skips that sibling's C layout check; live DSpark drafter 81/81 + Rust `--dspark` decode green) + host-table clear before sibling `model_open` green; sibling pointer assignment / CUDA upload still native |
+| Tokenizer | encode/decode/special/template/stop exact token ids — **green** on synthetic GGUF (`make test-tokenizer-parity`); host vocab apply (skip C `vocab_load` when installed) + `Model` host tokenize green; live Motif specials + encode `hi`→8320 |
+| Session | ownership + sync/eval/rewind/payload — **ledger + DSV4 prefix green** (`make test-session-parity`: rewrite/prefix/plan/rewind/generation + header/token tapes); GPU/logits tail / CUDA eval still native |
 | Backend dispatch | CUDA path unchanged; no extra dynamic dispatch on the hot path |
 
 ### Proof harness (any phase that can touch CUDA execution)

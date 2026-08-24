@@ -77,7 +77,7 @@ From `AGENT.md` and the current layout:
 |---|---|
 | `ds4.c` | GGUF load, metadata, tokenizer, CPU reference, session, KV payload, graph orchestration, backend dispatch |
 | `ds4_cli.c` | CLI / REPL |
-| `ds4_server.c` | four wire surfaces, workers, streaming, continuation, disk-KV policy |
+| `ds4_server.c` | four wire surfaces, workers, streaming, disk-KV policy; continuation registry ported to Rust |
 | `ds4_bench.c` / `ds4_eval.c` / `ds4_agent.c` | tools |
 | `ds4_kvstore.c` | KVC file format, eviction, prefix, trailers |
 | `ds4_web.c` | blocking sockets, poll, subprocess |
@@ -96,11 +96,11 @@ boundary is **narrower still**: `ds4_bridge.h`, not a bindgen of
 Cargo.toml
 crates/
 ├── ds4-sys/      unsafe FFI only — the single unsafe boundary
-├── ds4-core/     safe Model / Session / TokenBuffer / EvalResult / Backend
+├── ds4-core/     safe Model / Session + host-owned shape catalog / mmap GGUF identify / tensor inventory / bind plan / host load apply / host validate / host vocab apply / host bind lookup / host layout / MTP+DSpark sibling catalogs / tokenizer / session ledger / DSV4 prefix / live memgov census snapshot
 ├── ds4-cli/      ds4 / ds4-bench / later ds4-agent
 ├── ds4-kv/       KVC format + store policy (Phase 4)
 ├── ds4-web/      agent web utility (Phase 5; blocking I/O)
-├── ds4-server/   route_decide + HTTP door + four parsers; generation still C (Phase 7)
+├── ds4-server/   route_decide + HTTP door + parsers + projectors + admit + /metrics memgov porcelain + live census overlay + family render + tool-schema/invoke + generated-tool parse (Phase 7)
 └── ds4-dist/     distributed codecs + runtime (Phase 6)
 native/
 └── bridge/
