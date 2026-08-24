@@ -240,6 +240,47 @@ accept): the rolling scheduler, bank admit, per-seq eos and engine
 usage split are the same native path; multi-client width and the
 Anthropic/Responses cont promotion are follow-ups.
 
+### Recorded ABBA (2026-08-24, local benchmark shadow)
+
+Host commit `a9ba7b38cbf683f03c21e2604e055356ec2a2ad2`
+(`v0.6.3-dfm`), NVIDIA GB10, driver 610.43.02, CUDA 13.3. C binary
+SHA-256 `3c0af3d1d860cf3d2800261d51e729c3ca96aae3d048551ed721ed717aed0f8c`;
+Rust binary SHA-256
+`a66d97c48755af0e54178c57a5d70765019eade45cb9a038ccfd5615c940dae3`.
+Model artifact:
+`DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`
+(86,720,111,488 bytes; model label `DeepSeek V4 Flash`, revision label
+`0731-chat-v2`, quant label `IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8`).
+
+Order was C → Rust → Rust → C with teardown and `clear_cache` between
+cells. Both binaries used the same raw prompt, frontiers 1024→2048,
+`ctx_alloc=2081`, 32 decode tokens, width 1, and default packed FP8 KV
++ FP4 index; no `DS4_*` override was set. Logs and CSVs are under
+`scratch/rust-host-live/bench-abba-20260824/`.
+
+```bash
+$BIN --cuda -m "$MODEL" --prompt-file tests/long_context_essay_prompt.txt \
+  --ctx-start 1024 --ctx-max 2048 --ctx-alloc 2081 --step-incr 1024 \
+  --gen-tokens 32 --csv "$CELL.csv"
+```
+
+| Cell | Frontier | Prefill tok/s | Decode tok/s | Steady decode tok/s | First decode token s | Host max RSS KiB | KV bytes |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| C #1 | 1024 | 838.58 | 22.78 | 22.94 | 0.0531 | 8,972,888 | 28,482,336 |
+| C #1 | 2048 | 945.37 | 23.10 | 23.10 | 0.0433 | 8,972,888 | 32,968,864 |
+| Rust #1 | 1024 | 850.48 | 22.83 | 22.96 | 0.0517 | 9,024,668 | 28,482,336 |
+| Rust #1 | 2048 | 953.26 | 23.10 | 23.10 | 0.0433 | 9,024,668 | 32,968,864 |
+| Rust #2 | 1024 | 845.62 | 22.88 | 23.01 | 0.0518 | 9,025,144 | 28,482,336 |
+| Rust #2 | 2048 | 954.29 | 22.93 | 22.92 | 0.0433 | 9,025,144 | 32,968,864 |
+| C #2 | 1024 | 843.66 | 22.91 | 23.06 | 0.0523 | 8,972,584 | 28,482,336 |
+| C #2 | 2048 | 947.30 | 23.10 | 23.11 | 0.0439 | 8,972,584 | 32,968,864 |
+
+Rust/C mean ratios were 100.82% / 100.79% prefill and 100.04% /
+99.63% decode at the two frontiers. Rust host max RSS was +0.58%; KV
+bytes matched exactly. This passes the Phase 3 FFI-overhead thresholds.
+GPU resident peak was not sampled, so this is not the full pre-split
+performance gate.
+
 ## Status of this matrix
 
 Track per-subsystem color in [STATUS.md](STATUS.md). This file is
