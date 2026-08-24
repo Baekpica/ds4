@@ -77,7 +77,7 @@ From `AGENT.md` and the current layout:
 |---|---|
 | `ds4.c` | GGUF load, metadata, tokenizer, CPU reference, session, KV payload, graph orchestration, backend dispatch |
 | `ds4_cli.c` | CLI / REPL |
-| `ds4_server.c` | four wire surfaces, workers, streaming, disk-KV policy; continuation registry ported to Rust |
+| `ds4_server.c` | four wire surfaces, workers, streaming, disk-KV policy; continuation registry and bounded single-owner FIFO ported to the Rust shadow |
 | `ds4_bench.c` / `ds4_eval.c` / `ds4_agent.c` | tools |
 | `ds4_kvstore.c` | KVC file format, eviction, prefix, trailers |
 | `ds4_web.c` | blocking sockets, poll, subprocess |
@@ -100,7 +100,7 @@ crates/
 ├── ds4-cli/      ds4 / ds4-bench / later ds4-agent
 ├── ds4-kv/       KVC format + store policy (Phase 4)
 ├── ds4-web/      agent web utility (Phase 5; blocking I/O)
-├── ds4-server/   route_decide + HTTP door + parsers + projectors + admit + /metrics memgov porcelain + live census overlay + family render + tool-schema/invoke + generated-tool parse (Phase 7)
+├── ds4-server/   route_decide + HTTP door + parsers + projectors + admit + bounded owner FIFO + /metrics memgov porcelain + live census overlay + family render + tool-schema/invoke + generated-tool parse (Phase 7)
 └── ds4-dist/     distributed codecs + runtime (Phase 6)
 native/
 └── bridge/
@@ -154,6 +154,12 @@ Use `std::thread`, channels, `Mutex` / `Condvar`, and blocking
 sockets. Do not introduce Tokio, an async scheduler, or a new HTTP
 stack until `dfm-rs` exists. Language migration and concurrency
 redesign must be separable.
+
+The current Rust server shadow lets client threads read/parse and drain
+bounded output, while the caller thread remains the sole owner of the
+non-`Send` native engine and executes FIFO jobs to completion. This
+preserves C ownership; it does not yet prove live multi-client rolling
+batch width.
 
 Distributed frames use explicit `encode_*` / `decode_*` integer
 codecs. Do not `#[repr(C)]` a Rust struct onto the wire.

@@ -100,12 +100,22 @@ continuation registry (publish / resolve / hold / pin / TTL /
 bank claim + serial 503/409), and corrective recovery retry
 (`decode_again` / model-visible tool error + tag-completion
 repair) are `make test-server-parity`.
+The loaded-engine shadow now accepts and parses in client threads,
+then routes jobs through a bounded FIFO to one non-`Send` inference
+owner. Stable continuation pins, queue-inclusive TTFT, ordered
+terminal publication, nonblocking bounded sends, real TCP disconnect,
+slow-reader, and exactly-once settlement regressions are green at
+`6545d44` (`make test-server-parity`).
 Live Motif generate: content/finish/usage-count/`cache_write_tokens`
 match. Live CUDA census: `census_supported=1` epoch=1636
 weight_artifact 86.07 GiB (`scratch/rust-host-live/`).
 Serial buffered responses emit a C-shaped `timings` object.
-Remaining: Motif continuous-lane on the Rust server; proof harness
-on the Rust execution path.
+Live Motif width-1 continuous and the Rust smoke/long/OPP-C proof
+harness are green. Remaining: static lane, live multi-client rolling
+width, Anthropic/Responses continuous, and the full live API fixture
+inventory. `DS4_SERVER_CLIENT_SNDBUF` is also not applied by the safe
+stdlib socket path, so the pinned-buffer live slow-reader leg remains
+pending.
 Do not improve the table.
 
 All four surfaces:
@@ -236,10 +246,11 @@ Same protocol, `ds4-server-rs --cont-width 2` routing
 Rust pair spread 0.4%; the C pair spread is 9.0% (579/634 — the
 cross-lane run's C pair sat at 633.4/633.0), so the −2.4% Rust mean
 prefill delta is inside the C cell noise; decode is within 1%. No
-unexplained regression. Rust continuous is width-1 today (serial
-accept): the rolling scheduler, bank admit, per-seq eos and engine
-usage split are the same native path; multi-client width and the
-Anthropic/Responses cont promotion are follow-ups.
+unexplained regression. Rust continuous still has one active job today:
+client ingress is concurrent behind the FIFO, but the sole owner runs
+each job to completion. The rolling scheduler, bank admit, per-seq eos,
+and engine usage split are the same native path; live multi-client width
+and the Anthropic/Responses cont promotion are follow-ups.
 
 ### Recorded ABBA (2026-08-24, local benchmark shadow)
 

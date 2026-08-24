@@ -18,7 +18,7 @@ C golden baseline: `v0.6.3-dfm`
 | session lifecycle | yes | partial (host ledger + DSV4 prefix only; engine session, GPU/logits tail, and payload execution remain native) | C | synthetic C↔Rust green (`make test-session-parity`); live same-model CUDA payload pending | — |
 | KV store | yes | isolated envelope/policy crate; not production-integrated | C | file-format 4-way green | n/a |
 | web utility | yes | isolated blocking-I/O crate; not production-integrated | C (`ds4-agent`) | encode/wire + mock CDP green | n/a |
-| server (four surfaces) | yes | partial (`route_decide` + HTTP door + parsers + projectors + admission + metrics + render/tool/continuation machinery + scripted/FFI decode) | C | fixtures and live Motif serial/width-1 continuous green; static lane, multi-client continuous, and Anthropic/Responses continuous are not implemented | n/a |
+| server (four surfaces) | yes | partial (`route_decide` + HTTP door + parsers + projectors + admission + metrics + render/tool/continuation machinery + scripted/FFI decode + bounded FIFO single inference owner + per-client parse/drain + stable continuation pins + ordered terminal publication) | C | owner-FIFO, queue/TTFT, disconnect/slow-reader, terminal, and C-oracle CPU contracts green (`make test-server-parity`); live Motif serial/width-1 continuous green; static lane, live multi-client continuous batching, and Anthropic/Responses continuous are not implemented | n/a |
 | distributed runtime | yes | isolated codecs + blocking orchestration crate; not production-integrated | C | codecs + CLI/route/mock hop green | n/a |
 | CLI / bench / agent host | yes | partial: greedy/seeded-sampling `ds4-rs` with non-TTY thinking formatting, local non-MTP/non-distributed `ds4-bench-rs`, one-turn no-tool `ds4-agent-rs`, and `ds4-server-rs` | C | greedy, fixed-seed sampled, and fixed-seed thinking/non-thinking one-shot CLI stdout match C byte-for-byte; local benchmark ABBA green. Agent built-in prompt bytes, fixed datetime message, selected non-TTY projector tapes, and DSML refusal are green (`make test-agent-parity`), but live agent generation parity is not established | local benchmark green; full gate pending |
 | CPU reference backend | yes | no (not a cut-over blocker) | C | — | n/a |
@@ -41,7 +41,7 @@ Rust. They must not be read as production-path integration.
 | 4 | KV store port + 4-way matrix | **format/policy green** (`make test-kv-parity`); live session payload still C |
 | 5 | Web utility port | **isolated parity green** (`make test-web-parity`); production `ds4-agent` still uses C `ds4_web.c` |
 | 6 | Distributed runtime port | **isolated parity green** (`make test-dist-parity`); production still uses C pipelined prefetch, snapshot, and `ds4_dist_session_*` |
-| 7 | Server shadow by feature | **partial** — fixtures and live Motif serial/width-1 continuous are green, but static, multi-client continuous, and Anthropic/Responses continuous remain missing |
+| 7 | Server shadow by feature | **partial** — bounded owner-FIFO/terminal/disconnect CPU contract is green at `6545d44`; fixtures and live Motif serial/width-1 continuous are green, but static, live multi-client continuous batching, and Anthropic/Responses continuous remain missing |
 | 8 | `ds4.c` decomposition | **partial** — metadata, mmap catalogs, tokenizer (including family chat-transcript framing), and ledger slices are green; engine/model/session/scheduler execution and CUDA upload remain native |
 | 9 | Promote Rust binaries to default names | **not started** — blocked on Rust model/session/scheduler ownership, leaf-crate production integration, a narrow CUDA ABI, full CLI/bench/agent/server parity, native-drift proof, pre/post family regression, and pre-split performance/soak evidence |
 | split | `SPLIT_READINESS.md` + `dfm-rs` genesis | blocked on the full pre-split readiness gate; do not create the document or repository yet |
@@ -58,10 +58,10 @@ Rust. They must not be read as production-path integration.
 | `ds4-rs` | Partial Rust CLI host, same C CUDA core (`make ds4-rs`); diagnostics plus greedy, seeded-sampling, and non-TTY thinking-output one-shot paths are host-owned. TTY color, MTP, REPL, batch, and distributed CLI remain C-only |
 | `ds4-bench-rs` | Local raw-prompt benchmark shadow with the C incremental sync, snapshot/decode/restore timing, and 8-column CSV contract. Live CUDA two-frontier smoke is green; MTP, distributed, chat prompt, logits dump, output-head, warm, quality, and power modes remain C-only |
 | `ds4-agent-rs` | One-turn `--non-interactive -p` no-tool agent shadow over the native model/session/CUDA bridge. Rust owns the built-in tool prompt, transcript assembly, datetime message, sampling loop, and non-TTY projection for this narrow lane; interactive/stdin-repeat, tool execution, KV/resume, MTP, and distributed paths remain C-only |
-| `ds4-server-rs` | Partial Rust HTTP host over the native model/session/scheduler bridge. Serial and width-1 OpenAI continuous paths exist; static, multi-client continuous, and Anthropic/Responses continuous do not |
+| `ds4-server-rs` | Partial Rust HTTP host over the native model/session/scheduler bridge. Client threads parse and drain bounded output while one Rust owner executes native inference through FIFO. Serial and width-1 OpenAI continuous paths exist; static, live multi-client continuous batching, and Anthropic/Responses continuous do not |
 | `ds4_weight_server` | native CUDA (unchanged) |
 
-Phase 3/7 live Motif evidence is in `scratch/rust-host-live/` (tmux + workspace-local `../scripts/guarded-run.sh`, outside this repository; sequential C then Rust, `clear_cache` between loads). Production defaults stay C. Live CUDA census on `ds4-server-rs` is green (`census_supported=1`, epoch 1636, weight_artifact 86.07 GiB, observation ok). Live DSpark sibling FFI is green (DeepSeek-V4-Flash-IQ2XXS + DSpark-drafter-Q2K-Q8: C env fallback `Hi` 29.27/21.27 t/s with strict C validate; Rust `--dspark` host-map bind + layout skip, 9 decode ids; sequential, teardown + `clear_cache`). The Rust server has a continuous lane (`--cont-width`, default 2; width-1 serial accept): `ds4_bridge_batch_ctx_create_fit` + `ds4_bridge_continuous_generate` drive the native rolling scheduler, the host owns per-token stop/tool/think semantics (`ContStepper`), and live Motif routes `openai_chat_continuous` with `Hi.` / stop / 13+2 — byte-equal to C. Same-lane ABBA is recorded (PARITY_MATRIX: Rust 590.8/592.9 t/s prefill vs C 579.2/633.9; decode within 1%; all four completions byte-identical).
+Phase 3/7 live Motif evidence is in `scratch/rust-host-live/` (tmux + workspace-local `../scripts/guarded-run.sh`, outside this repository; sequential C then Rust, `clear_cache` between loads). Production defaults stay C. Live CUDA census on `ds4-server-rs` is green (`census_supported=1`, epoch 1636, weight_artifact 86.07 GiB, observation ok). Live DSpark sibling FFI is green (DeepSeek-V4-Flash-IQ2XXS + DSpark-drafter-Q2K-Q8: C env fallback `Hi` 29.27/21.27 t/s with strict C validate; Rust `--dspark` host-map bind + layout skip, 9 decode ids; sequential, teardown + `clear_cache`). The Rust server has a continuous lane (`--cont-width`, default 2; one active job behind the FIFO owner): `ds4_bridge_batch_ctx_create_fit` + `ds4_bridge_continuous_generate` drive the native rolling scheduler, the host owns per-token stop/tool/think semantics (`ContStepper`), and live Motif routes `openai_chat_continuous` with `Hi.` / stop / 13+2 — byte-equal to C. Client ingress is now concurrent, but the owner still runs each job to completion, so multi-client rolling width is not yet live-proven. Same-lane ABBA is recorded (PARITY_MATRIX: Rust 590.8/592.9 t/s prefill vs C 579.2/633.9; decode within 1%; all four completions byte-identical).
 
 The Rust benchmark smoke is in `scratch/rust-host-live/bench-rs-two-frontier.log` (GB10, DeepSeek-V4-Flash IQ2XXS, binary SHA-256 `a66d97c4...`). It completed 64 and 128 token frontiers with four decode tokens each, nonzero checkpoint sizes, exit 0, and post-run cache cleanup. These two rows prove execution and restore flow only; they are not a performance comparison.
 
@@ -93,7 +93,11 @@ a non-blocking compile).
   drift and clippy warnings. This blocks the post-split release gate in
   `DFM_RS_SPLIT_PLAN.md` §26; it is not by itself a pre-split readiness gate.
 - Unsafe-audit command: `rg -n 'unsafe \{' crates/`
-  Current count is 37, all in `crates/ds4-core`: 25 in `lib.rs`, 5 in
-  `batch.rs`, 4 in the GGUF mmap adapter (`mapped.rs`), and 3 in `mem.rs`.
-  `ds4-sys` is `extern "C"` declarations.
+  Current count is 40: 37 in `crates/ds4-core` native/mmap adapters
+  (25 in `lib.rs`, 5 in `batch.rs`, 4 in `mapped.rs`, 3 in `mem.rs`) and
+  3 libc parser calls in the allowed `crates/ds4-sys` boundary.
   `ds4-kv`, `ds4-web`, `ds4-dist`, and `ds4-server` have none.
+- `DS4_SERVER_CLIENT_SNDBUF` is not applied by the Rust shadow because
+  safe `std::net::TcpStream` has no send-buffer setter. The bounded-send
+  contract is CPU-tested, but the pinned-buffer live slow-reader leg remains
+  a Phase 7 gap.
