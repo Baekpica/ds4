@@ -2,7 +2,8 @@
 
 use ds4_kv::{
     chat_anchor_pos, continued_store_target, decode_file, encode_file, eviction_score, read_path,
-    store_len, write_path, Header, Options, Reason, Record, ScoreEntry, Store,
+    read_trailer, store_len, write_path, Header, Options, Reason, Record, ScoreEntry, Store,
+    EXT_TOOL_MAP,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -85,6 +86,8 @@ fn c_write(path: &Path, rec: &Record) {
             &rec.header.created_at.to_string(),
             "--used",
             &rec.header.last_used.to_string(),
+            "--trailer-hex",
+            &hex(&rec.trailer),
         ])
         .status()
         .unwrap();
@@ -180,6 +183,19 @@ fn c_save_rust_load() {
     c_write(&path, &rec);
     let got = decode_file(&fs::read(&path).unwrap()).unwrap();
     same_envelope(&rec, &got);
+}
+
+#[test]
+fn c_save_rust_trailer_only_load() {
+    let mut rec = sample();
+    rec.header.ext_flags = EXT_TOOL_MAP;
+    rec.trailer = b"KTM\x01\x01\0\0\0\xff".to_vec();
+    let path = tmp("cr-trailer.kv");
+    c_write(&path, &rec);
+
+    let (header, trailer) = read_trailer(&path, rec.trailer.len() as u64).unwrap();
+    assert_eq!(header.ext_flags, EXT_TOOL_MAP);
+    assert_eq!(trailer, rec.trailer);
 }
 
 #[test]

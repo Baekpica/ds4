@@ -5,7 +5,7 @@
 
 use crate::sha1::sha1_hex;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -128,6 +128,7 @@ pub enum FormatError {
     ZeroTokens,
     Truncated,
     TextLenMismatch,
+    TrailerTooLarge,
 }
 
 impl From<io::Error> for FormatError {
@@ -147,6 +148,7 @@ impl std::fmt::Display for FormatError {
             Self::ZeroTokens => write!(f, "token count is zero"),
             Self::Truncated => write!(f, "truncated KVC file"),
             Self::TextLenMismatch => write!(f, "text length does not match header"),
+            Self::TrailerTooLarge => write!(f, "KVC trailer exceeds read bound"),
         }
     }
 }
@@ -404,6 +406,24 @@ pub fn read_envelope(path: &Path) -> Result<Envelope, FormatError> {
     })
 }
 
+pub fn read_trailer(path: &Path, max_bytes: u64) -> Result<(Header, Vec<u8>), FormatError> {
+    let mut file = fs::File::open(path)?;
+    let metadata = read_metadata_file(&mut file)?;
+    if metadata.trailer_bytes > max_bytes {
+        return Err(FormatError::TrailerTooLarge);
+    }
+    let trailer_start = metadata
+        .payload_offset
+        .checked_add(metadata.header.payload_bytes)
+        .ok_or(FormatError::Truncated)?;
+    let trailer_bytes = usize::try_from(metadata.trailer_bytes)
+        .map_err(|_| FormatError::TrailerTooLarge)?;
+    file.seek(SeekFrom::Start(trailer_start))?;
+    let mut trailer = vec![0; trailer_bytes];
+    read_exact(&mut file, &mut trailer)?;
+    Ok((metadata.header, trailer))
+}
+
 pub(crate) fn read_metadata(path: &Path) -> Result<Metadata, FormatError> {
     let mut f = fs::File::open(path)?;
     read_metadata_file(&mut f)
@@ -572,6 +592,52 @@ mod tests {
         );
         assert_eq!(got.trailer_bytes, rec.trailer.len() as u64);
         assert_eq!(got.file_size, fs::metadata(&path).unwrap().len());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trailer_read_seeks_past_sparse_payload_and_honors_bound() {
+        use std::io::{Seek, SeekFrom};
+
+        const PAYLOAD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+        let dir =
+            std::env::temp_dir().join(format!("ds4-kv-trailer-sparse-{}", std::process::id()));
+        let path = dir.join("sample.kv");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let rec = sample();
+        let mut file = fs::File::create(&path).unwrap();
+        file.write_all(&fill_header(
+            rec.header.model_id,
+            rec.header.quant_bits,
+            rec.header.reason,
+            EXT_TOOL_MAP,
+            rec.header.tokens,
+            rec.header.hits,
+            rec.header.ctx_size,
+            rec.header.created_at,
+            rec.header.last_used,
+            PAYLOAD_BYTES,
+        ))
+        .unwrap();
+        let mut text_bytes = [0u8; 4];
+        le_put32(&mut text_bytes, rec.text.len() as u32);
+        file.write_all(&text_bytes).unwrap();
+        file.write_all(&rec.text).unwrap();
+        file.seek(SeekFrom::Current(PAYLOAD_BYTES as i64)).unwrap();
+        file.write_all(b"\0\xffTR").unwrap();
+        drop(file);
+
+        let (header, trailer) = read_trailer(&path, 4).unwrap();
+        assert_eq!(header.payload_bytes, PAYLOAD_BYTES);
+        assert_eq!(header.ext_flags, EXT_TOOL_MAP);
+        assert_eq!(trailer, b"\0\xffTR");
+        assert!(matches!(
+            read_trailer(&path, 3),
+            Err(FormatError::TrailerTooLarge)
+        ));
 
         let _ = fs::remove_dir_all(&dir);
     }

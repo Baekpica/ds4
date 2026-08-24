@@ -47,6 +47,7 @@ static int cmd_write(int argc, char **argv) {
     const char *path = NULL;
     const char *text_hex = NULL;
     const char *payload_hex = NULL;
+    const char *trailer_hex = "";
     uint8_t model_id = 0, quant = 2, reason = 1, ext = 0;
     uint32_t tokens = 512, hits = 0, ctx = 2048;
     uint64_t created = 1, used = 1;
@@ -54,6 +55,7 @@ static int cmd_write(int argc, char **argv) {
         if (!strcmp(argv[i], "--path")) path = need(&i, argc, argv, "--path");
         else if (!strcmp(argv[i], "--text-hex")) text_hex = need(&i, argc, argv, "--text-hex");
         else if (!strcmp(argv[i], "--payload-hex")) payload_hex = need(&i, argc, argv, "--payload-hex");
+        else if (!strcmp(argv[i], "--trailer-hex")) trailer_hex = need(&i, argc, argv, "--trailer-hex");
         else if (!strcmp(argv[i], "--model-id")) model_id = (uint8_t)atoi(need(&i, argc, argv, "--model-id"));
         else if (!strcmp(argv[i], "--quant")) quant = (uint8_t)atoi(need(&i, argc, argv, "--quant"));
         else if (!strcmp(argv[i], "--reason")) reason = (uint8_t)atoi(need(&i, argc, argv, "--reason"));
@@ -66,9 +68,10 @@ static int cmd_write(int argc, char **argv) {
         else die("unknown write flag");
     }
     if (!path || !text_hex || !payload_hex) die("write needs --path --text-hex --payload-hex");
-    size_t text_len = 0, payload_len = 0;
+    size_t text_len = 0, payload_len = 0, trailer_len = 0;
     unsigned char *text = parse_hex(text_hex, &text_len);
     unsigned char *payload = parse_hex(payload_hex, &payload_len);
+    unsigned char *trailer = parse_hex(trailer_hex, &trailer_len);
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     ds4_kvstore_fill_header(h, model_id, quant, reason, ext, tokens, hits, ctx,
                             created, used, (uint64_t)payload_len);
@@ -79,10 +82,12 @@ static int cmd_write(int argc, char **argv) {
     int ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
              fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb) &&
              fwrite(text, 1, text_len, fp) == text_len &&
-             fwrite(payload, 1, payload_len, fp) == payload_len;
+             fwrite(payload, 1, payload_len, fp) == payload_len &&
+             fwrite(trailer, 1, trailer_len, fp) == trailer_len;
     fclose(fp);
     free(text);
     free(payload);
+    free(trailer);
     if (!ok) die("fwrite");
     return 0;
 }
