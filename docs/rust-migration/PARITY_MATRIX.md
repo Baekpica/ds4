@@ -62,15 +62,56 @@ C save    → C load
 
 No new checkpoint format.
 
-Current isolated seams are green for metadata-only KVC indexing (including a
+The isolated seams are green for metadata-only KVC indexing (including a
 sparse 4 GiB payload fixture), bounded text-prefix comparison, embedded DSV4
 range validation, and a file-backed Rust payload writer. The writer stages the
 complete stream before eviction, protects a replaced destination, preserves
 the C-compatible O(trailer) fast path, and produces payload/trailer bytes read
 exactly by the C oracle. The no-GPU C oracle also proves nonzero seek, exact
-length, EOF rejection, and `uint64` overflow rejection. Production
-serial-server evict/save/restore and live same-model CUDA range restore remain
-pending.
+length, EOF rejection, and `uint64` overflow rejection.
+
+The ordinary serial Motif-3 no-think/no-tools slice is now live-green under the
+policy both servers implement (`cold=0, continued=0`). In
+`scratch/rust-host-live/rust-kv-no-think-final-IHtJue/`, C and Rust generated
+the same 301,972,392-byte
+`5522739e3318261231ec3ddd49a24da9e66a5118.kv`; visible text and payload bytes
+were exact, apart from volatile header counters/timestamps after reads. All four
+restart cells returned `RESTORED_OK` with 6,896 cached prompt tokens and 15
+new prompt tokens:
+
+```text
+C save    → Rust load   PASS
+Rust save → C load      PASS
+Rust save → Rust load   PASS
+C save    → C load      PASS
+```
+
+Request SHA-256 values were `a765063d149094c6542f42e7156735a8d466cc7f4eab1eac71e0fc40a7cbadbb`
+(A), `083ab2beb504500ee28dafe0d8184b53d7795d6958712c78b1c045cdf2c3d827`
+(evict), and `4ae9a992140aa7cd98a7ec0467b299c66ffcb4154c2429ca202239caa8cc9d4b`
+(restore). The 94,162,541,472-byte GGUF was
+`Motif-3-MQ87-88-FIT.gguf`. The C binary was
+`04f25a86040940674984c35160d2e4eec7f6c6d4e30313815ce10309cd57e662`
+and the Rust four-way binary was
+`dae70ae2f909fe6c0713a609a285c272db8d1b6ec0e2856a70bd361753625ff4`.
+The common launch contract was serial (`DS4_SERVER_COALESCE_MAX=1` /
+`--cont-width 0`), ctx 8192, max output 128, disk budget 2048 MiB, and minimum
+checkpoint 512 tokens; C additionally set both unimplemented policy knobs to
+zero. Follow-up `e5830c218361ec2288e98992cd388be1a5a24a04` corrected the Rust
+timing porcelain so a live Rust cache hit now reports
+`prefill_tokens=15` and `prefill_cached_tokens=6896`, matching C (post-fix
+binary `52471e49c4c22bde2f1abb063755847ff5d738da705896e925e8b7468b8ec197`).
+
+This is not the whole Phase 4 gate. C defaults to cold/continued checkpoints
+(`cold_max=30000`, `continued=10000`), while the Rust shadow does not expose or
+execute those policies yet. The old 6,782-token Motif fixture demonstrates why
+the omission matters: C's 6,144-token cold checkpoint changes the native
+prefill partition and produced a different greedy continuation than the
+shared cold-disabled path. Tool-call checkpoint replay is also missing.
+Restore performance is still yellow: the first comparable single-cell samples
+were C 879--934 ms TTFT versus Rust 1,590--1,715 ms; this is not an ABBA result
+and cannot satisfy the +5% TTFT gate. Diagnose and remeasure before marking
+Phase 4 performance green.
 
 ### Phase 5 — web utility
 
