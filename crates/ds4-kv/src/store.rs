@@ -259,8 +259,11 @@ impl Store {
                 }
             }
             let path = self.entries[victim].path.clone();
-            let _ = fs::remove_file(path);
+            let unlinked = fs::remove_file(path).is_ok();
             self.entries.remove(victim);
+            if !unlinked {
+                break;
+            }
         }
     }
 
@@ -300,6 +303,8 @@ mod tests {
         fill_header, le_put32, read_metadata, read_text_prefix, Header, Reason, FIXED_HEADER,
     };
     use std::io::Write as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn rec(text: &[u8], tokens: u32) -> Record {
         Record {
@@ -388,5 +393,27 @@ mod tests {
         assert_eq!(lcp, prompt.len());
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn eviction_stops_after_unlink_failure() {
+        let dir = std::env::temp_dir().join(format!("ds4-kv-evict-unlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        store.write(rec(b"first", 512)).unwrap();
+        store.write(rec(b"second", 1024)).unwrap();
+
+        let original_permissions = fs::metadata(&dir).unwrap().permissions();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        store.budget_bytes = 1;
+        store.evict(0, None);
+        let disk_files = fs::read_dir(&dir).unwrap().count();
+        let remaining_tokens: Vec<_> = store.entries().iter().map(|e| e.header.tokens).collect();
+        fs::set_permissions(&dir, original_permissions).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+
+        assert_eq!(disk_files, 2);
+        assert_eq!(remaining_tokens, vec![1024]);
     }
 }
