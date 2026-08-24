@@ -19,6 +19,11 @@ name = "ds4-bench-rs"
 path = "src/bin/ds4-bench-rs.rs"
 required-features = ["native"]
 
+[[bin]]
+name = "ds4-agent-rs"
+path = "src/bin/ds4-agent-rs.rs"
+required-features = ["native"]
+
 [features]
 default = []
 native = []

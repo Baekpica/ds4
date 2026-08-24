@@ -84,7 +84,7 @@ endif
         test-solar-gates test-solar-kv test-solar-tokenizer \
         test-solar-forward test-solar-session \
         test-exaone-ref test-exaone-kernels test-exaone-batch \
-        rust-bridge ds4-rs ds4-bench-rs ds4-server-rs test-kv-parity test-web-parity test-dist-parity test-route-parity test-server-parity test-catalog-parity test-tokenizer-parity test-session-parity
+        rust-bridge ds4-rs ds4-bench-rs ds4-agent-rs ds4-server-rs test-kv-parity test-web-parity test-dist-parity test-route-parity test-server-parity test-catalog-parity test-tokenizer-parity test-agent-parity test-session-parity
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -102,9 +102,11 @@ help:
 	@echo "  make test-server-parity C↔Rust HTTP door + parsers + tools + live tool stream + corrective retry + continuation + memgov /metrics (Phase 7)"
 	@echo "  make test-catalog-parity C↔Rust shape catalog + mmap GGUF identify + tensor inventory + bind plan + host bind lookup + host load apply + host validate + host vocab apply + host layout + MTP/DSpark sibling catalogs (Phase 8)"
 	@echo "  make test-tokenizer-parity C↔Rust tokenizer encode/decode/stop (Phase 8)"
+	@echo "  make test-agent-parity C↔Rust one-turn agent prompt/projector (agent shadow)"
 	@echo "  make test-session-parity C↔Rust session ledger / DSV4 prefix (Phase 8)"
 	@echo "  make ds4-rs       Build Rust shadow ./ds4-rs (same C core)"
 	@echo "  make ds4-bench-rs Build Rust shadow ./ds4-bench-rs"
+	@echo "  make ds4-agent-rs Build one-turn Rust shadow ./ds4-agent-rs"
 	@echo "  make ds4-server-rs Build Rust shadow ./ds4-server-rs (HTTP door + host generate; default names stay C)"
 	@echo "  make clean        Remove build outputs"
 
@@ -148,6 +150,7 @@ help:
 	@echo "  make rust-bridge         Compile native/bridge/ds4_bridge.o (Rust FFI skeleton)"
 	@echo "  make ds4-rs              Build Rust shadow ./ds4-rs (same C core + CUDA objects)"
 	@echo "  make ds4-bench-rs        Build Rust shadow ./ds4-bench-rs"
+	@echo "  make ds4-agent-rs        Build one-turn Rust shadow ./ds4-agent-rs"
 	@echo "  make test-kv-parity      C↔Rust KVC 4-way matrix (Phase 4)"
 	@echo "  make test-web-parity     C↔Rust web encode/wire + mock CDP (Phase 5)"
 	@echo "  make test-dist-parity    C↔Rust DS4D codecs + blocking runtime (Phase 6)"
@@ -155,6 +158,7 @@ help:
 	@echo "  make test-server-parity  C↔Rust HTTP door + parsers + tools + live tool stream + corrective retry + continuation + memgov /metrics (Phase 7)"
 	@echo "  make test-catalog-parity C↔Rust shape catalog + mmap GGUF identify + tensor inventory + bind plan + host bind lookup + host load apply + host validate + host vocab apply + host layout + MTP/DSpark sibling catalogs (Phase 8)"
 	@echo "  make test-tokenizer-parity C↔Rust tokenizer encode/decode/stop (Phase 8)"
+	@echo "  make test-agent-parity   C↔Rust one-turn agent prompt/projector (agent shadow)"
 	@echo "  make test-session-parity C↔Rust session ledger / DSV4 prefix (Phase 8)"
 	@echo "  make proof-rust-cuda-opp-c C→Rust OPP-C host parity (temporary C oracle)"
 	@echo "  make ds4-server-rs       Build Rust shadow ./ds4-server-rs (HTTP door + host generate; default names stay C)"
@@ -300,6 +304,12 @@ ds4-rs: native/bridge/ds4_bridge.o $(CORE_OBJS)
 		$(DS4_RS_LIBS)
 	cp -f target/release/ds4-rs $@
 
+ds4-agent-rs: native/bridge/ds4_bridge.o $(CORE_OBJS)
+	cargo rustc -p ds4-cli --bin ds4-agent-rs --release --features native -- \
+		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
+		$(DS4_RS_LIBS)
+	cp -f target/release/ds4-agent-rs $@
+
 ds4-bench-rs: native/bridge/ds4_bridge.o $(CORE_OBJS)
 	cargo rustc -p ds4-cli --bin ds4-bench-rs --release --features native -- \
 		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
@@ -411,6 +421,10 @@ tests/parity/tokenizer_c_oracle: tests/parity/tokenizer_c_oracle.c ds4.c ds4.h n
 	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
 		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
 
+tests/parity/agent_c_oracle: tests/parity/agent_c_oracle.c ds4_agent.c
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
 test-catalog-parity: tests/parity/shape_c_oracle tests/parity/catalog_c_oracle tests/parity/tensor_c_oracle tests/parity/bind_c_oracle tests/parity/bind_lookup_c_oracle tests/parity/load_c_oracle tests/parity/validate_c_oracle tests/parity/layout_c_oracle tests/parity/vocab_c_oracle tests/parity/tokenizer_c_oracle tests/parity/session_c_oracle tests/parity/payload_c_oracle
 	DS4_SHAPE_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/shape_c_oracle \
 	DS4_CATALOG_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/catalog_c_oracle \
@@ -430,6 +444,10 @@ test-tokenizer-parity: tests/parity/tokenizer_c_oracle tests/parity/vocab_c_orac
 	DS4_TOKENIZER_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/tokenizer_c_oracle \
 	DS4_VOCAB_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/vocab_c_oracle \
 		cargo test -p ds4-core --test tokenizer
+
+test-agent-parity: test-tokenizer-parity tests/parity/agent_c_oracle
+	DS4_AGENT_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/agent_c_oracle \
+		cargo test -p ds4-cli --lib agent::tests
 
 tests/parity/session_c_oracle: tests/parity/session_c_oracle.c ds4.c ds4.h native/bridge/ds4_host_load.h
 	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
@@ -822,4 +840,5 @@ tests/test_motif3_long: tests/test_motif3_long.o ds4_kvstore.o rax.o $(CORE_OBJS
 endif
 
 clean:
+	rm -f ds4-agent-rs tests/parity/agent_c_oracle tests/parity/agent_c_oracle.o
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-rs ds4-bench-rs ds4-server-rs ds4_weight_server tests/parity/shape_c_oracle tests/parity/shape_c_oracle.o tests/parity/catalog_c_oracle tests/parity/catalog_c_oracle.o tests/parity/tensor_c_oracle tests/parity/tensor_c_oracle.o tests/parity/bind_c_oracle tests/parity/bind_c_oracle.o tests/parity/bind_lookup_c_oracle tests/parity/bind_lookup_c_oracle.o tests/parity/load_c_oracle tests/parity/load_c_oracle.o tests/parity/validate_c_oracle tests/parity/validate_c_oracle.o tests/parity/layout_c_oracle tests/parity/layout_c_oracle.o tests/parity/vocab_c_oracle tests/parity/vocab_c_oracle.o tests/parity/tokenizer_c_oracle tests/parity/tokenizer_c_oracle.o tests/parity/session_c_oracle tests/parity/session_c_oracle.o tests/parity/payload_c_oracle tests/parity/payload_c_oracle.o tests/parity/kv_c_oracle tests/parity/kv_c_oracle.o tests/parity/kv_c_stubs.o tests/parity/web_c_oracle tests/parity/web_c_oracle.o tests/parity/dist_c_oracle tests/parity/dist_c_oracle.o tests/parity/route_c_oracle tests/parity/route_c_oracle.o tests/parity/server_c_oracle tests/parity/server_c_oracle.o tests/parity/parse_c_oracle tests/parity/parse_c_oracle.o tests/parity/stream_c_oracle tests/parity/stream_c_oracle.o tests/parity/tool_stream_c_oracle tests/parity/tool_stream_c_oracle.o tests/parity/dsml_c_oracle tests/parity/dsml_c_oracle.o tests/parity/retry_c_oracle tests/parity/retry_c_oracle.o tests/parity/admit_c_oracle tests/parity/admit_c_oracle.o tests/parity/render_c_oracle tests/parity/render_c_oracle.o tests/parity/bridge_null_oracle tests/parity/bridge_null_oracle.o tests/parity/bridge_null_stubs.o tests/parity/cont_c_oracle tests/parity/cont_c_oracle.o tests/parity/memgov_c_oracle tests/parity/memgov_c_oracle.o ds4_cpu ds4_native ds4_server_test ds4_test tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_batch tests/test_motif3_long tests/test_motif3_resident.o tests/test_motif3_batch.o tests/test_motif3_long.o tests/test_exaone_ref tests/test_exaone_kernels tests/test_exaone_batch tests/test_exaone_ref.o tests/test_exaone_kernels.o tests/test_exaone_batch.o *.o cuda/mmq/test/test_mmq_parity.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_repack_premapped tests/test_mmq_parity tests/test_model_family_kernels tests/test_model_family_kernels.o tests/test_solar_forward tests/test_solar_forward.o tests/test_solar_session tests/test_solar_session.o tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_kda_chunk tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_kda_chunk.o tests/test_solar_gates.o tests/test_solar_kv.o native/bridge/ds4_bridge.o

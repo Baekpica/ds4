@@ -1,5 +1,6 @@
 //! Shadow CLI host. Calls the same C inference core through `ds4-core`.
 
+pub mod agent;
 pub mod bench;
 
 use ds4_core::Backend;
