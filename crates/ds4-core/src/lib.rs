@@ -72,6 +72,9 @@ pub use tensors::{
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::os::raw::c_char;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::Path;
 use std::ptr::{self, NonNull};
 
 use ds4_sys::{
@@ -538,6 +541,20 @@ fn cstring_path(path: &str) -> Result<CString> {
     CString::new(path).map_err(|_| Error {
         code: 1,
         message: "model path contains NUL".into(),
+    })
+}
+
+fn cstring_payload_path(path: &Path) -> Result<CString> {
+    #[cfg(unix)]
+    let bytes = path.as_os_str().as_bytes();
+    #[cfg(not(unix))]
+    let bytes = path.to_str().ok_or_else(|| Error {
+        code: 1,
+        message: "payload path is not UTF-8".into(),
+    })?.as_bytes();
+    CString::new(bytes).map_err(|_| Error {
+        code: 1,
+        message: "payload path contains NUL".into(),
     })
 }
 
@@ -1078,14 +1095,15 @@ impl Session<'_> {
 
     /// Native writes the full DSV4 file (header + tokens + GPU tail).
     /// Host re-reads the prefix and requires token identity to match the ledger.
-    pub fn save_payload(&self, path: &str) -> Result<()> {
+    pub fn save_payload(&self, path: impl AsRef<Path>) -> Result<()> {
         if !self.host.valid {
             return Err(Error {
                 code: 1,
                 message: "session has no valid checkpoint to save".into(),
             });
         }
-        let c_path = cstring_path(path)?;
+        let path = path.as_ref();
+        let c_path = cstring_payload_path(path)?;
         let mut err = [0u8; 512];
         let rc = unsafe {
             ds4_bridge_session_save_payload(
@@ -1133,7 +1151,8 @@ impl Session<'_> {
     /// Host validates the DSV4 prefix independently, then native restores the
     /// GPU/logits tail. Generation follows native (`ds4_session_load_payload`
     /// bumps it). Tokens come from the host-parsed prefix.
-    pub fn load_payload(&mut self, path: &str) -> Result<()> {
+    pub fn load_payload(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
         let mut file = std::fs::File::open(path).map_err(|e| Error {
             code: 1,
             message: format!("failed to open session payload: {e}"),
@@ -1156,7 +1175,7 @@ impl Session<'_> {
             code: 1,
             message: e.to_string(),
         })?;
-        let c_path = cstring_path(path)?;
+        let c_path = cstring_payload_path(path)?;
         let mut err = [0u8; 512];
         let generation_before = self.native_generation();
         let rc = unsafe {
@@ -1185,7 +1204,13 @@ impl Session<'_> {
 
     /// Restore one DSV4 payload embedded in a larger file. Only the host
     /// prefix is read in Rust; the native loader consumes the bounded range.
-    pub fn load_payload_range(&mut self, path: &str, offset: u64, length: u64) -> Result<()> {
+    pub fn load_payload_range(
+        &mut self,
+        path: impl AsRef<Path>,
+        offset: u64,
+        length: u64,
+    ) -> Result<()> {
+        let path = path.as_ref();
         let mut file = std::fs::File::open(path).map_err(|e| Error {
             code: 1,
             message: format!("failed to open session payload range: {e}"),
@@ -1201,7 +1226,7 @@ impl Session<'_> {
             code: 1,
             message: e.to_string(),
         })?;
-        let c_path = cstring_path(path)?;
+        let c_path = cstring_payload_path(path)?;
         let mut err = [0u8; 512];
         let generation_before = self.native_generation();
         let rc = unsafe {
@@ -1262,5 +1287,31 @@ mod tests {
         let err = cstring_path("a\0b").unwrap_err();
         assert_eq!(err.code, 1);
         assert!(err.message.contains("NUL"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payload_path_preserves_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let raw = b"/tmp/ds4-payload-\xff".to_vec();
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(raw.clone()));
+
+        let c_path = cstring_payload_path(&path).unwrap();
+        assert_eq!(c_path.as_bytes(), raw);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn payload_path_rejects_embedded_nul_with_specific_error() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            b"/tmp/ds4-payload-\0suffix".to_vec(),
+        ));
+
+        let err = cstring_payload_path(&path).unwrap_err();
+        assert_eq!(err.code, 1);
+        assert_eq!(err.message, "payload path contains NUL");
     }
 }
