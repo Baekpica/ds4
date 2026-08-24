@@ -14,6 +14,7 @@ pub struct ShadowArgs {
     pub tokens: Vec<i32>,
     pub predict: i32,
     pub n_predict: i32,
+    pub system: String,
     pub nothink: bool,
     pub prompt: Option<String>,
     pub prompt_file: Option<String>,
@@ -45,22 +46,23 @@ pub struct ShadowArgs {
 impl Default for ShadowArgs {
     fn default() -> Self {
         Self {
-            model: None,
+            model: Some("ds4flash.gguf".into()),
             mtp: None,
             dspark: None,
-            backend: Backend::Cuda,
-            ctx: 2048,
+            backend: default_backend(),
+            ctx: 32768,
             ctx_set: false,
             threads: 0,
             tokens: Vec::new(),
             predict: 0,
-            n_predict: 128,
+            n_predict: 50000,
+            system: "You are a helpful assistant".into(),
             nothink: false,
             prompt: None,
             prompt_file: None,
             dump_logprobs: None,
             logprobs_top_k: 20,
-            temp: 0.0,
+            temp: 1.0,
             lifecycle_only: false,
             identify: false,
             inventory: false,
@@ -111,11 +113,18 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
             "--cpu" => parsed.backend = Backend::Cpu,
             "--metal" => parsed.backend = Backend::Metal,
             "-c" | "--ctx" => {
-                parsed.ctx = parse_i32(&arg, &require_value(&arg, iter.next())?)?;
+                parsed.ctx = parse_positive_i32(&arg, &require_value(&arg, iter.next())?)?;
                 parsed.ctx_set = true;
             }
-            "-n" | "--n-predict" => {
-                parsed.n_predict = parse_i32(&arg, &require_value(&arg, iter.next())?)?;
+            "-n" | "--tokens" | "--n-predict" => {
+                let value = require_value(&arg, iter.next())?;
+                if arg == "--tokens" && value.contains(',') {
+                    return Err(
+                        "--tokens is the output budget; use --token-ids for raw token IDs"
+                            .into(),
+                    );
+                }
+                parsed.n_predict = parse_positive_i32(&arg, &value)?;
             }
             "--temp" => {
                 let v = require_value(&arg, iter.next())?;
@@ -123,11 +132,21 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
                     .parse::<f32>()
                     .map_err(|_| format!("{arg} expects a float, got {v}"))?;
             }
+            "--think" => parsed.nothink = false,
             "--nothink" => parsed.nothink = true,
+            "-sys" | "--system" => {
+                parsed.system = require_value(&arg, iter.next())?;
+            }
             "-p" | "--prompt" => {
+                if parsed.prompt.is_some() || parsed.prompt_file.is_some() {
+                    return Err("specify only one prompt source".into());
+                }
                 parsed.prompt = Some(require_value(&arg, iter.next())?);
             }
             "--prompt-file" => {
+                if parsed.prompt.is_some() || parsed.prompt_file.is_some() {
+                    return Err("specify only one prompt source".into());
+                }
                 parsed.prompt_file = Some(require_value(&arg, iter.next())?);
             }
             "--dump-logprobs" => {
@@ -139,7 +158,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
             "-t" | "--threads" => {
                 parsed.threads = parse_i32(&arg, &require_value(&arg, iter.next())?)?;
             }
-            "--tokens" => {
+            "--token-ids" => {
                 parsed.tokens = parse_tokens(&require_value(&arg, iter.next())?)?;
             }
             "--predict" => {
@@ -200,26 +219,122 @@ fn is_rendered_chat_prompt(prompt: &str) -> bool {
     prompt.starts_with(DEEPSEEK_BOS)
 }
 
+fn prompt_text(args: &ShadowArgs) -> Result<String, String> {
+    match (&args.prompt, &args.prompt_file) {
+        (Some(prompt), None) => Ok(prompt.clone()),
+        (None, Some(path)) => {
+            std::fs::read_to_string(path).map_err(|e| format!("prompt-file: {e}"))
+        }
+        (Some(_), Some(_)) => Err("specify only one prompt source".into()),
+        (None, None) => Err(
+            "one-shot generation requires -p or --prompt-file; REPL is not implemented".into(),
+        ),
+    }
+}
+
+fn validate_one_shot_args(args: &ShadowArgs) -> Result<(), String> {
+    if args.prompt.is_none() && args.prompt_file.is_none() {
+        return Err(
+            "one-shot generation requires -p or --prompt-file; REPL is not implemented".into(),
+        );
+    }
+    if args.temp != 0.0 {
+        return Err("sampling is not implemented in ds4-rs; use --temp 0".into());
+    }
+    if !args.nothink {
+        return Err(
+            "thinking output formatting is not implemented in ds4-rs; use --nothink".into(),
+        );
+    }
+    if args.mtp.is_some() || args.dspark.is_some() {
+        return Err("one-shot generation with --mtp/--dspark is not implemented in ds4-rs".into());
+    }
+    Ok(())
+}
+
+fn generation_limit(ctx: i32, pos: i32, requested: i32) -> i32 {
+    let room = ctx.saturating_sub(pos);
+    requested.min(room).max(0)
+}
+
+fn run_one_shot(model: &ds4_core::Model, args: &ShadowArgs, text: &str) -> Result<i32, String> {
+    use std::io::Write;
+
+    const THINK_NONE: i32 = 0;
+    const THINK_LOW: i32 = 1;
+
+    let prompt = if is_rendered_chat_prompt(&text) {
+        model.tokenize_rendered_chat(&text)
+    } else {
+        model.encode_chat_prompt(
+            Some(args.system.as_str()),
+            &text,
+            if args.nothink { THINK_NONE } else { THINK_LOW },
+        )
+    }
+    .map_err(|e| e.to_string())?;
+
+    let mut session = model.session(args.ctx).map_err(|e| e.to_string())?;
+    session.sync(&prompt).map_err(|e| e.to_string())?;
+
+    let max_tokens = generation_limit(session.ctx(), session.pos(), args.n_predict);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut last_output_newline = true;
+    let mut decode_error = None;
+
+    for generated in 0..max_tokens {
+        let token = session.argmax();
+        if token < 0 {
+            decode_error = Some("failed to select the next token".into());
+            break;
+        }
+        if model.token_is_stop(token) {
+            break;
+        }
+        let piece = model.token_text(token).map_err(|e| e.to_string())?;
+        if let Some(last) = piece.last() {
+            last_output_newline = *last == b'\n';
+        }
+        out.write_all(&piece).map_err(|e| e.to_string())?;
+        out.flush().map_err(|e| e.to_string())?;
+        if generated + 1 == max_tokens {
+            break;
+        }
+        if let Err(e) = session.eval(token) {
+            decode_error = Some(e.to_string());
+            break;
+        }
+    }
+    if !last_output_newline {
+        out.write_all(b"\n").map_err(|e| e.to_string())?;
+    }
+    out.flush().map_err(|e| e.to_string())?;
+    match decode_error {
+        Some(error) => Err(error),
+        None => Ok(0),
+    }
+}
+
 /// Proof-harness dump: mirror of the C CLI `run_logprob_dump` loop
 /// (top_logprobs -> argmax -> write step -> stop check -> eval).  Prompt
 /// rendering follows the C CLI; token text and the stop set use the host vocab.
-fn run_logprob_dump(model: &ds4_core::Model, args: &ShadowArgs) -> Result<i32, String> {
+fn run_logprob_dump(
+    model: &ds4_core::Model,
+    args: &ShadowArgs,
+    prompt_text: &str,
+) -> Result<i32, String> {
     use std::io::Write;
 
     const THINK_NONE: i32 = 0;
     const THINK_LOW: i32 = 1;
     const TOP_K_CAP: usize = 128;
 
-    let prompt_text = match (&args.prompt, &args.prompt_file) {
-        (Some(p), _) => p.clone(),
-        (None, Some(f)) => std::fs::read_to_string(f).map_err(|e| format!("prompt-file: {e}"))?,
-        (None, None) => return Err("--dump-logprobs requires -p or --prompt-file".into()),
-    };
     let think = if args.nothink { THINK_NONE } else { THINK_LOW };
     let prompt = if is_rendered_chat_prompt(&prompt_text) {
         model.tokenize_rendered_chat(&prompt_text)
     } else {
-        model.encode_chat_prompt(None, &prompt_text, think)
+        model.encode_chat_prompt(Some(args.system.as_str()), &prompt_text, think)
     }
     .map_err(|e| e.to_string())?;
     let n_prompt = prompt.len() as i32;
@@ -327,7 +442,8 @@ Usage:
   {name} --session-plan CMD [ARGS...]
   {name} --session-payload CMD [ARGS...]
   {name} -m MODEL [--backend cuda|cpu|metal] [-c CTX] [--lifecycle]
-  {name} -m MODEL --tokens 1,2,3 [--predict N]
+  {name} -m MODEL (-p PROMPT | --prompt-file FILE) --temp 0 --nothink [-n N]
+  {name} -m MODEL --token-ids 1,2,3 [--predict N]
   {name} -m MODEL [--mtp GGUF] [--dspark GGUF] ...
   {name} --cuda -m MODEL --temp 0 -n N [--nothink] --dump-logprobs F \\
       --logprobs-top-k K (-p PROMPT | --prompt-file FILE)
@@ -338,6 +454,8 @@ sibling's name walk and layout check.
 --dump-logprobs mirrors the C CLI proof loop (chat-template encode via
 the engine, argmax decode, host stop set); ctx grows to fit prompt+n
 unless -c is explicit.
+--tokens is the C-compatible output budget; --token-ids is the shadow-only
+raw token-ID diagnostic.
 
 --identify mmaps GGUF metadata only (no CUDA, no ds4_bridge_model_open).
 --inventory mmaps the tensor directory + split remap (no CUDA, no engine open).
@@ -463,6 +581,19 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
         return Ok(0);
     }
 
+    let raw_token_diagnostic = !args.tokens.is_empty() || args.predict > 0;
+    let generation_text = if args.prompt.is_some() || args.prompt_file.is_some() {
+        Some(prompt_text(&args)?)
+    } else {
+        None
+    };
+    if args.dump_logprobs.is_none() && !args.lifecycle_only && !raw_token_diagnostic {
+        validate_one_shot_args(&args)?;
+    }
+    if args.dump_logprobs.is_some() && generation_text.is_none() {
+        return Err("--dump-logprobs requires -p or --prompt-file".into());
+    }
+
     let model = ds4_core::Model::open_with_support(
         model_path,
         args.backend,
@@ -474,12 +605,11 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
     .map_err(|e| e.to_string())?;
 
     if args.dump_logprobs.is_some() {
-        return run_logprob_dump(&model, &args);
+        return run_logprob_dump(&model, &args, generation_text.as_deref().unwrap());
     }
 
-    let mut session = model.session(args.ctx).map_err(|e| e.to_string())?;
-
     if args.lifecycle_only {
+        let session = model.session(args.ctx).map_err(|e| e.to_string())?;
         println!(
             "lifecycle ok backend={:?} ctx={} pos={}",
             args.backend,
@@ -489,17 +619,8 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
         return Ok(0);
     }
 
-    if args.tokens.is_empty() && args.predict <= 0 {
-        println!(
-            "open ok backend={:?} ctx={} pos={} (pass --tokens or --lifecycle)",
-            args.backend,
-            args.ctx,
-            session.pos()
-        );
-        return Ok(0);
-    }
-
     if !args.tokens.is_empty() {
+        let mut session = model.session(args.ctx).map_err(|e| e.to_string())?;
         let buf = ds4_core::TokenBuffer::from_tokens(args.tokens);
         session.sync(&buf).map_err(|e| e.to_string())?;
         print!("{}", session.argmax());
@@ -509,8 +630,15 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
             print!(" {}", session.argmax());
         }
         println!();
+        return Ok(0);
     }
-    Ok(0)
+    if args.predict > 0 {
+        /* Preserve the old diagnostic's no-op behavior when --predict was
+         * supplied without raw token IDs. */
+        let _session = model.session(args.ctx).map_err(|e| e.to_string())?;
+        return Ok(0);
+    }
+    run_one_shot(&model, &args, generation_text.as_deref().unwrap())
 }
 
 fn require_value(flag: &str, value: Option<String>) -> Result<String, String> {
@@ -521,6 +649,24 @@ fn parse_i32(flag: &str, value: &str) -> Result<i32, String> {
     value
         .parse()
         .map_err(|_| format!("{flag}: invalid integer {value}"))
+}
+
+fn parse_positive_i32(flag: &str, value: &str) -> Result<i32, String> {
+    value
+        .parse::<i32>()
+        .ok()
+        .filter(|v| *v > 0)
+        .ok_or_else(|| format!("invalid value for {flag}: {value}"))
+}
+
+#[cfg(target_os = "macos")]
+fn default_backend() -> Backend {
+    Backend::Metal
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_backend() -> Backend {
+    Backend::Cuda
 }
 
 fn parse_backend(value: &str) -> Result<Backend, String> {
@@ -562,14 +708,140 @@ mod tests {
         assert_eq!(parsed.model.as_deref(), Some("m.gguf"));
         assert_eq!(parsed.ctx, 4096);
         assert!(parsed.lifecycle_only);
-        assert_eq!(parsed.backend, Backend::Cuda);
+        assert_eq!(parsed.backend, default_backend());
+    }
+
+    #[test]
+    fn uses_c_cli_core_defaults() {
+        let parsed = parse_args(args(&[])).unwrap();
+
+        assert_eq!(parsed.model.as_deref(), Some("ds4flash.gguf"));
+        assert_eq!(parsed.backend, default_backend());
+        assert_eq!(parsed.ctx, 32768);
+        assert_eq!(parsed.n_predict, 50000);
+        assert_eq!(parsed.system, "You are a helpful assistant");
+        assert_eq!(parsed.temp, 1.0);
+        assert!(!parsed.nothink);
+    }
+
+    #[test]
+    fn parses_output_budget_and_explicit_raw_token_ids() {
+        let parsed = parse_args(args(&[
+            "--tokens",
+            "17",
+            "--token-ids",
+            "1, 2,3",
+            "--predict",
+            "4",
+        ]))
+        .unwrap();
+
+        assert_eq!(parsed.n_predict, 17);
+        assert_eq!(parsed.tokens, vec![1, 2, 3]);
+        assert_eq!(parsed.predict, 4);
     }
 
     #[test]
     fn parses_token_ids() {
-        let parsed = parse_args(args(&["--tokens", "1, 2,3", "--predict", "4"])).unwrap();
+        let parsed = parse_args(args(&["--token-ids", "1, 2,3", "--predict", "4"])).unwrap();
         assert_eq!(parsed.tokens, vec![1, 2, 3]);
         assert_eq!(parsed.predict, 4);
+    }
+
+    #[test]
+    fn raw_token_ids_have_an_actionable_tokens_collision_error() {
+        let err = parse_args(args(&["--tokens", "1,2,3"])).unwrap_err();
+
+        assert!(err.contains("use --token-ids for raw token IDs"), "{err}");
+    }
+
+    #[test]
+    fn rejects_non_positive_c_cli_integer_ranges() {
+        assert_eq!(
+            parse_args(args(&["--tokens", "0"])).unwrap_err(),
+            "invalid value for --tokens: 0"
+        );
+        assert_eq!(
+            parse_args(args(&["--ctx", "-1"])).unwrap_err(),
+            "invalid value for --ctx: -1"
+        );
+    }
+
+    #[test]
+    fn rejects_more_than_one_prompt_source() {
+        assert_eq!(
+            parse_args(args(&["-p", "one", "--prompt-file", "two.txt"])).unwrap_err(),
+            "specify only one prompt source"
+        );
+        assert_eq!(
+            parse_args(args(&["--prompt-file", "one.txt", "-p", "two"])).unwrap_err(),
+            "specify only one prompt source"
+        );
+    }
+
+    #[test]
+    fn parses_system_and_last_think_mode_wins() {
+        let thinking = parse_args(args(&[
+            "-sys",
+            "system",
+            "--nothink",
+            "--think",
+            "-p",
+            "hello",
+        ]))
+        .unwrap();
+        assert_eq!(thinking.system, "system");
+        assert!(!thinking.nothink);
+
+        let direct = parse_args(args(&["--think", "--nothink", "-p", "hello"])).unwrap();
+        assert!(direct.nothink);
+    }
+
+    #[test]
+    fn validates_only_supported_one_shot_routes() {
+        let greedy = parse_args(args(&["-p", "hello", "--temp", "0", "--nothink"])).unwrap();
+        assert!(validate_one_shot_args(&greedy).is_ok());
+
+        let sampled = parse_args(args(&["-p", "hello", "--temp", "0.5"])).unwrap();
+        assert!(validate_one_shot_args(&sampled)
+            .unwrap_err()
+            .contains("sampling is not implemented"));
+
+        let thinking = parse_args(args(&["-p", "hello", "--temp", "0"])).unwrap();
+        assert!(validate_one_shot_args(&thinking)
+            .unwrap_err()
+            .contains("thinking output formatting is not implemented"));
+
+        let mtp = parse_args(args(&[
+            "-p",
+            "hello",
+            "--temp",
+            "0",
+            "--nothink",
+            "--mtp",
+            "mtp.gguf",
+        ]))
+        .unwrap();
+        assert!(validate_one_shot_args(&mtp)
+            .unwrap_err()
+            .contains("--mtp/--dspark"));
+    }
+
+    #[test]
+    fn rejects_the_unimplemented_repl_route() {
+        let parsed = parse_args(args(&[])).unwrap();
+
+        assert!(validate_one_shot_args(&parsed)
+            .unwrap_err()
+            .contains("REPL is not implemented"));
+    }
+
+    #[test]
+    fn clamps_generation_to_the_remaining_context() {
+        assert_eq!(generation_limit(32768, 100, 50000), 32668);
+        assert_eq!(generation_limit(128, 127, 10), 1);
+        assert_eq!(generation_limit(128, 128, 10), 0);
+        assert_eq!(generation_limit(128, 120, 4), 4);
     }
 
     #[test]
