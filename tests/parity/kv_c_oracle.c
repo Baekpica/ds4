@@ -143,6 +143,72 @@ static int cmd_read(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_ktm_encode(int argc, char **argv) {
+    if ((argc - 2) % 2 != 0) die("ktm-encode needs ID_HEX DSML_HEX pairs");
+    if (argc == 2) {
+        printf("\n");
+        return 0;
+    }
+    uint8_t header[8] = {'K', 'T', 'M', 1, 0, 0, 0, 0};
+    ds4_kvstore_le_put32(header + 4, (uint32_t)((argc - 2) / 2));
+    print_hex(header, sizeof(header));
+    for (int i = 2; i < argc; i += 2) {
+        size_t id_len = 0, dsml_len = 0;
+        unsigned char *id = parse_hex(argv[i], &id_len);
+        unsigned char *dsml = parse_hex(argv[i + 1], &dsml_len);
+        if (id_len == 0 || dsml_len == 0 || id_len > UINT32_MAX || dsml_len > UINT32_MAX)
+            die("invalid ktm entry");
+        uint8_t lens[8];
+        ds4_kvstore_le_put32(lens, (uint32_t)id_len);
+        ds4_kvstore_le_put32(lens + 4, (uint32_t)dsml_len);
+        print_hex(lens, sizeof(lens));
+        print_hex(id, id_len);
+        print_hex(dsml, dsml_len);
+        free(id);
+        free(dsml);
+    }
+    printf("\n");
+    return 0;
+}
+
+static int cmd_ktm_decode(int argc, char **argv) {
+    if (argc < 3 || argc > 4) die("ktm-decode TRAILER_HEX [MAX_IDS]");
+    size_t len = 0;
+    unsigned char *data = parse_hex(argv[2], &len);
+    uint64_t max_ids = argc == 4 ? strtoull(argv[3], NULL, 10) : 100000;
+    if (max_ids == 0) max_ids = 100000;
+    int loaded = 0;
+    size_t pos = 8;
+    if (len < 8 || memcmp(data, "KTM\x01", 4) != 0) goto done;
+    uint32_t count = ds4_kvstore_le_get32(data + 4);
+    if ((uint64_t)count > max_ids * 4u) goto done;
+    for (uint32_t i = 0; i < count; i++) {
+        if (len - pos < 8) break;
+        uint32_t id_len = ds4_kvstore_le_get32(data + pos);
+        uint32_t dsml_len = ds4_kvstore_le_get32(data + pos + 4);
+        pos += 8;
+        if (id_len == 0 || id_len > 256 || dsml_len == 0 ||
+            dsml_len > 512u * 1024u * 1024u ||
+            (uint64_t)id_len + dsml_len > len - pos)
+            break;
+        unsigned char *id_zero = memchr(data + pos, 0, id_len);
+        size_t id_text_len = id_zero ? (size_t)(id_zero - (data + pos)) : id_len;
+        unsigned char *dsml = data + pos + id_len;
+        unsigned char *dsml_zero = memchr(dsml, 0, dsml_len);
+        size_t dsml_text_len = dsml_zero ? (size_t)(dsml_zero - dsml) : dsml_len;
+        print_hex(data + pos, id_text_len);
+        printf(":");
+        print_hex(dsml, dsml_text_len);
+        printf("\n");
+        pos += (size_t)id_len + dsml_len;
+        loaded++;
+    }
+done:
+    printf("loaded=%d\n", loaded);
+    free(data);
+    return 0;
+}
+
 static int cmd_sha1(int argc, char **argv) {
     if (argc < 3) die("sha1 --text-hex HEX");
     const char *hex = NULL;
@@ -226,9 +292,11 @@ static int cmd_chat_anchor(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) die("write|read|sha1|score|store-len|continued-target|chat-anchor");
+    if (argc < 2) die("write|read|ktm-encode|ktm-decode|sha1|score|store-len|continued-target|chat-anchor");
     if (!strcmp(argv[1], "write")) return cmd_write(argc, argv);
     if (!strcmp(argv[1], "read")) return cmd_read(argc, argv);
+    if (!strcmp(argv[1], "ktm-encode")) return cmd_ktm_encode(argc, argv);
+    if (!strcmp(argv[1], "ktm-decode")) return cmd_ktm_decode(argc, argv);
     if (!strcmp(argv[1], "sha1")) return cmd_sha1(argc, argv);
     if (!strcmp(argv[1], "score")) return cmd_score(argc, argv);
     if (!strcmp(argv[1], "store-len")) return cmd_store_len(argc, argv);

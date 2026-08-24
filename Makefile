@@ -373,7 +373,7 @@ tests/parity/cont_c_oracle: tests/parity/cont_c_oracle.c
 tests/parity/memgov_c_oracle: tests/parity/memgov_c_oracle.c
 	$(CC) $(CFLAGS) -o $@ tests/parity/memgov_c_oracle.c
 
-test-route-parity: tests/parity/route_c_oracle tests/parity/server_c_oracle tests/parity/parse_c_oracle tests/parity/stream_c_oracle tests/parity/tool_stream_c_oracle tests/parity/dsml_c_oracle tests/parity/retry_c_oracle tests/parity/admit_c_oracle tests/parity/render_c_oracle tests/parity/bridge_null_oracle tests/parity/cont_c_oracle tests/parity/memgov_c_oracle
+test-route-parity: tests/parity/route_c_oracle tests/parity/server_c_oracle tests/parity/parse_c_oracle tests/parity/stream_c_oracle tests/parity/tool_stream_c_oracle tests/parity/dsml_c_oracle tests/parity/retry_c_oracle tests/parity/admit_c_oracle tests/parity/render_c_oracle tests/parity/bridge_null_oracle tests/parity/cont_c_oracle tests/parity/memgov_c_oracle tests/parity/kv_c_oracle
 	DS4_ROUTE_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/route_c_oracle \
 	DS4_SERVER_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/server_c_oracle \
 	DS4_PARSE_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/parse_c_oracle \
@@ -386,6 +386,7 @@ test-route-parity: tests/parity/route_c_oracle tests/parity/server_c_oracle test
 	DS4_BRIDGE_NULL_ORACLE=$(DS4_RS_ROOT)/tests/parity/bridge_null_oracle \
 	DS4_CONT_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/cont_c_oracle \
 	DS4_MEMGOV_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/memgov_c_oracle \
+	DS4_KV_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/kv_c_oracle \
 		cargo test -p ds4-server
 
 test-server-parity: test-route-parity
