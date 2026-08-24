@@ -309,8 +309,6 @@ pub fn handle_client_inner(
                     let dec = route_decide(parsed.needs, surf, &route_env);
                     let id = {
                         let mut g = lock_inner(inner);
-                        g.metrics
-                            .record_route(surf, dec.lane, dec.reason, parsed.think_mode);
                         next_job_id(&mut g.admit, parsed.kind)
                     };
                     let body_len = req.body.len() as u64;
@@ -331,6 +329,12 @@ pub fn handle_client_inner(
                                 }
                             }
                             lock_inner(inner).metrics.record_shed(SHED_CONT_HOLD);
+                            lock_inner(inner).metrics.record_route(
+                                surf,
+                                dec.lane,
+                                dec.reason,
+                                parsed.think_mode,
+                            );
                             enqueue_release(&mut lock_inner(inner).admit, body_len);
                             write_all(
                                 stream,
@@ -363,6 +367,12 @@ pub fn handle_client_inner(
                                     g.creg.unpin_id(parsed.api, pid);
                                 }
                             }
+                            lock_inner(inner).metrics.record_route(
+                                surf,
+                                dec.lane,
+                                dec.reason,
+                                parsed.think_mode,
+                            );
                             enqueue_release(&mut lock_inner(inner).admit, body_len);
                             write_all(
                                 stream,
@@ -377,6 +387,11 @@ pub fn handle_client_inner(
                             return;
                         }
                         let created = unix_now();
+                        let mut actual_lane = if dec.lane == LANE_CONTINUOUS {
+                            LANE_CONTINUOUS
+                        } else {
+                            crate::route::LANE_SERIAL
+                        };
                         let result = if dec.lane == LANE_CONTINUOUS {
                             match cont.as_mut() {
                                 Some(exec) => match exec.generate(
@@ -390,15 +405,18 @@ pub fn handle_client_inner(
                                     /* Rejected before any bytes: the C
                                      * fallback runs the job on the single
                                      * path once the cont loop is free. */
-                                    Err(GenerateError::Unsupported(_)) => generate_and_write(
-                                        engine,
-                                        &parsed,
-                                        &id,
-                                        created,
-                                        cfg.cors,
-                                        cfg.default_tokens,
-                                        stream,
-                                    ),
+                                    Err(GenerateError::Unsupported(_)) => {
+                                        actual_lane = crate::route::LANE_SERIAL;
+                                        generate_and_write(
+                                            engine,
+                                            &parsed,
+                                            &id,
+                                            created,
+                                            cfg.cors,
+                                            cfg.default_tokens,
+                                            stream,
+                                        )
+                                    }
                                     r => r,
                                 },
                                 None => generate_and_write(
@@ -422,6 +440,12 @@ pub fn handle_client_inner(
                                 stream,
                             )
                         };
+                        lock_inner(inner).metrics.record_route(
+                            surf,
+                            actual_lane,
+                            dec.reason,
+                            parsed.think_mode,
+                        );
                         {
                             let mut g = lock_inner(inner);
                             if let Some(ref pid) = pin_id {
@@ -462,6 +486,12 @@ pub fn handle_client_inner(
                         }
                         return;
                     }
+                    lock_inner(inner).metrics.record_route(
+                        surf,
+                        dec.lane,
+                        dec.reason,
+                        parsed.think_mode,
+                    );
                     enqueue_release(&mut lock_inner(inner).admit, body_len);
                     let msg = if cfg.have_engine {
                         "generation remains on C ds4-server"
@@ -539,5 +569,84 @@ pub fn enq_verdict_name(v: EnqVerdict) -> &'static str {
         EnqVerdict::Stopping => "stopping",
         EnqVerdict::ShedQueueDepth => "shed_queue_depth",
         EnqVerdict::ShedQueueBytes => "shed_queue_bytes",
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use crate::generate::{GenerateOutcome, ScriptedDecode};
+    use crate::parse::ParsedRequest;
+    use std::io::{Read, Write};
+
+    struct RejectCont;
+
+    impl ContExec for RejectCont {
+        fn model_id(&self) -> i32 {
+            0
+        }
+
+        fn seq_cap(&self) -> i32 {
+            8192
+        }
+
+        fn encode_chat(&self, _rendered: &[u8]) -> Vec<i32> {
+            vec![1]
+        }
+
+        fn encode_text(&self, _text: &str) -> Vec<i32> {
+            vec![1]
+        }
+
+        fn generate(
+            &mut self,
+            _parsed: &ParsedRequest,
+            _job_id: &str,
+            _created: i64,
+            _cors: bool,
+            _default_tokens: i32,
+            _out: &mut dyn Write,
+        ) -> Result<GenerateOutcome, GenerateError> {
+            Err(GenerateError::Unsupported("serial fallback"))
+        }
+    }
+
+    #[test]
+    fn fallback_records_actual_serial_lane() {
+        let cfg = ServerConfig {
+            have_engine: true,
+            default_tokens: 8,
+            ..ServerConfig::default()
+        };
+        let inner = Mutex::new(ServerInner::from_cfg(&cfg));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#;
+        write!(
+            client,
+            "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let mut engine = ScriptedDecode::from_pieces(&[b"ok"]);
+        let mut cont = RejectCont;
+
+        handle_client_inner(
+            &cfg,
+            &inner,
+            &mut server,
+            Some(&mut engine),
+            Some(&mut cont),
+        );
+        drop(server);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+        let g = inner.lock().unwrap();
+        assert_eq!(g.metrics.route_requests[0][0], 1);
+        assert_eq!(g.metrics.route_requests[0][1], 0);
     }
 }
