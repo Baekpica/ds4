@@ -105,6 +105,8 @@ int ds4_bridge_session_sync(ds4_bridge_session *s,
 int ds4_bridge_eval(ds4_bridge_session *s, int32_t token,
                     char *err, size_t errlen);
 int ds4_bridge_session_argmax(ds4_bridge_session *s);
+int ds4_bridge_session_argmax_excluding(ds4_bridge_session *s,
+                                        int32_t excluded_id);
 int ds4_bridge_session_pos(ds4_bridge_session *s);
 int ds4_bridge_session_ctx(ds4_bridge_session *s);
 void ds4_bridge_session_rewind(ds4_bridge_session *s, int pos);

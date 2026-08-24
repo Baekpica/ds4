@@ -311,6 +311,13 @@ int ds4_bridge_session_argmax(ds4_bridge_session *s)
     return ds4_session_argmax(s->session);
 }
 
+int ds4_bridge_session_argmax_excluding(ds4_bridge_session *s,
+                                        int32_t excluded_id)
+{
+    if (!s || !s->session) return -1;
+    return ds4_session_argmax_excluding(s->session, (int)excluded_id);
+}
+
 int ds4_bridge_session_pos(ds4_bridge_session *s)
 {
     if (!s || !s->session) return -1;

@@ -43,6 +43,9 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     (void)s; (void)token; (void)err; (void)errlen; STUB("ds4_session_eval");
 }
 int ds4_session_argmax(ds4_session *s) { (void)s; STUB("ds4_session_argmax"); }
+int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
+    (void)s; (void)excluded_id; STUB("ds4_session_argmax_excluding");
+}
 int ds4_session_pos(ds4_session *s) { (void)s; STUB("ds4_session_pos"); }
 int ds4_session_ctx(ds4_session *s) { (void)s; STUB("ds4_session_ctx"); }
 void ds4_session_rewind(ds4_session *s, int pos) {

@@ -79,7 +79,8 @@ use ds4_sys::{
     ds4_bridge_encode_chat_prompt, ds4_bridge_eval, ds4_bridge_model, ds4_bridge_model_free,
     ds4_bridge_model_id,
     ds4_bridge_model_open, ds4_bridge_model_open_options, ds4_bridge_session,
-    ds4_bridge_session_argmax, ds4_bridge_session_create,
+    ds4_bridge_session_argmax, ds4_bridge_session_argmax_excluding,
+    ds4_bridge_session_create,
     ds4_bridge_session_exaone_rewind_span, ds4_bridge_session_free,
     ds4_bridge_session_generation, ds4_bridge_session_invalidate,
     ds4_bridge_session_load_payload, ds4_bridge_session_prefill_cap,
@@ -954,6 +955,10 @@ impl Session<'_> {
 
     pub fn argmax(&self) -> i32 {
         unsafe { ds4_bridge_session_argmax(self.raw.as_ptr()) }
+    }
+
+    pub fn argmax_excluding(&self, excluded_id: i32) -> i32 {
+        unsafe { ds4_bridge_session_argmax_excluding(self.raw.as_ptr(), excluded_id) }
     }
 
     /// Post-prefill distribution head, up to `k` entries (`k` clamps to the

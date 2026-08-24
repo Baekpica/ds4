@@ -280,6 +280,11 @@ extern "C" {
 
     pub fn ds4_bridge_session_argmax(s: *mut ds4_bridge_session) -> c_int;
 
+    pub fn ds4_bridge_session_argmax_excluding(
+        s: *mut ds4_bridge_session,
+        excluded_id: i32,
+    ) -> c_int;
+
     pub fn ds4_bridge_session_pos(s: *mut ds4_bridge_session) -> c_int;
 
     pub fn ds4_bridge_session_ctx(s: *mut ds4_bridge_session) -> c_int;

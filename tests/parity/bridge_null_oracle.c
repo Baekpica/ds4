@@ -44,6 +44,8 @@ int main(void) {
         fail("sample");
     if (ds4_bridge_session_ctx(NULL) != -1) fail("ctx");
     if (ds4_bridge_session_argmax(NULL) != -1) fail("argmax");
+    if (ds4_bridge_session_argmax_excluding(NULL, 7) != -1)
+        fail("argmax_excluding");
     if (ds4_bridge_session_pos(NULL) != -1) fail("pos");
 
     {
