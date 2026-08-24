@@ -218,12 +218,64 @@ Rust binary SHA-256 was
 The complete process was sequential; every resident exited before
 `clear_cache`, and the final host had no GPU compute application.
 
-This is still not the whole Phase 4 gate. C's intermediate-prefill progress
-checkpoints, continuous-bank checkpoints, the default configured
-10,000-token/effective aligned 10,240-token interval, and full default-policy
-ABBA remain pending. Tool-map replay is green only for the scoped OpenAI Chat,
-DeepSeek, no-think, ordinary-serial lane above; other surfaces and combined
-extension records remain pending.
+#### Intermediate-prefill continued checkpoint
+
+The scoped DeepSeek ordinary-serial gate is live-green under
+`scratch/rust-host-live/intermediate-prefill-fourway-40gDCF/` at `8361116`.
+The deterministic OpenAI Chat/no-think producer request SHA-256 is
+`efecb01d300f7e4f0e67420a7e9ce3be286d9665d716c55662aaa67e0ce79fd7`:
+6,778 raw user tokens plus four chat-framing tokens made a 6,782-token prompt.
+With ctx 8,192, `cold=0`, `continued=4096`, trim 0, and align 1, the 4,096
+frontier is reached inside prefill and the final prompt plus output stays below
+the next 8,192 frontier. Both producers returned `PREFILL_OK`, finish `stop`,
+and the serial route.
+
+C and Rust wrote the same
+`af7f4f7b6cc1a33c0ca93d55f7dc11bb08c0c507.kv`:
+
+```text
+size:          41,956,589 bytes
+reason/ext:    2 / 0
+model/ABI:     0 / 2
+tokens/ctx:    4,096 / 8,192
+text/payload:  14,617 / 41,941,920 bytes
+text SHA-256:  2dfc39c82411c86cadeabdfc517d0450054a0cba7c32bf4afb2b5f197dea9384
+payload SHA:   00d8719acee5341f3e92feb45347a43fa41d11f0102148c1775feffcdd318f1c
+```
+
+Each loader was a fresh process with an isolated copy of that one record and
+`continued=0`. The loader request SHA-256 is
+`6f29e35888928f2ac2228046695f3859c2c0d816301e6574c56bcb5e3beb3443`:
+
+```text
+C save    → Rust load   PASS  cached=4096 computed=2686 output=5 TTFT=3642.8 ms
+Rust save → C load      PASS  cached=4096 computed=2686 output=5 TTFT=3656.3 ms
+Rust save → Rust load   PASS  cached=4096 computed=2686 output=5 TTFT=3644.0 ms
+C save    → C load      PASS  cached=4096 computed=2686 output=5 TTFT=3729.4 ms
+```
+
+All cells returned `RESTORED_OK`, finish `stop`, prompt tokens 6,782, matching
+prefill usage/timing counts, and the serial route; normalized semantic
+SHA-256 is
+`7f0f6d75bd5f83e33fbd25eb224ced322825960f7e94a9467eca8ce71a125dcd`.
+The 86,720,111,488-byte DeepSeek V4 Flash IQ2XXS/w2Q2K model was shared.
+Its SHA-256 is
+`ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0`.
+C binary SHA-256 was
+`04f25a86040940674984c35160d2e4eec7f6c6d4e30313815ce10309cd57e662`;
+Rust binary SHA-256 was
+`3fd0e40320d06eae6891c5399fe622df16b9dfdfa081d92dd1df1519ff003736`.
+Every resident exited before `clear_cache`; final inspection found no GPU
+compute application or listener and 117 GiB available. This is a correctness
+and cross-read gate, not an ABBA performance claim, and it does not cover
+Motif/Solar callback semantics or continuous-bank ownership.
+
+This is still not the whole Phase 4 gate. Continuous-bank checkpoints, the
+default configured 10,000-token/effective aligned 10,240-token interval, and
+full default-policy ABBA remain pending. Intermediate-prefill is green only for
+the scoped DeepSeek CUDA, OpenAI Chat, no-think/no-tools, ordinary-serial lane
+above; other families and surfaces remain pending. Tool-map replay retains its
+separately scoped limitations above.
 
 ### Phase 5 — web utility
 
