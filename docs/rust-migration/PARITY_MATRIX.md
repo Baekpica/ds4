@@ -145,12 +145,14 @@ make proof-cuda-opp-c
 make proof-rust-cuda-opp-c
 ```
 
-`proof-cuda-opp-c` remains the native-drift gate against the tracked
-golden. `proof-rust-cuda-opp-c` is the separate host-parity gate: it
-writes a temporary snapshot with the current C oracle, then checks the
-Rust binary through the same stable runner path. Its artifacts remain
-under `/tmp/ds4_proof/proof-rust-cuda-opp-c.*` for audit; it does not
-rewrite or replace the tracked native golden.
+`proof-cuda-opp-c` remains the native-drift gate against a tracked
+golden. A persisted `CUDA_ARCH=sm_121` build selects the GB10 snapshot
+validated against `v0.6.3-dfm`; other builds keep their original generic
+snapshot and require separate architecture approval. `proof-rust-cuda-opp-c`
+is the separate host-parity gate: it writes a temporary snapshot with the
+current C oracle, then checks the Rust binary through the same stable runner
+path. Its artifacts remain under `/tmp/ds4_proof/proof-rust-cuda-opp-c.*`
+for audit; it does not rewrite or replace either tracked native golden.
 
 Both OPP-C gates must be green before the Rust execution path becomes
 default. Long-context captured-vs-eager stays a release gate.

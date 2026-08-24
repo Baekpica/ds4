@@ -51,6 +51,30 @@ Rust toolchain (host, not yet in tree): rustc 1.98.0 / cargo 1.98.0
 `sm_121a`. `-arch=sm_121a` alone is the documented silent-wrong-arch
 failure.
 
+## GB10 OPP-C golden
+
+The architecture-specific native drift snapshot is:
+
+```text
+tests/proof/expected/cuda-opp-c-full-sm121a-v0.6.3-dfm.json
+```
+
+It records five 512-token profiles from scenario plan
+`9da8afca7e450d7ad026b038edeffb6837f9b03c37a951f61f7e21fec0559d6b`
+on GB10 / `sm_121a`. All selected-token streams have MD5
+`6f1a24a5adf105053e9bed63fded9337`.
+
+The stable-runner snapshot was written by a detached build of
+`v0.6.3-dfm@516456f` and then checked exactly with the current C oracle on
+2026-08-24.
+The detached baseline binary SHA-256 was
+`42c841df96bf38b9a0ade75bd116cff2fac11883072a9829e96c12e8da5f73a9`;
+all five cells matched in both runs. This validates provenance without
+replacing the older generic golden, which remains untouched.
+
+With the persisted `CUDA_ARCH=sm_121` build configuration,
+`make proof-cuda-opp-c` selects this GB10 golden automatically.
+
 ## What `v0.6.3-dfm` itself proved
 
 From `docs/ds4-dfm-model-families.md` § Integration evidence for

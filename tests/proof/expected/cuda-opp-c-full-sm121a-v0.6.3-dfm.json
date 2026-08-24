@@ -1,0 +1,37 @@
+{
+  "cells": [
+    {
+      "gen_token_count": 512,
+      "profile": "cuda-default",
+      "prompt_id": "long_context_essay_prompt",
+      "selected_token_ids_md5": "6f1a24a5adf105053e9bed63fded9337"
+    },
+    {
+      "gen_token_count": 512,
+      "profile": "fp4-index",
+      "prompt_id": "long_context_essay_prompt",
+      "selected_token_ids_md5": "6f1a24a5adf105053e9bed63fded9337"
+    },
+    {
+      "gen_token_count": 512,
+      "profile": "fp8-kv",
+      "prompt_id": "long_context_essay_prompt",
+      "selected_token_ids_md5": "6f1a24a5adf105053e9bed63fded9337"
+    },
+    {
+      "gen_token_count": 512,
+      "profile": "fp8-kv+fp4-index",
+      "prompt_id": "long_context_essay_prompt",
+      "selected_token_ids_md5": "6f1a24a5adf105053e9bed63fded9337"
+    },
+    {
+      "gen_token_count": 512,
+      "profile": "fp8-kv+fp8-kv-predecode",
+      "prompt_id": "long_context_essay_prompt",
+      "selected_token_ids_md5": "6f1a24a5adf105053e9bed63fded9337"
+    }
+  ],
+  "expanded_plan_sha256": "9da8afca7e450d7ad026b038edeffb6837f9b03c37a951f61f7e21fec0559d6b",
+  "scenario": "cuda-opp-c-full",
+  "schema": "ds4-proof-expected-v1"
+}

@@ -216,15 +216,22 @@ cuda-regression: tests/cuda_long_context_smoke
 # counterpart parity contracts.
 #   - smoke / long: capture-vs-eager PARITY (two paths in one build must match).
 #   - opp-c: FP8 KV DRIFT gate. Single canonical, no parity contract; each cell
-#     is checked against a committed golden snapshot (tests/proof/expected/
-#     cuda-opp-c-full.json) so lossy-FP8 numeric drift between builds is caught.
-#     Regenerate the golden after an intentional output change with:
+#     is checked against the configured architecture's committed golden so
+#     lossy-FP8 numeric drift between builds is caught. Never replace a golden
+#     with candidate output; validate it against the frozen C tag first.
+#     Generate a newly approved architecture golden with:
 #       tests/ds4_proof.py --scenario cuda-opp-c-full \
-#         --write-expected tests/proof/expected/cuda-opp-c-full.json [weight-server flags]
+#         --write-expected <architecture-golden.json> [weight-server flags]
 #   - rust opp-c: HOST PARITY gate. The current C binary writes an ephemeral
 #     snapshot and the Rust binary checks it through the same stable runner
 #     path. This complements, and never replaces, the committed native golden.
 DS4_PROOF_REQUIRE_BASE = @if [ -z "$$DS4_PROOF_BASE" ]; then echo "$@: set DS4_PROOF_BASE to a base model gguf path" >&2; exit 2; fi
+ifeq ($(strip $(CUDA_ARCH)),sm_121)
+DS4_PROOF_OPPC_EXPECTED := tests/proof/expected/cuda-opp-c-full-sm121a-v0.6.3-dfm.json
+else
+DS4_PROOF_OPPC_EXPECTED := tests/proof/expected/cuda-opp-c-full.json
+endif
+DS4_PROOF_OPPC_RUNNER := /tmp/ds4_proof/proof-cuda-opp-c-bin
 
 proof-cuda-smoke: ds4
 	$(DS4_PROOF_REQUIRE_BASE)
@@ -236,8 +243,13 @@ proof-cuda-long: ds4
 
 proof-cuda-opp-c: ds4
 	$(DS4_PROOF_REQUIRE_BASE)
-	tests/ds4_proof.py --scenario cuda-opp-c-full --work-dir /tmp/ds4_proof/$@ \
-		--check-expected tests/proof/expected/cuda-opp-c-full.json
+	@set -eu; \
+		mkdir -p /tmp/ds4_proof; \
+		ln -sfn "$(CURDIR)/ds4" "$(DS4_PROOF_OPPC_RUNNER)"; \
+		echo "proof_expected=$(DS4_PROOF_OPPC_EXPECTED)"; \
+		tests/ds4_proof.py --bin "$(DS4_PROOF_OPPC_RUNNER)" \
+			--scenario cuda-opp-c-full --work-dir /tmp/ds4_proof/$@ \
+			--check-expected $(DS4_PROOF_OPPC_EXPECTED)
 
 proof-rust-cuda-opp-c: ds4 ds4-rs
 	$(DS4_PROOF_REQUIRE_BASE)
