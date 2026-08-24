@@ -29,7 +29,7 @@ Do not refresh goldens to hide a Rust miss.
 - Header exists; no bindgen of `ds4.h`
 - No production binary replaced
 
-### Phase 3 — FFI shadow (`ds4-rs` / `ds4-bench-rs`)
+### Phase 3 — FFI shadow (`ds4-rs` / `ds4-bench-rs` / `ds4-agent-rs`)
 
 Same model, same arguments, C vs Rust wrapper around the **same**
 C core:
@@ -40,6 +40,7 @@ C core:
 | KV behavior | save/load round-trip matches C (synthetic). Live Rust benchmark restored the 64-token frontier before incrementally syncing to 128; checkpoint sizes were 18,632,800 and 24,556,624 bytes |
 | Prefill / decode tok/s | Local C/Rust benchmark ABBA is green below; full production-path performance remains pending |
 | Memory | sequential; C server peak `nvidia-smi` 102833 MiB, Rust server 99077 MiB; teardown + `clear_cache` returned ~115 GiB available |
+| Agent shadow | `make test-agent-parity` is green: the 7,579-byte built-in prompt, fixed-input datetime message, selected non-TTY projector tapes, both supported DSML openers, and the 393,216-token high-thinking boundary are covered. The release binary links over the existing native core; live generation, transcript token tape, streaming, malformed/in-think DSML, tools, KV, MTP, and distributed paths remain pending |
 
 If FFI alone regresses performance, **stop**. Do not port subsystems
 on a dirty seam.

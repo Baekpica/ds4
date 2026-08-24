@@ -20,7 +20,7 @@ C golden baseline: `v0.6.3-dfm`
 | web utility | yes | isolated blocking-I/O crate; not production-integrated | C (`ds4-agent`) | encode/wire + mock CDP green | n/a |
 | server (four surfaces) | yes | partial (`route_decide` + HTTP door + parsers + projectors + admission + metrics + render/tool/continuation machinery + scripted/FFI decode) | C | fixtures and live Motif serial/width-1 continuous green; static lane, multi-client continuous, and Anthropic/Responses continuous are not implemented | n/a |
 | distributed runtime | yes | isolated codecs + blocking orchestration crate; not production-integrated | C | codecs + CLI/route/mock hop green | n/a |
-| CLI / bench / agent host | yes | partial: greedy/seeded-sampling `ds4-rs` with non-TTY thinking formatting, local non-MTP/non-distributed `ds4-bench-rs`, and `ds4-server-rs`; no `ds4-agent-rs` | C | greedy, fixed-seed sampled, and fixed-seed thinking/non-thinking one-shot stdout match C byte-for-byte; local benchmark ABBA green. TTY color, MTP/REPL/batch/distributed CLI, advanced benchmark modes, and agent parity are not established | local benchmark green; full gate pending |
+| CLI / bench / agent host | yes | partial: greedy/seeded-sampling `ds4-rs` with non-TTY thinking formatting, local non-MTP/non-distributed `ds4-bench-rs`, one-turn no-tool `ds4-agent-rs`, and `ds4-server-rs` | C | greedy, fixed-seed sampled, and fixed-seed thinking/non-thinking one-shot CLI stdout match C byte-for-byte; local benchmark ABBA green. Agent built-in prompt bytes, fixed datetime message, selected non-TTY projector tapes, and DSML refusal are green (`make test-agent-parity`), but live agent generation parity is not established | local benchmark green; full gate pending |
 | CPU reference backend | yes | no (not a cut-over blocker) | C | — | n/a |
 | Metal backend | native | unchanged | native | — | n/a |
 | CUDA / MMQ / VMM | native | unchanged | native | green (C baseline) | green (published band) |
@@ -37,7 +37,7 @@ Rust. They must not be read as production-path integration.
 | 0 | Freeze baseline + this document set | **done** (docs-only commit) |
 | 1 | Cargo workspace + FFI skeleton | **done** (`cargo check --workspace`, `make rust-bridge`) |
 | 2 | `ds4-core` safe wrappers | **wrapper layer green**; production model/session ownership remains native |
-| 3 | Shadow `ds4-rs` / `ds4-bench-rs` | **linked + live CUDA/ABBA green** (`make ds4-rs ds4-bench-rs`). Greedy, fixed-seed sampled, and fixed-seed thinking/non-thinking one-shot stdout match C exactly. The benchmark completed snapshot/restore smoke and a C→Rust→Rust→C local sweep inside prefill/decode/RSS thresholds; TTY color, advanced modes, and full production performance remain pending |
+| 3 | Shadow `ds4-rs` / `ds4-bench-rs` / `ds4-agent-rs` | **linked; CLI live CUDA and benchmark ABBA green** (`make ds4-rs ds4-bench-rs ds4-agent-rs`). Greedy, fixed-seed sampled, and fixed-seed thinking/non-thinking CLI stdout match C exactly. The benchmark completed snapshot/restore smoke and a C→Rust→Rust→C local sweep inside prefill/decode/RSS thresholds. The agent shadow owns one non-interactive no-tool turn and has no-GPU prompt/projector parity; live agent generation, tools, KV, TTY, MTP, and distributed paths remain pending |
 | 4 | KV store port + 4-way matrix | **format/policy green** (`make test-kv-parity`); live session payload still C |
 | 5 | Web utility port | **isolated parity green** (`make test-web-parity`); production `ds4-agent` still uses C `ds4_web.c` |
 | 6 | Distributed runtime port | **isolated parity green** (`make test-dist-parity`); production still uses C pipelined prefetch, snapshot, and `ds4_dist_session_*` |
@@ -57,6 +57,7 @@ Rust. They must not be read as production-path integration.
 | `ds4-agent` | C |
 | `ds4-rs` | Partial Rust CLI host, same C CUDA core (`make ds4-rs`); diagnostics plus greedy, seeded-sampling, and non-TTY thinking-output one-shot paths are host-owned. TTY color, MTP, REPL, batch, and distributed CLI remain C-only |
 | `ds4-bench-rs` | Local raw-prompt benchmark shadow with the C incremental sync, snapshot/decode/restore timing, and 8-column CSV contract. Live CUDA two-frontier smoke is green; MTP, distributed, chat prompt, logits dump, output-head, warm, quality, and power modes remain C-only |
+| `ds4-agent-rs` | One-turn `--non-interactive -p` no-tool agent shadow over the native model/session/CUDA bridge. Rust owns the built-in tool prompt, transcript assembly, datetime message, sampling loop, and non-TTY projection for this narrow lane; interactive/stdin-repeat, tool execution, KV/resume, MTP, and distributed paths remain C-only |
 | `ds4-server-rs` | Partial Rust HTTP host over the native model/session/scheduler bridge. Serial and width-1 OpenAI continuous paths exist; static, multi-client continuous, and Anthropic/Responses continuous do not |
 | `ds4_weight_server` | native CUDA (unchanged) |
 
@@ -75,8 +76,8 @@ Rust proof evidence after the rendered-prompt fix is in `scratch/rust-host-live/
 All default entry points are still C. The Rust leaf crates are not wired into
 the production binaries. The Rust server owns part of the HTTP host surface,
 but model/session/scheduler execution remains behind a broad native bridge,
-and the full CLI, advanced benchmark modes, agent, and serving-lane contracts
-have not been replaced. The decided native-forever pieces remain CUDA/MMQ/VMM (and Metal as
+and the full CLI, advanced benchmark modes, interactive/tool/KV agent, and
+serving-lane contracts have not been replaced. The decided native-forever pieces remain CUDA/MMQ/VMM (and Metal as
 a non-blocking compile).
 
 ## Notes
