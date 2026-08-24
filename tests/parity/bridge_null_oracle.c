@@ -67,6 +67,24 @@ int main(void) {
         if (ds4_bridge_mem_substrate_outstanding() != 0) fail("substrate");
     }
 
+    {
+        ds4_bridge_batch_ctx *bc = (ds4_bridge_batch_ctx *)0;
+        memset(err, 0, sizeof(err));
+        if (ds4_bridge_batch_ctx_create_fit(NULL, 2048, 4, 8192, &bc,
+                                            err, sizeof(err)) == 0)
+            fail("batch_ctx NULL model");
+        if (bc != NULL) fail("batch_ctx out");
+        if (!strstr(err, "NULL")) fail("batch_ctx err");
+        ds4_bridge_batch_ctx_destroy(NULL);
+        if (ds4_bridge_batch_ctx_max_seq(NULL) != 0) fail("batch max_seq");
+        if (ds4_bridge_batch_ctx_seq_cap(NULL) != 0) fail("batch seq_cap");
+        memset(err, 0, sizeof(err));
+        if (ds4_bridge_continuous_generate(NULL, NULL, NULL, NULL, NULL,
+                                           err, sizeof(err)) == 0)
+            fail("cont NULL ctx");
+        if (!strstr(err, "NULL")) fail("cont err");
+    }
+
     printf("ok\n");
     return 0;
 }

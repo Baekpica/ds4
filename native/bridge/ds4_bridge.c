@@ -638,3 +638,171 @@ uint64_t ds4_bridge_mem_substrate_outstanding(void)
 {
     return ds4_gpu_substrate_outstanding();
 }
+
+struct ds4_bridge_batch_ctx {
+    ds4_batch_ctx *ctx;
+};
+
+int ds4_bridge_batch_ctx_create_fit(ds4_bridge_model *m, int ctx_size,
+                                    int max_seq, int max_total_tokens,
+                                    ds4_bridge_batch_ctx **out,
+                                    char *err, size_t errlen)
+{
+    ds4_batch_ctx *ctx = NULL;
+    ds4_bridge_batch_ctx *c;
+    int rc;
+
+    if (out) *out = NULL;
+    if (!out) {
+        set_err(err, errlen, "out is NULL");
+        return 1;
+    }
+    if (!m || !m->engine) {
+        set_err(err, errlen, "model is NULL");
+        return 1;
+    }
+    rc = ds4_batch_ctx_create_fit(m->engine, ctx_size, max_seq,
+                                  max_total_tokens, &ctx, err, errlen);
+    if (rc != 0 || !ctx) return rc != 0 ? rc : 1;
+    c = calloc(1, sizeof(*c));
+    if (!c) {
+        ds4_batch_ctx_destroy(ctx);
+        set_err(err, errlen, "out of memory");
+        return 1;
+    }
+    c->ctx = ctx;
+    *out = c;
+    return 0;
+}
+
+void ds4_bridge_batch_ctx_destroy(ds4_bridge_batch_ctx *c)
+{
+    if (!c) return;
+    ds4_batch_ctx_destroy(c->ctx);
+    free(c);
+}
+
+int ds4_bridge_batch_ctx_max_seq(ds4_bridge_batch_ctx *c)
+{
+    if (!c || !c->ctx) return 0;
+    return ds4_batch_ctx_max_seq(c->ctx);
+}
+
+int ds4_bridge_batch_ctx_seq_cap(ds4_bridge_batch_ctx *c)
+{
+    if (!c || !c->ctx) return 0;
+    return ds4_batch_ctx_seq_cap(c->ctx);
+}
+
+/* Trampolines: the engine receives bridge-owned callbacks whose ud is this
+ * frame struct, and every caller-visible callback is forwarded with the
+ * caller's own ud.  Per-request callbacks are one shared set (the caller
+ * dispatches per `user`), installed only when the caller set them. */
+typedef struct {
+    int (*admit)(void *ud, ds4_bridge_cont_request *req);
+    int (*on_token)(void *ud, void *user, int32_t token);
+    void (*on_done)(void *ud, void *user, const int32_t *tokens, int32_t n,
+                    int32_t finish);
+    int (*sample_override)(void *ud, void *user);
+    int (*alive)(void *ud, void *user);
+    int (*on_admitted)(void *ud, void *user, int n_cached, int n_computed,
+                       int bank);
+    void *ud;
+} cont_tramp;
+
+static int cont_tramp_sample_override(void *ud, void *user)
+{
+    cont_tramp *t = ud;
+    return t->sample_override ? t->sample_override(t->ud, user) : 0;
+}
+
+static int cont_tramp_alive(void *ud, void *user)
+{
+    cont_tramp *t = ud;
+    return t->alive ? t->alive(t->ud, user) : 1;
+}
+
+static int cont_tramp_on_admitted(void *ud, void *user, int n_cached,
+                                  int n_computed, int bank)
+{
+    cont_tramp *t = ud;
+    return t->on_admitted ? t->on_admitted(t->ud, user, n_cached,
+                                           n_computed, bank)
+                          : 1;
+}
+
+static int cont_tramp_admit(void *ud, ds4_cont_request *req)
+{
+    cont_tramp *t = ud;
+    ds4_bridge_cont_request br;
+
+    memset(&br, 0, sizeof(br));
+    if (!t->admit || t->admit(t->ud, &br) == 0) return 0;
+    memset(req, 0, sizeof(*req));
+    req->tokens = br.tokens;
+    req->n = br.n;
+    req->max_new = br.max_new;
+    req->eos = br.eos;
+    req->user = br.user;
+    req->temperature = br.temperature;
+    req->top_k = br.top_k;
+    req->top_p = br.top_p;
+    req->min_p = br.min_p;
+    req->seed = br.seed;
+    /* The engine calls these with ITS ud (this frame), so the request
+     * carries the shared trampolines; the per-call fns land in t->*. */
+    t->sample_override = br.sample_override;
+    t->alive = br.alive;
+    t->on_admitted = br.on_admitted;
+    if (br.sample_override) req->sample_override = cont_tramp_sample_override;
+    if (br.alive) req->alive = cont_tramp_alive;
+    if (br.on_admitted) req->on_admitted = cont_tramp_on_admitted;
+    req->place_bank = br.place_bank;
+    req->n_cached = br.n_cached;
+    req->bank_used = br.bank_used;
+    req->fork_bank = br.fork_bank;
+    return 1;
+}
+
+static int cont_tramp_on_token(void *ud, void *user, int token)
+{
+    cont_tramp *t = ud;
+    return t->on_token ? t->on_token(t->ud, user, (int32_t)token) : 1;
+}
+
+static void cont_tramp_on_done(void *ud, void *user, const int *tokens,
+                               int n, int finish)
+{
+    cont_tramp *t = ud;
+    if (t->on_done)
+        t->on_done(t->ud, user, (const int32_t *)tokens, (int32_t)n,
+                   (int32_t)finish);
+}
+
+int ds4_bridge_continuous_generate(
+    ds4_bridge_batch_ctx *c,
+    int (*admit)(void *ud, ds4_bridge_cont_request *req),
+    int (*on_token)(void *ud, void *user, int32_t token),
+    void (*on_done)(void *ud, void *user, const int32_t *tokens, int32_t n,
+                    int32_t finish),
+    void *ud, char *err, size_t errlen)
+{
+    cont_tramp t;
+
+    if (!c || !c->ctx) {
+        set_err(err, errlen, "batch ctx is NULL");
+        return 1;
+    }
+    if (!admit) {
+        set_err(err, errlen, "admit is NULL");
+        return 1;
+    }
+    memset(&t, 0, sizeof(t));
+    t.admit = admit;
+    t.on_token = on_token;
+    t.on_done = on_done;
+    t.ud = ud;
+    return ds4_engine_continuous_generate(c->ctx, cont_tramp_admit,
+                                          on_token ? cont_tramp_on_token : NULL,
+                                          cont_tramp_on_done, &t, err, errlen);
+}

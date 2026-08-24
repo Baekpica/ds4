@@ -7,6 +7,7 @@
 //! crate. Application crates (`ds4-cli`, `ds4-server`, …) must not call
 //! `ds4-sys` directly.
 
+mod batch;
 mod bind;
 mod gguf;
 mod identify;
@@ -29,6 +30,9 @@ pub use bind::{
     BindName, BindNeed,
     BindPlan, BindSlot, HostBindLook, SupportCatalog, DSPARK_MARKOV_RANK, DSPARK_N_LAYER,
     HOST_BIND_MISS,
+};
+pub use batch::{
+    cont_sample_token, BatchCtx, ContAdmit, ContDriver, CONT_SAMPLE_GREEDY, CONT_SAMPLE_NONE,
 };
 pub use gguf::{GgufError, GgufFile};
 pub use identify::{dump_parse, identify_file, identify_gguf, Identified, IdentifyError};
@@ -682,6 +686,10 @@ impl Model {
 
     pub fn vocab(&self) -> &Vocab {
         &self.vocab
+    }
+
+    pub(crate) fn raw_ptr(&self) -> *mut ds4_bridge_model {
+        self.raw.as_ptr()
     }
 
     pub fn backend(&self) -> Backend {

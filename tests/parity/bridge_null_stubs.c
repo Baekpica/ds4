@@ -84,6 +84,27 @@ bool ds4_token_is_stop(ds4_engine *e, int token) {
     (void)e; (void)token; STUB("ds4_token_is_stop");
 }
 
+int ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq,
+                             int max_total_tokens, ds4_batch_ctx **out,
+                             char *err, size_t errlen) {
+    (void)e; (void)ctx_size; (void)max_seq; (void)max_total_tokens;
+    (void)out; (void)err; (void)errlen;
+    STUB("ds4_batch_ctx_create_fit");
+}
+void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) { (void)ctx; }
+int ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
+int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
+int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
+                                   int (*admit)(void *ud, ds4_cont_request *req),
+                                   int (*on_token)(void *ud, void *user, int token),
+                                   void (*on_done)(void *ud, void *user,
+                                                   const int *tokens, int n, int finish),
+                                   void *ud, char *err, size_t errlen) {
+    (void)ctx; (void)admit; (void)on_token; (void)on_done; (void)ud;
+    (void)err; (void)errlen;
+    STUB("ds4_engine_continuous_generate");
+}
+
 int ds4_gpu_mem_census_read(int consumer_class, int domain, ds4_mem_cell *out) {
     (void)consumer_class; (void)domain; (void)out;
     return 1;

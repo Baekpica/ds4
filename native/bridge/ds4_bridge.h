@@ -171,6 +171,55 @@ int ds4_bridge_mem_census_snap(ds4_bridge_mem_census *out);
 int ds4_bridge_mem_observe_snap(ds4_bridge_mem_observe *out);
 uint64_t ds4_bridge_mem_substrate_outstanding(void);
 
+/* Continuous batching (mid-flight admit/evict) over a persistent batch
+ * context.  Mirrors ds4_batch_ctx / ds4_engine_continuous_generate with
+ * a narrow request struct; the engine's rolling scheduler stays native.
+ * All callbacks run on the calling thread.  `user` is an opaque
+ * per-request handle echoed back verbatim; `ud` is the caller context
+ * given to ds4_bridge_continuous_generate. */
+typedef struct ds4_bridge_batch_ctx ds4_bridge_batch_ctx;
+
+int ds4_bridge_batch_ctx_create_fit(ds4_bridge_model *m, int ctx_size,
+                                    int max_seq, int max_total_tokens,
+                                    ds4_bridge_batch_ctx **out,
+                                    char *err, size_t errlen);
+void ds4_bridge_batch_ctx_destroy(ds4_bridge_batch_ctx *c);
+int ds4_bridge_batch_ctx_max_seq(ds4_bridge_batch_ctx *c);
+int ds4_bridge_batch_ctx_seq_cap(ds4_bridge_batch_ctx *c);
+
+typedef struct {
+    const int32_t *tokens;  /* caller-owned; keep alive until on_done */
+    int32_t n;
+    int32_t max_new;
+    int32_t eos;            /* < 0 => engine default */
+    void *user;
+    float temperature;      /* <= 0 => greedy argmax */
+    int32_t top_k;
+    float top_p;
+    float min_p;
+    uint64_t seed;
+    /* Optional (NULL disables).  Same contracts as ds4_cont_request:
+     * sample_override returns DS4_SAMPLE_OVERRIDE_* encoding; alive
+     * returns 0 to abandon a pending admission; on_admitted returns 0
+     * to cancel before prefill (n_cached + n_computed == n). */
+    int (*sample_override)(void *ud, void *user);
+    int (*alive)(void *ud, void *user);
+    int (*on_admitted)(void *ud, void *user, int n_cached, int n_computed,
+                       int bank);
+    int32_t place_bank;     /* bank id + 1; 0 = engine's choice */
+    int32_t n_cached;       /* committed prefix length; 0 = cold */
+    int32_t *bank_used;     /* OUT (optional): placed bank id */
+    int32_t fork_bank;      /* source bank id + 1; 0 = no fork */
+} ds4_bridge_cont_request;
+
+int ds4_bridge_continuous_generate(
+    ds4_bridge_batch_ctx *c,
+    int (*admit)(void *ud, ds4_bridge_cont_request *req),
+    int (*on_token)(void *ud, void *user, int32_t token),
+    void (*on_done)(void *ud, void *user, const int32_t *tokens, int32_t n,
+                    int32_t finish),
+    void *ud, char *err, size_t errlen);
+
 #ifdef __cplusplus
 }
 #endif

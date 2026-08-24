@@ -4,7 +4,7 @@
 
 #![allow(non_camel_case_types)]
 
-use std::os::raw::{c_char, c_int, c_float};
+use std::os::raw::{c_char, c_int, c_float, c_void};
 
 #[repr(C)]
 pub struct ds4_bridge_model {
@@ -13,6 +13,11 @@ pub struct ds4_bridge_model {
 
 #[repr(C)]
 pub struct ds4_bridge_session {
+    _opaque: [u8; 0],
+}
+
+#[repr(C)]
+pub struct ds4_bridge_batch_ctx {
     _opaque: [u8; 0],
 }
 
@@ -340,4 +345,57 @@ extern "C" {
     pub fn ds4_bridge_mem_observe_snap(out: *mut ds4_bridge_mem_observe) -> c_int;
 
     pub fn ds4_bridge_mem_substrate_outstanding() -> u64;
+
+    pub fn ds4_bridge_batch_ctx_create_fit(
+        m: *mut ds4_bridge_model,
+        ctx_size: c_int,
+        max_seq: c_int,
+        max_total_tokens: c_int,
+        out: *mut *mut ds4_bridge_batch_ctx,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_batch_ctx_destroy(c: *mut ds4_bridge_batch_ctx);
+
+    pub fn ds4_bridge_batch_ctx_max_seq(c: *mut ds4_bridge_batch_ctx) -> c_int;
+
+    pub fn ds4_bridge_batch_ctx_seq_cap(c: *mut ds4_bridge_batch_ctx) -> c_int;
+
+    pub fn ds4_bridge_continuous_generate(
+        c: *mut ds4_bridge_batch_ctx,
+        admit: Option<unsafe extern "C" fn(*mut c_void, *mut ds4_bridge_cont_request) -> c_int>,
+        on_token: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, i32) -> c_int>,
+        on_done: Option<
+            unsafe extern "C" fn(*mut c_void, *mut c_void, *const i32, i32, i32),
+        >,
+        ud: *mut c_void,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ds4_bridge_cont_request {
+    pub tokens: *const i32,
+    pub n: i32,
+    pub max_new: i32,
+    pub eos: i32,
+    pub user: *mut c_void,
+    pub temperature: c_float,
+    pub top_k: i32,
+    pub top_p: c_float,
+    pub min_p: c_float,
+    pub seed: u64,
+    pub sample_override:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
+    pub alive: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
+    pub on_admitted: Option<
+        unsafe extern "C" fn(*mut c_void, *mut c_void, c_int, c_int, c_int) -> c_int,
+    >,
+    pub place_bank: i32,
+    pub n_cached: i32,
+    pub bank_used: *mut i32,
+    pub fork_bank: i32,
 }
