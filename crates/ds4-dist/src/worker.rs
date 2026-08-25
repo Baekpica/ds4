@@ -153,36 +153,45 @@ impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
         rc
     }
 
+    pub fn serve_once(&mut self, stream: &mut TcpStream) -> std::io::Result<()> {
+        self.drive_one(stream)
+    }
+
     fn drive<Stream: Read + Write>(&mut self, stream: &mut Stream) -> std::io::Result<()> {
         loop {
-            let (typ, body) = match read_frame(stream) {
-                Ok(v) => v,
+            match self.drive_one(stream) {
+                Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e),
-            };
-            if typ == MSG_ERROR {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("coordinator error: {}", String::from_utf8_lossy(&body)),
-                ));
             }
-            match typ {
-                MSG_WORK => {
-                    let reply = self.process_work(&body, stream)?;
-                    if let Some(frame) = reply {
-                        stream.write_all(&frame)?;
-                    }
+        }
+    }
+
+    fn drive_one<Stream: Read + Write>(&mut self, stream: &mut Stream) -> std::io::Result<()> {
+        let (typ, body) = read_frame(stream)?;
+        if typ == MSG_ERROR {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("coordinator error: {}", String::from_utf8_lossy(&body)),
+            ));
+        }
+        match typ {
+            MSG_WORK => {
+                let reply = self.process_work(&body, stream)?;
+                if let Some(frame) = reply {
+                    stream.write_all(&frame)?;
                 }
-                MSG_SNAPSHOT_SAVE_REQ | MSG_SNAPSHOT_LOAD_BEGIN => {
-                    self.apply_snapshot(stream, typ, &body)?;
-                }
-                _ => {
-                    write_frame(stream, MSG_ERROR, b"unsupported distributed worker frame")?;
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("rejected unsupported frame type {typ}"),
-                    ));
-                }
+                Ok(())
+            }
+            MSG_SNAPSHOT_SAVE_REQ | MSG_SNAPSHOT_LOAD_BEGIN => {
+                self.apply_snapshot(stream, typ, &body)
+            }
+            _ => {
+                write_frame(stream, MSG_ERROR, b"unsupported distributed worker frame")?;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("rejected unsupported frame type {typ}"),
+                ))
             }
         }
     }

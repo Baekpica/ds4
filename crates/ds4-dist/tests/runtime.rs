@@ -1,11 +1,16 @@
 //! Coordinator/worker runtime: CLI strings, route search, HELLO/WORK/RESULT.
 
 use ds4_dist::{
-    build_route_plan, dispatch_eval, format_telemetry_line, parse_cli, parse_layers, parse_role,
-    prepare_engine_options, register_worker, resolved_layer_end, send_hello, token_span_hashes,
-    validate_layers_for_model, validate_options, Coordinator, CoordinatorView, EvalOutcome,
-    SliceExec, Telemetry, WorkOutput, WorkRequest, Worker, WorkerInfo, TOKEN_HASH_INIT,
+    build_route_plan, decode_logits_payload, decode_result_body, dispatch_eval, encode_route_blob,
+    encode_work_frame, format_telemetry_line, parse_cli, parse_layers, parse_role,
+    prepare_engine_options, read_frame, register_worker, resolved_layer_end, send_hello,
+    token_hash_update_span, token_span_hashes, validate_layers_for_model, validate_options,
+    work_with_ids, write_frame, Coordinator, CoordinatorView, EvalOutcome, ReturnTarget,
+    RouteEntry, SliceExec, Telemetry, Work, WorkBody, WorkOutput, WorkRequest, Worker, WorkerInfo,
+    MSG_ERROR, MSG_RESULT, RESULT_LOGITS, ROUTE_F_OUTPUT_LOGITS, ROUTE_RETURN_UPSTREAM,
+    TOKEN_HASH_INIT, WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS, WORK_F_RESET_SESSION,
 };
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
@@ -664,4 +669,122 @@ fn open_data_listener_accept_data_client_errors_after_close() {
     let err = ds4_dist::accept_data_client(&listener);
     std::mem::forget(listener);
     assert!(err.is_err());
+}
+
+fn hop_logits_exec() -> (MockExec, Vec<f32>) {
+    let logits = vec![0.1f32, 0.2, 0.7, 0.0];
+    (
+        MockExec {
+            model_id: 3,
+            n_layers: 4,
+            vocab: 8,
+            ctx_size: 128,
+            hidden_values: 2,
+            has_output: true,
+            layer_start: 2,
+            layer_end: 3,
+            hidden: vec![1.0, 2.0, 3.0, 4.0],
+            logits: logits.clone(),
+        },
+        logits,
+    )
+}
+
+fn hop_work_frame(port: u16) -> Vec<u8> {
+    let tokens = [1i32, 2];
+    let prefix = TOKEN_HASH_INIT;
+    let result = token_hash_update_span(prefix, &tokens);
+    let route_blob = encode_route_blob(
+        &[RouteEntry {
+            host: "127.0.0.1".into(),
+            port: u32::from(port),
+            layer_start: 2,
+            layer_end: 3,
+            flags: ROUTE_F_OUTPUT_LOGITS,
+        }],
+        &ReturnTarget {
+            kind: ROUTE_RETURN_UPSTREAM,
+            host: String::new(),
+            port: 0,
+        },
+    )
+    .unwrap();
+    let work = work_with_ids(
+        Work {
+            model_id: 3,
+            pos0: 0,
+            n_tokens: tokens.len() as u32,
+            layer_start: 2,
+            layer_end: 3,
+            flags: WORK_F_INPUT_HC | WORK_F_OUTPUT_LOGITS | WORK_F_RESET_SESSION,
+            input_hc_bits: 32,
+            route_count: 1,
+            route_index: 0,
+            ..Work::default()
+        },
+        9,
+        11,
+        prefix,
+        result,
+    );
+    encode_work_frame(&WorkBody {
+        work,
+        tokens: tokens.to_vec(),
+        input_hc: vec![1.0, 2.0, 3.0, 4.0],
+        route_blob,
+    })
+    .unwrap()
+}
+
+#[test]
+fn accepted_hop_serve_once_returns_result_for_work() {
+    // Given: a data listener and a MockExec worker that owns the final hop
+    let (listener, port) = ds4_dist::open_data_listener(Some("127.0.0.1"), 0).unwrap();
+    let frame = hop_work_frame(port);
+    let client = thread::spawn(move || {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        tune(&stream);
+        stream.write_all(&frame).unwrap();
+        read_frame(&mut stream).unwrap()
+    });
+
+    // When: accept the hop and serve one WORK
+    let mut hop = ds4_dist::accept_data_client(&listener).unwrap();
+    tune(&hop);
+    let (exec, logits) = hop_logits_exec();
+    let mut worker = Worker::new(exec);
+    worker.serve_once(&mut hop).unwrap();
+
+    // Then: the client reads a RESULT with the mock logits
+    let (typ, reply) = client.join().unwrap();
+    assert_eq!(typ, MSG_RESULT);
+    let result = decode_result_body(&reply).unwrap();
+    assert_eq!(result.hdr.status, 0);
+    assert_eq!(result.hdr.result_kind, RESULT_LOGITS);
+    assert_eq!(decode_logits_payload(&result.payload).unwrap(), logits);
+}
+
+#[test]
+fn accepted_hop_serve_once_unknown_frame_yields_error() {
+    // Given: a data listener and a MockExec worker
+    let (listener, port) = ds4_dist::open_data_listener(Some("127.0.0.1"), 0).unwrap();
+    let client = thread::spawn(move || {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        tune(&stream);
+        write_frame(&mut stream, 99, b"not-a-work-frame").unwrap();
+        read_frame(&mut stream).unwrap()
+    });
+
+    // When: accept the hop and serve one unknown frame
+    let mut hop = ds4_dist::accept_data_client(&listener).unwrap();
+    tune(&hop);
+    let (exec, _) = hop_logits_exec();
+    let mut worker = Worker::new(exec);
+    let err = worker.serve_once(&mut hop).unwrap_err();
+
+    // Then: the worker rejects the type and the client reads an ERROR frame
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    let (typ, body) = client.join().unwrap();
+    assert_eq!(typ, MSG_ERROR);
+    assert_eq!(body, b"unsupported distributed worker frame");
 }
