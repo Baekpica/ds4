@@ -38,7 +38,10 @@ fn main() {
     let mut model_path: Option<String> = None;
     let mut backend = Backend::Cuda;
     let mut n_threads = 0i32;
-    let mut cont_width = 2i32;
+    let mut cont_width = std::env::var("DS4_SERVER_COALESCE_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
     let mut kv = DiskKvArgs::default();
     let mut dist = DistArgs::default();
     let mut args = std::env::args().skip(1);
@@ -102,6 +105,8 @@ fn main() {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage());
             }
+            // Hidden rust-shadow alias for DS4_SERVER_COALESCE_MAX.
+            // Not a C flag; kept for rust-host-live scripts (e.g. --cont-width 1).
             "--cont-width" => {
                 cont_width = args
                     .next()
@@ -242,7 +247,7 @@ fn cli_error(message: &str) -> ! {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: ds4-server-rs [--host HOST] [--port PORT] [--listen HOST PORT] [--model-id ID] [-m GGUF] [--backend cuda|cpu|metal] [--tokens N] [-c N] [-t N] [--cont-width N] [--mem-floor-gb N] [--cors]\n\
+        "usage: ds4-server-rs [--host HOST] [--port PORT] [--listen HOST PORT] [--model-id ID] [-m GGUF] [--backend cuda|cpu|metal] [--tokens N] [-c N] [-t N] [--mem-floor-gb N] [--cors]\n\
          Disk KV: [--kv-disk-dir DIR] [--kv-disk-space-mb N] [--kv-cache-min-tokens N]\n\
          [--kv-cache-cold-max-tokens N] [--kv-cache-continued-interval-tokens N]\n\
          [--kv-cache-boundary-trim-tokens N]\n\
