@@ -1,5 +1,8 @@
 //! Worker `SliceExec` over a live `Session` layer-slice eval.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use ds4_core::{LayerSliceEval, Model, ModelFamily, Session, Shape};
 use ds4_dist::{resolved_layer_end, Layers, SliceExec, WorkOutput, WorkRequest};
 
@@ -47,17 +50,38 @@ pub fn slice_meta(model_id: u32, shape: &Shape, ctx_size: u32, layers: &Layers) 
 }
 
 pub struct SessionSliceExec<'m> {
-    session: Session<'m>,
+    session: Rc<RefCell<Session<'m>>>,
     meta: SliceMeta,
 }
 
 impl<'m> SessionSliceExec<'m> {
     pub fn new(session: Session<'m>, model: &Model, ctx_size: u32, layers: &Layers) -> Self {
+        Self::from_shared(Rc::new(RefCell::new(session)), model, ctx_size, layers)
+    }
+
+    pub fn from_shared(
+        session: Rc<RefCell<Session<'m>>>,
+        model: &Model,
+        ctx_size: u32,
+        layers: &Layers,
+    ) -> Self {
         let shape = &model.bind_plan().shape;
         let vocab = u32::try_from(model.vocab().n_vocab().max(0)).unwrap_or(0);
         let mut meta = slice_meta(model.model_id() as u32, shape, ctx_size, layers);
         meta.vocab = vocab;
         Self { session, meta }
+    }
+
+    pub fn from_meta(session: Rc<RefCell<Session<'m>>>, meta: SliceMeta) -> Self {
+        Self { session, meta }
+    }
+
+    pub fn session(&self) -> &Rc<RefCell<Session<'m>>> {
+        &self.session
+    }
+
+    pub fn meta(&self) -> SliceMeta {
+        self.meta
     }
 }
 
@@ -90,6 +114,7 @@ impl SliceExec for SessionSliceExec<'_> {
     fn eval(&mut self, req: &WorkRequest) -> Result<WorkOutput, String> {
         if req.reset {
             self.session
+                .borrow_mut()
                 .layer_slice_reset()
                 .map_err(|error| error.to_string())?;
         }
@@ -113,6 +138,7 @@ impl SliceExec for SessionSliceExec<'_> {
             None
         };
         self.session
+            .borrow_mut()
             .eval_layer_slice(LayerSliceEval {
                 tokens: &req.tokens,
                 pos0: req.pos0,

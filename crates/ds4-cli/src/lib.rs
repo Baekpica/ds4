@@ -6,6 +6,7 @@ pub mod repl;
 pub mod session_exec;
 pub mod session_snapshot;
 pub mod worker_hello;
+pub mod worker_run;
 
 use ds4_core::{Backend, ModelOpenOption};
 

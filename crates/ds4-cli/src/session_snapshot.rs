@@ -1,6 +1,8 @@
 //! Bind worker SNAPSHOT frames to a live `Session` layer payload.
 
+use std::cell::RefCell;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::rc::Rc;
 
 use ds4_core::{LayerPayloadLoad, Session};
 use ds4_dist::{
@@ -19,18 +21,30 @@ pub fn check_save_tokens(live: &[i32], req: &SnapshotSave) -> Result<(), String>
 }
 
 pub struct SessionSnapshotStore<'m> {
-    session: Session<'m>,
+    session: Rc<RefCell<Session<'m>>>,
     layer_start: u32,
     layer_end: u32,
 }
 
 impl<'m> SessionSnapshotStore<'m> {
     pub fn new(session: Session<'m>, layer_start: u32, layer_end: u32) -> Self {
+        Self::from_shared(Rc::new(RefCell::new(session)), layer_start, layer_end)
+    }
+
+    pub fn from_shared(
+        session: Rc<RefCell<Session<'m>>>,
+        layer_start: u32,
+        layer_end: u32,
+    ) -> Self {
         Self {
             session,
             layer_start,
             layer_end,
         }
+    }
+
+    pub fn session(&self) -> &Rc<RefCell<Session<'m>>> {
+        &self.session
     }
 }
 
@@ -38,10 +52,11 @@ impl SnapshotStore for SessionSnapshotStore<'_> {
     type SaveReader = TempShard;
 
     fn save(&mut self, req: SnapshotSave) -> Result<(TempShard, u64), String> {
-        check_save_tokens(self.session.host().tokens(), &req)?;
+        check_save_tokens(self.session.borrow().host().tokens(), &req)?;
         let mut tmp = create_temp(SAVE_PREFIX)
             .map_err(|_| "failed to create worker snapshot temp file".to_string())?;
         self.session
+            .borrow()
             .save_layer_payload(tmp.path(), self.layer_start, self.layer_end)
             .map_err(|_| "failed to save worker KV shard".to_string())?;
         tmp.rewind()
@@ -62,6 +77,7 @@ impl SnapshotStore for SessionSnapshotStore<'_> {
         tmp.flush()
             .map_err(|_| "failed to restore worker KV shard".to_string())?;
         self.session
+            .borrow_mut()
             .load_layer_payload(LayerPayloadLoad {
                 path: tmp.path(),
                 payload_bytes: req.payload_bytes,
