@@ -25,6 +25,25 @@ pub fn now_sec() -> f64 {
     START.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
+pub fn local_work_telemetry(
+    work: &crate::codec::Work,
+    eval_usec: u32,
+    output_bytes: u32,
+) -> Telemetry {
+    Telemetry {
+        layer_start: work.layer_start,
+        layer_end: work.layer_end,
+        route_index: work.route_index,
+        pos0: work.pos0,
+        n_tokens: work.n_tokens,
+        eval_usec,
+        downstream_wait_usec: 0,
+        forward_send_usec: 0,
+        input_bytes: work.token_bytes.saturating_add(work.input_hc_bytes),
+        output_bytes,
+    }
+}
+
 pub fn usec_since(t0: f64, t1: f64) -> u32 {
     if t1 <= t0 {
         return 0;

@@ -14,7 +14,7 @@ use crate::codec::{
 use crate::exec::{SliceExec, WorkRequest};
 use crate::hash::{token_hash_update_span, TOKEN_HASH_INIT};
 use crate::native_snapshot::{dispatch_worker_snapshot, MemorySnapshotStore, SnapshotStore};
-use crate::relay::forward_work_blocking;
+use crate::relay::{forward_work_blocking, local_work_telemetry, now_sec, usec_since};
 use crate::route::{decode_route_blob, validate_route_blob};
 use crate::transport::{read_frame, write_frame};
 use crate::work::{
@@ -312,6 +312,7 @@ impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
         let final_ack_only = ack_only && !has_next;
         let local_output = output_logits && !has_next && !final_ack_only;
         let produce_hidden = !local_output && !final_ack_only;
+        let eval_t0 = now_sec();
         let out = match self.exec.eval(&WorkRequest {
             session_id,
             request_id,
@@ -327,6 +328,7 @@ impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
             Ok(v) => v,
             Err(e) => return fail(e),
         };
+        let eval_usec = usec_since(eval_t0, now_sec());
         self.sessions.insert(session_id, result_hash);
 
         if has_next {
@@ -366,9 +368,10 @@ impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
         };
         let mut hdr = ok_result_hdr(request_id, result_hash, kind, bits);
         hdr.payload_bytes = payload.len() as u32;
+        let telemetry = local_work_telemetry(&work, eval_usec, payload.len() as u32);
         let frame = encode_result_frame(&ResultBody {
             hdr,
-            telemetry: Vec::new(),
+            telemetry: vec![telemetry],
             payload,
         })
         .map_err(|e| e.to_string())?;

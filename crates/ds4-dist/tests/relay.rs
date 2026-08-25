@@ -7,9 +7,9 @@ use std::thread;
 use std::time::Duration;
 
 use ds4_dist::{
-    decode_result_body, encode_result_frame, ok_result_hdr, prepend_telemetry, read_frame,
-    result_request_id, usec_since, Forwarder, PendingRequest, ResultBody, Telemetry,
-    ERR_NEXT_CLOSED, FRAME_HEADER_BYTES, MSG_RESULT, RESULT_ACK,
+    decode_result_body, encode_result_frame, local_work_telemetry, ok_result_hdr,
+    prepend_telemetry, read_frame, result_request_id, usec_since, Forwarder, PendingRequest,
+    ResultBody, Telemetry, Work, ERR_NEXT_CLOSED, FRAME_HEADER_BYTES, MSG_RESULT, RESULT_ACK,
 };
 
 fn pending(id: u64) -> PendingRequest {
@@ -46,6 +46,31 @@ fn tune(s: &std::net::TcpStream) {
     let _ = s.set_nodelay(true);
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+}
+
+#[test]
+fn local_work_telemetry_matches_c_fields() {
+    let work = Work {
+        layer_start: 2,
+        layer_end: 3,
+        route_index: 1,
+        pos0: 4,
+        n_tokens: 2,
+        token_bytes: 8,
+        input_hc_bytes: 16,
+        ..Work::default()
+    };
+    let tel = local_work_telemetry(&work, 12, 32);
+    assert_eq!(tel.layer_start, 2);
+    assert_eq!(tel.layer_end, 3);
+    assert_eq!(tel.route_index, 1);
+    assert_eq!(tel.pos0, 4);
+    assert_eq!(tel.n_tokens, 2);
+    assert_eq!(tel.eval_usec, 12);
+    assert_eq!(tel.downstream_wait_usec, 0);
+    assert_eq!(tel.forward_send_usec, 0);
+    assert_eq!(tel.input_bytes, 24);
+    assert_eq!(tel.output_bytes, 32);
 }
 
 #[test]
