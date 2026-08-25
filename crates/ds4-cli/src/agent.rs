@@ -3,6 +3,10 @@ const DSML_OPEN: &[u8] = "<｜DSML｜tool_calls>".as_bytes();
 const DSML_OPEN_MISSING_BAR: &[u8] = "<DSML｜tool_calls>".as_bytes();
 const THINK_OPEN: &[u8] = b"<think>";
 const THINK_CLOSE: &[u8] = b"</think>";
+const TOOL_UNSUPPORTED_ERROR: &str =
+    "tool execution is not implemented in ds4-agent-rs; use ./ds4-agent";
+
+mod web_tools;
 
 #[derive(Debug)]
 pub struct AgentArgs {
@@ -257,6 +261,7 @@ fn random_seed() -> u64 {
     now.as_secs() ^ (u64::from(std::process::id()) << 32) ^ u64::from(now.subsec_nanos())
 }
 
+#[cfg(test)]
 fn tool_marker_in_new_suffix(raw: &[u8], appended: usize) -> bool {
     let max_marker = DSML_OPEN.len().max(DSML_OPEN_MISSING_BAR.len());
     let start = raw
@@ -309,39 +314,59 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
         .sync(&transcript)
         .map_err(|error| error.to_string())?;
 
-    let room = session
-        .ctx()
-        .saturating_sub(session.pos())
-        .saturating_sub(1);
-    let max_tokens = args.tokens.min(room).max(0);
     let mut rng = if args.seed == 0 {
         random_seed()
     } else {
         args.seed
     };
-    let mut raw = Vec::new();
-    for _ in 0..max_tokens {
-        let token = session.sample(args.temp, 0, args.top_p, args.min_p, &mut rng);
-        if token < 0 {
-            return Err("failed to sample the next token".into());
+    let mut web = web_tools::non_interactive_web();
+    let mut output = Vec::new();
+    loop {
+        let room = session
+            .ctx()
+            .saturating_sub(session.pos())
+            .saturating_sub(1);
+        let max_tokens = args.tokens.min(room).max(0);
+        let mut raw = Vec::new();
+        for _ in 0..max_tokens {
+            let token = session.sample(args.temp, 0, args.top_p, args.min_p, &mut rng);
+            if token < 0 {
+                return Err("failed to sample the next token".into());
+            }
+            if token == model.token_eos() {
+                break;
+            }
+            session.eval(token).map_err(|error| error.to_string())?;
+            transcript.push(token);
+            let piece = model.token_text(token).map_err(|error| error.to_string())?;
+            raw.extend_from_slice(&piece);
+            if web_tools::block_complete(&raw) {
+                break;
+            }
         }
-        if token == model.token_eos() {
-            break;
-        }
-        session.eval(token).map_err(|error| error.to_string())?;
-        transcript.push(token);
-        let piece = model.token_text(token).map_err(|error| error.to_string())?;
-        let appended = piece.len();
-        raw.extend_from_slice(&piece);
-        if tool_marker_in_new_suffix(&raw, appended) {
-            return Err(
-                "tool execution is not implemented in ds4-agent-rs; use ./ds4-agent".into(),
-            );
-        }
-    }
-    transcript.push(model.token_eos());
+        transcript.push(model.token_eos());
 
-    let output = project_output(&[&raw])?;
+        if web_tools::has_block(&raw) {
+            let round = web_tools::handle_round(&raw, &mut web)
+                .map_err(|_| TOOL_UNSUPPORTED_ERROR.to_string())?;
+            output.extend_from_slice(&project_output(&[&round.visible])?);
+            model
+                .vocab()
+                .chat_append_message(&mut transcript, "tool", round.observation.as_bytes())
+                .map_err(|error| error.to_string())?;
+            model
+                .vocab()
+                .chat_append_assistant_prefix(&mut transcript, think)
+                .map_err(|error| error.to_string())?;
+            session
+                .sync(&transcript)
+                .map_err(|error| error.to_string())?;
+            continue;
+        }
+        output.extend_from_slice(&project_output(&[&raw])?);
+        break;
+    }
+
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
     stdout
@@ -415,7 +440,7 @@ fn project_output(chunks: &[&[u8]]) -> Result<Vec<u8>, &'static str> {
         .flat_map(|chunk| chunk.iter().copied())
         .collect();
     if contains_bytes(&raw, DSML_OPEN) || contains_bytes(&raw, DSML_OPEN_MISSING_BAR) {
-        return Err("tool execution is not implemented in ds4-agent-rs; use ./ds4-agent");
+        return Err(TOOL_UNSUPPORTED_ERROR);
     }
 
     let mut out = Vec::with_capacity(raw.len() + 2);

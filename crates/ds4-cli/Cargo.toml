@@ -30,3 +30,4 @@ native = []
 
 [dependencies]
 ds4-core = { path = "../ds4-core" }
+ds4-web = { path = "../ds4-web" }
