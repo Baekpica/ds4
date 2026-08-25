@@ -3,17 +3,19 @@
 use ds4_dist::{
     build_route_plan, decode_logits_payload, decode_result_body, dispatch_eval, encode_route_blob,
     encode_work_frame, format_telemetry_line, parse_cli, parse_layers, parse_role,
-    prepare_engine_options, read_frame, reconnect_local, register_worker, resolved_layer_end,
-    send_hello, token_hash_update_span, token_span_hashes, validate_layers_for_model,
-    validate_options, work_with_ids, write_frame, Coordinator, CoordinatorView, EvalOutcome,
-    LocalReconnect, ReturnTarget, RouteEntry, SliceExec, Telemetry, Work, WorkBody, WorkOutput,
-    WorkRequest, Worker, WorkerInfo, ERR_NEXT_CLOSED, MSG_ERROR, MSG_RESULT, RESULT_LOGITS,
-    ROUTE_F_OUTPUT_LOGITS, ROUTE_RETURN_UPSTREAM, TOKEN_HASH_INIT, WORK_F_INPUT_HC,
-    WORK_F_OUTPUT_LOGITS, WORK_F_RESET_SESSION,
+    prefetch_disabled_from, prepare_engine_options, read_frame, reconnect_local, register_worker,
+    resolved_layer_end, send_hello, serve_prefetch_local_with, token_hash_update_span,
+    token_span_hashes, validate_layers_for_model, validate_options, work_with_ids, write_frame,
+    Coordinator, CoordinatorView, EvalOutcome, JobQueue, LocalReconnect, PrefetchJob, ReturnTarget,
+    RouteEntry, SliceExec, Telemetry, Work, WorkBody, WorkOutput, WorkRequest, Worker, WorkerInfo,
+    ERR_NEXT_CLOSED, MSG_ERROR, MSG_RESULT, RESULT_LOGITS, ROUTE_F_OUTPUT_LOGITS,
+    ROUTE_RETURN_UPSTREAM, TOKEN_HASH_INIT, WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS,
+    WORK_F_RESET_SESSION,
 };
 use std::io::{Read, Write};
+use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -692,6 +694,10 @@ fn hop_logits_exec() -> (MockExec, Vec<f32>) {
 }
 
 fn hop_work_frame(port: u16) -> Vec<u8> {
+    hop_work_frame_with_id(port, 11)
+}
+
+fn hop_work_frame_with_id(port: u16, request_id: u64) -> Vec<u8> {
     let tokens = [1i32, 2];
     let prefix = TOKEN_HASH_INIT;
     let result = token_hash_update_span(prefix, &tokens);
@@ -724,7 +730,7 @@ fn hop_work_frame(port: u16) -> Vec<u8> {
             ..Work::default()
         },
         9,
-        11,
+        request_id,
         prefix,
         result,
     );
@@ -1081,4 +1087,163 @@ fn reconnect_local_missing_next_hop_keeps_c_forward_error() {
     drop(hop);
     drop(coord);
     middle_thread.join().unwrap().unwrap();
+}
+
+struct EvalGate {
+    started: Mutex<u32>,
+    started_cv: Condvar,
+    release: Mutex<bool>,
+    release_cv: Condvar,
+}
+
+impl EvalGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: Mutex::new(0),
+            started_cv: Condvar::new(),
+            release: Mutex::new(false),
+            release_cv: Condvar::new(),
+        })
+    }
+
+    fn wait_started(&self) {
+        let mut n = self.started.lock().expect("eval gate");
+        while *n == 0 {
+            n = self.started_cv.wait(n).expect("eval gate");
+        }
+    }
+
+    fn release(&self) {
+        *self.release.lock().expect("eval gate") = true;
+        self.release_cv.notify_all();
+    }
+}
+
+struct NotSendExec {
+    inner: MockExec,
+    gate: Arc<EvalGate>,
+    _not_send: PhantomData<*const ()>,
+}
+
+impl SliceExec for NotSendExec {
+    fn model_id(&self) -> u32 {
+        self.inner.model_id()
+    }
+    fn n_layers(&self) -> u32 {
+        self.inner.n_layers()
+    }
+    fn vocab(&self) -> u32 {
+        self.inner.vocab()
+    }
+    fn ctx_size(&self) -> u32 {
+        self.inner.ctx_size()
+    }
+    fn hidden_values(&self) -> u64 {
+        self.inner.hidden_values()
+    }
+    fn has_output(&self) -> bool {
+        self.inner.has_output()
+    }
+    fn layer_start(&self) -> u32 {
+        self.inner.layer_start()
+    }
+    fn layer_end(&self) -> u32 {
+        self.inner.layer_end()
+    }
+    fn eval(&mut self, req: &WorkRequest) -> Result<WorkOutput, String> {
+        {
+            let mut n = self.gate.started.lock().expect("eval gate");
+            *n += 1;
+            self.gate.started_cv.notify_all();
+        }
+        let mut released = self.gate.release.lock().expect("eval gate");
+        while !*released {
+            released = self.gate.release_cv.wait(released).expect("eval gate");
+        }
+        self.inner.eval(req)
+    }
+}
+
+fn assert_local_prefetch_accepts_not_send<E, S>(
+    worker: &mut Worker<E, S>,
+    stream: &mut TcpStream,
+    queue: &JobQueue<PrefetchJob>,
+) -> std::io::Result<()>
+where
+    E: SliceExec,
+    S: ds4_dist::SnapshotStore,
+{
+    serve_prefetch_local_with(worker, stream, queue)
+}
+
+#[test]
+fn prefetch_env_unset_enables_local_prefetch() {
+    // Given: C default is prefetch on unless DS4_DIST_DISABLE_WORKER_PREFETCH is present
+    // When: the disable env is unset
+    // Then: local reconnect must take the prefetch path
+    assert!(!prefetch_disabled_from(None));
+    assert!(ds4_dist::local_prefetch_enabled_from(None));
+}
+
+#[test]
+fn prefetch_env_set_disables_local_prefetch() {
+    // Given: C turns prefetch off when the disable env exists (any value)
+    // When: the disable env is present
+    // Then: local reconnect must not use prefetch
+    assert!(prefetch_disabled_from(Some(std::ffi::OsStr::new("1"))));
+    assert!(!ds4_dist::local_prefetch_enabled_from(Some(
+        std::ffi::OsStr::new("1")
+    )));
+}
+
+#[test]
+fn serve_prefetch_local_depth_2_queues_second_work_during_not_send_eval() {
+    // Given: a !Send exec and a depth-2 local prefetch queue
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (inner, logits) = hop_logits_exec();
+    let gate = EvalGate::new();
+    let queue = Arc::new(JobQueue::<PrefetchJob>::new(2));
+    let frame1 = hop_work_frame_with_id(port, 11);
+    let frame2 = hop_work_frame_with_id(port, 12);
+    let client_gate = Arc::clone(&gate);
+    let client_queue = Arc::clone(&queue);
+
+    let client = thread::spawn(move || {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        tune(&stream);
+        stream.write_all(&frame1).unwrap();
+        client_gate.wait_started();
+        stream.write_all(&frame2).unwrap();
+        client_queue.wait_until_queued(1);
+        let queued_during_eval = client_queue.queued();
+        client_gate.release();
+        let first = read_frame(&mut stream).unwrap();
+        let second = read_frame(&mut stream).unwrap();
+        (queued_during_eval, first, second)
+    });
+
+    // When: session-thread prefetch serves both WORKs on a !Send worker
+    let mut stream = listener.accept().unwrap().0;
+    tune(&stream);
+    let mut worker = Worker::new(NotSendExec {
+        inner,
+        gate,
+        _not_send: PhantomData,
+    });
+    assert_local_prefetch_accepts_not_send(&mut worker, &mut stream, &queue).unwrap();
+
+    // Then: WORK2 was queued while eval1 was still in progress
+    let (queued_during_eval, first, second) = client.join().unwrap();
+    assert!(
+        queued_during_eval >= 1,
+        "depth 2 must queue WORK2 during eval1, queued={queued_during_eval}"
+    );
+    for (typ, reply) in [first, second] {
+        assert_eq!(typ, MSG_RESULT);
+        let result = decode_result_body(&reply).unwrap();
+        assert_eq!(result.hdr.status, 0);
+        assert_eq!(result.hdr.result_kind, RESULT_LOGITS);
+        assert_eq!(decode_logits_payload(&result.payload).unwrap(), logits);
+    }
 }

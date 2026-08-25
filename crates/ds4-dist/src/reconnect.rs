@@ -9,6 +9,7 @@ use crate::codec::Hello;
 use crate::exec::SliceExec;
 use crate::native_snapshot::SnapshotStore;
 use crate::prefetch::prefetch_disabled;
+use crate::prefetch_local::{local_prefetch_enabled, serve_coordinator_and_hops_prefetch};
 use crate::serve_local::{serve_coordinator_and_hops, spawn_hop_accept, HopAccept};
 use crate::worker::{send_hello, Worker};
 
@@ -205,6 +206,12 @@ where
         spec.model_name,
         &mut spec.sleep,
         &mut spec.should_stop,
-        |w, stream, stop| serve_coordinator_and_hops(w, stream, rx, stop),
+        |w, stream, stop| {
+            if local_prefetch_enabled() {
+                serve_coordinator_and_hops_prefetch(w, stream, rx, stop)
+            } else {
+                serve_coordinator_and_hops(w, stream, rx, stop)
+            }
+        },
     )
 }

@@ -73,21 +73,21 @@ fn parse_strtol(s: &str) -> Option<i64> {
     Some(if neg { -v } else { v })
 }
 
-struct QueueInner {
+struct QueueInner<T> {
     depth: u32,
     queued: u32,
-    jobs: VecDeque<Vec<u8>>,
+    jobs: VecDeque<T>,
     closed: bool,
     canceled: bool,
 }
 
-pub struct JobQueue {
-    inner: Mutex<QueueInner>,
+pub struct JobQueue<T = Vec<u8>> {
+    inner: Mutex<QueueInner<T>>,
     not_empty: Condvar,
     not_full: Condvar,
 }
 
-impl JobQueue {
+impl<T> JobQueue<T> {
     pub fn new(depth: u32) -> Self {
         let depth = depth.max(1);
         Self {
@@ -107,7 +107,11 @@ impl JobQueue {
         self.inner.lock().expect("prefetch queue").depth
     }
 
-    pub fn enqueue(&self, job: Vec<u8>) -> bool {
+    pub fn queued(&self) -> u32 {
+        self.inner.lock().expect("prefetch queue").queued
+    }
+
+    pub fn enqueue(&self, job: T) -> bool {
         let mut g = self.inner.lock().expect("prefetch queue");
         while !g.closed && !g.canceled && g.queued >= g.depth {
             g = self.not_full.wait(g).expect("prefetch queue");
@@ -121,18 +125,34 @@ impl JobQueue {
         true
     }
 
-    pub fn pop(&self) -> Option<Vec<u8>> {
+    pub fn wait_until_queued(&self, n: u32) {
         let mut g = self.inner.lock().expect("prefetch queue");
-        while g.jobs.is_empty() && !g.closed && !g.canceled {
+        while g.queued < n && !g.closed && !g.canceled {
             g = self.not_empty.wait(g).expect("prefetch queue");
         }
+    }
+
+    fn take_job(g: &mut QueueInner<T>, not_full: &Condvar) -> Option<T> {
         if g.canceled || g.jobs.is_empty() {
             return None;
         }
         let job = g.jobs.pop_front();
         g.queued = g.queued.saturating_sub(1);
-        self.not_full.notify_one();
+        not_full.notify_one();
         job
+    }
+
+    pub fn try_pop(&self) -> Option<T> {
+        let mut g = self.inner.lock().expect("prefetch queue");
+        Self::take_job(&mut g, &self.not_full)
+    }
+
+    pub fn pop(&self) -> Option<T> {
+        let mut g = self.inner.lock().expect("prefetch queue");
+        while g.jobs.is_empty() && !g.closed && !g.canceled {
+            g = self.not_empty.wait(g).expect("prefetch queue");
+        }
+        Self::take_job(&mut g, &self.not_full)
     }
 
     pub fn finish(&self) {
@@ -153,7 +173,7 @@ impl JobQueue {
     }
 }
 
-struct MutexWrite<'a>(&'a Mutex<TcpStream>);
+pub(crate) struct MutexWrite<'a>(pub &'a Mutex<TcpStream>);
 
 impl Write for MutexWrite<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -168,7 +188,7 @@ impl Write for MutexWrite<'_> {
 impl<E: SliceExec + Send, S: SnapshotStore + Send> Worker<E, S> {
     pub fn serve_prefetch(&mut self, stream: &mut TcpStream) -> io::Result<()> {
         let depth = prefetch_depth();
-        let queue = Arc::new(JobQueue::new(depth));
+        let queue = Arc::new(JobQueue::<Vec<u8>>::new(depth));
         let worker = Mutex::new(&mut *self);
         let writer = Arc::new(Mutex::new(stream.try_clone()?));
         let mut reader = stream.try_clone()?;

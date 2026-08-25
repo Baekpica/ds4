@@ -12,7 +12,7 @@ use crate::exec::SliceExec;
 use crate::native_snapshot::SnapshotStore;
 use crate::worker::Worker;
 
-const IDLE: Duration = Duration::from_millis(25);
+pub(crate) const IDLE: Duration = Duration::from_millis(25);
 
 pub(crate) struct HopAccept {
     rx: Option<Receiver<TcpStream>>,
@@ -59,13 +59,13 @@ pub(crate) fn spawn_hop_accept(listener: &TcpListener) -> io::Result<HopAccept> 
     })
 }
 
-enum Drive {
+pub(crate) enum Drive {
     Continue,
     Closed,
     Failed(io::Error),
 }
 
-fn drive_ready<E, S>(worker: &mut Worker<E, S>, stream: &mut TcpStream) -> Drive
+pub(crate) fn drive_ready<E, S>(worker: &mut Worker<E, S>, stream: &mut TcpStream) -> Drive
 where
     E: SliceExec,
     S: SnapshotStore,

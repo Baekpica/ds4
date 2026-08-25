@@ -14,6 +14,7 @@ mod native_snapshot;
 mod options;
 mod plan;
 mod prefetch;
+mod prefetch_local;
 mod reconnect;
 mod relay;
 mod route;
@@ -79,6 +80,9 @@ pub use prefetch::{
     prefetch_depth, prefetch_depth_from, prefetch_disabled, prefetch_disabled_from,
     prefetch_enabled_message, JobQueue, ERR_OOM_QUEUE, ERR_OOM_READ, PREFETCH_DEPTH_DEFAULT,
     PREFETCH_DEPTH_MAX, PREFETCH_DEPTH_MIN,
+};
+pub use prefetch_local::{
+    local_prefetch_enabled, local_prefetch_enabled_from, serve_prefetch_local_with, PrefetchJob,
 };
 pub use reconnect::{
     cleared_sessions_message, connect_endpoint, connect_endpoint_once, connect_error,
