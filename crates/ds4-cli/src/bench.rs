@@ -24,6 +24,11 @@ pub struct BenchArgs {
     quality: bool,
     warm_weights: bool,
     power_percent: i32,
+    mtp: Option<String>,
+    mtp_draft: i32,
+    mtp_margin: f32,
+    output_head_bench_iters: i32,
+    dump_frontier_logits_dir: Option<String>,
     dist: ds4_dist::Options,
     help: bool,
 }
@@ -47,6 +52,11 @@ impl Default for BenchArgs {
             quality: false,
             warm_weights: false,
             power_percent: 100,
+            mtp: None,
+            mtp_draft: 1,
+            mtp_margin: 3.0,
+            output_head_bench_iters: 0,
+            dump_frontier_logits_dir: None,
             dist: ds4_dist::Options::default(),
             help: false,
         }
@@ -129,12 +139,24 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, S
             "--power" => {
                 parsed.power_percent = parse_power(&require_value(&arg, iter.next())?)?;
             }
-            "--mtp"
-            | "--mtp-draft"
-            | "--mtp-margin"
-            | "--output-head-bench"
-            | "--dump-frontier-logits-dir" => {
-                return Err(format!("{arg} is not implemented in ds4-bench-rs"));
+            "--mtp" => parsed.mtp = Some(require_value(&arg, iter.next())?),
+            "--mtp-draft" => {
+                parsed.mtp_draft = parse_positive_i32(&arg, &require_value(&arg, iter.next())?)?;
+            }
+            "--mtp-margin" => {
+                let value = require_value(&arg, iter.next())?;
+                let parsed_margin = parse_f64(&arg, &value)?;
+                if !(0.0..=1000.0).contains(&parsed_margin) {
+                    return Err(format!("invalid value for {arg}: {parsed_margin}"));
+                }
+                parsed.mtp_margin = parsed_margin as f32;
+            }
+            "--output-head-bench" => {
+                parsed.output_head_bench_iters =
+                    parse_positive_i32(&arg, &require_value(&arg, iter.next())?)?;
+            }
+            "--dump-frontier-logits-dir" => {
+                parsed.dump_frontier_logits_dir = Some(require_value(&arg, iter.next())?);
             }
             _ => match ds4_dist::parse_cli_arg(&arg, &mut iter, &mut parsed.dist)? {
                 ds4_dist::CliResult::Matched => {}
@@ -155,8 +177,12 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, S
     if parsed.step_mul < 1.0 {
         return Err("--step-mul must be >= 1".into());
     }
-    let live_tokens = parsed
-        .ctx_max
+    let measured_ctx = if parsed.output_head_bench_iters > 0 {
+        parsed.ctx_start
+    } else {
+        parsed.ctx_max
+    };
+    let live_tokens = measured_ctx
         .checked_add(parsed.gen_tokens)
         .ok_or_else(|| "requested context is too large".to_string())?;
     if parsed.ctx_alloc == 0 {
@@ -807,14 +833,42 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unported_mtp_benchmark_mode() {
-        let mtp = parse_args(argv(&[
+    fn parses_mtp_and_output_head_options() {
+        let args = parse_args(argv(&[
             "--prompt-file",
             "prompt.txt",
             "--mtp",
             "draft.gguf",
+            "--mtp-draft",
+            "2",
+            "--mtp-margin",
+            "4.5",
+            "--output-head-bench",
+            "8",
+            "--dump-frontier-logits-dir",
+            "/tmp/logits",
+        ]))
+        .unwrap();
+        assert_eq!(args.mtp.as_deref(), Some("draft.gguf"));
+        assert_eq!(args.mtp_draft, 2);
+        assert_eq!(args.mtp_margin, 4.5);
+        assert_eq!(args.output_head_bench_iters, 8);
+        assert_eq!(
+            args.dump_frontier_logits_dir.as_deref(),
+            Some("/tmp/logits")
+        );
+        assert_eq!(args.ctx_alloc, 2048 + 128 + 1);
+    }
+
+    #[test]
+    fn rejects_mtp_margin_outside_c_range() {
+        let err = parse_args(argv(&[
+            "--prompt-file",
+            "prompt.txt",
+            "--mtp-margin",
+            "1000.1",
         ]))
         .unwrap_err();
-        assert!(mtp.contains("not implemented"));
+        assert!(err.contains("invalid value for --mtp-margin"));
     }
 }
