@@ -5,6 +5,7 @@ pub mod bench;
 pub mod repl;
 pub mod session_exec;
 pub mod session_snapshot;
+pub mod worker_hello;
 
 use ds4_core::{Backend, ModelOpenOption};
 
