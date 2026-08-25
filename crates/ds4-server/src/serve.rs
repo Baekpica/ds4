@@ -124,6 +124,17 @@ fn parse_default_on(value: Option<&OsStr>) -> bool {
     value.map(os_str_bytes) != Some(b"0")
 }
 
+fn process_cont_tools() -> (bool, bool) {
+    crate::route::cont_tools_from_env(
+        std::env::var_os("DS4_SERVER_CONT_TOOLS_ANTHROPIC")
+            .as_deref()
+            .map(os_str_bytes),
+        std::env::var_os("DS4_SERVER_CONT_TOOLS_RESPONSES")
+            .as_deref()
+            .map(os_str_bytes),
+    )
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -991,13 +1002,14 @@ fn run_prepared<W: TerminalSink>(
             .map(|(_, toks)| (toks.len() as i32, exec.seq_cap())),
         _ => None,
     };
+    let (cont_tools_anthropic, cont_tools_responses) = process_cont_tools();
     let route_env = RouteEnv {
         coalesce: cont_gate.is_some(),
         have_cont: cont_gate.is_some(),
         cont_anthropic: parse_default_on(std::env::var_os("DS4_SERVER_CONT_ANTHROPIC").as_deref()),
         cont_responses: parse_default_on(std::env::var_os("DS4_SERVER_CONT_RESPONSES").as_deref()),
-        cont_tools_anthropic: false,
-        cont_tools_responses: false,
+        cont_tools_anthropic,
+        cont_tools_responses,
         seq_cap: cont_gate.map_or(cfg.ctx, |(_, cap)| cap),
         prompt_len: cont_gate.map_or(0, |(len, _)| len),
     };

@@ -58,13 +58,14 @@ pub(super) fn run_owner_maybe_roll(
 }
 
 fn roll_route_env(exec: &dyn ContExec, prompt_len: i32) -> RouteEnv {
+    let (cont_tools_anthropic, cont_tools_responses) = process_cont_tools();
     RouteEnv {
         coalesce: true,
         have_cont: true,
         cont_anthropic: parse_default_on(std::env::var_os("DS4_SERVER_CONT_ANTHROPIC").as_deref()),
         cont_responses: parse_default_on(std::env::var_os("DS4_SERVER_CONT_RESPONSES").as_deref()),
-        cont_tools_anthropic: false,
-        cont_tools_responses: false,
+        cont_tools_anthropic,
+        cont_tools_responses,
         seq_cap: exec.seq_cap(),
         prompt_len,
     }

@@ -1,5 +1,9 @@
 //! `route_decide` + `request_compute_needs` from `ds4_server.c` at v0.6.3-dfm.
 //! Pure functions. Do not improve the table.
+// allow: SIZE_OK — frozen C route_decide / compute_needs table; do not split.
+
+mod env;
+pub use env::cont_tools_from_env;
 
 pub const NEED_STREAMING: u32 = 1 << 0;
 pub const NEED_PER_ROW_SAMPLING: u32 = 1 << 1;
