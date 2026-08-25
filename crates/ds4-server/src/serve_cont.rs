@@ -1381,6 +1381,7 @@ mod native {
             work: &ContWork<'_>,
             bank_hold_retry: &mut dyn FnMut(i32, Option<(u64, i32)>) -> Option<i32>,
             mut store: Option<&mut KvStore>,
+            reserve: &crate::serve_cont_roll::RollReserve,
         ) -> Result<PreparedSlot, GenerateError> {
             let parsed = work.parsed;
             let prompt = render_prompt(parsed, self.model_id)?;
@@ -1404,7 +1405,8 @@ mod native {
             );
             let (temperature, top_k, top_p, min_p) = stepper.sampling(parsed);
             let capture_done = bank_scope(parsed);
-            let (protected, hold_retry) = self.protected_banks(bank_hold_retry);
+            let (hold, hold_retry) = self.protected_banks(bank_hold_retry);
+            let protected = reserve.protect(&hold);
             let warm = if capture_done {
                 self.warm_plan(&stepper.prompt).or_else(|| {
                     store
@@ -1589,7 +1591,12 @@ mod native {
                 t_arrive,
                 out,
             };
-            let prepared = self.prepare_slot(&work, bank_hold_retry, store.as_deref_mut())?;
+            let prepared = self.prepare_slot(
+                &work,
+                bank_hold_retry,
+                store.as_deref_mut(),
+                &crate::serve_cont_roll::RollReserve::new(),
+            )?;
             let mut adapter = WriteAdapter(work.out);
             let mut driver = RollDriver::new(self.vocab);
             driver.push(prepared.into_slot(&mut adapter));
@@ -1613,46 +1620,48 @@ mod native {
             let ContPair { first, second } = pair;
             let cors_a = first.cors;
             let cors_b = second.cors;
-            let prepared_a = match self.prepare_slot(&first, bank_hold_retry, store.as_deref_mut())
-            {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    let b = self.generate(
-                        second.parsed,
-                        second.job_id,
-                        second.created,
-                        second.cors,
-                        second.default_tokens,
-                        second.t_arrive,
-                        bank_hold_retry,
-                        store,
-                        second.out,
-                    );
-                    return [Err(error), b];
-                }
-            };
-            let prepared_b = match self.prepare_slot(&second, bank_hold_retry, store.as_deref_mut())
-            {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    let mut adapter = WriteAdapter(first.out);
-                    let mut driver = RollDriver::new(self.vocab);
-                    driver.push(prepared_a.into_slot(&mut adapter));
-                    let native_err = self
-                        .batch
-                        .continuous_generate(&mut driver)
-                        .err()
-                        .map(|e| e.to_string());
-                    let job = driver.slots.remove(&1).ok_or_else(|| {
-                        GenerateError::Engine("continuous driver lost the admitted job".into())
-                    });
-                    let a = match job {
-                        Ok(job) => self.finish_driven(job, native_err, store, cors_a),
-                        Err(error) => Err(error),
-                    };
-                    return [a, Err(error)];
-                }
-            };
+            let mut reserve = crate::serve_cont_roll::RollReserve::new();
+            let prepared_a =
+                match self.prepare_slot(&first, bank_hold_retry, store.as_deref_mut(), &reserve) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        let b = self.generate(
+                            second.parsed,
+                            second.job_id,
+                            second.created,
+                            second.cors,
+                            second.default_tokens,
+                            second.t_arrive,
+                            bank_hold_retry,
+                            store,
+                            second.out,
+                        );
+                        return [Err(error), b];
+                    }
+                };
+            reserve.note_place(prepared_a.admit.place_bank);
+            let prepared_b =
+                match self.prepare_slot(&second, bank_hold_retry, store.as_deref_mut(), &reserve) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        let mut adapter = WriteAdapter(first.out);
+                        let mut driver = RollDriver::new(self.vocab);
+                        driver.push(prepared_a.into_slot(&mut adapter));
+                        let native_err = self
+                            .batch
+                            .continuous_generate(&mut driver)
+                            .err()
+                            .map(|e| e.to_string());
+                        let job = driver.slots.remove(&1).ok_or_else(|| {
+                            GenerateError::Engine("continuous driver lost the admitted job".into())
+                        });
+                        let a = match job {
+                            Ok(job) => self.finish_driven(job, native_err, store, cors_a),
+                            Err(error) => Err(error),
+                        };
+                        return [a, Err(error)];
+                    }
+                };
             let mut adapter_a = WriteAdapter(first.out);
             let mut adapter_b = WriteAdapter(second.out);
             let mut driver = RollDriver::new(self.vocab);
@@ -1878,6 +1887,67 @@ mod bank_tests {
             !warm_placement(&with_spare, &[], 0, 70_000, 65_536, true)
                 .unwrap()
                 .fork
+        );
+    }
+
+    #[test]
+    fn rolling_fork_reuses_prefix_without_spending_the_live_target() {
+        let mut banks = vec![warm("trunk", 3), WarmBank::default(), WarmBank::default()];
+        let first = warm_placement(&banks, &[], 0, 10, 65_536, true).unwrap();
+        assert!(first.fork && first.target == 1);
+        banks[1].record = None;
+
+        let mut reserve = crate::serve_cont_roll::RollReserve::new();
+        reserve.note_place(i32::try_from(first.target + 1).unwrap());
+        let protected = reserve.protect(&[false, false, false]);
+        assert_eq!(
+            warm_victim_pick(&banks, &protected, None, 65_536, true),
+            Some(2)
+        );
+        assert_eq!(
+            warm_placement(&banks, &protected, 0, 10, 65_536, true),
+            Some(WarmPlacement {
+                source: 0,
+                target: 2,
+                fork: true,
+            })
+        );
+    }
+
+    #[test]
+    fn rolling_pin_prevents_evict_of_a_deep_fork_target() {
+        let mut banks = vec![warm("trunk", 3), warm("tenant", 1), WarmBank::default()];
+        banks[1].committed_tokens = 70_000;
+        let mut reserve = crate::serve_cont_roll::RollReserve::new();
+        reserve.note_place(3);
+        let protected = reserve.protect(&[false, false, false]);
+        assert_eq!(
+            warm_victim_pick(&banks, &protected, Some(0), 65_536, false),
+            None
+        );
+        assert_eq!(
+            warm_placement(&banks, &protected, 0, 10, 65_536, true),
+            Some(WarmPlacement {
+                source: 0,
+                target: 0,
+                fork: false,
+            })
+        );
+    }
+
+    #[test]
+    fn rolling_protected_saturation_refuses_when_hold_and_live_fill_the_table() {
+        let banks = vec![warm("trunk", 3), warm("tenant", 1)];
+        let mut reserve = crate::serve_cont_roll::RollReserve::new();
+        reserve.note_place(2);
+        let protected = reserve.protect(&[true, false]);
+        assert_eq!(
+            warm_victim_pick(&banks, &protected, None, 65_536, true),
+            None
+        );
+        assert_eq!(
+            warm_placement(&banks, &protected, 0, 10, 65_536, true),
+            None
         );
     }
 
