@@ -1,6 +1,8 @@
+pub(super) mod posix;
 pub(super) mod scan;
 
 use super::web_tools::parse_bool;
+use posix::PosixRegex;
 use scan::{
     clamp_usize, glob_match, literal_match, parse_int_default, read_file, split_lines, BodyBuf,
 };
@@ -24,14 +26,10 @@ pub(crate) struct SearchArgs<'a> {
     pub max_results: Option<&'a str>,
 }
 
-pub(crate) enum SearchOutcome {
-    Output(Vec<u8>),
-    Unsupported,
-}
-
 struct SearchCtx<'a> {
     query: &'a [u8],
     glob: Option<&'a [u8]>,
+    regex: Option<PosixRegex>,
     case_sensitive: bool,
     context: usize,
     max_results: usize,
@@ -43,18 +41,25 @@ pub(crate) fn default_search_path(path: Option<&str>) -> &str {
     path.filter(|path| !path.is_empty()).unwrap_or(".")
 }
 
-pub(crate) fn search_result(args: SearchArgs<'_>) -> SearchOutcome {
+pub(crate) fn search_result(args: SearchArgs<'_>) -> Vec<u8> {
     let Some(query) = args.query.filter(|query| !query.is_empty()) else {
-        return SearchOutcome::Output(b"Tool error: search requires query\n".to_vec());
+        return b"Tool error: search requires query\n".to_vec();
     };
-    if args.mode == Some("regex") {
-        return SearchOutcome::Unsupported;
-    }
+    let case_sensitive = parse_bool(args.case_sensitive, true);
+    let regex = if args.mode == Some("regex") {
+        match PosixRegex::compile(query, case_sensitive) {
+            Ok(regex) => Some(regex),
+            Err(bytes) => return bytes,
+        }
+    } else {
+        None
+    };
     let path = default_search_path(args.path);
     let mut ctx = SearchCtx {
         query: query.as_bytes(),
         glob: args.glob.filter(|glob| !glob.is_empty()).map(str::as_bytes),
-        case_sensitive: parse_bool(args.case_sensitive, true),
+        regex,
+        case_sensitive,
         context: clamp_usize(parse_int_default(args.context, 0, 0, CONTEXT_MAX)),
         max_results: clamp_usize(parse_int_default(
             args.max_results,
@@ -66,7 +71,7 @@ pub(crate) fn search_result(args: SearchArgs<'_>) -> SearchOutcome {
         out: BodyBuf::new(),
     };
     search_path(&mut ctx, path.as_bytes(), 0);
-    SearchOutcome::Output(finish_search(ctx))
+    finish_search(ctx)
 }
 
 fn finish_search(ctx: SearchCtx<'_>) -> Vec<u8> {
@@ -148,7 +153,7 @@ fn search_file(ctx: &mut SearchCtx<'_>, path: &[u8]) {
         let Some((start, content_end)) = spans.get(clamp_usize(index)).copied() else {
             break;
         };
-        if !literal_match(&data[start..content_end], ctx.query, ctx.case_sensitive) {
+        if !line_matches(ctx, &data[start..content_end]) {
             index += 1;
             continue;
         }
@@ -179,6 +184,13 @@ fn search_file(ctx: &mut SearchCtx<'_>, path: &[u8]) {
     }
     if printed_file {
         ctx.out.append(b"\n");
+    }
+}
+
+fn line_matches(ctx: &SearchCtx<'_>, line: &[u8]) -> bool {
+    match &ctx.regex {
+        Some(regex) => regex.is_match(line),
+        None => literal_match(line, ctx.query, ctx.case_sensitive),
     }
 }
 

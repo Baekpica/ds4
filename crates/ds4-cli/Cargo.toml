@@ -32,3 +32,4 @@ native = []
 ds4-core = { path = "../ds4-core" }
 ds4-dist = { path = "../ds4-dist" }
 ds4-web = { path = "../ds4-web" }
+libc = "0.2"

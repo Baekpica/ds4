@@ -702,7 +702,7 @@ pub(super) fn handle_round_with_tools<B: Browser>(
                     },
                 )
             }
-            super::search::SEARCH => match super::search::search_result(super::search::SearchArgs {
+            super::search::SEARCH => super::search::search_result(super::search::SearchArgs {
                 query: call.arg(QUERY_ARG),
                 path: call.arg(PATH_ARG),
                 mode: call.arg("mode"),
@@ -710,12 +710,7 @@ pub(super) fn handle_round_with_tools<B: Browser>(
                 case_sensitive: call.arg("case_sensitive"),
                 context: call.arg("context"),
                 max_results: call.arg("max_results"),
-            }) {
-                super::search::SearchOutcome::Output(bytes) => bytes,
-                super::search::SearchOutcome::Unsupported => {
-                    return Err(TOOL_UNSUPPORTED_ERROR.into());
-                }
-            },
+            }),
             _ => return Err(TOOL_UNSUPPORTED_ERROR.into()),
         };
         observation.append(format!("Tool result {} ({}):\n", index + 1, call.name).as_bytes());

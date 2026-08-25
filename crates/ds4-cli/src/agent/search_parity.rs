@@ -1,6 +1,5 @@
-use super::search::{default_search_path, search_result, SearchArgs, SearchOutcome, SEARCH};
+use super::search::{default_search_path, search_result, SearchArgs, SEARCH};
 use super::web_tools::{handle_round_with_cursor, Browser, ReadCursor};
-use super::TOOL_UNSUPPORTED_ERROR;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -125,10 +124,7 @@ fn c_search_in(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn rust_search(args: SearchArgs<'_>) -> Vec<u8> {
-    match search_result(args) {
-        SearchOutcome::Output(bytes) => bytes,
-        SearchOutcome::Unsupported => panic!("literal search must not be unsupported"),
-    }
+    search_result(args)
 }
 
 fn args<'a>(
@@ -388,28 +384,57 @@ fn search_empty_and_missing_path_both_mean_dot() {
 }
 
 #[test]
-fn search_regex_mode_is_still_unsupported() {
+fn search_regex_hit_and_invalid_match_c_oracle() {
     let fixture = Fixture::create();
-    let path = fixture.path();
-    match search_result(args(
-        Some("needle"),
-        Some(path),
+    let hit = fixture.child("hit.txt");
+    let rust_hit = rust_search(args(
+        Some("needl."),
+        Some(&hit),
         Some("regex"),
         None,
         None,
         None,
         None,
-    )) {
-        SearchOutcome::Unsupported => {}
-        SearchOutcome::Output(bytes) => panic!("regex should stay unsupported, got {bytes:?}"),
-    }
-    let error = match handle_round_with_cursor(
-        &search_dsml(Some("needle"), Some(path), Some("regex")),
+    ));
+    assert_eq!(rust_hit, c_search(&["needl.", &hit, "regex"]));
+    assert!(std::str::from_utf8(&rust_hit)
+        .unwrap()
+        .contains("needle here"));
+
+    let rust_bad = rust_search(args(
+        Some("("),
+        Some(&hit),
+        Some("regex"),
+        None,
+        None,
+        None,
+        None,
+    ));
+    assert_eq!(rust_bad, c_search(&["(", &hit, "regex"]));
+    assert!(std::str::from_utf8(&rust_bad)
+        .unwrap()
+        .starts_with("Tool error: invalid regex: "));
+
+    let rust_case = rust_search(args(
+        Some("NEEDLE"),
+        Some(&fixture.child("Case.txt")),
+        Some("regex"),
+        None,
+        Some("false"),
+        None,
+        None,
+    ));
+    assert_eq!(
+        rust_case,
+        c_search(&["NEEDLE", &fixture.child("Case.txt"), "regex", "-", "false"])
+    );
+    assert!(std::str::from_utf8(&rust_case).unwrap().contains("Needle"));
+
+    let round = handle_round_with_cursor(
+        &search_dsml(Some("needl."), Some(&hit), Some("regex")),
         &mut NoWeb,
         &mut ReadCursor::default(),
-    ) {
-        Err(error) => error,
-        Ok(_) => panic!("regex mode stays on the unsupported tool path"),
-    };
-    assert_eq!(error, TOOL_UNSUPPORTED_ERROR);
+    )
+    .expect("regex search is a supported tool path");
+    assert_eq!(round.observation, observation(&rust_hit));
 }
