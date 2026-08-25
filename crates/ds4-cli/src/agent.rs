@@ -435,6 +435,17 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
     ))?;
     log.tokens("initial_system_prompt", &model, transcript.as_slice(), 0)?;
 
+    let sys = build_system_transcript(model.vocab(), &args, think)?;
+    compact::compact_if_needed(
+        &model,
+        &mut session,
+        model.vocab(),
+        args.ctx,
+        &sys,
+        &mut transcript,
+        "soft limit before user turn",
+    )?;
+
     let prompt = args
         .prompt
         .as_deref()
@@ -521,6 +532,16 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
         transcript.push(model.token_eos());
 
         if web_tools::has_block(&raw) {
+            let sys = build_system_transcript(model.vocab(), &args, think)?;
+            compact::compact_if_needed(
+                &model,
+                &mut session,
+                model.vocab(),
+                args.ctx,
+                &sys,
+                &mut transcript,
+                "soft limit before tool continuation",
+            )?;
             let round = web_tools::handle_round_with_tools(
                 &raw,
                 &mut web,
@@ -529,8 +550,15 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
             )
             .map_err(|_| TOOL_UNSUPPORTED_ERROR.to_string())?;
             output.extend_from_slice(&project_output(&[&round.visible])?);
-            let observation =
-                fit_tool_observation(model.vocab(), &transcript, args.ctx, round.observation)?;
+            let observation = fit_tool_observation(
+                &model,
+                &mut session,
+                model.vocab(),
+                &args,
+                think,
+                &mut transcript,
+                round.observation,
+            )?;
             model
                 .vocab()
                 .chat_append_message(&mut transcript, "tool", &observation)
@@ -600,21 +628,52 @@ fn built_in_tools_prompt() -> &'static str {
     BUILT_IN_TOOLS_PROMPT
 }
 
-fn fit_tool_observation(
+fn observation_fits(
     vocab: &ds4_core::Vocab,
     transcript: &ds4_core::TokenBuffer,
     ctx: i32,
-    observation: Vec<u8>,
-) -> Result<Vec<u8>, String> {
+    observation: &[u8],
+) -> Result<(bool, i32), String> {
     let mut projected = ds4_core::TokenBuffer::from_tokens(transcript.as_slice().to_vec());
     vocab
-        .chat_append_message(&mut projected, "tool", &observation)
+        .chat_append_message(&mut projected, "tool", observation)
         .map_err(|error| error.to_string())?;
     let projected_len = i32::try_from(projected.len()).unwrap_or(i32::MAX);
-    if projected_len + compact::TOOL_RESULT_RESERVE_TOKENS < ctx {
+    Ok((
+        projected_len + compact::TOOL_RESULT_RESERVE_TOKENS < ctx,
+        projected_len,
+    ))
+}
+
+fn fit_tool_observation(
+    model: &ds4_core::Model,
+    session: &mut ds4_core::Session<'_>,
+    vocab: &ds4_core::Vocab,
+    args: &AgentArgs,
+    think: ds4_core::ChatThinkMode,
+    transcript: &mut ds4_core::TokenBuffer,
+    observation: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let (fits, _) = observation_fits(vocab, transcript, args.ctx, &observation)?;
+    if fits {
         return Ok(observation);
     }
-    Ok(compact::overflow_error(projected_len, ctx))
+    let sys = build_system_transcript(vocab, args, think)?;
+    compact::compact(
+        model,
+        session,
+        vocab,
+        args.ctx,
+        &sys,
+        transcript,
+        "tool result would exceed context",
+    )?;
+    let (fits, projected_len) = observation_fits(vocab, transcript, args.ctx, &observation)?;
+    if fits {
+        Ok(observation)
+    } else {
+        Ok(compact::overflow_error(projected_len, args.ctx))
+    }
 }
 
 fn format_datetime_context(when: &str) -> String {
