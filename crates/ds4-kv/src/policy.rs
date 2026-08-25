@@ -261,6 +261,35 @@ mod tests {
     }
 
     #[test]
+    fn continued_step_maps_default_10000_interval_to_10240() {
+        let opt = Options::default();
+        assert_eq!(DEFAULT_CONTINUED_INTERVAL_TOKENS, 10000);
+        assert_eq!(
+            opt.continued_interval_tokens,
+            DEFAULT_CONTINUED_INTERVAL_TOKENS
+        );
+        assert_eq!(continued_step(&opt), 10240);
+    }
+
+    #[test]
+    fn bank_checkpoint_due_when_committed_at_10240_aligned_frontier() {
+        let opt = Options::default();
+        assert!(bank_checkpoint_due(&opt, 10240, 0));
+    }
+
+    #[test]
+    fn bank_checkpoint_not_due_when_committed_is_raw_10000_interval() {
+        let opt = Options::default();
+        assert!(!bank_checkpoint_due(&opt, 10000, 0));
+    }
+
+    #[test]
+    fn bank_checkpoint_not_due_when_committed_is_9999() {
+        let opt = Options::default();
+        assert!(!bank_checkpoint_due(&opt, 9999, 0));
+    }
+
+    #[test]
     fn continued_step_disables_unrepresentable_aligned_interval() {
         let opt = Options {
             min_tokens: 1,
