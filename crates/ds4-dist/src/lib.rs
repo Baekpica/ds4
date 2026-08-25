@@ -5,6 +5,7 @@ mod activation;
 mod codec;
 mod coordinator;
 mod exec;
+mod forward;
 mod hash;
 mod memory_snapshot;
 mod native_snapshot;
@@ -46,6 +47,12 @@ pub use coordinator::{
     EvalOutcome, RegisteredWorker, SharedCoordinator,
 };
 pub use exec::{SliceExec, WorkOutput, WorkRequest};
+pub use forward::{
+    forward_window, forward_window_from, opened_forwarder_message, PendingQueue, PendingRequest,
+    ERR_CLOSED_WHILE_RESULT, ERR_FORWARD, ERR_FORWARD_HIDDEN, ERR_INVALID_RESULT, ERR_NEXT_CLOSED,
+    ERR_OOM_FORWARDER, ERR_OOM_TRACK, ERR_RELAY_THREAD, ERR_RESULT_METADATA, ERR_RESULT_TOO_LARGE,
+    ERR_TELEMETRY_TOO_LARGE, FORWARD_WINDOW_DEFAULT, FORWARD_WINDOW_MAX, FORWARD_WINDOW_MIN,
+};
 pub use hash::{token_hash_prefix, token_hash_update, token_hash_update_span, TOKEN_HASH_INIT};
 pub use native_snapshot::{
     apply_snapshot_load, dispatch_worker_snapshot, prepare_snapshot_save, MemorySnapshotStore,
