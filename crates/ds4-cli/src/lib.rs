@@ -5,8 +5,11 @@ pub mod bench;
 pub mod repl;
 pub mod session_exec;
 pub mod session_snapshot;
+mod token_printer;
 pub mod worker_hello;
 pub mod worker_run;
+
+use token_printer::TokenPrinter;
 
 use ds4_core::{Backend, ModelOpenOption};
 
@@ -362,80 +365,6 @@ fn session_ready<'m>(
         }
         ticks = ticks.wrapping_add(1);
         std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-}
-
-const THINK_OPEN: &[u8] = b"<think>";
-const THINK_CLOSE: &[u8] = b"</think>";
-
-// Non-TTY byte parity only. The Rust shadow intentionally emits no ANSI color.
-struct TokenPrinter {
-    format_thinking: bool,
-    pending: Vec<u8>,
-    last_output_newline: bool,
-}
-
-impl TokenPrinter {
-    fn new(format_thinking: bool) -> Self {
-        Self {
-            format_thinking,
-            pending: Vec::new(),
-            last_output_newline: true,
-        }
-    }
-
-    fn write_text<W: std::io::Write>(&mut self, out: &mut W, text: &[u8]) -> std::io::Result<()> {
-        if !self.format_thinking {
-            out.write_all(text)?;
-            if let Some(last) = text.last() {
-                self.last_output_newline = *last == b'\n';
-            }
-            return Ok(());
-        }
-
-        let mut bytes = std::mem::take(&mut self.pending);
-        bytes.extend_from_slice(text);
-        let mut i = 0;
-        while i < bytes.len() {
-            let rem = &bytes[i..];
-            if rem.starts_with(THINK_OPEN) {
-                i += THINK_OPEN.len();
-                continue;
-            }
-            if rem.starts_with(THINK_CLOSE) {
-                if !self.last_output_newline {
-                    out.write_all(b"\n")?;
-                    self.last_output_newline = true;
-                }
-                i += THINK_CLOSE.len();
-                continue;
-            }
-            if rem[0] == b'<'
-                && ((rem.len() < THINK_OPEN.len() && THINK_OPEN.starts_with(rem))
-                    || (rem.len() < THINK_CLOSE.len() && THINK_CLOSE.starts_with(rem)))
-            {
-                self.pending.extend_from_slice(rem);
-                break;
-            }
-
-            out.write_all(&rem[..1])?;
-            self.last_output_newline = rem[0] == b'\n';
-            i += 1;
-        }
-        Ok(())
-    }
-
-    fn finish<W: std::io::Write>(&mut self, out: &mut W) -> std::io::Result<()> {
-        if self.format_thinking && !self.pending.is_empty() {
-            out.write_all(&self.pending)?;
-            self.last_output_newline = self.pending.last() == Some(&b'\n');
-            self.pending.clear();
-        }
-        if !self.last_output_newline {
-            out.write_all(b"\n")?;
-            self.last_output_newline = true;
-        }
-        out.flush()
     }
 }
 
@@ -1035,7 +964,7 @@ unless -c is explicit.
 without inference.
 One-shot sampling uses the native C sampler; an explicit --seed is
 reproducible across the C and Rust hosts.
-Thinking tags follow the C non-TTY byte contract; ANSI coloring is omitted.
+Thinking tags follow the C contract: TTY greys the body; pipes stay uncolored.
 --tokens is the C-compatible output budget; --token-ids is the shadow-only
 raw token-ID diagnostic.
 
@@ -1451,7 +1380,15 @@ mod tests {
     use super::*;
 
     fn format_fragments(format_thinking: bool, parts: &[&[u8]]) -> Vec<u8> {
-        let mut printer = TokenPrinter::new(format_thinking);
+        format_fragments_colored(format_thinking, false, parts)
+    }
+
+    fn format_fragments_colored(
+        format_thinking: bool,
+        use_color: bool,
+        parts: &[&[u8]],
+    ) -> Vec<u8> {
+        let mut printer = TokenPrinter::with_color(format_thinking, use_color);
         let mut out = Vec::new();
         for part in parts {
             printer.write_text(&mut out, part).unwrap();
@@ -1837,6 +1774,30 @@ mod tests {
             format_fragments(false, &[b"<thi", b"nk>x</think>"]),
             b"<think>x</think>\n"
         );
+    }
+
+    #[test]
+    fn tty_thinking_body_uses_c_grey_ansi() {
+        assert_eq!(
+            format_fragments_colored(true, true, &[b"<thi", b"nk>plan", b"</thi", b"nk>answer"],),
+            b"\x1b[90mplan\x1b[0m\nanswer\n"
+        );
+        assert_eq!(
+            format_fragments_colored(true, true, &[b"plan</think>answer"]),
+            b"\x1b[90mplan\x1b[0m\nanswer\n"
+        );
+        assert_eq!(
+            format_fragments_colored(true, true, &[b"plan"]),
+            b"\x1b[90mplan\x1b[0m\n"
+        );
+    }
+
+    #[test]
+    fn pipe_thinking_output_has_no_esc() {
+        let out = format_fragments_colored(true, false, &[b"<think>plan</think>answer"]);
+        assert!(!out.contains(&0x1b), "pipe must not emit ESC, got {out:?}");
+        assert_eq!(out, b"plan\nanswer\n");
+        assert!(!format_fragments(true, &[b"<think>plan</think>answer"]).contains(&0x1b));
     }
 
     #[test]
