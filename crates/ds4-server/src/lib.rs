@@ -18,6 +18,7 @@ pub mod retry;
 pub mod route;
 pub mod serve;
 pub mod serve_cont;
+pub mod serve_static;
 pub mod stream;
 #[cfg(any(feature = "native", test))]
 mod tool_memory;

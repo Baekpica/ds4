@@ -30,8 +30,11 @@ use crate::metrics::{
 };
 use crate::models::{model_id_known, model_one_json, models_list_json};
 use crate::parse::{parse_request, ParseEnv};
-use crate::route::{route_decide, Api, RouteEnv, ThinkMode, WireSurface, LANE_CONTINUOUS};
+use crate::route::{
+    route_decide, Api, RouteEnv, ThinkMode, WireSurface, LANE_CONTINUOUS, LANE_STATIC,
+};
 use crate::serve_cont::{cont_prompt_tokens, ContExec};
+use crate::serve_static::{static_width_error, STATIC_WIDTH_ERR};
 use crate::stream::unix_now;
 
 #[derive(Debug, Clone)]
@@ -1067,10 +1070,35 @@ fn run_engine<W: TerminalSink>(
             }
         }
     }
+    if dec.lane == LANE_STATIC {
+        return (LANE_STATIC, refuse_static_singleton(cfg, job, out));
+    }
     (
         crate::route::LANE_SERIAL,
         run_serial(cfg, inner, job, id, engine, out, arrived_at),
     )
+}
+
+fn refuse_static_singleton<W: Write>(
+    cfg: &ServerConfig,
+    job: &PreparedJob,
+    out: &mut W,
+) -> Settlement {
+    let msg = static_width_error(1).unwrap_or(STATIC_WIDTH_ERR);
+    let ok = out
+        .write_all(&wire_http_error_bytes(
+            job.surface,
+            400,
+            msg,
+            cfg.cors,
+            None,
+        ))
+        .is_ok();
+    if ok {
+        Settlement::COMPLETED
+    } else {
+        Settlement::CANCELED
+    }
 }
 
 fn run_serial<W: TerminalSink>(
