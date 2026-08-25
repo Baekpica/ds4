@@ -17,6 +17,7 @@ pub struct BenchArgs {
     gen_tokens: i32,
     step_mul: f64,
     csv: Option<String>,
+    dist: ds4_dist::Options,
     help: bool,
 }
 
@@ -34,6 +35,7 @@ impl Default for BenchArgs {
             gen_tokens: 128,
             step_mul: 1.0,
             csv: None,
+            dist: ds4_dist::Options::default(),
             help: false,
         }
     }
@@ -119,7 +121,13 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, S
             | "--dump-frontier-logits-dir" => {
                 return Err(format!("{arg} is not implemented in ds4-bench-rs"));
             }
-            _ => return Err(format!("unsupported ds4-bench-rs option: {arg}")),
+            _ => match ds4_dist::parse_cli_arg(&arg, &mut iter, &mut parsed.dist)? {
+                ds4_dist::CliResult::Matched => {}
+                ds4_dist::CliResult::NotMatched => {
+                    return Err(format!("unsupported ds4-bench-rs option: {arg}"));
+                }
+                ds4_dist::CliResult::Error => unreachable!(),
+            },
         }
     }
 
@@ -144,12 +152,59 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, S
     if parsed.ctx_alloc <= live_tokens {
         return Err("--ctx-alloc must be greater than measured context + gen-tokens".into());
     }
+    ds4_dist::prepare_engine_options(&parsed.dist)?;
+    if parsed.dist.role == ds4_dist::Role::Worker {
+        return Err("--role worker is a serving mode; start workers with ./ds4".into());
+    }
     Ok(parsed)
+}
+
+fn uses_distributed_replay(args: &BenchArgs) -> bool {
+    args.dist.role == ds4_dist::Role::Coordinator
+}
+
+fn wait_distributed_route(session: &Session<'_>) -> Result<(), String> {
+    let mut ticks = 0u32;
+    loop {
+        if session
+            .distributed_route_ready()
+            .map_err(|e| format!("distributed route readiness failed: {e}"))?
+        {
+            if ticks != 0 {
+                eprintln!("ds4-bench-rs: distributed route ready");
+            }
+            return Ok(());
+        }
+        if ticks % 20 == 0 {
+            eprintln!("ds4-bench-rs: waiting for distributed route: route incomplete");
+        }
+        ticks = ticks.wrapping_add(1);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+fn maybe_warn_distributed_step_shape(args: &BenchArgs, session: &Session<'_>) {
+    let chunk = if args.dist.prefill_chunk != 0 {
+        args.dist.prefill_chunk
+    } else {
+        session.host().prefill_cap
+    };
+    if chunk != 0
+        && args.step_mul == 1.0
+        && args.step_incr > 0
+        && (args.step_incr as u32) < chunk
+        && args.ctx_start < args.ctx_max
+    {
+        eprintln!(
+            "ds4-bench-rs: note: --step-incr={} is smaller than distributed prefill chunk {}; suffix rows will not show multi-chunk pipeline overlap",
+            args.step_incr, chunk
+        );
+    }
 }
 
 pub fn run(args: BenchArgs) -> Result<i32, String> {
     if args.help {
-        print!("{}", help_text());
+        print!("{}\nDistributed:\n{}", help_text(), ds4_dist::USAGE);
         return Ok(0);
     }
 
@@ -159,8 +214,20 @@ pub fn run(args: BenchArgs) -> Result<i32, String> {
         .ok_or_else(|| "--prompt-file is required".to_string())?;
     let text = std::fs::read_to_string(prompt_path)
         .map_err(|e| format!("failed to read {prompt_path}: {e}"))?;
-    let model =
-        Model::open(&args.model, args.backend, args.threads, false).map_err(|e| e.to_string())?;
+    let native_dist = crate::distributed_config(&args.dist);
+    let model = match native_dist.as_ref() {
+        Some(config) => Model::open_distributed(
+            &args.model,
+            args.backend,
+            args.threads,
+            false,
+            None,
+            None,
+            config,
+        ),
+        None => Model::open(&args.model, args.backend, args.threads, false),
+    }
+    .map_err(|e| e.to_string())?;
     let prompt = model.tokenize_text(&text).map_err(|e| e.to_string())?;
     if prompt.len() < args.ctx_max as usize {
         return Err(format!(
@@ -171,7 +238,15 @@ pub fn run(args: BenchArgs) -> Result<i32, String> {
     }
 
     let mut session = model.session(args.ctx_alloc).map_err(|e| e.to_string())?;
-    let mut snapshot = SessionSnapshot::new().map_err(|e| e.to_string())?;
+    if uses_distributed_replay(&args) {
+        wait_distributed_route(&session)?;
+        maybe_warn_distributed_step_shape(&args, &session);
+    }
+    let mut snapshot = if uses_distributed_replay(&args) {
+        None
+    } else {
+        Some(SessionSnapshot::new().map_err(|e| e.to_string())?)
+    };
 
     if let Some(path) = args.csv.as_deref() {
         let file =
@@ -205,13 +280,14 @@ fn run_sweep<W: Write>(
     model: &Model,
     prompt: &TokenBuffer,
     session: &mut Session<'_>,
-    snapshot: &mut SessionSnapshot,
+    snapshot: &mut Option<SessionSnapshot>,
     out: &mut W,
 ) -> Result<(), String> {
     writeln!(out, "{CSV_HEADER}").map_err(|e| e.to_string())?;
     out.flush().map_err(|e| e.to_string())?;
 
     let eos = model.token_eos();
+    let distributed = uses_distributed_replay(args);
     let mut previous = 0;
     let mut frontier = args.ctx_start;
 
@@ -222,7 +298,10 @@ fn run_sweep<W: Write>(
         let prefill_sec = prefill_t0.elapsed().as_secs_f64();
         let prefill_tokens = frontier - previous;
 
-        if args.gen_tokens > 0 {
+        if args.gen_tokens > 0 && !distributed {
+            let snapshot = snapshot
+                .as_mut()
+                .ok_or_else(|| "local bench snapshot is missing".to_string())?;
             session
                 .save_snapshot(snapshot)
                 .map_err(|e| format!("snapshot at {frontier} failed: {e}"))?;
@@ -256,9 +335,18 @@ fn run_sweep<W: Write>(
         let gen_t1 = Instant::now();
 
         if args.gen_tokens > 0 && frontier < args.ctx_max {
-            session
-                .load_snapshot(snapshot)
-                .map_err(|e| format!("restore at {frontier} failed: {e}"))?;
+            if distributed {
+                session.sync(&prefix).map_err(|e| {
+                    format!("distributed replay restore at {frontier} failed: {e}")
+                })?;
+            } else {
+                let snapshot = snapshot
+                    .as_ref()
+                    .ok_or_else(|| "local bench snapshot is missing".to_string())?;
+                session
+                    .load_snapshot(snapshot)
+                    .map_err(|e| format!("restore at {frontier} failed: {e}"))?;
+            }
         }
 
         let gen_sec = gen_t1.duration_since(gen_t0).as_secs_f64();
@@ -277,7 +365,11 @@ fn run_sweep<W: Write>(
             gen_tps: rate(args.gen_tokens, gen_sec),
             gen_tps_ss: rate(ss_tokens, ss_sec),
             first_token_sec,
-            kvcache_bytes: snapshot.len(),
+            kvcache_bytes: if distributed {
+                0
+            } else {
+                snapshot.as_ref().map_or(0, SessionSnapshot::len)
+            },
         };
         writeln!(out, "{}", row.csv_line()).map_err(|e| e.to_string())?;
         out.flush().map_err(|e| e.to_string())?;
@@ -377,7 +469,7 @@ fn default_backend() -> Backend {
 fn help_text() -> &'static str {
     "Usage: ds4-bench-rs --prompt-file FILE [options]\n\
      \n\
-     Local non-MTP throughput sweep over one fixed raw prompt.\n\
+     Non-MTP throughput sweep over one fixed raw prompt.\n\
      \n\
      -m, --model FILE       GGUF model path (default: ds4flash.gguf)\n\
      --cuda|--metal|--cpu   Select backend\n\
@@ -431,6 +523,59 @@ mod tests {
         assert_eq!(args.prompt_file.as_deref(), Some("prompt.txt"));
         assert_eq!(args.ctx_alloc, 16513);
         assert_eq!(args.csv.as_deref(), Some("out.csv"));
+    }
+
+    #[test]
+    fn parses_distributed_coordinator_for_native_bench_runtime() {
+        let args = parse_args(argv(&[
+            "--prompt-file",
+            "prompt.txt",
+            "--role",
+            "coordinator",
+            "--layers",
+            "0:20",
+            "--listen",
+            "127.0.0.1",
+            "7000",
+            "--dist-prefill-chunk",
+            "4096",
+            "--dist-prefill-window",
+            "4",
+            "--dist-activation-bits",
+            "16",
+        ]))
+        .unwrap();
+
+        assert_eq!(args.dist.role, ds4_dist::Role::Coordinator);
+        assert_eq!(args.dist.layers.start, 0);
+        assert_eq!(args.dist.layers.end, 20);
+        assert_eq!(args.dist.listen_host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(args.dist.listen_port, 7000);
+        assert_eq!(args.dist.prefill_chunk, 4096);
+        assert_eq!(args.dist.prefill_window, 4);
+        assert_eq!(args.dist.activation_bits, 16);
+        assert!(uses_distributed_replay(&args));
+    }
+
+    #[test]
+    fn rejects_distributed_worker_as_a_serving_mode() {
+        let err = parse_args(argv(&[
+            "--prompt-file",
+            "prompt.txt",
+            "--role",
+            "worker",
+            "--layers",
+            "21:output",
+            "--coordinator",
+            "127.0.0.1",
+            "7000",
+        ]))
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            "--role worker is a serving mode; start workers with ./ds4"
+        );
     }
 
     #[test]
@@ -510,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unported_benchmark_modes() {
+    fn rejects_unported_mtp_benchmark_mode() {
         let mtp = parse_args(argv(&[
             "--prompt-file",
             "prompt.txt",
@@ -519,14 +664,5 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(mtp.contains("not implemented"));
-
-        let distributed = parse_args(argv(&[
-            "--prompt-file",
-            "prompt.txt",
-            "--role",
-            "coordinator",
-        ]))
-        .unwrap_err();
-        assert!(distributed.contains("unsupported"));
     }
 }
