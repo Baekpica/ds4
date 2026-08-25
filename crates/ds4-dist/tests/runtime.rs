@@ -1,10 +1,10 @@
 //! Coordinator/worker runtime: CLI strings, route search, HELLO/WORK/RESULT.
 
 use ds4_dist::{
-    build_route_plan, dispatch_eval, parse_cli, parse_layers, parse_role, prepare_engine_options,
-    register_worker, resolved_layer_end, send_hello, token_span_hashes, validate_layers_for_model,
-    validate_options, Coordinator, CoordinatorView, EvalOutcome, SliceExec, WorkOutput,
-    WorkRequest, Worker, WorkerInfo, TOKEN_HASH_INIT,
+    build_route_plan, dispatch_eval, format_telemetry_line, parse_cli, parse_layers, parse_role,
+    prepare_engine_options, register_worker, resolved_layer_end, send_hello, token_span_hashes,
+    validate_layers_for_model, validate_options, Coordinator, CoordinatorView, EvalOutcome,
+    SliceExec, Telemetry, WorkOutput, WorkRequest, Worker, WorkerInfo, TOKEN_HASH_INIT,
 };
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
@@ -133,6 +133,26 @@ fn tune(s: &TcpStream) {
     let _ = s.set_nodelay(true);
     let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = s.set_write_timeout(Some(Duration::from_secs(5)));
+}
+
+#[test]
+fn telemetry_line_matches_c_format() {
+    let tel = Telemetry {
+        layer_start: 2,
+        layer_end: 3,
+        route_index: 1,
+        pos0: 4,
+        n_tokens: 2,
+        eval_usec: 1500,
+        downstream_wait_usec: 250,
+        forward_send_usec: 100,
+        input_bytes: 2 * 1024 * 1024,
+        output_bytes: 512 * 1024,
+    };
+    assert_eq!(
+        format_telemetry_line(9, 0, &tel),
+        "ds4: distributed telemetry: request=9 hop=0 layers=2:3 route=1 pos=4 tokens=2 eval=1.500ms downstream_wait=0.250ms forward_send=0.100ms input=2.00MiB output=0.50MiB\n"
+    );
 }
 
 #[test]

@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::activation::decode_activation;
 use crate::codec::{
-    decode_hello_payload, Hello, Work, MSG_HELLO, MSG_RESULT, RESULT_HIDDEN_STATE, RESULT_LOGITS,
-    ROUTE_F_OUTPUT_LOGITS, WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS, WORK_F_RESET_SESSION,
+    decode_hello_payload, Hello, Telemetry, Work, MSG_HELLO, MSG_RESULT, RESULT_HIDDEN_STATE,
+    RESULT_LOGITS, ROUTE_F_OUTPUT_LOGITS, WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS,
+    WORK_F_RESET_SESSION,
 };
 use crate::hash::token_hash_update_span;
 use crate::plan::{build_route_plan, register_worker, CoordinatorView, RoutePlan, WorkerInfo};
@@ -27,6 +28,7 @@ pub struct Coordinator {
     pub view: CoordinatorView,
     pub model_id: u32,
     pub activation_bits: u32,
+    pub debug: bool,
     workers: Vec<WorkerInfo>,
     generation: u64,
 }
@@ -41,6 +43,7 @@ impl Coordinator {
             } else {
                 activation_bits
             },
+            debug: false,
             workers: Vec::new(),
             generation: 0,
         }
@@ -156,6 +159,11 @@ pub fn dispatch_eval<S: Read + Write>(
         return Err("distributed worker returned invalid frame".into());
     }
     let result = decode_result_body(&reply).map_err(|e| e.to_string())?;
+    if coord.debug {
+        for (hop, tel) in result.telemetry.iter().enumerate() {
+            eprint!("{}", format_telemetry_line(request_id, hop as u32, tel));
+        }
+    }
     if result_request_id(&result.hdr) != request_id {
         return Err("distributed result metadata mismatch".into());
     }
@@ -183,6 +191,22 @@ pub fn dispatch_eval<S: Read + Write>(
         }
         _ => Err("distributed route did not return logits or hidden-state".into()),
     }
+}
+
+pub fn format_telemetry_line(request_id: u64, hop: u32, tel: &Telemetry) -> String {
+    format!(
+        "ds4: distributed telemetry: request={request_id} hop={hop} layers={}:{} route={} pos={} tokens={} eval={:.3}ms downstream_wait={:.3}ms forward_send={:.3}ms input={:.2}MiB output={:.2}MiB\n",
+        tel.layer_start,
+        tel.layer_end,
+        tel.route_index,
+        tel.pos0,
+        tel.n_tokens,
+        f64::from(tel.eval_usec) / 1000.0,
+        f64::from(tel.downstream_wait_usec) / 1000.0,
+        f64::from(tel.forward_send_usec) / 1000.0,
+        f64::from(tel.input_bytes) / (1024.0 * 1024.0),
+        f64::from(tel.output_bytes) / (1024.0 * 1024.0),
+    )
 }
 
 #[derive(Debug, Clone)]
