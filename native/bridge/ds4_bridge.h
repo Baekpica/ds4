@@ -107,6 +107,8 @@ typedef struct {
     const char *dspark_path;              /* optional; borrowed */
     const ds4_host_bind_map *mtp_bind;    /* optional; borrowed */
     const ds4_host_bind_map *dspark_bind; /* optional; borrowed */
+    int32_t mtp_draft_tokens;             /* 0 => native default 1 */
+    float mtp_margin;
 } ds4_bridge_model_open_options;
 
 /* All functions: 0 on success, nonzero on failure.  err is optional; when
@@ -151,6 +153,13 @@ int ds4_bridge_session_sync_cb(ds4_bridge_session *s,
                                char *err, size_t errlen);
 int ds4_bridge_eval(ds4_bridge_session *s, int32_t token,
                     char *err, size_t errlen);
+int ds4_bridge_eval_speculative_argmax(ds4_bridge_session *s,
+                                       int32_t first_token,
+                                       int32_t max_tokens,
+                                       int32_t eos_token,
+                                       int32_t *accepted,
+                                       int32_t accepted_cap,
+                                       char *err, size_t errlen);
 int ds4_bridge_session_argmax(ds4_bridge_session *s);
 int ds4_bridge_session_argmax_excluding(ds4_bridge_session *s,
                                         int32_t excluded_id);

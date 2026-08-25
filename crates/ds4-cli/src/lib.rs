@@ -4,7 +4,7 @@ pub mod agent;
 pub mod bench;
 pub mod repl;
 
-use ds4_core::Backend;
+use ds4_core::{Backend, ModelOpenOption};
 
 fn distributed_config(opt: &ds4_dist::Options) -> Option<ds4_core::DistributedConfig> {
     let role = match opt.role {
@@ -296,10 +296,23 @@ fn validate_one_shot_args(args: &ShadowArgs) -> Result<(), String> {
     if args.prompt.is_none() && args.prompt_file.is_none() {
         return Err("one-shot generation requires -p or --prompt-file".into());
     }
-    if args.mtp.is_some() || args.dspark.is_some() {
-        return Err("one-shot generation with --mtp/--dspark is not implemented in ds4-rs".into());
+    if args.dspark.is_some() {
+        return Err("one-shot generation with --dspark is not implemented in ds4-rs".into());
     }
     Ok(())
+}
+
+fn use_mtp_spec(temp: f32, mtp: Option<&str>, draft: i32) -> bool {
+    temp <= 0.0 && mtp.is_some() && draft > 1 && std::env::var_os("DS4_MTP_SPEC_DISABLE").is_none()
+}
+
+fn mtp_open_options(args: &ShadowArgs) -> Vec<ModelOpenOption> {
+    let mut options = Vec::new();
+    if args.mtp.is_some() {
+        options.push(ModelOpenOption::MtpDraftTokens(args.mtp_draft));
+        options.push(ModelOpenOption::MtpMargin(args.mtp_margin));
+    }
+    options
 }
 
 fn generation_limit(ctx: i32, pos: i32, requested: i32) -> i32 {
@@ -452,8 +465,11 @@ fn run_one_shot(model: &ds4_core::Model, args: &ShadowArgs, text: &str) -> Resul
     let mut out = stdout.lock();
     let mut printer = TokenPrinter::new(!args.nothink);
     let mut decode_error = None;
+    let use_mtp = use_mtp_spec(args.temp, args.mtp.as_deref(), args.mtp_draft);
+    let eos = model.token_eos();
+    let mut generated = 0;
 
-    for generated in 0..max_tokens {
+    while generated < max_tokens {
         let token = if sampled {
             session.sample(args.temp, 0, args.top_p, args.min_p, &mut rng)
         } else {
@@ -470,6 +486,36 @@ fn run_one_shot(model: &ds4_core::Model, args: &ShadowArgs, text: &str) -> Resul
         if model.token_is_stop(token) {
             break;
         }
+        if use_mtp {
+            let accepted = match session.eval_speculative_argmax(token, max_tokens - generated, eos)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    decode_error = Some(e.to_string());
+                    break;
+                }
+            };
+            let mut stop = false;
+            for t in accepted {
+                if model.token_is_stop(t) {
+                    stop = true;
+                    break;
+                }
+                let piece = model.token_text(t).map_err(|e| e.to_string())?;
+                printer
+                    .write_text(&mut out, &piece)
+                    .map_err(|e| e.to_string())?;
+                out.flush().map_err(|e| e.to_string())?;
+                generated += 1;
+                if generated >= max_tokens {
+                    break;
+                }
+            }
+            if stop {
+                break;
+            }
+            continue;
+        }
         if sampled {
             if let Err(e) = session.eval(token) {
                 decode_error = Some(e.to_string());
@@ -482,9 +528,10 @@ fn run_one_shot(model: &ds4_core::Model, args: &ShadowArgs, text: &str) -> Resul
             .write_text(&mut out, &piece)
             .map_err(|e| e.to_string())?;
         out.flush().map_err(|e| e.to_string())?;
+        generated += 1;
 
         if !sampled {
-            if generated + 1 == max_tokens {
+            if generated >= max_tokens {
                 break;
             }
             if let Err(e) = session.eval(token) {
@@ -803,8 +850,9 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
     }
 
     let native_dist = distributed_config(&args.dist);
+    let mtp_opts = mtp_open_options(&args);
     let model = match native_dist.as_ref() {
-        Some(config) => ds4_core::Model::open_distributed(
+        Some(config) => ds4_core::Model::open_distributed_options(
             model_path,
             args.backend,
             args.threads,
@@ -812,14 +860,16 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
             args.mtp.as_deref(),
             args.dspark.as_deref(),
             config,
+            &mtp_opts,
         ),
-        None => ds4_core::Model::open_with_support(
+        None => ds4_core::Model::open_with_support_options(
             model_path,
             args.backend,
             args.threads,
             true,
             args.mtp.as_deref(),
             args.dspark.as_deref(),
+            &mtp_opts,
         ),
     }
     .map_err(|e| e.to_string())?;
@@ -1258,11 +1308,34 @@ mod tests {
             "--nothink",
             "--mtp",
             "mtp.gguf",
+            "--mtp-draft",
+            "2",
         ]))
         .unwrap();
-        assert!(validate_one_shot_args(&mtp)
+        assert!(validate_one_shot_args(&mtp).is_ok());
+        assert!(use_mtp_spec(mtp.temp, mtp.mtp.as_deref(), mtp.mtp_draft));
+
+        let dspark = parse_args(args(&[
+            "-p",
+            "hello",
+            "--temp",
+            "0",
+            "--nothink",
+            "--dspark",
+            "draft.gguf",
+        ]))
+        .unwrap();
+        assert!(validate_one_shot_args(&dspark)
             .unwrap_err()
-            .contains("--mtp/--dspark"));
+            .contains("--dspark"));
+    }
+
+    #[test]
+    fn mtp_spec_follows_c_gates() {
+        assert!(!use_mtp_spec(0.0, None, 2));
+        assert!(!use_mtp_spec(0.0, Some("mtp.gguf"), 1));
+        assert!(!use_mtp_spec(0.5, Some("mtp.gguf"), 2));
+        assert!(use_mtp_spec(0.0, Some("mtp.gguf"), 2));
     }
 
     #[test]

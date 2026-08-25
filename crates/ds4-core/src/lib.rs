@@ -83,8 +83,9 @@ use std::ptr::{self, NonNull};
 use ds4_sys::{
     ds4_bridge_bind_plan, ds4_bridge_bind_plan_check, ds4_bridge_bind_slot,
     ds4_bridge_distributed_options, ds4_bridge_encode_chat_prompt, ds4_bridge_eval,
-    ds4_bridge_model, ds4_bridge_model_boot_prewarm, ds4_bridge_model_free, ds4_bridge_model_id,
-    ds4_bridge_model_open, ds4_bridge_model_open_distributed, ds4_bridge_model_open_options,
+    ds4_bridge_eval_speculative_argmax, ds4_bridge_model, ds4_bridge_model_boot_prewarm,
+    ds4_bridge_model_free, ds4_bridge_model_id, ds4_bridge_model_open,
+    ds4_bridge_model_open_distributed, ds4_bridge_model_open_options,
     ds4_bridge_model_routed_quant_bits, ds4_bridge_model_run_distributed_worker,
     ds4_bridge_session, ds4_bridge_session_argmax, ds4_bridge_session_argmax_excluding,
     ds4_bridge_session_create, ds4_bridge_session_ctx, ds4_bridge_session_distributed_route_ready,
@@ -109,11 +110,13 @@ pub enum Backend {
     Cpu,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ModelOpenOption {
     Quality,
     WarmWeights,
     PowerPercent(u8),
+    MtpDraftTokens(i32),
+    MtpMargin(f32),
 }
 
 #[derive(Clone, Copy)]
@@ -121,6 +124,8 @@ struct OpenTuning {
     quality: bool,
     warm_weights: bool,
     power_percent: i32,
+    mtp_draft_tokens: i32,
+    mtp_margin: f32,
 }
 
 impl Default for OpenTuning {
@@ -129,6 +134,8 @@ impl Default for OpenTuning {
             quality: false,
             warm_weights: false,
             power_percent: 100,
+            mtp_draft_tokens: 1,
+            mtp_margin: 3.0,
         }
     }
 }
@@ -147,6 +154,22 @@ fn open_tuning(options: &[ModelOpenOption]) -> Result<OpenTuning> {
                 return Err(Error {
                     code: 1,
                     message: "power percent must be between 1 and 100".into(),
+                });
+            }
+            ModelOpenOption::MtpDraftTokens(n) if n > 0 => tuning.mtp_draft_tokens = n,
+            ModelOpenOption::MtpDraftTokens(_) => {
+                return Err(Error {
+                    code: 1,
+                    message: "mtp draft tokens must be positive".into(),
+                });
+            }
+            ModelOpenOption::MtpMargin(margin) if (0.0..=1000.0).contains(&margin) => {
+                tuning.mtp_margin = margin;
+            }
+            ModelOpenOption::MtpMargin(_) => {
+                return Err(Error {
+                    code: 1,
+                    message: "mtp margin must be between 0 and 1000".into(),
                 });
             }
         }
@@ -810,6 +833,26 @@ impl Model {
         mtp_path: Option<&str>,
         dspark_path: Option<&str>,
     ) -> Result<Self> {
+        Self::open_with_support_options(
+            path,
+            backend,
+            n_threads,
+            defer_boot_prewarm,
+            mtp_path,
+            dspark_path,
+            &[],
+        )
+    }
+
+    pub fn open_with_support_options(
+        path: &str,
+        backend: Backend,
+        n_threads: i32,
+        defer_boot_prewarm: bool,
+        mtp_path: Option<&str>,
+        dspark_path: Option<&str>,
+        options: &[ModelOpenOption],
+    ) -> Result<Self> {
         Self::open_impl(
             path,
             backend,
@@ -818,7 +861,7 @@ impl Model {
             mtp_path,
             dspark_path,
             None,
-            &[],
+            options,
         )
     }
 
@@ -831,6 +874,28 @@ impl Model {
         dspark_path: Option<&str>,
         distributed: &DistributedConfig,
     ) -> Result<Self> {
+        Self::open_distributed_options(
+            path,
+            backend,
+            n_threads,
+            defer_boot_prewarm,
+            mtp_path,
+            dspark_path,
+            distributed,
+            &[],
+        )
+    }
+
+    pub fn open_distributed_options(
+        path: &str,
+        backend: Backend,
+        n_threads: i32,
+        defer_boot_prewarm: bool,
+        mtp_path: Option<&str>,
+        dspark_path: Option<&str>,
+        distributed: &DistributedConfig,
+        options: &[ModelOpenOption],
+    ) -> Result<Self> {
         Self::open_impl(
             path,
             backend,
@@ -839,7 +904,7 @@ impl Model {
             mtp_path,
             dspark_path,
             Some(distributed),
-            &[],
+            options,
         )
     }
 
@@ -960,6 +1025,8 @@ impl Model {
             dspark_path: dspark_path_ptr,
             mtp_bind: mtp_bind_ptr,
             dspark_bind: dspark_bind_ptr,
+            mtp_draft_tokens: tuning.mtp_draft_tokens,
+            mtp_margin: tuning.mtp_margin,
         };
         let mut ffi_distributed = distributed.map(pack_distributed).transpose()?;
         let mut raw = ptr::null_mut();
@@ -1240,6 +1307,36 @@ impl Session<'_> {
         Ok(EvalResult {
             pos: self.host.pos(),
         })
+    }
+
+    pub fn eval_speculative_argmax(
+        &mut self,
+        first: i32,
+        max_tokens: i32,
+        eos: i32,
+    ) -> Result<Vec<i32>> {
+        let mut accepted = vec![0i32; 17];
+        let mut err = [0u8; 512];
+        let n = unsafe {
+            ds4_bridge_eval_speculative_argmax(
+                self.raw.as_ptr(),
+                first,
+                max_tokens,
+                eos,
+                accepted.as_mut_ptr(),
+                accepted.len() as i32,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if n < 0 {
+            return Err(fail(n, &err));
+        }
+        accepted.truncate(n as usize);
+        for &tok in &accepted {
+            self.host.commit_eval(tok);
+        }
+        Ok(accepted)
     }
 
     pub fn rewind(&mut self, pos: i32) {

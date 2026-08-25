@@ -228,6 +228,8 @@ static int model_open_impl(ds4_bridge_model **out,
     eopt.quality = opt->quality != 0;
     eopt.mtp_path = opt->mtp_path;
     eopt.dspark_path = opt->dspark_path;
+    eopt.mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
+    eopt.mtp_margin = opt->mtp_margin;
     if (map_backend(opt->backend, &eopt.backend, err, errlen) != 0) return 1;
     if (distributed) {
         if (map_distributed_options(distributed, &dist, err, errlen) != 0 ||
@@ -459,6 +461,32 @@ int ds4_bridge_eval(ds4_bridge_session *s, int32_t token,
         return 1;
     }
     return ds4_session_eval(s->session, (int)token, err, errlen);
+}
+
+int ds4_bridge_eval_speculative_argmax(ds4_bridge_session *s,
+                                       int32_t first_token,
+                                       int32_t max_tokens,
+                                       int32_t eos_token,
+                                       int32_t *accepted,
+                                       int32_t accepted_cap,
+                                       char *err, size_t errlen)
+{
+    if (!s || !s->session) {
+        set_err(err, errlen, "session is NULL");
+        return -1;
+    }
+    if (!accepted && accepted_cap != 0) {
+        set_err(err, errlen, "accepted is NULL");
+        return -1;
+    }
+    return ds4_session_eval_speculative_argmax(s->session,
+                                               (int)first_token,
+                                               (int)max_tokens,
+                                               (int)eos_token,
+                                               accepted,
+                                               (int)accepted_cap,
+                                               err,
+                                               errlen);
 }
 
 int ds4_bridge_session_argmax(ds4_bridge_session *s)

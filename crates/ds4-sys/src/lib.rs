@@ -217,6 +217,8 @@ pub struct ds4_bridge_model_open_options {
     pub dspark_path: *const c_char,
     pub mtp_bind: *const ds4_host_bind_map,
     pub dspark_bind: *const ds4_host_bind_map,
+    pub mtp_draft_tokens: i32,
+    pub mtp_margin: c_float,
 }
 
 #[repr(C)]
@@ -391,6 +393,17 @@ extern "C" {
     pub fn ds4_bridge_eval(
         s: *mut ds4_bridge_session,
         token: i32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_eval_speculative_argmax(
+        s: *mut ds4_bridge_session,
+        first_token: i32,
+        max_tokens: i32,
+        eos_token: i32,
+        accepted: *mut i32,
+        accepted_cap: i32,
         err: *mut c_char,
         errlen: usize,
     ) -> c_int;
