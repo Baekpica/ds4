@@ -75,7 +75,7 @@ pub use reconnect::{
     reconnect_with, retrying_message, sleep_reconnect, CONNECT_RETRY_ATTEMPTS, CONNECT_RETRY_DELAY,
     RECONNECT_SLEEP,
 };
-pub use relay::{now_sec, prepend_telemetry, usec_since, Forwarder};
+pub use relay::{forward_work_blocking, now_sec, prepend_telemetry, usec_since, Forwarder};
 pub use route::{
     decode_route_blob, encode_route_blob, validate_route_blob, ReturnTarget, RouteEntry,
 };

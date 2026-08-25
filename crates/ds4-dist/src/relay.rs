@@ -14,8 +14,11 @@ use crate::forward::{
     ERR_TELEMETRY_TOO_LARGE,
 };
 use crate::reconnect::connect_endpoint;
-use crate::transport::read_frame;
-use crate::work::{decode_result_body, encode_result_frame, result_request_id};
+use crate::route::RouteEntry;
+use crate::transport::{read_frame, write_frame};
+use crate::work::{
+    decode_result_body, encode_result_frame, encode_work_frame, result_request_id, WorkBody,
+};
 
 pub fn now_sec() -> f64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -174,4 +177,19 @@ fn relay_main(
         }
     }
     queue.close();
+}
+
+pub fn forward_work_blocking<W: Write>(
+    next: &RouteEntry,
+    body: &WorkBody,
+    upstream: &mut W,
+) -> Result<(), String> {
+    let mut hop = connect_endpoint(&next.host, next.port as u16).map_err(|_| ERR_FORWARD)?;
+    let frame = encode_work_frame(body).map_err(|e| e.to_string())?;
+    hop.write_all(&frame).map_err(|_| ERR_FORWARD)?;
+    let (typ, reply) = read_frame(&mut hop).map_err(|_| ERR_FORWARD)?;
+    if typ != MSG_RESULT {
+        return Err(ERR_INVALID_RESULT.into());
+    }
+    write_frame(upstream, typ, &reply).map_err(|e| e.to_string())
 }

@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 use crate::activation::bits_or_default;
 use crate::codec::{
@@ -15,11 +14,12 @@ use crate::codec::{
 use crate::exec::{SliceExec, WorkRequest};
 use crate::hash::{token_hash_update_span, TOKEN_HASH_INIT};
 use crate::native_snapshot::{dispatch_worker_snapshot, MemorySnapshotStore, SnapshotStore};
+use crate::relay::forward_work_blocking;
 use crate::route::{decode_route_blob, validate_route_blob};
 use crate::transport::{read_frame, write_frame};
 use crate::work::{
-    decode_work_body, encode_logits_payload, encode_result_frame, encode_work_frame,
-    error_result_frame, ok_result_hdr, ResultBody, WorkBody,
+    decode_work_body, encode_logits_payload, encode_result_frame, error_result_frame,
+    ok_result_hdr, ResultBody, WorkBody,
 };
 use crate::worker_snapshot::WorkerSnapshotIdentity;
 
@@ -342,15 +342,9 @@ impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
                 fwd.work.flags &= !WORK_F_OUTPUT_LOGITS;
             }
             fwd.input_hc = out.hidden.unwrap_or_default();
-            let mut hop = TcpStream::connect((next.host.as_str(), next.port as u16))
-                .map_err(|e| format!("failed to forward distributed work: {e}"))?;
-            let frame = encode_work_frame(&fwd).map_err(|e| e.to_string())?;
-            hop.write_all(&frame).map_err(|e| e.to_string())?;
-            let (typ, reply) = read_frame(&mut hop).map_err(|e| e.to_string())?;
-            if typ != crate::codec::MSG_RESULT {
-                return fail("next worker did not return valid RESULT".into());
+            if let Err(msg) = forward_work_blocking(&next, &fwd, stream) {
+                return fail(msg);
             }
-            write_frame(stream, typ, &reply).map_err(|e| e.to_string())?;
             return Ok(None);
         }
 
