@@ -372,14 +372,12 @@ fn one_shot(cfg: &ServerConfig, req: &[u8]) -> Vec<u8> {
 
 #[test]
 fn tcp_models_options_unknown_bad_http() {
-    let cfg = ServerConfig {
-        model_id: "Motif-3-Mixed-Quant-GGUF".into(),
-        model_name: "Motif-3-Mixed-Quant-GGUF".into(),
-        ctx: 196608,
-        default_tokens: 1024,
-        cors: true,
-        ..ServerConfig::default()
-    };
+    let mut cfg = ServerConfig::default();
+    cfg.model_id = "Motif-3-Mixed-Quant-GGUF".into();
+    cfg.model_name = "Motif-3-Mixed-Quant-GGUF".into();
+    cfg.ctx = 196608;
+    cfg.default_tokens = 1024;
+    cfg.cors = true;
 
     let out = one_shot(&cfg, b"GET /v1/models HTTP/1.1\r\n\r\n");
     let s = String::from_utf8_lossy(&out);

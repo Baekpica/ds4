@@ -538,13 +538,10 @@ fn motif3_no_think_invalidates_user_stop_and_tool_syntax_cut() {
 
 #[test]
 fn scripted_http_door_generates() {
-    let cfg = ServerConfig {
-        model_id: "ds4".into(),
-        model_name: "ds4".into(),
-        have_engine: true,
-        default_tokens: 16,
-        ..ServerConfig::default()
-    };
+    let mut cfg = ServerConfig::test_cfg();
+    cfg.model_id = "ds4".into();
+    cfg.model_name = "ds4".into();
+    cfg.default_tokens = 16;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let h = thread::spawn(move || {
@@ -571,10 +568,7 @@ fn scripted_http_door_generates() {
 
 #[test]
 fn scripted_motif_generates_over_http() {
-    let cfg = ServerConfig {
-        have_engine: true,
-        ..ServerConfig::default()
-    };
+    let cfg = ServerConfig::test_cfg();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let h = thread::spawn(move || {

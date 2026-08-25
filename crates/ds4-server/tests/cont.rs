@@ -92,11 +92,8 @@ fn http_post(addr: std::net::SocketAddr, path: &str, body: &str) -> String {
 
 #[test]
 fn serial_hold_sheds_unrelated_with_retry_after() {
-    let cfg = ServerConfig {
-        have_engine: true,
-        default_tokens: 16,
-        ..ServerConfig::default()
-    };
+    let mut cfg = ServerConfig::test_cfg();
+    cfg.default_tokens = 16;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let now = unix_now() as f64;
@@ -121,11 +118,8 @@ fn serial_hold_sheds_unrelated_with_retry_after() {
 
 #[test]
 fn live_only_tool_result_conflicts_when_reference_moved() {
-    let cfg = ServerConfig {
-        have_engine: true,
-        default_tokens: 16,
-        ..ServerConfig::default()
-    };
+    let mut cfg = ServerConfig::test_cfg();
+    cfg.default_tokens = 16;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let now = unix_now() as f64;
@@ -152,11 +146,8 @@ fn live_only_tool_result_conflicts_when_reference_moved() {
 
 #[test]
 fn anthropic_tool_turn_publishes_and_holds_next_seat() {
-    let cfg = ServerConfig {
-        have_engine: true,
-        default_tokens: 16,
-        ..ServerConfig::default()
-    };
+    let mut cfg = ServerConfig::test_cfg();
+    cfg.default_tokens = 16;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let h = thread::spawn(move || {

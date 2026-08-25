@@ -179,6 +179,14 @@ fn mem_floor_gb_from_env() -> u64 {
 }
 
 impl ServerConfig {
+    /// Integration-test fixture. Built inside the crate so `serial_fit` stays
+    /// `pub(crate)` and external tests never need functional-update syntax.
+    pub fn test_cfg() -> Self {
+        let mut cfg = Self::default();
+        cfg.have_engine = true;
+        cfg
+    }
+
     pub fn apply_mem_floor_gb(&mut self, raw: &str) {
         self.mem_floor_gb = MemFloor::from_cli_or_env(Some(raw.as_bytes()), None).gb();
     }
@@ -2070,11 +2078,16 @@ mod owner_tests {
     }
 
     fn test_cfg() -> ServerConfig {
-        ServerConfig {
-            have_engine: true,
-            default_tokens: 8,
-            ..ServerConfig::default()
-        }
+        let mut cfg = ServerConfig::test_cfg();
+        cfg.default_tokens = 8;
+        cfg
+    }
+
+    #[test]
+    fn test_cfg_enables_engine_and_keeps_serial_fit_unset() {
+        let cfg = ServerConfig::test_cfg();
+        assert!(cfg.have_engine);
+        assert!(cfg.serial_fit.is_none());
     }
 
     #[test]
