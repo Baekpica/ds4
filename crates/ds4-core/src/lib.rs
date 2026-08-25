@@ -861,6 +861,15 @@ fn pack_support(
     })
 }
 
+// Phase 8.6 model-bridge inventory (todo 45). No CUDA/mmap move this slice.
+// KEEP native (mmap GGUF + CUDA/VMM alloc + engine teardown):
+//   ds4_bridge_model_open / open_distributed (open_impl)
+//   ds4_bridge_model_free (Drop; todo 46 orders only)
+//   ds4_bridge_model_boot_prewarm (device graph/weight warm)
+// MOVE later (host already has the data, or production already left):
+//   ds4_bridge_model_id -> Shape::model_id from identify_gguf
+//   ds4_bridge_model_routed_quant_bits -> host inventory tensor types
+//   ds4_bridge_model_run_distributed_worker -> assemble_worker (oracle FFI)
 impl Model {
     pub fn open(
         path: &str,
@@ -1310,6 +1319,7 @@ impl Model {
 
 impl Drop for Model {
     fn drop(&mut self) {
+        // KEEP native: ds4_engine_close (mmap + CUDA). Todo 46: Drop order only.
         unsafe { ds4_bridge_model_free(self.raw.as_ptr()) }
     }
 }
