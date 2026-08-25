@@ -90,7 +90,11 @@ fn prefix_round_trip_and_tail() {
     let b = raw.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        let hi = if b[i] <= b'9' { b[i] - b'0' } else { b[i] - b'a' + 10 };
+        let hi = if b[i] <= b'9' {
+            b[i] - b'0'
+        } else {
+            b[i] - b'a' + 10
+        };
         let lo = if b[i + 1] <= b'9' {
             b[i + 1] - b'0'
         } else {
@@ -113,12 +117,7 @@ fn prefix_round_trip_and_tail() {
     assert_eq!(again, prefix);
     assert_eq!(payload_tail(&with_tail).unwrap(), &[0xde, 0xad, 0xbe, 0xef]);
 
-    let mut host = SessionLedger::new(
-        ModelFamily::DeepSeek4,
-        SessionBackend::Cuda,
-        8192,
-        64,
-    );
+    let mut host = SessionLedger::new(ModelFamily::DeepSeek4, SessionBackend::Cuda, 8192, 64);
     host.apply_payload(&prefix).unwrap();
     assert!(host.valid);
     assert_eq!(host.pos(), 3);

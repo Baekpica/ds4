@@ -287,7 +287,8 @@ impl DsmlToolStream {
             return true;
         };
         let tag = &raw[self.parse_pos..self.parse_pos + rel + 1];
-        let (Some(name), Some(is_string)) = (dsml_attr(tag, "name"), dsml_attr(tag, "string")) else {
+        let (Some(name), Some(is_string)) = (dsml_attr(tag, "name"), dsml_attr(tag, "string"))
+        else {
             return self.fail();
         };
         let string_value = is_string == b"true";
@@ -478,7 +479,14 @@ pub fn dump_script(name: &str) -> Vec<u8> {
                 "Before.\n\n{}\n{} name=\"bash\">\n{} name=\"command\" string=\"true\">echo partial",
                 DSML_TOOL_CALLS_START, DSML_INVOKE_START, DSML_PARAM_START
             );
-            openai_sse_stream_update(&mut w, &r, "chatcmpl_partial_tool", &mut st, raw1.as_bytes(), false);
+            openai_sse_stream_update(
+                &mut w,
+                &r,
+                "chatcmpl_partial_tool",
+                &mut st,
+                raw1.as_bytes(),
+                false,
+            );
             let raw2 = format!(
                 "Before.\n\n{}\n{} name=\"bash\">\n{} name=\"command\" string=\"true\">echo partial done{}\n{}\n{}",
                 DSML_TOOL_CALLS_START,
@@ -488,7 +496,14 @@ pub fn dump_script(name: &str) -> Vec<u8> {
                 DSML_INVOKE_END,
                 DSML_TOOL_CALLS_END
             );
-            openai_sse_stream_update(&mut w, &r, "chatcmpl_partial_tool", &mut st, raw2.as_bytes(), false);
+            openai_sse_stream_update(
+                &mut w,
+                &r,
+                "chatcmpl_partial_tool",
+                &mut st,
+                raw2.as_bytes(),
+                false,
+            );
             openai_sse_finish_live(
                 &mut w,
                 &r,
@@ -509,7 +524,14 @@ pub fn dump_script(name: &str) -> Vec<u8> {
                 "{}\n{} name=\"edit\">\n{} name=\"edits\" string=\"false\">[1,2,3",
                 DSML_TOOL_CALLS_START, DSML_INVOKE_START, DSML_PARAM_START
             );
-            openai_sse_stream_update(&mut w, &r, "chatcmpl_raw_tool", &mut st, raw.as_bytes(), false);
+            openai_sse_stream_update(
+                &mut w,
+                &r,
+                "chatcmpl_raw_tool",
+                &mut st,
+                raw.as_bytes(),
+                false,
+            );
             w.out
         }
         "openai-wait-tag" => {
@@ -545,7 +567,14 @@ pub fn dump_script(name: &str) -> Vec<u8> {
                 "{}\n{} name=\"bash\">\n{} name=\"command\" string=\"true\">echo &amp",
                 DSML_TOOL_CALLS_START, DSML_INVOKE_START, DSML_PARAM_START
             );
-            openai_sse_stream_update(&mut w, &r, "chatcmpl_entity_tool", &mut st, raw1.as_bytes(), false);
+            openai_sse_stream_update(
+                &mut w,
+                &r,
+                "chatcmpl_entity_tool",
+                &mut st,
+                raw1.as_bytes(),
+                false,
+            );
             let raw2 = format!(
                 "{}\n{} name=\"bash\">\n{} name=\"command\" string=\"true\">echo &amp; done{}\n{}\n{}",
                 DSML_TOOL_CALLS_START,
@@ -555,7 +584,14 @@ pub fn dump_script(name: &str) -> Vec<u8> {
                 DSML_INVOKE_END,
                 DSML_TOOL_CALLS_END
             );
-            openai_sse_stream_update(&mut w, &r, "chatcmpl_entity_tool", &mut st, raw2.as_bytes(), false);
+            openai_sse_stream_update(
+                &mut w,
+                &r,
+                "chatcmpl_entity_tool",
+                &mut st,
+                raw2.as_bytes(),
+                false,
+            );
             w.out
         }
         "openai-think-tool" => {
@@ -679,7 +715,14 @@ pub fn dump_script(name: &str) -> Vec<u8> {
                 DSML_INVOKE_END,
                 DSML_TOOL_CALLS_END
             );
-            openai_sse_stream_update(&mut w, &r, "chatcmpl_multi_tool", &mut st, raw.as_bytes(), false);
+            openai_sse_stream_update(
+                &mut w,
+                &r,
+                "chatcmpl_multi_tool",
+                &mut st,
+                raw.as_bytes(),
+                false,
+            );
             w.out
         }
         _ => b"ERROR unknown-script\n".to_vec(),

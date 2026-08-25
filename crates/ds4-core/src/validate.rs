@@ -8,13 +8,13 @@
 
 use crate::bind::{dots3_layer_is_full_attention, expected_compress_ratio, solar_layer_is_gqa};
 use crate::gguf::{
-    GgufError, GgufFile, GGUF_VALUE_BOOL, GGUF_VALUE_FLOAT32, GGUF_VALUE_FLOAT64,
-    GGUF_VALUE_INT32, GGUF_VALUE_UINT32,
+    GgufError, GgufFile, GGUF_VALUE_BOOL, GGUF_VALUE_FLOAT32, GGUF_VALUE_FLOAT64, GGUF_VALUE_INT32,
+    GGUF_VALUE_UINT32,
 };
 use crate::identify::{identify_file, IdentifyError};
 use crate::shape::{
-    route_architecture, ArchRoute, ModelFamily, Shape, Variant, SHAPE_DOTS3_NOTE_PREV,
-    SHAPE_FLASH, SHAPE_KEXAONE_236B, SHAPE_MOTIF3, SHAPE_PRO, SHAPE_SOLAR_OPEN2_250B,
+    route_architecture, ArchRoute, ModelFamily, Shape, Variant, SHAPE_DOTS3_NOTE_PREV, SHAPE_FLASH,
+    SHAPE_KEXAONE_236B, SHAPE_MOTIF3, SHAPE_PRO, SHAPE_SOLAR_OPEN2_250B,
 };
 
 const MOTIF_SHA: &[u8] = b"30f14b635d3258a18c3ff7e69829f8fbfa775e87477ffabb59a79115bba820a5";
@@ -147,10 +147,9 @@ fn motif3_layer_is_full_attention(shape: &Shape, il: u32) -> bool {
 
 fn validate_compress(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
     let key = "deepseek4.attention.compress_ratios";
-    let arr = g.get_array(key).ok_or(ValidateError::TokenKey(
-        "missing-array",
-        key.into(),
-    ))?;
+    let arr = g
+        .get_array(key)
+        .ok_or(ValidateError::TokenKey("missing-array", key.into()))?;
     if arr.typ != GGUF_VALUE_UINT32 && arr.typ != GGUF_VALUE_INT32 {
         return Err(ValidateError::TokenKey("array-type", key.into()));
     }
@@ -190,10 +189,9 @@ fn validate_compress(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
 
 fn validate_swiglu(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
     let key = "deepseek4.swiglu_clamp_exp";
-    let arr = g.get_array(key).ok_or(ValidateError::TokenKey(
-        "missing-array",
-        key.into(),
-    ))?;
+    let arr = g
+        .get_array(key)
+        .ok_or(ValidateError::TokenKey("missing-array", key.into()))?;
     if arr.typ != GGUF_VALUE_FLOAT32 && arr.typ != GGUF_VALUE_FLOAT64 {
         return Err(ValidateError::TokenKey("array-type", key.into()));
     }
@@ -202,7 +200,11 @@ fn validate_swiglu(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
     }
     let vals = g.array_f32s(&arr)?;
     for il in 0..shape.n_layer {
-        expect_f32("swiglu_clamp_exp", vals[il as usize], shape.swiglu_clamp_exp)?;
+        expect_f32(
+            "swiglu_clamp_exp",
+            vals[il as usize],
+            shape.swiglu_clamp_exp,
+        )?;
     }
     Ok(())
 }
@@ -240,13 +242,21 @@ fn validate_deepseek(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
     expect_u32("attention.head_count_kv", n_head_kv, shape.n_head_kv)?;
     expect_u32("attention.value_length", n_value_dim, shape.n_value_dim)?;
     expect_u32("rope.dimension_count", n_rot, shape.n_rot)?;
-    expect_u32("attention.output_group_count", n_out_group, shape.n_out_group)?;
+    expect_u32(
+        "attention.output_group_count",
+        n_out_group,
+        shape.n_out_group,
+    )?;
     expect_u32("attention.q_lora_rank", n_lora_q, shape.n_lora_q)?;
     expect_u32("attention.output_lora_rank", n_lora_o, shape.n_lora_o)?;
     expect_u32("expert_count", n_expert, shape.n_expert)?;
     expect_u32("expert_used_count", n_expert_used, shape.n_expert_used)?;
     expect_u32("expert_feed_forward_length", n_ff_exp, shape.n_ff_exp)?;
-    expect_u32("expert_shared_count", n_expert_shared, shape.n_expert_shared)?;
+    expect_u32(
+        "expert_shared_count",
+        n_expert_shared,
+        shape.n_expert_shared,
+    )?;
     expect_u32("hash_layer_count", n_hash_layer, shape.n_hash_layer)?;
     expect_u32("expert_group_count", n_expert_groups, 0)?;
     expect_u32("expert_group_used_count", n_group_used, 0)?;
@@ -280,7 +290,11 @@ fn validate_deepseek(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
     if let Some(v) = g.get_u64_compat("deepseek4.rope.scaling.original_context_length") {
         rope_orig = v;
     }
-    expect_u64("rope.scaling.original_context_length", rope_orig, shape.rope_orig_ctx)?;
+    expect_u64(
+        "rope.scaling.original_context_length",
+        rope_orig,
+        shape.rope_orig_ctx,
+    )?;
     expect_f32(
         "rope.freq_base",
         req_f32(g, "deepseek4.rope.freq_base")?,
@@ -338,14 +352,26 @@ fn validate_deepseek(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
 }
 
 fn validate_motif3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
-    expect_u32("block_count", req_u32(g, "motif3.block_count")?, shape.n_layer)?;
+    expect_u32(
+        "block_count",
+        req_u32(g, "motif3.block_count")?,
+        shape.n_layer,
+    )?;
     expect_u64(
         "context_length",
         req_u64c(g, "motif3.context_length")?,
         262144,
     )?;
-    expect_u32("embedding_length", req_u32(g, "motif3.embedding_length")?, shape.n_embd)?;
-    expect_u32("vocab_size", req_u32(g, "motif3.vocab_size")?, shape.n_vocab)?;
+    expect_u32(
+        "embedding_length",
+        req_u32(g, "motif3.embedding_length")?,
+        shape.n_embd,
+    )?;
+    expect_u32(
+        "vocab_size",
+        req_u32(g, "motif3.vocab_size")?,
+        shape.n_vocab,
+    )?;
     expect_u32(
         "feed_forward_length",
         req_u32(g, "motif3.feed_forward_length")?,
@@ -356,7 +382,11 @@ fn validate_motif3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "motif3.leading_dense_block_count")?,
         shape.n_leading_dense,
     )?;
-    expect_u32("expert_count", req_u32(g, "motif3.expert_count")?, shape.n_expert)?;
+    expect_u32(
+        "expert_count",
+        req_u32(g, "motif3.expert_count")?,
+        shape.n_expert,
+    )?;
     expect_u32(
         "expert_used_count",
         req_u32(g, "motif3.expert_used_count")?,
@@ -372,8 +402,16 @@ fn validate_motif3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "motif3.expert_shared_count")?,
         shape.n_expert_shared,
     )?;
-    expect_u32("expert_gating_func", req_u32(g, "motif3.expert_gating_func")?, 1)?;
-    expect_u32("attention.head_count", req_u32(g, "motif3.attention.head_count")?, shape.n_head)?;
+    expect_u32(
+        "expert_gating_func",
+        req_u32(g, "motif3.expert_gating_func")?,
+        1,
+    )?;
+    expect_u32(
+        "attention.head_count",
+        req_u32(g, "motif3.attention.head_count")?,
+        shape.n_head,
+    )?;
     expect_u32(
         "attention.head_count_kv",
         req_u32(g, "motif3.attention.head_count_kv")?,
@@ -419,7 +457,11 @@ fn validate_motif3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "motif3.attention.sliding_window_period")?,
         shape.n_swa_period,
     )?;
-    expect_u32("mhc.expansion_rate", req_u32(g, "motif3.mhc.expansion_rate")?, shape.n_hc)?;
+    expect_u32(
+        "mhc.expansion_rate",
+        req_u32(g, "motif3.mhc.expansion_rate")?,
+        shape.n_hc,
+    )?;
     expect_u32(
         "mhc.sinkhorn_iterations",
         req_u32(g, "motif3.mhc.sinkhorn_iterations")?,
@@ -430,7 +472,11 @@ fn validate_motif3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "motif3.mtp.block_count")?,
         shape.n_nextn_predict,
     )?;
-    expect_bool("expert_weights_norm", req_bool(g, "motif3.expert_weights_norm")?, true)?;
+    expect_bool(
+        "expert_weights_norm",
+        req_bool(g, "motif3.expert_weights_norm")?,
+        true,
+    )?;
     expect_bool(
         "attention.elementwise_output_gate",
         req_bool(g, "motif3.attention.elementwise_output_gate")?,
@@ -462,8 +508,16 @@ fn validate_motif3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_f32(g, "motif3.attention.layer_norm_rms_epsilon")?,
         shape.rms_eps,
     )?;
-    expect_f32("rope.freq_base", req_f32(g, "motif3.rope.freq_base")?, shape.rope_freq_base)?;
-    expect_f32("rope.freq_base_swa", req_f32(g, "motif3.rope.freq_base_swa")?, 10000.0)?;
+    expect_f32(
+        "rope.freq_base",
+        req_f32(g, "motif3.rope.freq_base")?,
+        shape.rope_freq_base,
+    )?;
+    expect_f32(
+        "rope.freq_base_swa",
+        req_f32(g, "motif3.rope.freq_base_swa")?,
+        10000.0,
+    )?;
     expect_f32(
         "rope.scaling.factor",
         req_f32(g, "motif3.rope.scaling.factor")?,
@@ -479,15 +533,31 @@ fn validate_motif3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_f32(g, "motif3.rope.scaling.beta_slow")?,
         shape.rope_yarn_beta_slow,
     )?;
-    expect_f32("rope.scaling.mscale", req_f32(g, "motif3.rope.scaling.mscale")?, 1.0)?;
+    expect_f32(
+        "rope.scaling.mscale",
+        req_f32(g, "motif3.rope.scaling.mscale")?,
+        1.0,
+    )?;
     expect_f32(
         "mhc.h_post_coefficient",
         req_f32(g, "motif3.mhc.h_post_coefficient")?,
         1.0,
     )?;
-    expect_f32("polynorm.output_scale", req_f32(g, "motif3.polynorm.output_scale")?, 0.5)?;
-    expect_f32("polynorm.bias_clamp", req_f32(g, "motif3.polynorm.bias_clamp")?, 0.5)?;
-    expect_f32("hidden_clamp", req_f32(g, "motif3.hidden_clamp")?, 1_000_000.0)?;
+    expect_f32(
+        "polynorm.output_scale",
+        req_f32(g, "motif3.polynorm.output_scale")?,
+        0.5,
+    )?;
+    expect_f32(
+        "polynorm.bias_clamp",
+        req_f32(g, "motif3.polynorm.bias_clamp")?,
+        0.5,
+    )?;
+    expect_f32(
+        "hidden_clamp",
+        req_f32(g, "motif3.hidden_clamp")?,
+        1_000_000.0,
+    )?;
 
     let pattern = g
         .get_string("motif3.attention.sliding_window_pattern")
@@ -501,20 +571,24 @@ fn validate_motif3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
             "motif3.attention.sliding_window_pattern".into(),
         ));
     }
-    let rope_type = g.get_string("motif3.rope.scaling.type").ok_or(ValidateError::TokenKey(
-        "mismatch-string",
-        "motif3.rope.scaling.type".into(),
-    ))?;
+    let rope_type = g
+        .get_string("motif3.rope.scaling.type")
+        .ok_or(ValidateError::TokenKey(
+            "mismatch-string",
+            "motif3.rope.scaling.type".into(),
+        ))?;
     if rope_type != b"yarn" {
         return Err(ValidateError::TokenKey(
             "mismatch-string",
             "motif3.rope.scaling.type".into(),
         ));
     }
-    let activation = g.get_string("motif3.activation").ok_or(ValidateError::TokenKey(
-        "mismatch-string",
-        "motif3.activation".into(),
-    ))?;
+    let activation = g
+        .get_string("motif3.activation")
+        .ok_or(ValidateError::TokenKey(
+            "mismatch-string",
+            "motif3.activation".into(),
+        ))?;
     if activation != b"poly_norm" {
         return Err(ValidateError::TokenKey(
             "mismatch-string",
@@ -543,7 +617,11 @@ fn validate_motif3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
 }
 
 fn validate_dots3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
-    expect_u32("block_count", req_u32(g, "dots3-note.block_count")?, shape.n_layer)?;
+    expect_u32(
+        "block_count",
+        req_u32(g, "dots3-note.block_count")?,
+        shape.n_layer,
+    )?;
     expect_u64(
         "context_length",
         req_u64c(g, "dots3-note.context_length")?,
@@ -554,7 +632,11 @@ fn validate_dots3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "dots3-note.embedding_length")?,
         shape.n_embd,
     )?;
-    expect_u32("vocab_size", req_u32(g, "dots3-note.vocab_size")?, shape.n_vocab)?;
+    expect_u32(
+        "vocab_size",
+        req_u32(g, "dots3-note.vocab_size")?,
+        shape.n_vocab,
+    )?;
     expect_u32(
         "feed_forward_length",
         req_u32(g, "dots3-note.feed_forward_length")?,
@@ -565,7 +647,11 @@ fn validate_dots3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "dots3-note.leading_dense_block_count")?,
         shape.n_leading_dense,
     )?;
-    expect_u32("expert_count", req_u32(g, "dots3-note.expert_count")?, shape.n_expert)?;
+    expect_u32(
+        "expert_count",
+        req_u32(g, "dots3-note.expert_count")?,
+        shape.n_expert,
+    )?;
     expect_u32(
         "expert_used_count",
         req_u32(g, "dots3-note.expert_used_count")?,
@@ -601,10 +687,26 @@ fn validate_dots3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "dots3-note.attention.value_length")?,
         shape.n_value_mla,
     )?;
-    expect_u32("sliding_window", req_u32(g, "dots3-note.sliding_window")?, shape.n_swa)?;
-    expect_u32("index_topk", req_u32(g, "dots3-note.index_topk")?, shape.n_indexer_top_k)?;
-    expect_u32("q_lora_rank", req_u32(g, "dots3-note.q_lora_rank")?, shape.n_lora_q)?;
-    expect_u32("kv_lora_rank", req_u32(g, "dots3-note.kv_lora_rank")?, shape.n_kv_lora)?;
+    expect_u32(
+        "sliding_window",
+        req_u32(g, "dots3-note.sliding_window")?,
+        shape.n_swa,
+    )?;
+    expect_u32(
+        "index_topk",
+        req_u32(g, "dots3-note.index_topk")?,
+        shape.n_indexer_top_k,
+    )?;
+    expect_u32(
+        "q_lora_rank",
+        req_u32(g, "dots3-note.q_lora_rank")?,
+        shape.n_lora_q,
+    )?;
+    expect_u32(
+        "kv_lora_rank",
+        req_u32(g, "dots3-note.kv_lora_rank")?,
+        shape.n_kv_lora,
+    )?;
     expect_u32(
         "swa_kv_lora_rank",
         req_u32(g, "dots3-note.swa_kv_lora_rank")?,
@@ -615,7 +717,11 @@ fn validate_dots3(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "dots3-note.full_attention_count")?,
         shape.n_full_attn_count,
     )?;
-    expect_bool("language_only", req_bool(g, "dots3-note.language_only")?, true)?;
+    expect_bool(
+        "language_only",
+        req_bool(g, "dots3-note.language_only")?,
+        true,
+    )?;
     expect_bool("mtp.present", req_bool(g, "dots3-note.mtp.present")?, true)?;
     expect_f32(
         "rope.freq_base",
@@ -666,7 +772,11 @@ fn validate_solar(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "solar-open2.embedding_length")?,
         shape.n_embd,
     )?;
-    expect_u32("vocab_size", req_u32(g, "solar-open2.vocab_size")?, shape.n_vocab)?;
+    expect_u32(
+        "vocab_size",
+        req_u32(g, "solar-open2.vocab_size")?,
+        shape.n_vocab,
+    )?;
     expect_u32(
         "feed_forward_length",
         req_u32(g, "solar-open2.feed_forward_length")?,
@@ -687,7 +797,11 @@ fn validate_solar(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "solar-open2.attention.value_length")?,
         shape.n_value_dim,
     )?;
-    expect_u32("expert_count", req_u32(g, "solar-open2.expert_count")?, shape.n_expert)?;
+    expect_u32(
+        "expert_count",
+        req_u32(g, "solar-open2.expert_count")?,
+        shape.n_expert,
+    )?;
     expect_u32(
         "expert_used_count",
         req_u32(g, "solar-open2.expert_used_count")?,
@@ -708,9 +822,21 @@ fn validate_solar(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "solar-open2.leading_dense_block_count")?,
         0,
     )?;
-    expect_u32("ssm.conv_kernel", req_u32(g, "solar-open2.ssm.conv_kernel")?, shape.n_ssm_conv)?;
-    expect_u32("kda.head_dim", req_u32(g, "solar-open2.kda.head_dim")?, shape.n_kda_head_dim)?;
-    expect_u32("expert_gating_func", req_u32(g, "solar-open2.expert_gating_func")?, 2)?;
+    expect_u32(
+        "ssm.conv_kernel",
+        req_u32(g, "solar-open2.ssm.conv_kernel")?,
+        shape.n_ssm_conv,
+    )?;
+    expect_u32(
+        "kda.head_dim",
+        req_u32(g, "solar-open2.kda.head_dim")?,
+        shape.n_kda_head_dim,
+    )?;
+    expect_u32(
+        "expert_gating_func",
+        req_u32(g, "solar-open2.expert_gating_func")?,
+        2,
+    )?;
     expect_f32(
         "attention.layer_norm_rms_epsilon",
         req_f32(g, "solar-open2.attention.layer_norm_rms_epsilon")?,
@@ -737,10 +863,9 @@ fn validate_solar(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
     expect_bool("internal use_rope", shape.use_rope, false)?;
 
     let key = "solar-open2.attention.head_count_kv";
-    let arr = g.get_array(key).ok_or(ValidateError::TokenKey(
-        "missing-array",
-        key.into(),
-    ))?;
+    let arr = g
+        .get_array(key)
+        .ok_or(ValidateError::TokenKey("missing-array", key.into()))?;
     if arr.typ != GGUF_VALUE_INT32 && arr.typ != GGUF_VALUE_UINT32 {
         return Err(ValidateError::TokenKey("array-type", key.into()));
     }
@@ -773,7 +898,11 @@ fn validate_solar(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         pos += 4;
     }
     expect_f32("internal KDA q/k l2 epsilon", shape.kda_l2_eps, 1.0e-6)?;
-    expect_f32("internal KDA gate clamp minimum", shape.kda_gate_clamp_min, -5.0)?;
+    expect_f32(
+        "internal KDA gate clamp minimum",
+        shape.kda_gate_clamp_min,
+        -5.0,
+    )?;
     Ok(())
 }
 
@@ -790,7 +919,11 @@ fn validate_exaone(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "exaone-moe.embedding_length")?,
         shape.n_embd,
     )?;
-    expect_u32("vocab_size", req_u32(g, "exaone-moe.vocab_size")?, shape.n_vocab)?;
+    expect_u32(
+        "vocab_size",
+        req_u32(g, "exaone-moe.vocab_size")?,
+        shape.n_vocab,
+    )?;
     expect_u32(
         "feed_forward_length",
         req_u32(g, "exaone-moe.feed_forward_length")?,
@@ -816,7 +949,11 @@ fn validate_exaone(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "exaone-moe.attention.value_length")?,
         shape.n_value_dim,
     )?;
-    expect_u32("expert_count", req_u32(g, "exaone-moe.expert_count")?, shape.n_expert)?;
+    expect_u32(
+        "expert_count",
+        req_u32(g, "exaone-moe.expert_count")?,
+        shape.n_expert,
+    )?;
     expect_u32(
         "expert_used_count",
         req_u32(g, "exaone-moe.expert_used_count")?,
@@ -837,13 +974,21 @@ fn validate_exaone(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
         req_u32(g, "exaone-moe.expert_shared_count")?,
         shape.n_expert_shared,
     )?;
-    expect_u32("expert_group_count", req_u32(g, "exaone-moe.expert_group_count")?, 1)?;
+    expect_u32(
+        "expert_group_count",
+        req_u32(g, "exaone-moe.expert_group_count")?,
+        1,
+    )?;
     expect_u32(
         "expert_group_used_count",
         req_u32(g, "exaone-moe.expert_group_used_count")?,
         1,
     )?;
-    expect_u32("expert_gating_func", req_u32(g, "exaone-moe.expert_gating_func")?, 2)?;
+    expect_u32(
+        "expert_gating_func",
+        req_u32(g, "exaone-moe.expert_gating_func")?,
+        2,
+    )?;
     expect_u32(
         "leading_dense_block_count",
         req_u32(g, "exaone-moe.leading_dense_block_count")?,
@@ -881,10 +1026,9 @@ fn validate_exaone(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
     )?;
 
     let key = "exaone-moe.attention.sliding_window_pattern";
-    let arr = g.get_array(key).ok_or(ValidateError::TokenKey(
-        "missing-array",
-        key.into(),
-    ))?;
+    let arr = g
+        .get_array(key)
+        .ok_or(ValidateError::TokenKey("missing-array", key.into()))?;
     if arr.typ != GGUF_VALUE_BOOL {
         return Err(ValidateError::TokenKey("array-type", key.into()));
     }

@@ -303,7 +303,14 @@ impl Builder {
     }
 
     fn write_types(&self, path: &Path, arch: &str, type_tag: u32) {
-        write_tok_gguf(path, arch, &self.tokens, &self.merges, &self.types, type_tag);
+        write_tok_gguf(
+            path,
+            arch,
+            &self.tokens,
+            &self.merges,
+            &self.types,
+            type_tag,
+        );
     }
 }
 
@@ -401,7 +408,15 @@ fn family_cases(family: ModelFamily) {
     let vocab = load(family, &path);
     assert_cmd(family, &path, &vocab, "specials", "");
 
-    let mut encodes: Vec<&str> = vec!["", "hello", "12345", ">;\n", "  hello", "hello world", "it's"];
+    let mut encodes: Vec<&str> = vec![
+        "",
+        "hello",
+        "12345",
+        ">;\n",
+        "  hello",
+        "hello world",
+        "it's",
+    ];
     let mut renders: Vec<String> = Vec::new();
     match family {
         ModelFamily::DeepSeek4 => {
@@ -411,7 +426,12 @@ fn family_cases(family: ModelFamily) {
             renders.push("｜DSML｜x".into());
         }
         ModelFamily::Motif3 => {
-            encodes.extend(["<|user|>hello", "hello  <ls53>x", "hello  <ls85>x", "HelloWorld"]);
+            encodes.extend([
+                "<|user|>hello",
+                "hello  <ls53>x",
+                "hello  <ls85>x",
+                "HelloWorld",
+            ]);
             renders.push("<|user|>hello<|endofturn|>".into());
             renders.push("<think>plan</think>".into());
         }

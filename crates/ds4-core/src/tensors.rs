@@ -206,7 +206,11 @@ impl TensorInventory {
     }
 }
 
-fn parse_one(g: &GgufFile, shard: u32, file_size: u64) -> Result<(u64, Vec<TensorInfo>), TensorError> {
+fn parse_one(
+    g: &GgufFile,
+    shard: u32,
+    file_size: u64,
+) -> Result<(u64, Vec<TensorInfo>), TensorError> {
     let data = g.as_bytes();
     let mut pos = g.tensor_dir_pos;
     let mut tensors = Vec::with_capacity(g.n_tensors.min(1024) as usize);
@@ -268,9 +272,7 @@ fn parse_one(g: &GgufFile, shard: u32, file_size: u64) -> Result<(u64, Vec<Tenso
         t.abs_offset = data_pos
             .checked_add(t.rel_offset)
             .ok_or(TensorError::Overflow)?;
-        if t.bytes != 0
-            && (t.abs_offset > file_size || t.bytes > file_size - t.abs_offset)
-        {
+        if t.bytes != 0 && (t.abs_offset > file_size || t.bytes > file_size - t.abs_offset) {
             return Err(TensorError::OutsideFile);
         }
     }
@@ -304,11 +306,7 @@ fn split_sibling_path_c(path: &str, index: u32, count: u32) -> Option<String> {
     if num < 1 || path.as_bytes().get(num - 1) != Some(&b'-') {
         return None;
     }
-    if !path.as_bytes()[num..of]
-        .iter()
-        .all(|c| c.is_ascii_digit())
-        || of - num != 5
-    {
+    if !path.as_bytes()[num..of].iter().all(|c| c.is_ascii_digit()) || of - num != 5 {
         return None;
     }
     let prefix = &path[..num];
@@ -536,11 +534,7 @@ pub fn apply_host_dir(
         return Err("count-mismatch");
     }
     let Some(out) = out else {
-        return if n > 0 {
-            Err("out-null")
-        } else {
-            Ok(())
-        };
+        return if n > 0 { Err("out-null") } else { Ok(()) };
     };
     if out.len() as u32 != cap {
         return Err("count-mismatch");
@@ -624,14 +618,7 @@ pub fn dump_consume_tapes() -> String {
     native = host.clone();
     out.push_str(&format!(
         "count {}\n",
-        consume_token(
-            &mut native,
-            32,
-            32,
-            Some((&host[..1], 32, 32)),
-            None,
-            false
-        )
+        consume_token(&mut native, 32, 32, Some((&host[..1], 32, 32)), None, false)
     ));
     let mut bad_name = host.clone();
     bad_name[1].name = "other".into();

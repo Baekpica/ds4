@@ -4,8 +4,8 @@ use ds4_core::{
     bind_dspark_names, bind_mtp_names, bind_names, dump_expected_layouts, dump_expected_support,
     dump_layout_check_tapes, expected_dspark_layouts, expected_layouts, expected_mtp_layouts,
     shape_for_variant, validate_dspark_layouts, validate_mtp_layouts, validate_support_layouts,
-    BindNeed, BindPlan, BindSlot, SupportCatalog,
-    LayoutSpec, TensorInfo, TypeClass, DSPARK_MARKOV_RANK, SHAPE_FLASH, Variant,
+    BindNeed, BindPlan, BindSlot, LayoutSpec, SupportCatalog, TensorInfo, TypeClass, Variant,
+    DSPARK_MARKOV_RANK, SHAPE_FLASH,
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -141,8 +141,10 @@ fn support_layout_covers_bind_catalog() {
     for v in [Variant::Flash, Variant::Pro] {
         let shape = shape_for_variant(v);
         let mtp_bind: HashSet<String> = bind_mtp_names().into_iter().map(|n| n.name).collect();
-        let mtp_layout: HashSet<String> =
-            expected_mtp_layouts(&shape).into_iter().map(|s| s.name).collect();
+        let mtp_layout: HashSet<String> = expected_mtp_layouts(&shape)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
         assert_eq!(mtp_bind, mtp_layout, "{v:?} MTP bind/layout name set");
         let ds_bind: HashSet<String> = bind_dspark_names().into_iter().map(|n| n.name).collect();
         let ds_layout: HashSet<String> = expected_dspark_layouts(&shape, DSPARK_MARKOV_RANK)
@@ -165,7 +167,10 @@ fn layout_covers_bind_catalog() {
     ] {
         let shape = shape_for_variant(v);
         let bind: HashSet<String> = bind_names(&shape).into_iter().map(|n| n.name).collect();
-        let layout: HashSet<String> = expected_layouts(&shape).into_iter().map(|s| s.name).collect();
+        let layout: HashSet<String> = expected_layouts(&shape)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
         let missing: Vec<_> = bind.difference(&layout).cloned().collect();
         let extra: Vec<_> = layout.difference(&bind).cloned().collect();
         assert!(

@@ -623,12 +623,10 @@ pub struct ds4_bridge_cont_request {
     pub top_p: c_float,
     pub min_p: c_float,
     pub seed: u64,
-    pub sample_override:
-        Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
+    pub sample_override: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
     pub alive: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> c_int>,
-    pub on_admitted: Option<
-        unsafe extern "C" fn(*mut c_void, *mut c_void, c_int, c_int, c_int) -> c_int,
-    >,
+    pub on_admitted:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, c_int, c_int, c_int) -> c_int>,
     pub place_bank: i32,
     pub n_cached: i32,
     pub bank_used: *mut i32,

@@ -74,8 +74,8 @@ pub fn parse_layers(s: &str) -> Result<Layers, String> {
     if s[colon + 1..].contains(':') {
         return Err("layer range has too many ':' separators".into());
     }
-    let start = parse_u32_component(&s[..colon])
-        .ok_or_else(|| format!("invalid start layer in {s}"))?;
+    let start =
+        parse_u32_component(&s[..colon]).ok_or_else(|| format!("invalid start layer in {s}"))?;
     let end_s = &s[colon + 1..];
     if end_s == "output" {
         return Ok(Layers {
@@ -137,7 +137,9 @@ pub fn parse_cli_arg(
 ) -> Result<CliResult, String> {
     match arg {
         "--role" => {
-            let role = rest.next().ok_or_else(|| "--role requires an argument".to_string())?;
+            let role = rest
+                .next()
+                .ok_or_else(|| "--role requires an argument".to_string())?;
             let parsed = parse_role(&role).ok_or_else(|| {
                 format!("invalid distributed role: {role} (valid roles: none, coordinator, worker)")
             })?;
@@ -145,7 +147,9 @@ pub fn parse_cli_arg(
             Ok(CliResult::Matched)
         }
         "--layers" => {
-            let layers = rest.next().ok_or_else(|| "--layers requires an argument".to_string())?;
+            let layers = rest
+                .next()
+                .ok_or_else(|| "--layers requires an argument".to_string())?;
             match parse_layers(&layers) {
                 Ok(l) => {
                     opt.layers = l;
@@ -158,8 +162,12 @@ pub fn parse_cli_arg(
             if opt.listen_host.is_some() || opt.listen_port != 0 {
                 return Err("specify --listen only once".into());
             }
-            let host = rest.next().ok_or_else(|| "--listen requires an argument".to_string())?;
-            let port = rest.next().ok_or_else(|| "--listen requires an argument".to_string())?;
+            let host = rest
+                .next()
+                .ok_or_else(|| "--listen requires an argument".to_string())?;
+            let port = rest
+                .next()
+                .ok_or_else(|| "--listen requires an argument".to_string())?;
             opt.listen_port = parse_port(&port, "--listen")?;
             opt.listen_host = Some(host);
             Ok(CliResult::Matched)
@@ -168,8 +176,12 @@ pub fn parse_cli_arg(
             if opt.coordinator_host.is_some() || opt.coordinator_port != 0 {
                 return Err("specify --coordinator only once".into());
             }
-            let host = rest.next().ok_or_else(|| "--coordinator requires an argument".to_string())?;
-            let port = rest.next().ok_or_else(|| "--coordinator requires an argument".to_string())?;
+            let host = rest
+                .next()
+                .ok_or_else(|| "--coordinator requires an argument".to_string())?;
+            let port = rest
+                .next()
+                .ok_or_else(|| "--coordinator requires an argument".to_string())?;
             opt.coordinator_port = parse_port(&port, "--coordinator")?;
             opt.coordinator_host = Some(host);
             Ok(CliResult::Matched)
@@ -239,9 +251,7 @@ pub fn validate_options(opt: &Options) -> Result<(), String> {
             || opt.prefill_window != 0
             || opt.activation_bits != 0
         {
-            return Err(
-                "distributed options require --role coordinator or --role worker".into(),
-            );
+            return Err("distributed options require --role coordinator or --role worker".into());
         }
         return Ok(());
     }

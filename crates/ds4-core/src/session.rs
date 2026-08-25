@@ -363,12 +363,8 @@ pub fn dump_cmd(cmd: &str, args: &[&str]) -> String {
             let live = parse_ids(args[1]);
             let prompt = parse_ids(args[2]);
             let common: i32 = args[3].parse().unwrap_or(-1);
-            let mut host = SessionLedger::new(
-                ModelFamily::DeepSeek4,
-                SessionBackend::Cuda,
-                ctx,
-                64,
-            );
+            let mut host =
+                SessionLedger::new(ModelFamily::DeepSeek4, SessionBackend::Cuda, ctx, 64);
             host.tokens = live;
             host.valid = true;
             let kind = host.rewrite_from_common(&prompt, common);
@@ -429,12 +425,7 @@ pub fn dump_cmd(cmd: &str, args: &[&str]) -> String {
             )
         }
         "invalidate" => {
-            let mut host = SessionLedger::new(
-                ModelFamily::DeepSeek4,
-                SessionBackend::Cuda,
-                16,
-                64,
-            );
+            let mut host = SessionLedger::new(ModelFamily::DeepSeek4, SessionBackend::Cuda, 16, 64);
             host.tokens = vec![1, 2, 3];
             host.valid = true;
             host.invalidate();
@@ -447,12 +438,7 @@ pub fn dump_cmd(cmd: &str, args: &[&str]) -> String {
         }
         "create" if args.len() == 1 => {
             let ctx: i32 = args[0].parse().unwrap_or(0);
-            let host = SessionLedger::new(
-                ModelFamily::DeepSeek4,
-                SessionBackend::Cuda,
-                ctx,
-                64,
-            );
+            let host = SessionLedger::new(ModelFamily::DeepSeek4, SessionBackend::Cuda, ctx, 64);
             format!(
                 "CREATE gen={} pos={} valid={} ctx={}\n",
                 host.generation,
@@ -473,9 +459,7 @@ fn parse_ids(s: &str) -> Vec<i32> {
         let n: usize = rest.parse().unwrap_or(0);
         return vec![1; n];
     }
-    s.split(',')
-        .filter_map(|p| p.parse().ok())
-        .collect()
+    s.split(',').filter_map(|p| p.parse().ok()).collect()
 }
 
 fn split_pair(s: &str) -> (Vec<i32>, Vec<i32>) {

@@ -1225,7 +1225,11 @@ fn motif3_match_contraction(text: &[u8], pos: usize) -> usize {
 fn motif3_match_word_pattern(text: &[u8], pos: usize, lower_pattern: bool) -> usize {
     let mut word = pos;
     let first = char_at(text, word);
-    if first.valid && first.cp != b'\r' as u32 && first.cp != b'\n' as u32 && !first.is_letter && !first.is_number
+    if first.valid
+        && first.cp != b'\r' as u32
+        && first.cp != b'\n' as u32
+        && !first.is_letter
+        && !first.is_number
     {
         word = first.next;
     }
@@ -1302,7 +1306,10 @@ fn bpe_tokenize_text_motif3_core(vocab: &Vocab, s: &[u8], out: &mut Vec<i32>) {
             }
             while pos < s.len() {
                 let scan = char_at(s, pos);
-                if !scan.valid || !(scan.cp == b'\r' as u32 || scan.cp == b'\n' as u32 || scan.cp == b'/' as u32)
+                if !scan.valid
+                    || !(scan.cp == b'\r' as u32
+                        || scan.cp == b'\n' as u32
+                        || scan.cp == b'/' as u32)
                 {
                     break;
                 }
@@ -1547,8 +1554,10 @@ fn bpe_tokenize_text_exaone(vocab: &Vocab, s: &[u8], out: &mut Vec<i32>) {
         }
         {
             let mut p = pos;
-            let lead_ok =
-                !(cur.cp == b'\r' as u32 || cur.cp == b'\n' as u32 || cur.is_letter || cur.is_number);
+            let lead_ok = !(cur.cp == b'\r' as u32
+                || cur.cp == b'\n' as u32
+                || cur.is_letter
+                || cur.is_number);
             if lead_ok {
                 p = cur.next;
             }
@@ -1594,7 +1603,8 @@ fn bpe_tokenize_text_exaone(vocab: &Vocab, s: &[u8], out: &mut Vec<i32>) {
             }
             if run > p {
                 let c = char_at(s, run);
-                if c.valid && (c.cp == b'\r' as u32 || c.cp == b'\n' as u32 || c.cp == b'/' as u32) {
+                if c.valid && (c.cp == b'\r' as u32 || c.cp == b'\n' as u32 || c.cp == b'/' as u32)
+                {
                     run = c.next;
                 }
                 pos = run;
@@ -1623,7 +1633,11 @@ fn bpe_tokenize_text_exaone(vocab: &Vocab, s: &[u8], out: &mut Vec<i32>) {
                 }
                 p = c.next;
             }
-            pos = if last_nl_end != 0 { last_nl_end } else { ws_end };
+            pos = if last_nl_end != 0 {
+                last_nl_end
+            } else {
+                ws_end
+            };
             bpe_emit_piece(vocab, &s[start..pos], out);
             continue;
         }
@@ -2059,12 +2073,26 @@ pub fn dump_vocab_apply_tapes() -> String {
     let missing_tok = [(a, false), (b, true)];
     out.push_str(&format!(
         "token-empty {}\n",
-        apply_host_vocab(Some(&missing_tok), None, Some(&merges), None, Some(&ud), None)
+        apply_host_vocab(
+            Some(&missing_tok),
+            None,
+            Some(&merges),
+            None,
+            Some(&ud),
+            None
+        )
     ));
     let missing_merge = [(merge, false)];
     out.push_str(&format!(
         "merge-empty {}\n",
-        apply_host_vocab(Some(&tokens), None, Some(&missing_merge), None, Some(&ud), None)
+        apply_host_vocab(
+            Some(&tokens),
+            None,
+            Some(&missing_merge),
+            None,
+            Some(&ud),
+            None
+        )
     ));
     out.push_str(&format!(
         "ud-range {}\n",
@@ -2074,7 +2102,14 @@ pub fn dump_vocab_apply_tapes() -> String {
     let empty_tok = [(empty, true), (b, true)];
     out.push_str(&format!(
         "ud-empty {}\n",
-        apply_host_vocab(Some(&empty_tok), None, Some(&merges), None, Some(&[0]), None)
+        apply_host_vocab(
+            Some(&empty_tok),
+            None,
+            Some(&merges),
+            None,
+            Some(&[0]),
+            None
+        )
     ));
     out.push_str(&format!(
         "ok {}\n",

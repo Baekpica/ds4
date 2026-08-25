@@ -131,7 +131,13 @@ fn reason_table_matches_c() {
     let mut resp_off = on;
     resp_off.cont_responses = false;
 
-    assert_row(0, WireSurface::OpenaiChat, &on, LANE_CONTINUOUS, REASON_CONT);
+    assert_row(
+        0,
+        WireSurface::OpenaiChat,
+        &on,
+        LANE_CONTINUOUS,
+        REASON_CONT,
+    );
     assert_row(
         NEED_STREAMING,
         WireSurface::OpenaiChat,
@@ -139,10 +145,34 @@ fn reason_table_matches_c() {
         LANE_SERIAL,
         REASON_CONT_UNAVAILABLE,
     );
-    assert_row(0, WireSurface::OpenaiChat, &no_ctx, LANE_STATIC, REASON_STATIC_NO_CONT);
-    assert_row(0, WireSurface::OpenaiChat, &big, LANE_STATIC, REASON_STATIC_PROMPT_BOUNDS);
-    assert_row(0, WireSurface::OpenaiChat, &empty, LANE_STATIC, REASON_STATIC_PROMPT_BOUNDS);
-    assert_row(0, WireSurface::OpenaiChat, &off, LANE_SERIAL, REASON_COALESCE_OFF);
+    assert_row(
+        0,
+        WireSurface::OpenaiChat,
+        &no_ctx,
+        LANE_STATIC,
+        REASON_STATIC_NO_CONT,
+    );
+    assert_row(
+        0,
+        WireSurface::OpenaiChat,
+        &big,
+        LANE_STATIC,
+        REASON_STATIC_PROMPT_BOUNDS,
+    );
+    assert_row(
+        0,
+        WireSurface::OpenaiChat,
+        &empty,
+        LANE_STATIC,
+        REASON_STATIC_PROMPT_BOUNDS,
+    );
+    assert_row(
+        0,
+        WireSurface::OpenaiChat,
+        &off,
+        LANE_SERIAL,
+        REASON_COALESCE_OFF,
+    );
 
     assert_row(
         NEED_TOKEN_IDS | NEED_STREAMING,
@@ -165,7 +195,13 @@ fn reason_table_matches_c() {
         LANE_SERIAL,
         REASON_TOKEN_IDS_PROJECTION,
     );
-    assert_row(NEED_TOOL_SCAN, WireSurface::OpenaiChat, &on, LANE_CONTINUOUS, REASON_CONT);
+    assert_row(
+        NEED_TOOL_SCAN,
+        WireSurface::OpenaiChat,
+        &on,
+        LANE_CONTINUOUS,
+        REASON_CONT,
+    );
     assert_row(
         NEED_TOOL_SCAN,
         WireSurface::OpenaiCompletion,
@@ -182,7 +218,13 @@ fn reason_table_matches_c() {
         LANE_CONTINUOUS,
         REASON_CONT,
     );
-    assert_row(0, WireSurface::Anthropic, &anth_off, LANE_SERIAL, REASON_SURFACE);
+    assert_row(
+        0,
+        WireSurface::Anthropic,
+        &anth_off,
+        LANE_SERIAL,
+        REASON_SURFACE,
+    );
     assert_row(0, WireSurface::Responses, &on, LANE_CONTINUOUS, REASON_CONT);
     assert_row(
         NEED_THINKING | NEED_PER_ROW_SAMPLING,
@@ -191,11 +233,35 @@ fn reason_table_matches_c() {
         LANE_CONTINUOUS,
         REASON_CONT,
     );
-    assert_row(0, WireSurface::Responses, &resp_off, LANE_SERIAL, REASON_SURFACE);
-    assert_row(0, WireSurface::Anthropic, &resp_off, LANE_CONTINUOUS, REASON_CONT);
-    assert_row(0, WireSurface::Responses, &anth_off, LANE_CONTINUOUS, REASON_CONT);
+    assert_row(
+        0,
+        WireSurface::Responses,
+        &resp_off,
+        LANE_SERIAL,
+        REASON_SURFACE,
+    );
+    assert_row(
+        0,
+        WireSurface::Anthropic,
+        &resp_off,
+        LANE_CONTINUOUS,
+        REASON_CONT,
+    );
+    assert_row(
+        0,
+        WireSurface::Responses,
+        &anth_off,
+        LANE_CONTINUOUS,
+        REASON_CONT,
+    );
 
-    assert_row(NEED_STREAMING, WireSurface::Anthropic, &on, LANE_CONTINUOUS, REASON_CONT);
+    assert_row(
+        NEED_STREAMING,
+        WireSurface::Anthropic,
+        &on,
+        LANE_CONTINUOUS,
+        REASON_CONT,
+    );
     assert_row(
         NEED_STREAMING | NEED_THINKING | NEED_STOP_SCAN,
         WireSurface::Anthropic,
@@ -203,7 +269,13 @@ fn reason_table_matches_c() {
         LANE_CONTINUOUS,
         REASON_CONT,
     );
-    assert_row(NEED_STREAMING, WireSurface::Anthropic, &anth_off, LANE_SERIAL, REASON_SURFACE);
+    assert_row(
+        NEED_STREAMING,
+        WireSurface::Anthropic,
+        &anth_off,
+        LANE_SERIAL,
+        REASON_SURFACE,
+    );
     assert_row(
         NEED_STREAMING,
         WireSurface::Anthropic,
@@ -218,7 +290,13 @@ fn reason_table_matches_c() {
         LANE_SERIAL,
         REASON_CONT_UNAVAILABLE,
     );
-    assert_row(NEED_STREAMING, WireSurface::Responses, &on, LANE_CONTINUOUS, REASON_CONT);
+    assert_row(
+        NEED_STREAMING,
+        WireSurface::Responses,
+        &on,
+        LANE_CONTINUOUS,
+        REASON_CONT,
+    );
     assert_row(
         NEED_STREAMING | NEED_THINKING,
         WireSurface::Responses,
@@ -226,7 +304,13 @@ fn reason_table_matches_c() {
         LANE_CONTINUOUS,
         REASON_CONT,
     );
-    assert_row(NEED_STREAMING, WireSurface::Responses, &resp_off, LANE_SERIAL, REASON_SURFACE);
+    assert_row(
+        NEED_STREAMING,
+        WireSurface::Responses,
+        &resp_off,
+        LANE_SERIAL,
+        REASON_SURFACE,
+    );
     assert_row(
         NEED_STREAMING,
         WireSurface::Responses,
@@ -242,9 +326,27 @@ fn reason_table_matches_c() {
         REASON_CONT_UNAVAILABLE,
     );
 
-    assert_row(0, WireSurface::Anthropic, &big, LANE_STATIC, REASON_STATIC_PROMPT_BOUNDS);
-    assert_row(0, WireSurface::Anthropic, &no_ctx, LANE_STATIC, REASON_STATIC_NO_CONT);
-    assert_row(0, WireSurface::Responses, &big, LANE_STATIC, REASON_STATIC_PROMPT_BOUNDS);
+    assert_row(
+        0,
+        WireSurface::Anthropic,
+        &big,
+        LANE_STATIC,
+        REASON_STATIC_PROMPT_BOUNDS,
+    );
+    assert_row(
+        0,
+        WireSurface::Anthropic,
+        &no_ctx,
+        LANE_STATIC,
+        REASON_STATIC_NO_CONT,
+    );
+    assert_row(
+        0,
+        WireSurface::Responses,
+        &big,
+        LANE_STATIC,
+        REASON_STATIC_PROMPT_BOUNDS,
+    );
     assert_row(
         NEED_STOP_SCAN,
         WireSurface::Anthropic,
@@ -261,13 +363,31 @@ fn reason_table_matches_c() {
     );
     let mut anth_off_noctx = no_ctx;
     anth_off_noctx.cont_anthropic = false;
-    assert_row(0, WireSurface::Anthropic, &anth_off_noctx, LANE_SERIAL, REASON_SURFACE);
+    assert_row(
+        0,
+        WireSurface::Anthropic,
+        &anth_off_noctx,
+        LANE_SERIAL,
+        REASON_SURFACE,
+    );
     let mut resp_off_noctx = no_ctx;
     resp_off_noctx.cont_responses = false;
-    assert_row(0, WireSurface::Responses, &resp_off_noctx, LANE_SERIAL, REASON_SURFACE);
+    assert_row(
+        0,
+        WireSurface::Responses,
+        &resp_off_noctx,
+        LANE_SERIAL,
+        REASON_SURFACE,
+    );
 
     let stream_tools = NEED_STREAMING | NEED_TOOL_SCAN | NEED_CONTINUATION_PUBLISH;
-    assert_row(stream_tools, WireSurface::Anthropic, &on, LANE_CONTINUOUS, REASON_CONT);
+    assert_row(
+        stream_tools,
+        WireSurface::Anthropic,
+        &on,
+        LANE_CONTINUOUS,
+        REASON_CONT,
+    );
     assert_row(
         stream_tools | NEED_THINKING | NEED_PER_ROW_SAMPLING | NEED_STOP_SCAN,
         WireSurface::Anthropic,
@@ -275,7 +395,13 @@ fn reason_table_matches_c() {
         LANE_CONTINUOUS,
         REASON_CONT,
     );
-    assert_row(stream_tools, WireSurface::Responses, &on, LANE_CONTINUOUS, REASON_CONT);
+    assert_row(
+        stream_tools,
+        WireSurface::Responses,
+        &on,
+        LANE_CONTINUOUS,
+        REASON_CONT,
+    );
     let mut tools_off_a = on;
     tools_off_a.cont_tools_anthropic = false;
     assert_row(
@@ -285,7 +411,13 @@ fn reason_table_matches_c() {
         LANE_SERIAL,
         REASON_NEED_CONTINUATION_PUBLISH,
     );
-    assert_row(stream_tools, WireSurface::Responses, &tools_off_a, LANE_CONTINUOUS, REASON_CONT);
+    assert_row(
+        stream_tools,
+        WireSurface::Responses,
+        &tools_off_a,
+        LANE_CONTINUOUS,
+        REASON_CONT,
+    );
     let mut tools_off_r = on;
     tools_off_r.cont_tools_responses = false;
     assert_row(
@@ -316,7 +448,13 @@ fn reason_table_matches_c() {
         LANE_SERIAL,
         REASON_CONT_UNAVAILABLE,
     );
-    assert_row(stream_tools, WireSurface::Anthropic, &off, LANE_SERIAL, REASON_COALESCE_OFF);
+    assert_row(
+        stream_tools,
+        WireSurface::Anthropic,
+        &off,
+        LANE_SERIAL,
+        REASON_COALESCE_OFF,
+    );
 
     assert_row(
         NEED_BANK_FRONTIER,
@@ -418,7 +556,11 @@ fn c_needs(r: &NeedInput) -> u32 {
         ])
         .output()
         .expect("run route_c_oracle needs");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
 }
 

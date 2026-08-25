@@ -30,7 +30,10 @@ impl DsmlDecodeState {
         self != DsmlDecodeState::Outside
     }
     pub fn uses_payload_sampling(self) -> bool {
-        matches!(self, DsmlDecodeState::StringBody | DsmlDecodeState::JsonString)
+        matches!(
+            self,
+            DsmlDecodeState::StringBody | DsmlDecodeState::JsonString
+        )
     }
     pub fn name(self) -> &'static str {
         match self {
@@ -113,7 +116,11 @@ impl DsmlDecodeTracker {
                 match dsml_find_tool_start_from(raw, self.pos) {
                     None => {
                         let hold = dsml_max_tool_start_len();
-                        self.pos = if raw.len() > hold { raw.len() - hold } else { 0 };
+                        self.pos = if raw.len() > hold {
+                            raw.len() - hold
+                        } else {
+                            0
+                        };
                         self.decode = DsmlDecodeState::Outside;
                         return;
                     }
@@ -258,7 +265,11 @@ fn dsml_attr_is_string_true(raw: &[u8], tag_start: usize, tag_end: usize) -> boo
 }
 
 fn dsml_max_tool_start_len() -> usize {
-    SYNTAXES.iter().map(|s| s.tool_calls_start.len()).max().unwrap_or(0)
+    SYNTAXES
+        .iter()
+        .map(|s| s.tool_calls_start.len())
+        .max()
+        .unwrap_or(0)
 }
 
 fn dsml_find_tool_start(raw: &[u8]) -> Option<(usize, DsmlSyntax)> {
@@ -481,8 +492,7 @@ pub fn sampling_override(
     think_pos: &mut i32,
     p: &SamplePolicy<'_>,
 ) -> SampleOverride {
-    let required_pending =
-        p.tool_choice == ToolChoice::Required && track_tools && !saw_tool_start;
+    let required_pending = p.tool_choice == ToolChoice::Required && track_tools && !saw_tool_start;
     let reserve_post_thinking = required_pending || p.has_tool_results;
     if reserve_post_thinking && thinking_inside {
         if completion >= agent_turn_reasoning_cap(p.think_mode, p.max_tokens)

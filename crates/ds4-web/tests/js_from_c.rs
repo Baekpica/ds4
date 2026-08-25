@@ -33,9 +33,7 @@ fn unescape_c(s: &str) -> String {
 }
 
 fn extract_c_strings(src: &str, after: &str) -> String {
-    let start = src
-        .find(after)
-        .unwrap_or_else(|| panic!("missing {after}"));
+    let start = src.find(after).unwrap_or_else(|| panic!("missing {after}"));
     let mut i = start + after.len();
     let bytes = src.as_bytes();
     let mut out = String::new();
@@ -84,5 +82,8 @@ fn js_matches_ds4_web_c() {
         extract_c_strings(scroll_src, "const char *expr =")
     );
     let probe_src = &src[src.find("static bool web_page_probe").unwrap()..];
-    assert_eq!(PAGE_PROBE, extract_c_strings(probe_src, "const char *expr ="));
+    assert_eq!(
+        PAGE_PROBE,
+        extract_c_strings(probe_src, "const char *expr =")
+    );
 }

@@ -259,7 +259,9 @@ pub fn encode_file(record: &Record) -> Vec<u8> {
     );
     // payload_bytes in the header follows the payload vector, matching C.
     le_put64(&mut h[40..48], record.payload.len() as u64);
-    let mut out = Vec::with_capacity(FIXED_HEADER + 4 + record.text.len() + record.payload.len() + record.trailer.len());
+    let mut out = Vec::with_capacity(
+        FIXED_HEADER + 4 + record.text.len() + record.payload.len() + record.trailer.len(),
+    );
     out.extend_from_slice(&h);
     let mut tb = [0u8; 4];
     le_put32(&mut tb, record.text.len() as u32);
@@ -345,7 +347,11 @@ pub(crate) fn stage_stream(
     let (tmp, mut f) = loop {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = path.with_extension(format!("kv.tmp.{}.{}", std::process::id(), seq));
-        match fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
             Ok(f) => break (tmp, f),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(FormatError::Io(e)),
@@ -416,8 +422,8 @@ pub fn read_trailer(path: &Path, max_bytes: u64) -> Result<(Header, Vec<u8>), Fo
         .payload_offset
         .checked_add(metadata.header.payload_bytes)
         .ok_or(FormatError::Truncated)?;
-    let trailer_bytes = usize::try_from(metadata.trailer_bytes)
-        .map_err(|_| FormatError::TrailerTooLarge)?;
+    let trailer_bytes =
+        usize::try_from(metadata.trailer_bytes).map_err(|_| FormatError::TrailerTooLarge)?;
     file.seek(SeekFrom::Start(trailer_start))?;
     let mut trailer = vec![0; trailer_bytes];
     read_exact(&mut file, &mut trailer)?;
@@ -655,7 +661,10 @@ mod tests {
         assert_eq!(sha_hex_name("not-a-kv"), None);
         let sha = text_sha_hex(b"hello");
         assert_eq!(sha.len(), 40);
-        assert_eq!(sha_hex_name(&format!("{sha}.kv")).as_deref(), Some(sha.as_str()));
+        assert_eq!(
+            sha_hex_name(&format!("{sha}.kv")).as_deref(),
+            Some(sha.as_str())
+        );
     }
 
     #[test]
@@ -702,8 +711,7 @@ mod tests {
 
     #[test]
     fn stream_layout_matches_buffered_encoder() {
-        let dir =
-            std::env::temp_dir().join(format!("ds4-kv-stream-layout-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ds4-kv-stream-layout-{}", std::process::id()));
         let path = dir.join("entry.kv");
         let _ = fs::remove_dir_all(&dir);
 
@@ -726,8 +734,7 @@ mod tests {
 
     #[test]
     fn staged_stream_leaves_destination_until_commit() {
-        let dir =
-            std::env::temp_dir().join(format!("ds4-kv-stream-stage-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ds4-kv-stream-stage-{}", std::process::id()));
         let path = dir.join("entry.kv");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();

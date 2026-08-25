@@ -1,13 +1,12 @@
 //! Scripted decode + HTTP generate path. No GGUF.
 
-use ds4_server::{
-    generate_and_write, handle_client_inner, generation_blocked, render_prompt,
-    stop_list_find_from, ContStepper, DecodeIo, GenerateError, ParseEnv, ParsedRequest,
-    ReqTimings, ScriptedDecode, ScriptedStep, ServerConfig, ServerInner, ThinkMode, CREATED_TEST,
-    TAPE_PLAIN,
-};
 use ds4_server::parse::{parse_request, ChatMsg, ToolCall};
 use ds4_server::route::WireSurface;
+use ds4_server::{
+    generate_and_write, generation_blocked, handle_client_inner, render_prompt,
+    stop_list_find_from, ContStepper, DecodeIo, GenerateError, ParseEnv, ParsedRequest, ReqTimings,
+    ScriptedDecode, ScriptedStep, ServerConfig, ServerInner, ThinkMode, CREATED_TEST, TAPE_PLAIN,
+};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -177,8 +176,7 @@ impl DecodeIo for PromptSyncDecode {
         rng: &mut u64,
     ) -> i32 {
         self.events.push("sample");
-        self.inner
-            .sample(temperature, top_k, top_p, min_p, rng)
+        self.inner.sample(temperature, top_k, top_p, min_p, rng)
     }
 
     fn pos(&self) -> i32 {
@@ -281,12 +279,8 @@ fn continued_store_is_best_effort_and_runs_before_sampling_without_final_catchup
 #[test]
 fn scripted_buffered_openai_has_text_and_stop() {
     let parsed = user_req();
-    let mut engine = ScriptedDecode::from_pieces(
-        &TAPE_PLAIN
-            .iter()
-            .map(|s| s.as_bytes())
-            .collect::<Vec<_>>(),
-    );
+    let mut engine =
+        ScriptedDecode::from_pieces(&TAPE_PLAIN.iter().map(|s| s.as_bytes()).collect::<Vec<_>>());
     let mut out = Vec::new();
     generate_and_write(
         &mut engine,
@@ -307,7 +301,10 @@ fn scripted_buffered_openai_has_text_and_stop() {
         s.contains("\"cache_write_tokens\":1"),
         "cold serial prompt should count as a KV write: {s}"
     );
-    assert!(s.contains("\"timings\":{\"ttft_ms\":"), "serial path should emit timings: {s}");
+    assert!(
+        s.contains("\"timings\":{\"ttft_ms\":"),
+        "serial path should emit timings: {s}"
+    );
     assert!(s.contains("\"prefill_tokens\":1"), "{s}");
 }
 
@@ -350,12 +347,8 @@ fn scripted_responses_stream_activates_after_created() {
 #[test]
 fn prompt_sync_reports_buffered_cache_usage_from_effective_pos() {
     let parsed = user_req();
-    let inner = ScriptedDecode::from_pieces(
-        &TAPE_PLAIN
-            .iter()
-            .map(|s| s.as_bytes())
-            .collect::<Vec<_>>(),
-    );
+    let inner =
+        ScriptedDecode::from_pieces(&TAPE_PLAIN.iter().map(|s| s.as_bytes()).collect::<Vec<_>>());
     let mut engine = PromptSyncDecode::new(inner, 4, 6);
     engine.prompt_sync_elapsed = Some(Duration::from_secs(2));
     let mut out = Vec::new();
@@ -391,12 +384,8 @@ fn prompt_sync_reports_streaming_cache_usage_from_effective_pos() {
     let mut parsed = user_req();
     parsed.stream = true;
     parsed.stream_include_usage = true;
-    let inner = ScriptedDecode::from_pieces(
-        &TAPE_PLAIN
-            .iter()
-            .map(|s| s.as_bytes())
-            .collect::<Vec<_>>(),
-    );
+    let inner =
+        ScriptedDecode::from_pieces(&TAPE_PLAIN.iter().map(|s| s.as_bytes()).collect::<Vec<_>>());
     let mut engine = PromptSyncDecode::new(inner, 4, 6);
     let mut out = Vec::new();
 
@@ -431,11 +420,7 @@ fn prompt_sync_receives_thinking_visible_surface_gate() {
             r#"{"messages":[{"role":"user","content":"hi"}]}"#,
             true,
         ),
-        (
-            WireSurface::OpenaiCompletion,
-            r#"{"prompt":"hi"}"#,
-            false,
-        ),
+        (WireSurface::OpenaiCompletion, r#"{"prompt":"hi"}"#, false),
         (
             WireSurface::Anthropic,
             r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#,
@@ -707,8 +692,7 @@ fn cont_stepper_streams_anthropic_events() {
     for piece in TAPE_PLAIN {
         deltas.extend(stepper.feed(piece.as_bytes()).bytes);
     }
-    let (tail, outcome) =
-        stepper.finalize(true, 0, 1, ReqTimings::default(), false);
+    let (tail, outcome) = stepper.finalize(true, 0, 1, ReqTimings::default(), false);
     let deltas = String::from_utf8(deltas).unwrap();
     let tail = String::from_utf8(tail).unwrap();
     assert!(deltas.contains("event: content_block_delta"), "{deltas}");
@@ -740,8 +724,7 @@ fn cont_stepper_buffers_anthropic_message() {
     for piece in TAPE_PLAIN {
         assert!(stepper.feed(piece.as_bytes()).bytes.is_empty());
     }
-    let (body, outcome) =
-        stepper.finalize(true, 0, 1, ReqTimings::default(), false);
+    let (body, outcome) = stepper.finalize(true, 0, 1, ReqTimings::default(), false);
     let body = String::from_utf8(body).unwrap();
     assert!(body.contains("\"type\":\"message\""), "{body}");
     assert!(body.contains("\"text\":\"Hello world.\""), "{body}");
@@ -845,8 +828,7 @@ fn cont_stepper_stream_tool_id_matches_outcome() {
     );
     let streamed = stepper.feed(block.as_bytes());
     assert!(streamed.done);
-    let (terminal, outcome) =
-        stepper.finalize(false, 0, 1, ReqTimings::default(), false);
+    let (terminal, outcome) = stepper.finalize(false, 0, 1, ReqTimings::default(), false);
     assert_eq!(outcome.tool_ids.len(), 1);
     let id = &outcome.tool_ids[0];
     assert!(id.starts_with("call_"));
@@ -949,7 +931,9 @@ fn tool_replay_restores_raw_dsml_before_render_and_uses_scoped_sync() {
         "</｜DSML｜invoke>\n",
         "</｜DSML｜tool_calls>"
     );
-    assert!(!canonical.windows(raw.len()).any(|window| window == raw.as_bytes()));
+    assert!(!canonical
+        .windows(raw.len())
+        .any(|window| window == raw.as_bytes()));
     let inner = ScriptedDecode::from_pieces(&[b"done"]);
     let mut engine = PromptSyncDecode::new(inner, 1, 1);
     engine.replay_raw = Some(raw.into());
@@ -969,13 +953,21 @@ fn tool_replay_restores_raw_dsml_before_render_and_uses_scoped_sync() {
     assert!(engine.replay_prompts[0]
         .windows(raw.len())
         .any(|window| window == raw.as_bytes()));
-    let restore = engine.events.iter().position(|event| *event == "restore").unwrap();
+    let restore = engine
+        .events
+        .iter()
+        .position(|event| *event == "restore")
+        .unwrap();
     let sync = engine
         .events
         .iter()
         .position(|event| *event == "tool-sync")
         .unwrap();
-    let sample = engine.events.iter().position(|event| *event == "sample").unwrap();
+    let sample = engine
+        .events
+        .iter()
+        .position(|event| *event == "sample")
+        .unwrap();
     assert!(restore < sync && sync < sample);
 }
 
@@ -1014,7 +1006,11 @@ fn tool_producer_remembers_final_wire_ids_with_sampled_dsml() {
         .iter()
         .position(|event| *event == "remember-tool")
         .unwrap();
-    let sample = engine.events.iter().position(|event| *event == "sample").unwrap();
+    let sample = engine
+        .events
+        .iter()
+        .position(|event| *event == "sample")
+        .unwrap();
     assert!(sample < remember);
 }
 
@@ -1088,7 +1084,10 @@ fn scripted_invalid_dsml_retries_and_emits_tool_calls() {
     assert!(s.contains("\"finish_reason\":\"tool_calls\""), "{s}");
     assert!(s.contains("\"name\":\"bash\""), "{s}");
     assert!(s.contains("ls"), "{s}");
-    assert!(engine.idx >= 2, "second decode pass should consume the valid call");
+    assert!(
+        engine.idx >= 2,
+        "second decode pass should consume the valid call"
+    );
 }
 
 #[test]
@@ -1108,10 +1107,19 @@ fn recovery_suffix_uses_sync_not_prompt_sync() {
     )
     .unwrap();
 
-    assert_eq!(engine.prompt_sync_calls, 1, "only the initial prompt uses the hook");
-    assert_eq!(engine.sync_calls, 1, "the recovery suffix uses ordinary sync");
+    assert_eq!(
+        engine.prompt_sync_calls, 1,
+        "only the initial prompt uses the hook"
+    );
+    assert_eq!(
+        engine.sync_calls, 1,
+        "the recovery suffix uses ordinary sync"
+    );
     assert_eq!(engine.disk_eligible, [false]);
-    assert!(engine.inner.idx >= 2, "the retry must run a second decode pass");
+    assert!(
+        engine.inner.idx >= 2,
+        "the retry must run a second decode pass"
+    );
 }
 
 #[test]

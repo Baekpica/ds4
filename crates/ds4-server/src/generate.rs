@@ -24,28 +24,24 @@ use ds4_kv::{
 
 use crate::dsml::{SampleOverride, SamplePolicy};
 use crate::parse::{ChatMsg, ParsedRequest, ToolCall, ToolChoice};
+use crate::parse::{DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_TOP_P};
+use crate::render::{render_chat_choice, syntax_for_model_id, ModelSyntax, RenderError};
 use crate::retry::{
     build_invalid_tool_error_suffix, parse_failure_should_retry, terminal_finish,
     truncation_outcome, TruncationOutcome,
 };
-use crate::render::{
-    render_chat_choice, syntax_for_model_id, RenderError, ModelSyntax,
-};
-use crate::parse::{DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_TOP_P};
 use crate::route::{decode_budget, think_mode_enabled, Api, ReqKind};
 use crate::stream::{
     anthropic_final_response, anthropic_sse_finish_live, anthropic_sse_start_live,
     anthropic_sse_stream_update, final_response, openai_sse_finish_live, openai_sse_stream_update,
-    openai_stream_start, responses_final_response, responses_sse_created, responses_sse_finish_live,
-    responses_sse_stream_update, responses_stream_init, sse_chunk, sse_done, sse_headers,
-    think_end, think_start, AnthropicStream, ChatFormat, OpenaiStream, ReqTimings, ResponsesStream,
-    StreamReq, Writer,
-};
-use crate::tools::{
-    assign_tool_ids, parse_generated_for_response, SemAccum,
+    openai_stream_start, responses_final_response, responses_sse_created,
+    responses_sse_finish_live, responses_sse_stream_update, responses_stream_init, sse_chunk,
+    sse_done, sse_headers, think_end, think_start, AnthropicStream, ChatFormat, OpenaiStream,
+    ReqTimings, ResponsesStream, StreamReq, Writer,
 };
 #[cfg(feature = "native")]
 use crate::tool_memory::ToolMemory;
+use crate::tools::{assign_tool_ids, parse_generated_for_response, SemAccum};
 
 #[derive(Debug)]
 pub enum GenerateError {
@@ -112,8 +108,14 @@ pub trait DecodeIo {
         Ok(())
     }
     fn eval(&mut self, token: i32) -> Result<(), GenerateError>;
-    fn sample(&mut self, temperature: f32, top_k: i32, top_p: f32, min_p: f32, rng: &mut u64)
-        -> i32;
+    fn sample(
+        &mut self,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        min_p: f32,
+        rng: &mut u64,
+    ) -> i32;
     fn pos(&self) -> i32;
     fn ctx(&self) -> i32;
     fn generation(&self) -> u64;
@@ -285,9 +287,7 @@ fn try_store_live(
     let mut header = kv_header(model_id, quant_bits, ctx, tokens);
     header.reason = reason;
     header.ext_flags = ext_flags;
-    write_checkpoint(store, header, &text, &trailer, |path| {
-        io.save_payload(path)
-    })?;
+    write_checkpoint(store, header, &text, &trailer, |path| io.save_payload(path))?;
     Ok(true)
 }
 
@@ -297,11 +297,8 @@ fn try_store_continued(
     store: &mut KvStore,
     identity: (u8, u8, u32),
 ) -> Result<bool, GenerateError> {
-    let target = kv_continued_store_target(
-        &store.opt,
-        store.continued_last_store_tokens,
-        io.live_len(),
-    );
+    let target =
+        kv_continued_store_target(&store.opt, store.continued_last_store_tokens, io.live_len());
     if target == 0 {
         return Ok(false);
     }
@@ -350,12 +347,7 @@ fn sync_maybe_checkpoint(
 
 #[cfg(any(feature = "native", test))]
 fn suppress_continued(store: &mut KvStore, target: i32) -> Option<i32> {
-    if kv_continued_store_target(
-        &store.opt,
-        store.continued_last_store_tokens,
-        target,
-    ) != target
-    {
+    if kv_continued_store_target(&store.opt, store.continued_last_store_tokens, target) != target {
         return None;
     }
     let old = store.continued_last_store_tokens;
@@ -456,19 +448,12 @@ fn cold_sync_and_store(
         restore_suppressed_continued(store, suppressed, target_i32);
         return Err(error);
     }
-    let cold_stored = matches!(try_store_live(
-        io,
-        store,
-        model_id,
-        quant_bits,
-        ctx,
-        KvReason::Cold,
-        None,
-    ), Ok(true));
+    let cold_stored = matches!(
+        try_store_live(io, store, model_id, quant_bits, ctx, KvReason::Cold, None,),
+        Ok(true)
+    );
     if cold_stored {
-        store.continued_last_store_tokens = store
-            .continued_last_store_tokens
-            .max(target_i32);
+        store.continued_last_store_tokens = store.continued_last_store_tokens.max(target_i32);
     } else {
         restore_suppressed_continued(store, suppressed, target_i32);
     }
@@ -952,10 +937,7 @@ fn flush(w: &mut Writer, out: &mut impl Write) -> Result<(), GenerateError> {
     Ok(())
 }
 
-fn append_recovery_suffix(
-    engine: &mut dyn DecodeIo,
-    suffix: &[u8],
-) -> Result<i32, GenerateError> {
+fn append_recovery_suffix(engine: &mut dyn DecodeIo, suffix: &[u8]) -> Result<i32, GenerateError> {
     if suffix.is_empty() {
         return Ok(0);
     }
@@ -1138,7 +1120,11 @@ pub(crate) fn generate_terminal_at(
     if tool_replay {
         engine.restore_tool_replay(&mut parsed.messages);
     }
-    prepare_required_prefixes(engine, &mut parsed, chat_format_for_syntax(syntax_for_model_id(engine.model_id())))?;
+    prepare_required_prefixes(
+        engine,
+        &mut parsed,
+        chat_format_for_syntax(syntax_for_model_id(engine.model_id())),
+    )?;
 
     let prompt = render_prompt(&parsed, engine.model_id())?;
     let tokens = match parsed.kind {
@@ -1216,7 +1202,8 @@ pub(crate) fn generate_terminal_at(
 
     let mut parsed_gen;
     loop {
-        let mut max_tokens = decode_budget(parsed.max_tokens_set, parsed.max_tokens, default_tokens);
+        let mut max_tokens =
+            decode_budget(parsed.max_tokens_set, parsed.max_tokens, default_tokens);
         let room = engine.ctx() - engine.pos();
         if room >= 0 && max_tokens > room {
             max_tokens = room;
@@ -1376,13 +1363,9 @@ pub(crate) fn generate_terminal_at(
         }
         finish = "tool_calls";
     }
-    if let Some(visible) = motif3_no_think_visible_checkpoint(
-        &parsed,
-        syntax,
-        &prompt,
-        &parsed_gen.content,
-        finish,
-    ) {
+    if let Some(visible) =
+        motif3_no_think_visible_checkpoint(&parsed, syntax, &prompt, &parsed_gen.content, finish)
+    {
         engine.remember_thinking_visible_checkpoint(visible);
     }
     let matched_stop = acc.matched_stop.clone();
@@ -1862,9 +1845,9 @@ impl<'a> NativeDecode<'a> {
             &self.thinking_visible,
             &self.tool_memory,
         );
-        let session = session.as_mut().ok_or_else(|| {
-            GenerateError::Engine("native session was not created".into())
-        })?;
+        let session = session
+            .as_mut()
+            .ok_or_else(|| GenerateError::Engine("native session was not created".into()))?;
         let mut io = NativeSerialKvIo {
             session,
             vocab,
@@ -1943,7 +1926,8 @@ impl DecodeIo for NativeDecode<'_> {
         if let Some(v) = self.vocab {
             return Ok(v.encode_rendered_bytes(text));
         }
-        let s = std::str::from_utf8(text).map_err(|_| GenerateError::Engine("prompt not utf8".into()))?;
+        let s = std::str::from_utf8(text)
+            .map_err(|_| GenerateError::Engine("prompt not utf8".into()))?;
         self.model
             .tokenize_rendered_chat(s)
             .map(|b| b.as_slice().to_vec())
@@ -2029,11 +2013,9 @@ impl DecodeIo for NativeDecode<'_> {
             return Ok(());
         };
         let vocab = self.vocab.unwrap_or_else(|| self.model.vocab());
-        let (Some(session), Some(store), tool_memory) = (
-            &mut self.session,
-            &mut self.store,
-            &self.tool_memory,
-        ) else {
+        let (Some(session), Some(store), tool_memory) =
+            (&mut self.session, &mut self.store, &self.tool_memory)
+        else {
             return Ok(());
         };
         let mut io = NativeSerialKvIo {
@@ -2143,10 +2125,9 @@ mod disk_sync_tests {
     use super::{
         continued_decode_allowed, discard_loaded, disk_sync_prompt, disk_sync_tool_replay,
         intermediate_prefill_eligible, ordinary_disk_cache_eligible,
-        settle_thinking_visible_checkpoint,
-        thinking_visible_cache_eligible, tool_replay_disk_cache_eligible,
-        tool_replay_producer_eligible, try_store_continued, try_store_live, DiskSyncPolicy,
-        GenerateError, SerialKvIo, ThinkingVisibleCheckpoint,
+        settle_thinking_visible_checkpoint, thinking_visible_cache_eligible,
+        tool_replay_disk_cache_eligible, tool_replay_producer_eligible, try_store_continued,
+        try_store_live, DiskSyncPolicy, GenerateError, SerialKvIo, ThinkingVisibleCheckpoint,
     };
     use crate::parse::{parse_request, ChatMsg, ParseEnv, ToolCall};
     use crate::render::{render_motif3_chat_ex, ModelSyntax};
@@ -2154,8 +2135,7 @@ mod disk_sync_tests {
     use crate::stream::ChatFormat;
     use crate::tools::SemAccum;
     use ds4_kv::{
-        read_envelope, Header, Options, Reason, Record, Store, EXT_THINKING_VISIBLE,
-        EXT_TOOL_MAP,
+        read_envelope, Header, Options, Reason, Record, Store, EXT_THINKING_VISIBLE, EXT_TOOL_MAP,
     };
     use std::cell::Cell;
     use std::fs;
@@ -2284,7 +2264,9 @@ mod disk_sync_tests {
             self.events.push("save");
             self.save_calls += 1;
             if self.fail_save || self.fail_save_at == Some(self.save_calls) {
-                return Err(GenerateError::Engine("injected payload save failure".into()));
+                return Err(GenerateError::Engine(
+                    "injected payload save failure".into(),
+                ));
             }
             fs::write(path, b"current-payload").map_err(|e| GenerateError::Engine(e.to_string()))
         }
@@ -2298,7 +2280,9 @@ mod disk_sync_tests {
             self.events.push("load");
             self.loads.push((path.to_path_buf(), offset, length));
             if self.fail_load {
-                return Err(GenerateError::Engine("injected payload load failure".into()));
+                return Err(GenerateError::Engine(
+                    "injected payload load failure".into(),
+                ));
             }
             self.live = self.loaded_tokens.clone();
             Ok(())
@@ -2509,7 +2493,10 @@ mod disk_sync_tests {
             },
         )
         .unwrap();
-        assert_eq!(save_io.syncs, [prompt_tokens[..8].to_vec(), prompt_tokens.clone()]);
+        assert_eq!(
+            save_io.syncs,
+            [prompt_tokens[..8].to_vec(), prompt_tokens.clone()]
+        );
         assert_eq!(save_io.events, ["sync", "save", "sync"]);
         assert!(save_store.entries().is_empty());
         assert_eq!(save_store.continued_last_store_tokens, 0);
@@ -2582,7 +2569,10 @@ mod disk_sync_tests {
         assert_eq!(io.live_token_reads.get(), 1);
         assert_eq!(continued_store.continued_last_store_tokens, 8);
         assert_eq!(continued_store.entries().len(), 1);
-        assert_eq!(continued_store.entries()[0].header.reason, Reason::Continued);
+        assert_eq!(
+            continued_store.entries()[0].header.reason,
+            Reason::Continued
+        );
         assert_eq!(continued_store.entries()[0].header.tokens, 8);
 
         continued_store.continued_last_store_tokens = 0;
@@ -2823,8 +2813,8 @@ mod disk_sync_tests {
         let (dir, mut store) = store("continued-motif-prefix");
         let user = "summarize this";
         let live_decode = "The model serves five families.";
-        let first = render_motif3_chat_ex(&[chat_msg("user", user)], "", &[], ThinkMode::None)
-            .unwrap();
+        let first =
+            render_motif3_chat_ex(&[chat_msg("user", user)], "", &[], ThinkMode::None).unwrap();
         let mut live = first.clone();
         live.extend_from_slice(live_decode.as_bytes());
 
@@ -2877,15 +2867,14 @@ mod disk_sync_tests {
         )
         .unwrap();
         assert_eq!(cached, 8);
-        assert_eq!(hit.suffixes, [b"\nReply with exactly RESTORED_OK.".to_vec()]);
+        assert_eq!(
+            hit.suffixes,
+            [b"\nReply with exactly RESTORED_OK.".to_vec()]
+        );
         assert_eq!(hit.syncs, [vec![1, 2, 3, 4, 5, 6, 7, 8, 9]]);
         assert_eq!(
             hit.loads,
-            [(
-                path,
-                envelope.payload_offset,
-                envelope.header.payload_bytes
-            )]
+            [(path, envelope.payload_offset, envelope.header.payload_bytes)]
         );
 
         let wrap = render_motif3_chat_ex(
@@ -3039,22 +3028,21 @@ mod disk_sync_tests {
         io.loaded_tokens = vec![41, 42];
         io.suffix_tokens = vec![43];
 
-        let cached =
-            disk_sync_prompt(
-                &mut io,
-                Some(&mut store),
-                0,
-                2,
-                b"hello world",
-                &[90, 91],
-                None,
-                false,
-                DiskSyncPolicy {
-                    save_current: true,
-                    load: true,
-                },
-            )
-            .unwrap();
+        let cached = disk_sync_prompt(
+            &mut io,
+            Some(&mut store),
+            0,
+            2,
+            b"hello world",
+            &[90, 91],
+            None,
+            false,
+            DiskSyncPolicy {
+                save_current: true,
+                load: true,
+            },
+        )
+        .unwrap();
 
         assert_eq!(cached, 2);
         assert_eq!(io.suffixes, [b"world".to_vec()]);
@@ -3099,22 +3087,21 @@ mod disk_sync_tests {
         io.loaded_tokens = vec![41];
         io.suffix_tokens = vec![43];
 
-        let cached =
-            disk_sync_prompt(
-                &mut io,
-                Some(&mut store),
-                0,
-                2,
-                b"hello world",
-                &[90, 91],
-                None,
-                false,
-                DiskSyncPolicy {
-                    save_current: false,
-                    load: true,
-                },
-            )
-            .unwrap();
+        let cached = disk_sync_prompt(
+            &mut io,
+            Some(&mut store),
+            0,
+            2,
+            b"hello world",
+            &[90, 91],
+            None,
+            false,
+            DiskSyncPolicy {
+                save_current: false,
+                load: true,
+            },
+        )
+        .unwrap();
 
         assert_eq!(cached, 0);
         assert_eq!(io.invalidations, 1);
@@ -3165,22 +3152,21 @@ mod disk_sync_tests {
         io.suffix_tokens = vec![43];
         io.fail_sync = true;
 
-        let error =
-            disk_sync_prompt(
-                &mut io,
-                Some(&mut store),
-                0,
-                2,
-                b"hello world",
-                &[90, 91],
-                None,
-                false,
-                DiskSyncPolicy {
-                    save_current: false,
-                    load: true,
-                },
-            )
-            .unwrap_err();
+        let error = disk_sync_prompt(
+            &mut io,
+            Some(&mut store),
+            0,
+            2,
+            b"hello world",
+            &[90, 91],
+            None,
+            false,
+            DiskSyncPolicy {
+                save_current: false,
+                load: true,
+            },
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("injected suffix sync failure"));
         assert_eq!(io.invalidations, 1);
@@ -3258,16 +3244,7 @@ mod disk_sync_tests {
         let mut io = FakeSerial::new(&[41, 42], b"plain sampled tool block");
         io.trailer = Some(b"KTM\x01\0\0\0\0".to_vec());
 
-        try_store_live(
-            &mut io,
-            &mut store,
-            0,
-            2,
-            4096,
-            Reason::Evict,
-            None,
-        )
-        .unwrap();
+        try_store_live(&mut io, &mut store, 0, 2, 4096, Reason::Evict, None).unwrap();
 
         assert_eq!(store.entries().len(), 1);
         let record = store.read(&store.entries()[0].path).unwrap();
@@ -3282,16 +3259,7 @@ mod disk_sync_tests {
         let mut io = FakeSerial::new(&[1, 2, 3, 4, 5, 6, 7, 8], b"plain sampled tool block");
         io.trailer = None;
 
-        assert!(!try_store_live(
-            &mut io,
-            &mut store,
-            0,
-            2,
-            4096,
-            Reason::Evict,
-            None,
-        )
-        .unwrap());
+        assert!(!try_store_live(&mut io, &mut store, 0, 2, 4096, Reason::Evict, None,).unwrap());
         assert!(!try_store_continued(&mut io, &mut store, (0, 2, 4096)).unwrap());
 
         assert!(store.entries().is_empty());
@@ -3354,11 +3322,7 @@ mod disk_sync_tests {
         assert!(ordinary.loads.is_empty());
 
         let (tool_dir, mut tool_store) = store("tool-map-scoped-load");
-        write_tool_candidate(
-            &mut tool_store,
-            EXT_TOOL_MAP,
-            b"KTM\x01\0\0\0\0".to_vec(),
-        );
+        write_tool_candidate(&mut tool_store, EXT_TOOL_MAP, b"KTM\x01\0\0\0\0".to_vec());
         let mut tool = FakeSerial::new(&[], b"");
         tool.loaded_tokens = vec![41, 42];
         tool.suffix_tokens = vec![43];
@@ -3494,7 +3458,9 @@ mod disk_sync_tests {
         request.live_call_ids.push("call_1".into());
         cases.push(request);
 
-        assert!(cases.iter().all(|request| !ordinary_disk_cache_eligible(request)));
+        assert!(cases
+            .iter()
+            .all(|request| !ordinary_disk_cache_eligible(request)));
 
         let mut replay = cases[4].clone();
         replay.api = Api::Openai;
@@ -3522,11 +3488,7 @@ mod disk_sync_tests {
             &replay,
             ModelSyntax::DeepSeek
         ));
-        for syntax in [
-            ModelSyntax::Motif3,
-            ModelSyntax::Exaone,
-            ModelSyntax::Dots3,
-        ] {
+        for syntax in [ModelSyntax::Motif3, ModelSyntax::Exaone, ModelSyntax::Dots3] {
             assert!(!tool_replay_disk_cache_eligible(&replay, syntax));
         }
         for mutate in 0..4 {

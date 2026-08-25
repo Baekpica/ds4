@@ -440,9 +440,21 @@ fn next_tool_block(text: &[u8], from: usize) -> Option<(usize, usize)> {
             DSML_TOOL_CALLS_END_SHORT.as_bytes(),
             false,
         ),
-        (b"\n\n<tool_calls>".as_slice(), b"</tool_calls>".as_slice(), false),
-        (b"<tool_calls>".as_slice(), b"</tool_calls>".as_slice(), false),
-        (SOLAR_TOOL_CALLS.as_bytes(), SOLAR_TOOL_CALL_END.as_bytes(), true),
+        (
+            b"\n\n<tool_calls>".as_slice(),
+            b"</tool_calls>".as_slice(),
+            false,
+        ),
+        (
+            b"<tool_calls>".as_slice(),
+            b"</tool_calls>".as_slice(),
+            false,
+        ),
+        (
+            SOLAR_TOOL_CALLS.as_bytes(),
+            SOLAR_TOOL_CALL_END.as_bytes(),
+            true,
+        ),
     ];
     let mut best: Option<(usize, usize, bool)> = None;
     for (start_marker, end_marker, solar) in forms {
@@ -790,10 +802,8 @@ mod tests {
         use ds4_kv::{Header, Options, Reason, Record, Store, EXT_TOOL_MAP};
         use std::fs;
 
-        let dir = std::env::temp_dir().join(format!(
-            "ds4-tool-memory-restore-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ds4-tool-memory-restore-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut store = Store::open(&dir, 16, true, Options::default()).unwrap();
         let raw = dsml("restore");

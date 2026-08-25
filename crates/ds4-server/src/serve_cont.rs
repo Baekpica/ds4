@@ -11,13 +11,13 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
+#[cfg(feature = "native")]
+use ds4_kv::bank_checkpoint_due;
 use ds4_kv::Store as KvStore;
 #[cfg(any(feature = "native", test))]
 use ds4_kv::{Reason as KvReason, EXT_BANK_REPLAY_V1};
-#[cfg(feature = "native")]
-use ds4_kv::bank_checkpoint_due;
 
-use crate::dsml::{SamplePolicy, SampleOverride};
+use crate::dsml::{SampleOverride, SamplePolicy};
 #[cfg(any(feature = "native", test))]
 use crate::generate::ordinary_disk_cache_eligible;
 use crate::generate::{
@@ -30,11 +30,11 @@ use crate::retry::{terminal_finish, truncation_outcome, TruncationOutcome};
 use crate::route::{decode_budget, think_mode_enabled, Api, ReqKind};
 use crate::stream::{
     anthropic_final_response, anthropic_sse_finish_live, anthropic_sse_start_live,
-    anthropic_sse_stream_update, final_response, openai_sse_finish_live,
-    openai_sse_stream_update, openai_stream_start, responses_final_response,
-    responses_sse_created, responses_sse_finish_live, responses_sse_stream_update,
-    responses_stream_init, sse_chunk, sse_done, sse_headers, AnthropicStream, OpenaiStream,
-    ReqTimings, ResponsesStream, StreamReq, Writer,
+    anthropic_sse_stream_update, final_response, openai_sse_finish_live, openai_sse_stream_update,
+    openai_stream_start, responses_final_response, responses_sse_created,
+    responses_sse_finish_live, responses_sse_stream_update, responses_stream_init, sse_chunk,
+    sse_done, sse_headers, AnthropicStream, OpenaiStream, ReqTimings, ResponsesStream, StreamReq,
+    Writer,
 };
 use crate::tools::{assign_tool_ids, parse_generated_for_response, SemAccum};
 
@@ -118,12 +118,8 @@ impl ContStepper {
                 }
                 Api::Responses => {
                     let (response_id, reasoning_id, message_id) = responses_ids(job_id);
-                    let mut st = responses_stream_init(
-                        &req,
-                        &response_id,
-                        &reasoning_id,
-                        &message_id,
-                    );
+                    let mut st =
+                        responses_stream_init(&req, &response_id, &reasoning_id, &message_id);
                     responses_sse_created(&mut w, &req, &mut st, created);
                     resp = Some(st);
                 }
@@ -178,12 +174,7 @@ impl ContStepper {
         if think_mode_enabled(parsed.think_mode) {
             (DEFAULT_TEMPERATURE, 0, DEFAULT_TOP_P, DEFAULT_MIN_P)
         } else {
-            (
-                parsed.temperature,
-                parsed.top_k,
-                parsed.top_p,
-                parsed.min_p,
-            )
+            (parsed.temperature, parsed.top_k, parsed.top_p, parsed.min_p)
         }
     }
 
@@ -331,8 +322,20 @@ impl ContStepper {
         if self.req.stream {
             match (self.req.api, self.req.kind) {
                 (Api::Openai, ReqKind::Completion) => {
-                    sse_chunk(&mut self.w, &self.req, &self.job_id, None, Some(self.finish));
-                    sse_done(&mut self.w, &self.req, &self.job_id, self.prompt_n, completion);
+                    sse_chunk(
+                        &mut self.w,
+                        &self.req,
+                        &self.job_id,
+                        None,
+                        Some(self.finish),
+                    );
+                    sse_done(
+                        &mut self.w,
+                        &self.req,
+                        &self.job_id,
+                        self.prompt_n,
+                        completion,
+                    );
                 }
                 (Api::Openai, ReqKind::Chat) => {
                     if let Some(st) = self.oa.as_mut() {
@@ -549,9 +552,10 @@ fn warm_record_superseded(banks: &[WarmBank], bank: usize) -> bool {
     }
     banks.iter().enumerate().any(|(other_bank, state)| {
         other_bank != bank
-            && state.record.as_ref().is_some_and(|other| {
-                !other.text.is_empty() && other.text.starts_with(&record.text)
-            })
+            && state
+                .record
+                .as_ref()
+                .is_some_and(|other| !other.text.is_empty() && other.text.starts_with(&record.text))
     })
 }
 
@@ -622,11 +626,16 @@ fn warm_admit_tokens(
     if key.is_empty() || key.len() >= prompt.len() || !prompt.starts_with(key) {
         return None;
     }
-    let cached = i32::try_from(snapshot_tokens.len()).ok().filter(|n| *n > 0)?;
+    let cached = i32::try_from(snapshot_tokens.len())
+        .ok()
+        .filter(|n| *n > 0)?;
     let mut tokens = snapshot_tokens.to_vec();
     tokens.extend(tokenize_suffix(&prompt[key.len()..]));
     if tokens.len() <= snapshot_tokens.len()
-        || i32::try_from(tokens.len()).ok().filter(|n| *n <= seq_cap).is_none()
+        || i32::try_from(tokens.len())
+            .ok()
+            .filter(|n| *n <= seq_cap)
+            .is_none()
     {
         return None;
     }
@@ -941,10 +950,9 @@ mod native {
         ) -> Self {
             let max_seq = usize::try_from(batch.max_seq().max(0)).unwrap_or(0);
             let warm_pin_min = crate::serve::env_i32_bound("DS4_SERVER_PIN_MIN_TOKENS", 65536);
-            let warm_fork = std::env::var_os("DS4_SERVER_FORK")
-                .is_none_or(|value| value != "0");
-            let warm_checkpoint = std::env::var_os("DS4_SERVER_BANK_CHECKPOINT")
-                .is_none_or(|value| value != "0");
+            let warm_fork = std::env::var_os("DS4_SERVER_FORK").is_none_or(|value| value != "0");
+            let warm_checkpoint =
+                std::env::var_os("DS4_SERVER_BANK_CHECKPOINT").is_none_or(|value| value != "0");
             Self {
                 batch,
                 vocab,
@@ -998,36 +1006,26 @@ mod native {
                 .iter()
                 .enumerate()
                 .map(|(bank, state)| {
-                    let live = state.record.as_ref().map(|record| {
-                        (record.generation, state.committed_tokens)
-                    });
+                    let live = state
+                        .record
+                        .as_ref()
+                        .map(|record| (record.generation, state.committed_tokens));
                     bank_protected(i32::try_from(bank).unwrap_or(-1), live)
                 })
                 .collect()
         }
 
         fn disk_victim(&self, protected: &[bool], disk_tokens: u32) -> Option<usize> {
-            if let Some(bank) = warm_victim_pick(
-                &self.warm,
-                protected,
-                None,
-                self.warm_pin_min,
-                false,
-            ) {
+            if let Some(bank) =
+                warm_victim_pick(&self.warm, protected, None, self.warm_pin_min, false)
+            {
                 return Some(bank);
             }
             if self.warm_pin_min <= 0 || disk_tokens < self.warm_pin_min as u32 {
                 return None;
             }
-            let bank = warm_victim_pick(
-                &self.warm,
-                protected,
-                None,
-                self.warm_pin_min,
-                true,
-            )?;
-            (self.warm[bank].committed_tokens < self.warm_pin_min)
-                .then_some(bank)
+            let bank = warm_victim_pick(&self.warm, protected, None, self.warm_pin_min, true)?;
+            (self.warm[bank].committed_tokens < self.warm_pin_min).then_some(bank)
         }
 
         fn disk_plan(
@@ -1107,9 +1105,8 @@ mod native {
                 return;
             }
             let key = if done_tokens.is_empty() {
-                let retained = committed_key(&[], &snapshot.tokens, |token| {
-                    self.vocab.token_text(token)
-                });
+                let retained =
+                    committed_key(&[], &snapshot.tokens, |token| self.vocab.token_text(token));
                 if retained.is_empty() || !prompt.starts_with(&retained) {
                     self.warm[bank].record = None;
                     return;
@@ -1141,8 +1138,12 @@ mod native {
             if bank >= self.warm.len() {
                 return;
             }
-            let Some(identity) = self.identity() else { return };
-            let Ok(bank_i32) = i32::try_from(bank) else { return };
+            let Some(identity) = self.identity() else {
+                return;
+            };
+            let Ok(bank_i32) = i32::try_from(bank) else {
+                return;
+            };
             let Ok(snapshot) = self.batch.bank_snapshot(bank_i32) else {
                 return;
             };
@@ -1155,11 +1156,7 @@ mod native {
                 .is_none_or(|record| record.generation != snapshot.generation)
                 || committed < min_committed
                 || (due_only
-                    && !bank_checkpoint_due(
-                        &store.opt,
-                        committed,
-                        self.warm[bank].stored_tokens,
-                    ))
+                    && !bank_checkpoint_due(&store.opt, committed, self.warm[bank].stored_tokens))
             {
                 return;
             }
@@ -1218,26 +1215,10 @@ mod native {
             Some(placement)
         }
 
-        fn place_cold(
-            &mut self,
-            protected: &[bool],
-            store: Option<&mut KvStore>,
-        ) -> Option<usize> {
-            let target = warm_victim_pick(
-                &self.warm,
-                protected,
-                None,
-                self.warm_pin_min,
-                true,
-            )?;
+        fn place_cold(&mut self, protected: &[bool], store: Option<&mut KvStore>) -> Option<usize> {
+            let target = warm_victim_pick(&self.warm, protected, None, self.warm_pin_min, true)?;
             if let Some(store) = store {
-                self.persist_bank(
-                    store,
-                    target,
-                    KvReason::BankEvict,
-                    self.warm_pin_min,
-                    false,
-                );
+                self.persist_bank(store, target, KvReason::BankEvict, self.warm_pin_min, false);
             }
             self.warm[target].record = None;
             self.warm[target].committed_tokens = 0;
@@ -1283,10 +1264,9 @@ mod native {
         ) -> Result<GenerateOutcome, GenerateError> {
             let prompt = render_prompt(parsed, self.model_id)?;
             let tokens = match parsed.kind {
-                ReqKind::Completion => {
-                    self.vocab
-                        .encode_text(std::str::from_utf8(&prompt).unwrap_or(""))
-                }
+                ReqKind::Completion => self
+                    .vocab
+                    .encode_text(std::str::from_utf8(&prompt).unwrap_or("")),
                 ReqKind::Chat => self.vocab.encode_rendered_bytes(&prompt),
             };
             let prompt_n = tokens.len() as i32;
@@ -1314,9 +1294,9 @@ mod native {
             } else {
                 None
             };
-            let placement = warm.as_ref().and_then(|plan| {
-                self.place_warm(plan, &protected, store.as_deref_mut())
-            });
+            let placement = warm
+                .as_ref()
+                .and_then(|plan| self.place_warm(plan, &protected, store.as_deref_mut()));
             let mut admit = if let (Some(plan), Some(placement)) = (warm, placement) {
                 let mut admit = ContAdmit::cold(1, plan.tokens, stepper.max_tokens.max(1));
                 admit.place_bank = i32::try_from(placement.target + 1).unwrap_or(0);
@@ -1326,11 +1306,9 @@ mod native {
                 }
                 admit
             } else {
-                let target = self
-                    .place_cold(&protected, store.as_deref_mut())
-                    .ok_or(GenerateError::Unsupported(
-                        "continuous banks are protected; serial fallback",
-                    ))?;
+                let target = self.place_cold(&protected, store.as_deref_mut()).ok_or(
+                    GenerateError::Unsupported("continuous banks are protected; serial fallback"),
+                )?;
                 let mut admit = ContAdmit::cold(1, canonical_tokens, stepper.max_tokens.max(1));
                 admit.place_bank = i32::try_from(target + 1).unwrap_or(0);
                 admit
@@ -1477,10 +1455,8 @@ mod bank_tests {
     use std::fs;
 
     fn temp_store(tag: &str) -> (std::path::PathBuf, Store) {
-        let dir = std::env::temp_dir().join(format!(
-            "ds4-server-bank-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ds4-server-bank-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let store = Store::open(&dir, 16, false, Options::default()).unwrap();
         (dir, store)
@@ -1534,7 +1510,10 @@ mod bank_tests {
             committed_key(b"prompt:", &[1, 2, 3], |token| vec![b'0' + token as u8]),
             b"prompt:12"
         );
-        assert_eq!(committed_key(b"prompt:", &[], |_| unreachable!()), b"prompt:");
+        assert_eq!(
+            committed_key(b"prompt:", &[], |_| unreachable!()),
+            b"prompt:"
+        );
     }
 
     #[test]
@@ -1550,24 +1529,20 @@ mod bank_tests {
         };
         assert!(warm_admit_tokens(&warm, b"shared", &[10, 11], 7, 8, |_| vec![12]).is_none());
         assert!(warm_admit_tokens(&warm, b"other", &[10, 11], 7, 8, |_| vec![12]).is_none());
-        assert!(warm_admit_tokens(&warm, b"shared suffix", &[10, 11], 8, 8, |_| vec![12])
-            .is_none());
-        let (tokens, cached) = warm_admit_tokens(
-            &warm,
-            b"shared suffix",
-            &[10, 11],
-            7,
-            8,
-            |suffix| {
+        assert!(
+            warm_admit_tokens(&warm, b"shared suffix", &[10, 11], 8, 8, |_| vec![12]).is_none()
+        );
+        let (tokens, cached) =
+            warm_admit_tokens(&warm, b"shared suffix", &[10, 11], 7, 8, |suffix| {
                 assert_eq!(suffix, b" suffix");
                 vec![20, 21]
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         assert_eq!(tokens, vec![10, 11, 20, 21]);
         assert_eq!(cached, 2);
-        assert!(warm_admit_tokens(&warm, b"shared suffix", &[10, 11], 7, 3, |_| vec![20, 21])
-            .is_none());
+        assert!(
+            warm_admit_tokens(&warm, b"shared suffix", &[10, 11], 7, 3, |_| vec![20, 21]).is_none()
+        );
     }
 
     #[test]
@@ -1582,27 +1557,18 @@ mod bank_tests {
     fn cold_victim_matches_c_no_value_superseded_and_depth_tiers() {
         let mut banks = vec![warm("trunk", 30), WarmBank::default(), warm("tenant", 10)];
         banks[0].committed_tokens = 70_000;
-        assert_eq!(
-            warm_victim_pick(&banks, &[], None, 65_536, true),
-            Some(1)
-        );
+        assert_eq!(warm_victim_pick(&banks, &[], None, 65_536, true), Some(1));
 
         banks[1] = warm("trunk child", 20);
         banks[1].committed_tokens = 70_000;
-        assert_eq!(
-            warm_victim_pick(&banks, &[], None, 65_536, true),
-            Some(0)
-        );
+        assert_eq!(warm_victim_pick(&banks, &[], None, 65_536, true), Some(0));
 
         banks[0] = warm("alpha", 5);
         banks[1] = warm("beta", 4);
         banks[2] = warm("gamma", 10);
         banks[0].committed_tokens = 70_000;
         banks[1].committed_tokens = 70_000;
-        assert_eq!(
-            warm_victim_pick(&banks, &[], None, 65_536, true),
-            Some(2)
-        );
+        assert_eq!(warm_victim_pick(&banks, &[], None, 65_536, true), Some(2));
         banks[2].committed_tokens = 90_000;
         assert_eq!(warm_victim_pick(&banks, &[], None, 65_536, true), Some(1));
     }
@@ -1610,10 +1576,7 @@ mod bank_tests {
     #[test]
     fn fork_target_never_spends_a_plain_tenant_record() {
         let banks = vec![warm("source", 3), warm("tenant-a", 1), warm("tenant-b", 2)];
-        assert_eq!(
-            warm_victim_pick(&banks, &[], Some(0), 65_536, false),
-            None
-        );
+        assert_eq!(warm_victim_pick(&banks, &[], Some(0), 65_536, false), None);
 
         let mut spare = banks;
         spare[2] = WarmBank::default();
@@ -1645,16 +1608,20 @@ mod bank_tests {
             })
         );
         with_spare[0].committed_tokens = 70_000;
-        assert!(!warm_placement(&with_spare, &[], 0, 70_000, 65_536, true)
-            .unwrap()
-            .fork);
+        assert!(
+            !warm_placement(&with_spare, &[], 0, 70_000, 65_536, true)
+                .unwrap()
+                .fork
+        );
     }
 
     #[test]
     fn protected_trunk_forks_safely_or_refuses_in_place_extension() {
         let with_spare = vec![warm("trunk", 3), WarmBank::default()];
-        assert!(warm_placement(&with_spare, &[true, false], 0, 10, 65_536, true)
-            .is_some_and(|placement| placement.fork && placement.target == 1));
+        assert!(
+            warm_placement(&with_spare, &[true, false], 0, 10, 65_536, true)
+                .is_some_and(|placement| placement.fork && placement.target == 1)
+        );
 
         let no_spare = vec![warm("trunk", 3), warm("tenant", 2)];
         assert_eq!(

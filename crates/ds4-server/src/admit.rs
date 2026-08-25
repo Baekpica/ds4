@@ -108,7 +108,9 @@ pub fn preparse_shed(
             "request queue is full; retry later",
         ));
     }
-    if inference && s.max_queue_bytes > 0 && s.inflight_body_bytes + incoming_body > s.max_queue_bytes
+    if inference
+        && s.max_queue_bytes > 0
+        && s.inflight_body_bytes + incoming_body > s.max_queue_bytes
     {
         return Some((
             SHED_QUEUE_BYTES,

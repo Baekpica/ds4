@@ -5,7 +5,9 @@
 //! `census_supported = false` follows C: the cell family is absent, not zero.
 
 use crate::admit::{AdmitState, SHED_NAMES, SHED_REASONS};
-use crate::route::{ThinkMode, WireSurface, LANE_CONTINUOUS, LANE_SERIAL, LANE_STATIC, REASON_NAMES};
+use crate::route::{
+    ThinkMode, WireSurface, LANE_CONTINUOUS, LANE_SERIAL, LANE_STATIC, REASON_NAMES,
+};
 
 pub const ROUTE_SURFACES: usize = 4;
 pub const ROUTE_LANES: usize = 3;
@@ -141,7 +143,10 @@ fn render_stats_observation(m: &RouteMetrics, admit: &AdmitState) -> String {
         if ri > 0 {
             b.push(',');
         }
-        b.push_str(&format!("\"{}\":{}", REASON_NAMES[ri], m.route_decisions[ri]));
+        b.push_str(&format!(
+            "\"{}\":{}",
+            REASON_NAMES[ri], m.route_decisions[ri]
+        ));
     }
     b.push_str("},\"think_modes\":{");
     for ti in 0..THINK_MODES {

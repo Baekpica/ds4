@@ -92,7 +92,9 @@ fn parse_dsml_nested_parameters() {
     assert_eq!(p.content, b"review done");
     assert_eq!(p.calls.len(), 1);
     assert_eq!(p.calls[0].name, "edit");
-    assert!(p.calls[0].arguments.contains("\"path\": \"/private/tmp/tetris.c\""));
+    assert!(p.calls[0]
+        .arguments
+        .contains("\"path\": \"/private/tmp/tetris.c\""));
     assert!(p.calls[0].arguments.contains("\"edits\": {"));
     assert!(
         p.calls[0].arguments.contains("\"oldText\":\"old <text>\""),
@@ -194,7 +196,10 @@ fn sem_accum_dsml_closes_and_no_tools_cuts() {
     assert!(f.hit_stop);
     assert!(f.tool_syntax_cut);
     assert_eq!(cut.verdict, Some("stop"));
-    assert!(!cut.text.windows(DSML_START.len()).any(|w| w == DSML_START.as_bytes()));
+    assert!(!cut
+        .text
+        .windows(DSML_START.len())
+        .any(|w| w == DSML_START.as_bytes()));
 }
 
 #[test]

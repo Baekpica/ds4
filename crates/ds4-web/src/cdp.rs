@@ -31,8 +31,7 @@ pub fn cdp_eval_string(ws: &mut Ws, expr: &str) -> Result<String, String> {
     if resp.contains("\"exceptionDetails\"") {
         return Err("JavaScript evaluation failed".into());
     }
-    json_get_string(&resp, "value")
-        .ok_or_else(|| "Runtime.evaluate did not return a string".into())
+    json_get_string(&resp, "value").ok_or_else(|| "Runtime.evaluate did not return a string".into())
 }
 
 pub fn wait_ready(ws: &mut Ws) -> Result<(), String> {
@@ -87,9 +86,7 @@ pub fn wait_navigated_ready(ws: &mut Ws) -> Result<(), String> {
                 continue;
             }
         };
-        let real_url = !href.is_empty()
-            && href != "about:blank"
-            && !href.starts_with("chrome://");
+        let real_url = !href.is_empty() && href != "about:blank" && !href.starts_with("chrome://");
         let ready_state = ready == "complete" || ready == "interactive";
         if real_url {
             saw_real_url = true;
@@ -115,7 +112,11 @@ pub fn wait_navigated_ready(ws: &mut Ws) -> Result<(), String> {
 pub fn cdp_prepare_page(ws: &mut Ws) -> Result<(), String> {
     cdp_call(ws, "Page.enable", Some("{}"))?;
     cdp_call(ws, "Runtime.enable", Some("{}"))?;
-    cdp_call_optional(ws, "Emulation.setFocusEmulationEnabled", "{\"enabled\":true}");
+    cdp_call_optional(
+        ws,
+        "Emulation.setFocusEmulationEnabled",
+        "{\"enabled\":true}",
+    );
     cdp_call_optional(
         ws,
         "Emulation.setDeviceMetricsOverride",

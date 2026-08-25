@@ -3,8 +3,8 @@
 use ds4_dist::{
     build_route_plan, dispatch_eval, parse_cli, parse_layers, parse_role, prepare_engine_options,
     register_worker, resolved_layer_end, send_hello, token_span_hashes, validate_layers_for_model,
-    validate_options, Coordinator, CoordinatorView, EvalOutcome, SliceExec, Worker, WorkerInfo,
-    WorkOutput, WorkRequest, TOKEN_HASH_INIT,
+    validate_options, Coordinator, CoordinatorView, EvalOutcome, SliceExec, WorkOutput,
+    WorkRequest, Worker, WorkerInfo, TOKEN_HASH_INIT,
 };
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
@@ -148,7 +148,10 @@ fn layers_and_role_match_c() {
     assert_eq!(resolved_layer_end(&l, 53), 52);
     assert_eq!(c_out(&["layers", "foo"]), "ERROR:expected A:B or A:output");
     assert_eq!(parse_layers("foo").unwrap_err(), "expected A:B or A:output");
-    assert_eq!(c_out(&["layers", "x:1"]), "ERROR:invalid start layer in x:1");
+    assert_eq!(
+        c_out(&["layers", "x:1"]),
+        "ERROR:invalid start layer in x:1"
+    );
     assert_eq!(
         parse_layers("x:1").unwrap_err(),
         "invalid start layer in x:1"
@@ -235,22 +238,23 @@ fn layers_for_model_match_c() {
         "127.0.0.1",
         "7000",
     ];
-    let c = c_out(
-        &[
-            "layers-for-model",
-            "4",
-            "--role",
-            "coordinator",
-            "--layers",
-            "2:3",
-            "--listen",
-            "127.0.0.1",
-            "7000",
-        ],
-    );
+    let c = c_out(&[
+        "layers-for-model",
+        "4",
+        "--role",
+        "coordinator",
+        "--layers",
+        "2:3",
+        "--listen",
+        "127.0.0.1",
+        "7000",
+    ]);
     let r = rust_cli_layers(4, &args);
     assert_eq!(c, "ERROR:coordinator layer range must start at layer 0");
-    assert_eq!(r.unwrap_err(), "coordinator layer range must start at layer 0");
+    assert_eq!(
+        r.unwrap_err(),
+        "coordinator layer range must start at layer 0"
+    );
 
     let past = rust_cli_layers(
         4,
@@ -264,7 +268,10 @@ fn layers_for_model_match_c() {
             "1",
         ],
     );
-    assert_eq!(past.unwrap_err(), "layer range starts past final model layer 3");
+    assert_eq!(
+        past.unwrap_err(),
+        "layer range starts past final model layer 3"
+    );
 }
 
 #[test]
@@ -353,11 +360,7 @@ fn route_plan_prefers_output_then_longer_end() {
         local_has_output: false,
         local_can_output_head: false,
     };
-    let workers = vec![
-        worker(2, 3, false),
-        worker(2, 5, true),
-        worker(2, 4, false),
-    ];
+    let workers = vec![worker(2, 3, false), worker(2, 5, true), worker(2, 4, false)];
     let plan = build_route_plan(&view, &workers).unwrap();
     assert_eq!(plan.entries.len(), 1);
     assert_eq!(plan.entries[0].layer_end, 5);

@@ -187,9 +187,7 @@ fn read_chunked_body<R: Read>(
         while !rest.is_empty() && (rest[0] == b' ' || rest[0] == b'\t') {
             rest = &rest[1..];
         }
-        if rest.is_empty()
-            || (rest[0] != b';' && rest[0] != b'\r' && rest[0] != b'\n')
-        {
+        if rest.is_empty() || (rest[0] != b';' && rest[0] != b'\r' && rest[0] != b'\n') {
             return None;
         }
         pos = le;

@@ -3,9 +3,8 @@
 use ds4_core::{
     bind_dspark_names, bind_mtp_names, bind_names, catalog_from_bind_name, dump_bind_check_oracle,
     dump_bind_lookup_tapes, dump_bind_match_oracle, dump_bind_names, dump_bind_support,
-    SupportCatalog,
-    expected_compress_ratio, BindNeed, BindPlan, TensorInventory, Variant, SHAPE_FLASH,
-    SHAPE_MOTIF3,
+    expected_compress_ratio, BindNeed, BindPlan, SupportCatalog, TensorInventory, Variant,
+    SHAPE_FLASH, SHAPE_MOTIF3,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -139,9 +138,7 @@ fn bind_lookup_tapes_match_c() {
         "build the C oracle first: make tests/parity/bind_lookup_c_oracle (missing {})",
         p.display()
     );
-    let out = Command::new(&p)
-        .output()
-        .expect("run bind_lookup_c_oracle");
+    let out = Command::new(&p).output().expect("run bind_lookup_c_oracle");
     assert!(
         out.status.success(),
         "lookup oracle failed: {}",

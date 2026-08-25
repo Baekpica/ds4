@@ -108,7 +108,9 @@ pub fn build_route_plan(
     let mut path = Vec::new();
     let mut missing = next;
     if !search(view, &sorted, next, last, &mut path, &mut missing) {
-        return Err(format!("distributed route incomplete: missing layer {missing}"));
+        return Err(format!(
+            "distributed route incomplete: missing layer {missing}"
+        ));
     }
 
     let mut entries = Vec::new();

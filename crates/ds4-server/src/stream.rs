@@ -186,12 +186,7 @@ fn responses_tool_call_is_tool_search(tc: &ToolCall, order: Option<&ToolSchemaOr
     tc.name == "tool_search" && order.map(|o| o.responses_tool_search).unwrap_or(true)
 }
 
-pub fn append_anthropic_tool_use(
-    out: &mut Vec<u8>,
-    tc: &ToolCall,
-    id_prefix: &str,
-    i: usize,
-) {
+pub fn append_anthropic_tool_use(out: &mut Vec<u8>, tc: &ToolCall, id_prefix: &str, i: usize) {
     let fallback = format!("toolu_{id_prefix}_{i}");
     let id = if tc.id.is_empty() {
         fallback.as_str()
@@ -245,7 +240,10 @@ fn append_responses_function_call_item(
         .as_bytes(),
     );
     out.extend(json_escape_bytes(name.as_bytes()));
-    if let Some(ns) = order.map(|o| o.namespace.as_str()).filter(|s| !s.is_empty()) {
+    if let Some(ns) = order
+        .map(|o| o.namespace.as_str())
+        .filter(|s| !s.is_empty())
+    {
         out.extend_from_slice(b",\"namespace\":");
         out.extend(json_escape_bytes(ns.as_bytes()));
     }
@@ -457,7 +455,9 @@ fn responses_usage(r: &StreamReq, input: i32, output: i32, reasoning: i32) -> St
 }
 
 pub fn sse_headers(cors: bool) -> Vec<u8> {
-    let mut h = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n".to_vec();
+    let mut h =
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
+            .to_vec();
     if cors {
         h.extend_from_slice(cors_headers().as_bytes());
     }
@@ -465,7 +465,13 @@ pub fn sse_headers(cors: bool) -> Vec<u8> {
     h
 }
 
-pub fn sse_chunk(w: &mut Writer, r: &StreamReq, id: &str, text: Option<&[u8]>, finish: Option<&str>) {
+pub fn sse_chunk(
+    w: &mut Writer,
+    r: &StreamReq,
+    id: &str,
+    text: Option<&[u8]>,
+    finish: Option<&str>,
+) {
     if r.kind == ReqKind::Chat {
         w.put_str(&format!(
             "data: {{\"id\":\"{id}\",\"object\":\"chat.completion.chunk\",\"created\":{},\"model\":",
@@ -572,9 +578,11 @@ impl ToolSink for OpenaiToolSink<'_> {
             ",\"choices\":[{{\"index\":0,\"delta\":{{\"tool_calls\":[{{\"index\":{index},\"id\":"
         ));
         self.w.esc_str(id);
-        self.w.put_str(",\"type\":\"function\",\"function\":{\"name\":");
+        self.w
+            .put_str(",\"type\":\"function\",\"function\":{\"name\":");
         self.w.esc(name);
-        self.w.put_str(",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n");
+        self.w
+            .put_str(",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n");
         true
     }
 
@@ -1180,7 +1188,10 @@ fn anthropic_sse_tool_blocks_live(
         delta.extend_from_slice(b"}}");
         sse_event(w, "content_block_delta", &delta);
 
-        let stop = format!("{{\"type\":\"content_block_stop\",\"index\":{}}}", st.next_index);
+        let stop = format!(
+            "{{\"type\":\"content_block_stop\",\"index\":{}}}",
+            st.next_index
+        );
         sse_event(w, "content_block_stop", stop.as_bytes());
         st.next_index += 1;
     }
@@ -1300,7 +1311,12 @@ fn find_type_close(body: &[u8]) -> Option<usize> {
     None
 }
 
-pub fn responses_sse_created(w: &mut Writer, r: &StreamReq, st: &mut ResponsesStream, created_at: i64) {
+pub fn responses_sse_created(
+    w: &mut Writer,
+    r: &StreamReq,
+    st: &mut ResponsesStream,
+    created_at: i64,
+) {
     st.active = true;
     let mut b = format!(
         "{{\"type\":\"response.created\",\"response\":{{\"id\":\"{}\",\"object\":\"response\",\"created_at\":{created_at},\"status\":\"in_progress\",\"model\":",
@@ -1361,7 +1377,12 @@ fn responses_status_for_finish(finish: &str) -> &'static str {
     }
 }
 
-fn responses_sse_reasoning_done(w: &mut Writer, st: &mut ResponsesStream, raw: &[u8], _finish: &str) -> bool {
+fn responses_sse_reasoning_done(
+    w: &mut Writer,
+    st: &mut ResponsesStream,
+    raw: &[u8],
+    _finish: &str,
+) -> bool {
     let item_status = if st.reasoning_closed_naturally {
         "completed"
     } else {
@@ -1446,13 +1467,20 @@ fn responses_message_text_escape_fixed(st: &ResponsesStream, raw: &[u8]) -> Vec<
         b.extend(json_escape_fragment(&raw[st.message_start..st.message_end]));
     }
     if st.message_tail_end > st.message_tail_start {
-        b.extend(json_escape_fragment(&raw[st.message_tail_start..st.message_tail_end]));
+        b.extend(json_escape_fragment(
+            &raw[st.message_tail_start..st.message_tail_end],
+        ));
     }
     b.push(b'"');
     b
 }
 
-fn responses_sse_message_done(w: &mut Writer, st: &mut ResponsesStream, raw: &[u8], finish: &str) -> bool {
+fn responses_sse_message_done(
+    w: &mut Writer,
+    st: &mut ResponsesStream,
+    raw: &[u8],
+    finish: &str,
+) -> bool {
     let item_status = responses_item_status_for_finish(finish);
     let text = responses_message_text_escape_fixed(st, raw);
     let mut b = format!(
@@ -1512,7 +1540,9 @@ fn responses_sse_completed(
     .into_bytes();
     b.extend(json_escape_bytes(r.model.as_bytes()));
     if event_type == "response.failed" {
-        b.extend_from_slice(b",\"error\":{\"code\":\"server_error\",\"message\":\"generation failed\"}");
+        b.extend_from_slice(
+            b",\"error\":{\"code\":\"server_error\",\"message\":\"generation failed\"}",
+        );
     } else if event_type == "response.incomplete" {
         b.extend_from_slice(b",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}");
     }
@@ -1729,7 +1759,18 @@ pub fn responses_sse_finish_live(
         }
         st.message_item_closed = true;
     }
-    responses_sse_completed(w, r, st, raw, finish, prompt, completion, reasoning_tokens, created_at, calls);
+    responses_sse_completed(
+        w,
+        r,
+        st,
+        raw,
+        finish,
+        prompt,
+        completion,
+        reasoning_tokens,
+        created_at,
+        calls,
+    );
     true
 }
 
@@ -1799,7 +1840,9 @@ pub fn final_response(
             .as_bytes(),
         );
         b.extend(json_escape_bytes(r.model.as_bytes()));
-        b.extend_from_slice(b",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
+        b.extend_from_slice(
+            b",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":",
+        );
         b.extend(json_escape_bytes(text));
         if !reasoning.is_empty() {
             b.extend_from_slice(b",\"reasoning_content\":");
@@ -1887,7 +1930,9 @@ pub fn responses_final_response(
     .into_bytes();
     b.extend(json_escape_bytes(r.model.as_bytes()));
     if finish == "error" {
-        b.extend_from_slice(b",\"error\":{\"code\":\"server_error\",\"message\":\"generation failed\"}");
+        b.extend_from_slice(
+            b",\"error\":{\"code\":\"server_error\",\"message\":\"generation failed\"}",
+        );
     } else if finish == "length" {
         b.extend_from_slice(b",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}");
     }
@@ -1972,7 +2017,17 @@ pub fn project_openai_chat_thinking(created: i64) -> Vec<u8> {
         raw.extend_from_slice(piece.as_bytes());
         openai_sse_stream_update(&mut w, &r, "chatcmpl_tape", &mut st, &raw, false);
     }
-    openai_sse_finish_live(&mut w, &r, "chatcmpl_tape", &mut st, &raw, "stop", 7, 4, &[]);
+    openai_sse_finish_live(
+        &mut w,
+        &r,
+        "chatcmpl_tape",
+        &mut st,
+        &raw,
+        "stop",
+        7,
+        4,
+        &[],
+    );
     w.out
 }
 
@@ -1987,7 +2042,17 @@ pub fn project_openai_chat_utf8(created: i64) -> Vec<u8> {
         raw.extend_from_slice(piece);
         openai_sse_stream_update(&mut w, &r, "chatcmpl_tape8", &mut st, &raw, false);
     }
-    openai_sse_finish_live(&mut w, &r, "chatcmpl_tape8", &mut st, &raw, "stop", 4, 4, &[]);
+    openai_sse_finish_live(
+        &mut w,
+        &r,
+        "chatcmpl_tape8",
+        &mut st,
+        &raw,
+        "stop",
+        4,
+        4,
+        &[],
+    );
     w.out
 }
 

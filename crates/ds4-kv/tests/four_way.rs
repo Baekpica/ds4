@@ -99,11 +99,17 @@ fn c_read(path: &Path) -> Record {
         .args(["read", path.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(out.status.success(), "C read failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "C read failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8(out.stdout).unwrap();
     let mut rec = sample();
     for line in text.lines() {
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         match k {
             "model_id" => rec.header.model_id = v.parse().unwrap(),
             "quant_bits" => rec.header.quant_bits = v.parse().unwrap(),
@@ -247,7 +253,11 @@ fn store_len_matches_c() {
             .output()
             .unwrap();
         assert!(out.status.success());
-        let c: i32 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+        let c: i32 = String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         assert_eq!(store_len(&Options::default(), tokens), c, "tokens={tokens}");
     }
 }
@@ -280,7 +290,11 @@ fn continued_target_matches_c() {
             .output()
             .unwrap();
         assert!(out.status.success(), "C continued-target failed for {name}");
-        let c: i32 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+        let c: i32 = String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         assert_eq!(c, expected, "C case={name}");
         let opt = Options {
             min_tokens: min,
@@ -303,7 +317,11 @@ fn chat_anchor_matches_c() {
     args.extend(tokens.iter().map(i32::to_string));
     let out = Command::new(require_oracle()).args(&args).output().unwrap();
     assert!(out.status.success());
-    let c: i32 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+    let c: i32 = String::from_utf8(out.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     assert_eq!(chat_anchor_pos(&Options::default(), &tokens, 99, 100), c);
     assert_eq!(c, 530);
 }
@@ -331,7 +349,11 @@ fn eviction_score_matches_c() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    let c: f64 = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+    let c: f64 = String::from_utf8(out.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
     let rust = eviction_score(
         &ScoreEntry {
             sha: "x",

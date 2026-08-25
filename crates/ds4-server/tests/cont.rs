@@ -100,7 +100,8 @@ fn serial_hold_sheds_unrelated_with_retry_after() {
         let inner = Mutex::new(ServerInner::from_cfg(&cfg));
         {
             let mut g = inner.lock().unwrap();
-            g.creg.publish_serial(Api::Anthropic, &["toolu_hold".into()], 4, 70, now);
+            g.creg
+                .publish_serial(Api::Anthropic, &["toolu_hold".into()], 4, 70, now);
         }
         let mut engine = ScriptedDecode::from_pieces(&[b"ok"]);
         handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine), None);
@@ -138,7 +139,10 @@ fn live_only_tool_result_conflicts_when_reference_moved() {
     let s = http_post(addr, "/v1/messages", body);
     h.join().unwrap();
     assert!(s.starts_with("HTTP/1.1 409 "), "{s}");
-    assert!(s.contains("Anthropic continuation state is not available"), "{s}");
+    assert!(
+        s.contains("Anthropic continuation state is not available"),
+        "{s}"
+    );
 }
 
 #[test]

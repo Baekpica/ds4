@@ -4,21 +4,21 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
+use crate::activation::bits_or_default;
 use crate::codec::{
-    decode_hello_payload, encode_hello_payload, u64_from_halves, CodecError, Hello, Work, MSG_ERROR,
-    MSG_HELLO, MSG_WORK, RESULT_ACK, RESULT_HIDDEN_STATE, RESULT_LOGITS, ROUTE_F_OUTPUT_LOGITS,
-    ROUTE_RETURN_UPSTREAM, WORK_F_ACK_ONLY, WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS,
-    WORK_F_RESET_SESSION, WORK_F_VALID_MASK, WORK_FIXED_BYTES,
+    decode_hello_payload, encode_hello_payload, u64_from_halves, CodecError, Hello, Work,
+    MSG_ERROR, MSG_HELLO, MSG_WORK, RESULT_ACK, RESULT_HIDDEN_STATE, RESULT_LOGITS,
+    ROUTE_F_OUTPUT_LOGITS, ROUTE_RETURN_UPSTREAM, WORK_FIXED_BYTES, WORK_F_ACK_ONLY,
+    WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS, WORK_F_RESET_SESSION, WORK_F_VALID_MASK,
 };
 use crate::exec::{SliceExec, WorkRequest};
 use crate::hash::{token_hash_update_span, TOKEN_HASH_INIT};
 use crate::route::{decode_route_blob, validate_route_blob};
 use crate::transport::{read_frame, write_frame};
 use crate::work::{
-    decode_work_body, encode_logits_payload, encode_result_frame, encode_work_frame, error_result_frame,
-    ok_result_hdr, ResultBody, WorkBody,
+    decode_work_body, encode_logits_payload, encode_result_frame, encode_work_frame,
+    error_result_frame, ok_result_hdr, ResultBody, WorkBody,
 };
-use crate::activation::bits_or_default;
 
 pub fn send_hello<W: Write>(w: &mut W, hello: &Hello, model_name: &str) -> std::io::Result<()> {
     let payload = encode_hello_payload(hello, model_name)
@@ -79,10 +79,7 @@ impl<E: SliceExec> Worker<E> {
             if typ == MSG_ERROR {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!(
-                        "coordinator error: {}",
-                        String::from_utf8_lossy(&body)
-                    ),
+                    format!("coordinator error: {}", String::from_utf8_lossy(&body)),
                 ));
             }
             if typ != MSG_WORK {
@@ -105,7 +102,10 @@ impl<E: SliceExec> Worker<E> {
         stream: &mut S,
     ) -> std::io::Result<Option<Vec<u8>>> {
         if payload.len() < WORK_FIXED_BYTES {
-            return Ok(Some(error_result_frame(0, "truncated distributed WORK frame")));
+            return Ok(Some(error_result_frame(
+                0,
+                "truncated distributed WORK frame",
+            )));
         }
         let request_id = match Work::decode(payload) {
             Ok(w) => u64_from_halves(w.request_hi, w.request_lo),
@@ -207,12 +207,13 @@ impl<E: SliceExec> Worker<E> {
             return fail("WORK frame has hidden bytes without input flag".into());
         }
 
-        if let Err(e) = validate_route_blob(&body.route_blob, work.route_count, self.exec.n_layers())
+        if let Err(e) =
+            validate_route_blob(&body.route_blob, work.route_count, self.exec.n_layers())
         {
             return fail(e.to_string());
         }
-        let (entries, ret) = decode_route_blob(&body.route_blob, work.route_count)
-            .map_err(|e| e.to_string())?;
+        let (entries, ret) =
+            decode_route_blob(&body.route_blob, work.route_count).map_err(|e| e.to_string())?;
         let current = entries
             .get(work.route_index as usize)
             .ok_or_else(|| "invalid route entry index".to_string())?;
@@ -235,10 +236,7 @@ impl<E: SliceExec> Worker<E> {
         if reset {
             self.sessions.insert(session_id, TOKEN_HASH_INIT);
         }
-        let sess_hash = *self
-            .sessions
-            .entry(session_id)
-            .or_insert(TOKEN_HASH_INIT);
+        let sess_hash = *self.sessions.entry(session_id).or_insert(TOKEN_HASH_INIT);
         if sess_hash != prefix_hash {
             return fail("worker KV prefix hash mismatch".into());
         }
@@ -291,10 +289,14 @@ impl<E: SliceExec> Worker<E> {
         let (kind, payload, bits) = if final_ack_only {
             (RESULT_ACK, Vec::new(), 0u32)
         } else if local_output {
-            let logits = out.logits.ok_or_else(|| "slice exec returned no logits".to_string())?;
+            let logits = out
+                .logits
+                .ok_or_else(|| "slice exec returned no logits".to_string())?;
             (RESULT_LOGITS, encode_logits_payload(&logits), 32)
         } else {
-            let hidden = out.hidden.ok_or_else(|| "slice exec returned no hidden-state".to_string())?;
+            let hidden = out
+                .hidden
+                .ok_or_else(|| "slice exec returned no hidden-state".to_string())?;
             let bits = bits_or_default(work.input_hc_bits);
             let wire = crate::activation::encode_activation(&hidden, bits)
                 .ok_or_else(|| "invalid output hidden-state size".to_string())?;

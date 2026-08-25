@@ -90,14 +90,23 @@ fn enqueue_verdicts_match_c() {
             &body.to_string(),
         ]);
         let rust = format!("{} queued={} inflight={}\n", verdict_name(v), nq, ninf);
-        assert_eq!(rust, c, "enqueue st={st} q={q} mq={mq} inf={inf} mb={mb} body={body}");
+        assert_eq!(
+            rust, c,
+            "enqueue st={st} q={q} mq={mq} inf={inf} mb={mb} body={body}"
+        );
     }
 }
 
 #[test]
 fn mint_job_id_matches_c() {
-    assert_eq!(mint_job_id(ReqKind::Chat, 1), c_str(&["mint", "0", "1"]).trim());
-    assert_eq!(mint_job_id(ReqKind::Completion, 42), c_str(&["mint", "1", "42"]).trim());
+    assert_eq!(
+        mint_job_id(ReqKind::Chat, 1),
+        c_str(&["mint", "0", "1"]).trim()
+    );
+    assert_eq!(
+        mint_job_id(ReqKind::Completion, 42),
+        c_str(&["mint", "1", "42"]).trim()
+    );
     assert_eq!(mint_job_id(ReqKind::Chat, 1), "chatcmpl-1");
     assert_eq!(mint_job_id(ReqKind::Completion, 7), "cmpl-7");
 }
@@ -145,7 +154,10 @@ fn preparse_shed_matches_c() {
 
     s = AdmitState::default();
     assert!(preparse_shed(&s, true, true, 100).is_none());
-    assert_eq!(c_str(&["preparse", "0", "0", "0", "0", "0", "0", "100", "1", "1"]), "ok\n");
+    assert_eq!(
+        c_str(&["preparse", "0", "0", "0", "0", "0", "0", "100", "1", "1"]),
+        "ok\n"
+    );
 }
 
 #[test]

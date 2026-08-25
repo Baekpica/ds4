@@ -953,8 +953,7 @@ fn responses_special_schema_from_tool(raw: &str) -> Option<String> {
     }
     if typ.as_deref() == Some("tool_search") {
         let desc = description.unwrap_or_else(|| "Search available tools.".into());
-        let params =
-            parameters.unwrap_or_else(|| "{\"type\":\"object\",\"properties\":{}}".into());
+        let params = parameters.unwrap_or_else(|| "{\"type\":\"object\",\"properties\":{}}".into());
         return Some(format!(
             "{{\"name\":\"tool_search\",\"description\":{},\"parameters\":{params}}}",
             json_escape(&desc)
@@ -1106,10 +1105,7 @@ fn tool_schema_orders_add_json_wire(
     }
 }
 
-fn responses_namespace_function_schema(
-    raw: &str,
-    namespace: &str,
-) -> Option<(String, String)> {
+fn responses_namespace_function_schema(raw: &str, namespace: &str) -> Option<(String, String)> {
     let mut p = Json::new(raw);
     p.ws();
     if p.bump() != Some(b'{') {
@@ -1326,11 +1322,7 @@ fn collect_tool_call_ids(m: &ChatMsg) -> Vec<String> {
     ids
 }
 
-fn prepare_tool_choice(
-    r: &mut ParsedRequest,
-    have_schemas: bool,
-    err: &mut String,
-) -> bool {
+fn prepare_tool_choice(r: &mut ParsedRequest, have_schemas: bool, err: &mut String) -> bool {
     r.has_tools = have_schemas && r.tool_choice != ToolChoice::None;
     if r.tool_choice == ToolChoice::Required && !have_schemas {
         *err = "tool_choice=required requires at least one tool".into();
@@ -1691,10 +1683,7 @@ fn parse_responses_input(
                 name.clone().unwrap_or_default()
             };
             let tc = ToolCall {
-                id: call_id
-                    .clone()
-                    .or(item_id.clone())
-                    .unwrap_or_default(),
+                id: call_id.clone().or(item_id.clone()).unwrap_or_default(),
                 name: tc_name,
                 arguments: args.to_string(),
             };
@@ -1903,7 +1892,9 @@ pub fn parse_chat_request(env: &ParseEnv, body: &str) -> Result<ParsedRequest, S
         } else if key == "max_tokens" || key == "max_completion_tokens" {
             parse_budget(&mut p, &key, &mut r, &mut err)
         } else if key == "temperature" {
-            json_number(&mut p).map(|v| r.temperature = v as f32).is_some()
+            json_number(&mut p)
+                .map(|v| r.temperature = v as f32)
+                .is_some()
         } else if key == "top_p" {
             json_number(&mut p).map(|v| r.top_p = v as f32).is_some()
         } else if key == "min_p" {
@@ -2035,7 +2026,9 @@ pub fn parse_completion_request(env: &ParseEnv, body: &str) -> Result<ParsedRequ
         } else if key == "max_tokens" {
             parse_budget(&mut p, &key, &mut r, &mut err)
         } else if key == "temperature" {
-            json_number(&mut p).map(|v| r.temperature = v as f32).is_some()
+            json_number(&mut p)
+                .map(|v| r.temperature = v as f32)
+                .is_some()
         } else if key == "top_p" {
             json_number(&mut p).map(|v| r.top_p = v as f32).is_some()
         } else if key == "min_p" {
@@ -2192,7 +2185,9 @@ pub fn parse_anthropic_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
         } else if key == "max_tokens" {
             parse_budget(&mut p, &key, &mut r, &mut err)
         } else if key == "temperature" {
-            json_number(&mut p).map(|v| r.temperature = v as f32).is_some()
+            json_number(&mut p)
+                .map(|v| r.temperature = v as f32)
+                .is_some()
         } else if key == "top_p" {
             json_number(&mut p).map(|v| r.top_p = v as f32).is_some()
         } else if key == "top_k" {
@@ -2384,7 +2379,9 @@ pub fn parse_responses_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
         } else if key == "max_output_tokens" || key == "max_tokens" {
             parse_budget(&mut p, &key, &mut r, &mut err)
         } else if key == "temperature" {
-            json_number(&mut p).map(|v| r.temperature = v as f32).is_some()
+            json_number(&mut p)
+                .map(|v| r.temperature = v as f32)
+                .is_some()
         } else if key == "top_p" {
             json_number(&mut p).map(|v| r.top_p = v as f32).is_some()
         } else if key == "stream" {

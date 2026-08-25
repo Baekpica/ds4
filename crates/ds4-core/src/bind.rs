@@ -861,31 +861,9 @@ pub fn dump_bind_check_oracle() -> String {
     ok.slots[0].name.clear();
     ok.slots[0].need = BindNeed::Required;
     out.push_str(&check_line(&ok));
-    ok.slots[0] = slot(
-        "token_embd.weight",
-        false,
-        false,
-        8,
-        0,
-        [0; 8],
-        0,
-        0,
-        0,
-        0,
-    );
+    ok.slots[0] = slot("token_embd.weight", false, false, 8, 0, [0; 8], 0, 0, 0, 0);
     out.push_str(&check_line(&ok));
-    ok.slots[0] = slot(
-        "token_embd.weight",
-        true,
-        true,
-        8,
-        0,
-        [0; 8],
-        0,
-        32,
-        272,
-        0,
-    );
+    ok.slots[0] = slot("token_embd.weight", true, true, 8, 0, [0; 8], 0, 32, 272, 0);
     out.push_str(&check_line(&ok));
     out
 }

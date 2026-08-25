@@ -2,13 +2,13 @@
 //! `ds4_server.c` at v0.6.3-dfm. DSML greedy / required-prefix sampling
 //! and corrective retry (`retry`) are host-owned.
 
+use crate::dsml::{DsmlDecodeState, DsmlDecodeTracker, SampleOverride, SamplePolicy};
 use crate::json::{json_escape_bytes, json_minify_raw_value, json_raw_value, json_string, Json};
 use crate::parse::{ToolCall, ToolSchemaOrder};
 use crate::render::{
     syntax_for_model_id, ModelSyntax, SOLAR_THINK_END, SOLAR_THINK_START, SOLAR_TOOL_ARG_END,
-    SOLAR_TOOL_ARG_START, SOLAR_TOOL_ARG_VALUE, SOLAR_TOOL_CALL_END, SOLAR_TOOL_CALLS,
+    SOLAR_TOOL_ARG_START, SOLAR_TOOL_ARG_VALUE, SOLAR_TOOL_CALLS, SOLAR_TOOL_CALL_END,
 };
-use crate::dsml::{DsmlDecodeState, DsmlDecodeTracker, SampleOverride, SamplePolicy};
 use crate::stream::{think_end, think_start, ChatFormat};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -151,7 +151,11 @@ fn split_reasoning_content(text: &[u8], n: usize, format: ChatFormat) -> (Vec<u8
     let s = &text[..n.min(text.len())];
     let start = think_start(format).as_bytes();
     let end = think_end(format).as_bytes();
-    let body = if s.starts_with(start) { &s[start.len()..] } else { s };
+    let body = if s.starts_with(start) {
+        &s[start.len()..]
+    } else {
+        s
+    };
     if let Some(i) = find_substr(body, end) {
         (body[i + end.len()..].to_vec(), body[..i].to_vec())
     } else {
@@ -252,10 +256,7 @@ struct DsmlStyle {
     param_end: &'static [u8],
 }
 
-fn parse_dsml_generated(
-    text: &[u8],
-    require_thinking_closed: bool,
-) -> Option<ParsedGenerated> {
+fn parse_dsml_generated(text: &[u8], require_thinking_closed: bool) -> Option<ParsedGenerated> {
     let mut tool_search = 0usize;
     if require_thinking_closed {
         match find_last_substr(text, b"</think>") {
@@ -379,13 +380,14 @@ fn parse_dsml_generated(
             let param_is_string = dsml_attr(tag, "string");
             let value_start = p + gt + 1;
             let after_ws = skip_ws(text, value_start);
-            if param_is_string.is_none()
-                && text[after_ws..].starts_with(sty.param_start)
-            {
+            if param_is_string.is_none() && text[after_ws..].starts_with(sty.param_start) {
                 let mut nested_p = value_start;
-                let Some(nested) =
-                    dsml_parse_nested_params_object(text, &mut nested_p, sty.param_start, sty.param_end)
-                else {
+                let Some(nested) = dsml_parse_nested_params_object(
+                    text,
+                    &mut nested_p,
+                    sty.param_start,
+                    sty.param_end,
+                ) else {
                     return None;
                 };
                 tool_call_json_args_add(&mut args, &param_name, &nested, false);
@@ -399,7 +401,10 @@ fn parse_dsml_generated(
                 return None;
             };
             let raw = &text[value_start..value_start + rel];
-            let is_string = param_is_string.as_deref().map(|v| v == b"true").unwrap_or(true);
+            let is_string = param_is_string
+                .as_deref()
+                .map(|v| v == b"true")
+                .unwrap_or(true);
             let value = if is_string {
                 dsml_unescape_text(raw)
             } else {
@@ -733,7 +738,10 @@ fn tool_schema_orders_find<'a>(
     orders.iter().find(|o| o.name == name)
 }
 
-fn tool_schema_order_prop_type<'a>(order: Option<&'a ToolSchemaOrder>, name: &str) -> Option<&'a str> {
+fn tool_schema_order_prop_type<'a>(
+    order: Option<&'a ToolSchemaOrder>,
+    name: &str,
+) -> Option<&'a str> {
     let order = order?;
     order
         .prop
@@ -855,8 +863,7 @@ fn parse_solar_generated(
     if calls.is_empty() {
         return None;
     }
-    let (content, reasoning) =
-        split_reasoning_content(text, content_len, ChatFormat::SolarOpen2);
+    let (content, reasoning) = split_reasoning_content(text, content_len, ChatFormat::SolarOpen2);
     Some(ParsedGenerated {
         content,
         reasoning,
@@ -942,8 +949,7 @@ pub fn parse_generated_for_response(
     finish: &str,
 ) -> (ParsedGenerated, &'static str) {
     if !has_tools {
-        let (content, reasoning) =
-            split_reasoning_response(text, format, require_thinking_closed);
+        let (content, reasoning) = split_reasoning_response(text, format, require_thinking_closed);
         return (
             ParsedGenerated {
                 content,
@@ -1034,11 +1040,7 @@ pub fn observe_tool_markers(
     if start.is_some() {
         *saw_start = true;
     }
-    let end_scan = if had_start {
-        Some(0)
-    } else {
-        start
-    };
+    let end_scan = if had_start { Some(0) } else { start };
     let end = end_scan.and_then(|off| find_tool_end(&scan[off..], format));
     if end.is_some() {
         *saw_end = true;
@@ -1271,7 +1273,13 @@ pub struct SemFeed {
 }
 
 impl SemAccum {
-    pub fn init(kind_chat: bool, has_tools: bool, think_enabled: bool, format: ChatFormat, prompt: &[u8]) -> Self {
+    pub fn init(
+        kind_chat: bool,
+        has_tools: bool,
+        think_enabled: bool,
+        format: ChatFormat,
+        prompt: &[u8],
+    ) -> Self {
         let mut a = Self {
             text: Vec::new(),
             track_tools: kind_chat && has_tools,
@@ -1380,7 +1388,9 @@ impl SemAccum {
                     self.saw_tool_start = true;
                 }
                 let end_off = if old_start { Some(0) } else { start };
-                if end_off.and_then(|o| find_tool_end(&scan[o..], self.chat_format)).is_some()
+                if end_off
+                    .and_then(|o| find_tool_end(&scan[o..], self.chat_format))
+                    .is_some()
                 {
                     self.saw_tool_end = true;
                 }
@@ -1404,7 +1414,8 @@ impl SemAccum {
         }
 
         if let Some((pos, len)) = hit {
-            self.matched_stop = Some(String::from_utf8_lossy(&self.text[pos..pos + len]).into_owned());
+            self.matched_stop =
+                Some(String::from_utf8_lossy(&self.text[pos..pos + len]).into_owned());
             self.text.truncate(pos);
             self.verdict = Some("stop");
             f.hit_stop = true;

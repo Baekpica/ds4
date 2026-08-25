@@ -3,9 +3,7 @@
 use crate::encode::{json_quote, url_encode};
 
 pub fn http_request(method: &str, port: i32, path: &str) -> String {
-    format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    )
+    format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n")
 }
 
 pub fn ws_handshake(path: &str, host: &str, port: i32, key: &str) -> String {

@@ -22,7 +22,9 @@ fn http_local_returns_body_after_headers() {
     let body = http_local("GET", port, "/json/version").expect("http_local");
     assert_eq!(body, "BODY-OK");
     assert_eq!(
-        http_request("GET", port, "/json/version").matches("Connection: close").count(),
+        http_request("GET", port, "/json/version")
+            .matches("Connection: close")
+            .count(),
         1
     );
     server.join().unwrap();

@@ -86,9 +86,7 @@ impl Identified {
     pub fn identify_line(&self) -> String {
         format!(
             "IDENTIFY {} family={} variant={}",
-            self.shape.name,
-            self.shape.family as u32,
-            self.shape.variant as u32
+            self.shape.name, self.shape.family as u32, self.shape.variant as u32
         )
     }
 }
@@ -103,37 +101,35 @@ const DS_KEYS: [(&str, fn(&mut DeepSeekDims, u32)); 22] = [
     ("deepseek4.attention.value_length", |d, v| d.n_value_dim = v),
     ("deepseek4.rope.dimension_count", |d, v| d.n_rot = v),
     ("deepseek4.attention.q_lora_rank", |d, v| d.n_lora_q = v),
-    ("deepseek4.attention.output_lora_rank", |d, v| d.n_lora_o = v),
-    (
-        "deepseek4.attention.output_group_count",
-        |d, v| d.n_out_group = v,
-    ),
+    ("deepseek4.attention.output_lora_rank", |d, v| {
+        d.n_lora_o = v
+    }),
+    ("deepseek4.attention.output_group_count", |d, v| {
+        d.n_out_group = v
+    }),
     ("deepseek4.expert_count", |d, v| d.n_expert = v),
     ("deepseek4.expert_used_count", |d, v| d.n_expert_used = v),
-    (
-        "deepseek4.expert_feed_forward_length",
-        |d, v| d.n_ff_exp = v,
-    ),
-    ("deepseek4.expert_shared_count", |d, v| d.n_expert_shared = v),
+    ("deepseek4.expert_feed_forward_length", |d, v| {
+        d.n_ff_exp = v
+    }),
+    ("deepseek4.expert_shared_count", |d, v| {
+        d.n_expert_shared = v
+    }),
     ("deepseek4.hash_layer_count", |d, v| d.n_hash_layer = v),
     ("deepseek4.attention.sliding_window", |d, v| d.n_swa = v),
-    (
-        "deepseek4.attention.indexer.head_count",
-        |d, v| d.n_indexer_head = v,
-    ),
-    (
-        "deepseek4.attention.indexer.key_length",
-        |d, v| d.n_indexer_head_dim = v,
-    ),
-    (
-        "deepseek4.attention.indexer.top_k",
-        |d, v| d.n_indexer_top_k = v,
-    ),
+    ("deepseek4.attention.indexer.head_count", |d, v| {
+        d.n_indexer_head = v
+    }),
+    ("deepseek4.attention.indexer.key_length", |d, v| {
+        d.n_indexer_head_dim = v
+    }),
+    ("deepseek4.attention.indexer.top_k", |d, v| {
+        d.n_indexer_top_k = v
+    }),
     ("deepseek4.hyper_connection.count", |d, v| d.n_hc = v),
-    (
-        "deepseek4.hyper_connection.sinkhorn_iterations",
-        |d, v| d.n_hc_sinkhorn_iter = v,
-    ),
+    ("deepseek4.hyper_connection.sinkhorn_iterations", |d, v| {
+        d.n_hc_sinkhorn_iter = v
+    }),
 ];
 
 fn deepseek_dims(g: &GgufFile) -> Result<DeepSeekDims, IdentifyError> {

@@ -1,7 +1,7 @@
 //! Route blob: `[Route + host]*` then `RouteReturn + host`. No struct memcpy.
 
 use crate::codec::{
-    bytes_have_nul, Route, RouteReturn, CodecError, NI_MAXHOST, ROUTE_FIXED_BYTES,
+    bytes_have_nul, CodecError, Route, RouteReturn, NI_MAXHOST, ROUTE_FIXED_BYTES,
     ROUTE_F_OUTPUT_LOGITS, ROUTE_RETURN_FIXED_BYTES, ROUTE_RETURN_UPSTREAM,
 };
 
@@ -21,7 +21,10 @@ pub struct ReturnTarget {
     pub port: u32,
 }
 
-pub fn encode_route_blob(entries: &[RouteEntry], ret: &ReturnTarget) -> Result<Vec<u8>, CodecError> {
+pub fn encode_route_blob(
+    entries: &[RouteEntry],
+    ret: &ReturnTarget,
+) -> Result<Vec<u8>, CodecError> {
     let mut out = Vec::new();
     for e in entries {
         let host = e.host.as_bytes();
@@ -40,7 +43,9 @@ pub fn encode_route_blob(entries: &[RouteEntry], ret: &ReturnTarget) -> Result<V
     }
     let rhost = ret.host.as_bytes();
     if rhost.len() >= NI_MAXHOST || bytes_have_nul(rhost) {
-        return Err(CodecError::Invalid("invalid route final destination host length"));
+        return Err(CodecError::Invalid(
+            "invalid route final destination host length",
+        ));
     }
     let rec = RouteReturn {
         kind: ret.kind,
@@ -84,16 +89,22 @@ pub fn decode_route_blob(
         remaining = &remaining[fixed.host_len as usize..];
     }
     if remaining.len() < ROUTE_RETURN_FIXED_BYTES {
-        return Err(CodecError::Invalid("route payload missing final destination"));
+        return Err(CodecError::Invalid(
+            "route payload missing final destination",
+        ));
     }
     let ret = RouteReturn::decode(remaining)?;
     remaining = &remaining[ROUTE_RETURN_FIXED_BYTES..];
     if ret.host_len as usize >= NI_MAXHOST || ret.host_len as usize > remaining.len() {
-        return Err(CodecError::Invalid("invalid route final destination host length"));
+        return Err(CodecError::Invalid(
+            "invalid route final destination host length",
+        ));
     }
     let host = &remaining[..ret.host_len as usize];
     if bytes_have_nul(host) {
-        return Err(CodecError::Invalid("route final destination host contains NUL bytes"));
+        return Err(CodecError::Invalid(
+            "route final destination host contains NUL bytes",
+        ));
     }
     remaining = &remaining[ret.host_len as usize..];
     if !remaining.is_empty() {
@@ -114,7 +125,9 @@ pub fn validate_route_blob(blob: &[u8], route_count: u32, n_layers: u32) -> Resu
         return if blob.is_empty() {
             Ok(())
         } else {
-            Err(CodecError::Invalid("route payload has entries without a route count"))
+            Err(CodecError::Invalid(
+                "route payload has entries without a route count",
+            ))
         };
     }
     let (entries, ret) = decode_route_blob(blob, route_count)?;
@@ -141,7 +154,9 @@ pub fn validate_route_blob(blob: &[u8], route_count: u32, n_layers: u32) -> Resu
         return Err(CodecError::Invalid("unsupported route final destination"));
     }
     if !ret.host.is_empty() || ret.port != 0 {
-        return Err(CodecError::Invalid("invalid upstream route final destination"));
+        return Err(CodecError::Invalid(
+            "invalid upstream route final destination",
+        ));
     }
     Ok(())
 }

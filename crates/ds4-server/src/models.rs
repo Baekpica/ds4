@@ -57,7 +57,8 @@ pub fn parent_is_gguf_artifact_dir(parent: &str) -> bool {
         return true;
     }
     let n = parent.len();
-    n > 4 && parent.as_bytes()[n - 4].eq_ignore_ascii_case(&b'G')
+    n > 4
+        && parent.as_bytes()[n - 4].eq_ignore_ascii_case(&b'G')
         && parent.as_bytes()[n - 3].eq_ignore_ascii_case(&b'G')
         && parent.as_bytes()[n - 2].eq_ignore_ascii_case(&b'U')
         && parent.as_bytes()[n - 1].eq_ignore_ascii_case(&b'F')
@@ -144,7 +145,13 @@ pub fn append_model_json_values(id: &str, name: &str, ctx: i32, default_tokens: 
     )
 }
 
-pub fn models_list_json(id: &str, name: &str, ctx: i32, default_tokens: i32, codex: Option<&str>) -> String {
+pub fn models_list_json(
+    id: &str,
+    name: &str,
+    ctx: i32,
+    default_tokens: i32,
+    codex: Option<&str>,
+) -> String {
     let mut b = String::from("{\"object\":\"list\",\"data\":[");
     b.push_str(&append_model_json_values(id, name, ctx, default_tokens));
     b.push(']');

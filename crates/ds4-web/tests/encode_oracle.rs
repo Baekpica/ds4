@@ -53,7 +53,11 @@ fn url_encode_matches_c() {
 #[test]
 fn base64_matches_c() {
     for data in [b"".as_slice(), b"a", b"ab", b"abc", b"0123456789abcdef"] {
-        assert_eq!(base64(data), c_out(&["base64", &hex(data)]), "base64 {data:?}");
+        assert_eq!(
+            base64(data),
+            c_out(&["base64", &hex(data)]),
+            "base64 {data:?}"
+        );
     }
 }
 
@@ -76,11 +80,19 @@ fn json_get_and_id_match_c() {
         c_out(&["json-get", json, "t"])
     );
     assert_eq!(
-        if json_id_matches(json, 7) { "yes" } else { "no" },
+        if json_id_matches(json, 7) {
+            "yes"
+        } else {
+            "no"
+        },
         c_out(&["json-id", json, "7"])
     );
     assert_eq!(
-        if json_id_matches(json, 8) { "yes" } else { "no" },
+        if json_id_matches(json, 8) {
+            "yes"
+        } else {
+            "no"
+        },
         c_out(&["json-id", json, "8"])
     );
 }

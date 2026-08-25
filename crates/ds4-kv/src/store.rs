@@ -2,8 +2,8 @@
 
 use crate::format::{
     fill_header, is_automatic_exact_replay, is_bank_replay_v1, path_for_sha, read_envelope,
-    read_metadata, read_path, read_text_prefix, sha_hex_name, text_sha_hex, write_path,
-    stage_stream, Envelope, FormatError, Header, Record, EXT_TOOL_MAP,
+    read_metadata, read_path, read_text_prefix, sha_hex_name, stage_stream, text_sha_hex,
+    write_path, Envelope, FormatError, Header, Record, EXT_TOOL_MAP,
 };
 use crate::policy::{
     eviction_score, file_size_bytes, file_size_fits, EvictionContext, Options, ScoreEntry,
@@ -69,7 +69,11 @@ impl Store {
         }
         #[cfg(not(unix))]
         fs::create_dir_all(&dir)?;
-        let budget_mb = if budget_mb == 0 { DEFAULT_MB } else { budget_mb };
+        let budget_mb = if budget_mb == 0 {
+            DEFAULT_MB
+        } else {
+            budget_mb
+        };
         let mut store = Self {
             dir,
             budget_bytes: budget_mb * 1024 * 1024,
@@ -108,9 +112,13 @@ impl Store {
         for ent in rd.flatten() {
             let name = ent.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some(sha) = sha_hex_name(name) else { continue };
+            let Some(sha) = sha_hex_name(name) else {
+                continue;
+            };
             let path = ent.path();
-            let Ok(metadata) = read_metadata(&path) else { continue };
+            let Ok(metadata) = read_metadata(&path) else {
+                continue;
+            };
             self.entries.push(Entry {
                 sha,
                 path,
@@ -131,7 +139,10 @@ impl Store {
             record.payload.len() as u64,
             record.trailer.len() as u64,
         ) {
-            return Err(io::Error::new(io::ErrorKind::OutOfMemory, "KVC file exceeds budget"));
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "KVC file exceeds budget",
+            ));
         }
         record.header.text_bytes = record.text.len() as u32;
         record.header.payload_bytes = record.payload.len() as u64;
@@ -144,7 +155,11 @@ impl Store {
             ctx_size: record.header.ctx_size,
             reject_different_quant: self.reject_different_quant,
         };
-        let extra = 48 + 4 + record.text.len() as u64 + record.payload.len() as u64 + record.trailer.len() as u64;
+        let extra = 48
+            + 4
+            + record.text.len() as u64
+            + record.payload.len() as u64
+            + record.trailer.len() as u64;
         self.evict(extra, Some(&incoming));
         write_path(&path, &record).map_err(|e| io::Error::other(e))?;
         self.refresh();
@@ -168,8 +183,7 @@ impl Store {
             return Ok(None);
         };
         let compatible = existing.header.model_id == header.model_id
-            && (!self.reject_different_quant
-                || existing.header.quant_bits == header.quant_bits)
+            && (!self.reject_different_quant || existing.header.quant_bits == header.quant_bits)
             && existing.header.ctx_size <= header.ctx_size
             && is_automatic_exact_replay(existing.header.reason, existing.header.ext_flags)
             && is_automatic_exact_replay(header.reason, header.ext_flags)
@@ -254,7 +268,13 @@ impl Store {
         read_path(path).map_err(|e| io::Error::other(e))
     }
 
-    pub fn find_text_prefix(&mut self, prompt: &[u8], model_id: u8, quant_bits: u8, ctx_size: u32) -> Option<usize> {
+    pub fn find_text_prefix(
+        &mut self,
+        prompt: &[u8],
+        model_id: u8,
+        quant_bits: u8,
+        ctx_size: u32,
+    ) -> Option<usize> {
         self.find_prefix(prompt, model_id, quant_bits, ctx_size, false)
     }
 
@@ -420,7 +440,9 @@ impl Store {
                 if (e.header.text_bytes as usize) < be.header.text_bytes as usize {
                     continue;
                 }
-                if e.header.text_bytes == be.header.text_bytes && e.header.tokens <= be.header.tokens {
+                if e.header.text_bytes == be.header.text_bytes
+                    && e.header.tokens <= be.header.tokens
+                {
                     continue;
                 }
             }
@@ -657,8 +679,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn new_nested_store_directories_are_private() {
-        let base =
-            std::env::temp_dir().join(format!("ds4-kv-private-dir-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("ds4-kv-private-dir-{}", std::process::id()));
         let dir = base.join("nested/store");
         let _ = fs::remove_dir_all(&base);
 
@@ -673,14 +694,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn existing_store_directory_mode_is_unchanged() {
-        let dir =
-            std::env::temp_dir().join(format!("ds4-kv-existing-dir-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ds4-kv-existing-dir-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
 
         let _store = Store::open(&dir, 16, false, Options::default()).unwrap();
-        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -688,15 +711,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn payload_temp_is_private_and_drop_removes_it() {
-        let dir =
-            std::env::temp_dir().join(format!("ds4-kv-payload-temp-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ds4-kv-payload-temp-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let store = Store::open(&dir, 16, false, Options::default()).unwrap();
 
         let temp = store.payload_temp().unwrap();
         let path = temp.path().to_path_buf();
         assert!(path.exists());
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         drop(temp);
         assert!(!path.exists());
@@ -705,8 +730,7 @@ mod tests {
 
     #[test]
     fn payload_temps_are_distinct_and_drop_independently() {
-        let dir =
-            std::env::temp_dir().join(format!("ds4-kv-payload-pair-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ds4-kv-payload-pair-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let store = Store::open(&dir, 16, false, Options::default()).unwrap();
 
@@ -748,10 +772,7 @@ mod tests {
 
     #[test]
     fn bank_discard_preserves_the_serial_checkpoint_marker() {
-        let dir = std::env::temp_dir().join(format!(
-            "ds4-kv-bank-discard-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("ds4-kv-bank-discard-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
         let discarded = store.write(rec(b"bank-corrupt", 512)).unwrap();
@@ -806,9 +827,7 @@ mod tests {
         let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
         store.write(rec(b"hello", 512)).unwrap();
         store.write(rec(b"hello world", 512)).unwrap();
-        let idx = store
-            .find_text_prefix(b"hello world!", 0, 2, 2048)
-            .unwrap();
+        let idx = store.find_text_prefix(b"hello world!", 0, 2, 2048).unwrap();
         assert_eq!(store.entries()[idx].header.text_bytes, 11);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1190,10 +1209,8 @@ mod tests {
 
     #[test]
     fn bank_candidate_requires_a_valid_strict_suffix() {
-        let dir = std::env::temp_dir().join(format!(
-            "ds4-kv-bank-candidate-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ds4-kv-bank-candidate-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
         let mut record = rec(b"shared prefix", 512);

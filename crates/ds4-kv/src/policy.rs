@@ -82,8 +82,8 @@ pub fn continued_step(opt: &Options) -> i32 {
     let mut step = opt.continued_interval_tokens;
     let align = opt.boundary_align_tokens;
     if align > 0 {
-        let rounded = ((i64::from(step) + i64::from(align) - 1) / i64::from(align))
-            * i64::from(align);
+        let rounded =
+            ((i64::from(step) + i64::from(align) - 1) / i64::from(align)) * i64::from(align);
         step = i32::try_from(rounded).unwrap_or(0);
     }
     step
@@ -116,7 +116,10 @@ pub fn bank_checkpoint_due(opt: &Options, committed: i32, stored_tokens: i32) ->
 
 pub fn file_size_bytes(text_bytes: u64, payload_bytes: u64, trailer_bytes: u64) -> Option<u64> {
     const FIXED: u64 = 48 + 4;
-    FIXED.checked_add(text_bytes)?.checked_add(payload_bytes)?.checked_add(trailer_bytes)
+    FIXED
+        .checked_add(text_bytes)?
+        .checked_add(payload_bytes)?
+        .checked_add(trailer_bytes)
 }
 
 pub fn budget_required(file_bytes: u64) -> Option<u64> {
@@ -127,7 +130,12 @@ pub fn budget_required(file_bytes: u64) -> Option<u64> {
     file_bytes.checked_add(slack)
 }
 
-pub fn file_size_fits(budget_bytes: u64, text_bytes: u64, payload_bytes: u64, trailer_bytes: u64) -> bool {
+pub fn file_size_fits(
+    budget_bytes: u64,
+    text_bytes: u64,
+    payload_bytes: u64,
+    trailer_bytes: u64,
+) -> bool {
     let Some(file_bytes) = file_size_bytes(text_bytes, payload_bytes, trailer_bytes) else {
         return false;
     };
@@ -177,7 +185,11 @@ pub fn eviction_score(e: &ScoreEntry<'_>, now: u64, incoming: Option<&EvictionCo
         return 0.0;
     }
     let mut effective_hits = e.hits as f64;
-    let used_at = if e.last_used != 0 { e.last_used } else { e.created_at };
+    let used_at = if e.last_used != 0 {
+        e.last_used
+    } else {
+        e.created_at
+    };
     if used_at == 0 {
         effective_hits = 0.0;
     } else if now > used_at {
@@ -204,7 +216,12 @@ pub fn eviction_score(e: &ScoreEntry<'_>, now: u64, incoming: Option<&EvictionCo
     score
 }
 
-pub fn chat_anchor_pos(opt: &Options, prompt: &[i32], user_token_id: i32, assistant_token_id: i32) -> i32 {
+pub fn chat_anchor_pos(
+    opt: &Options,
+    prompt: &[i32],
+    user_token_id: i32,
+    assistant_token_id: i32,
+) -> i32 {
     if user_token_id < 0 || assistant_token_id < 0 {
         return -1;
     }

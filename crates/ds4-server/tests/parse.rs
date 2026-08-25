@@ -128,15 +128,27 @@ fn c_unit_error_cases_match() {
         r#"{"max_completion_tokens":-2}"#,
         "max_completion_tokens must be >= 0",
     );
-    assert_err_eq("anthropic", r#"{"max_tokens":-1}"#, "max_tokens must be >= 0");
+    assert_err_eq(
+        "anthropic",
+        r#"{"max_tokens":-1}"#,
+        "max_tokens must be >= 0",
+    );
     assert_err_eq(
         "responses",
         r#"{"max_output_tokens":-3}"#,
         "max_output_tokens must be >= 0",
     );
-    assert_err_eq("completion", r#"{"max_tokens":-1}"#, "max_tokens must be >= 0");
+    assert_err_eq(
+        "completion",
+        r#"{"max_tokens":-1}"#,
+        "max_tokens must be >= 0",
+    );
 
-    assert_err_eq("chat", r#"{"response_format":{"type":"text"}}"#, "missing messages");
+    assert_err_eq(
+        "chat",
+        r#"{"response_format":{"type":"text"}}"#,
+        "missing messages",
+    );
     assert_err_eq("chat", r#"{"response_format":null}"#, "missing messages");
     assert_err_eq("chat", r#"{"response_format":{}}"#, "missing messages");
     assert_err_eq(

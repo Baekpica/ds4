@@ -29,11 +29,12 @@ pub use codec::{
     RESULT_LOGITS, ROUTE_FIXED_BYTES, ROUTE_F_OUTPUT_LOGITS, ROUTE_RETURN_FIXED_BYTES,
     ROUTE_RETURN_UPSTREAM, SNAPSHOT_BEGIN_FIXED_BYTES, SNAPSHOT_CHUNK_FIXED_BYTES,
     SNAPSHOT_DONE_FIXED_BYTES, SNAPSHOT_REQ_FIXED_BYTES, TELEMETRY_FIXED_BYTES, WORK_FIXED_BYTES,
-    WORK_F_ACK_ONLY, WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS, WORK_F_RESET_SESSION, WORK_F_VALID_MASK,
+    WORK_F_ACK_ONLY, WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS, WORK_F_RESET_SESSION,
+    WORK_F_VALID_MASK,
 };
 pub use coordinator::{
-    accept_loop, dispatch_eval, listen, recv_hello_only, token_span_hashes, Coordinator, EvalOutcome,
-    RegisteredWorker, SharedCoordinator,
+    accept_loop, dispatch_eval, listen, recv_hello_only, token_span_hashes, Coordinator,
+    EvalOutcome, RegisteredWorker, SharedCoordinator,
 };
 pub use exec::{SliceExec, WorkOutput, WorkRequest};
 pub use hash::{token_hash_prefix, token_hash_update, token_hash_update_span, TOKEN_HASH_INIT};
@@ -48,7 +49,8 @@ pub use route::{
 pub use transport::{read_frame, write_frame};
 pub use work::{
     decode_logits_payload, decode_result_body, decode_work_body, encode_logits_payload,
-    encode_result_body, encode_result_frame, encode_work_body, encode_work_frame, error_result_frame,
-    ok_result_hdr, result_hash, result_request_id, work_with_ids, ResultBody, WorkBody,
+    encode_result_body, encode_result_frame, encode_work_body, encode_work_frame,
+    error_result_frame, ok_result_hdr, result_hash, result_request_id, work_with_ids, ResultBody,
+    WorkBody,
 };
 pub use worker::{recv_hello, send_hello, Worker};

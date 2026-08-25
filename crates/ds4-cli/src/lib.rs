@@ -154,8 +154,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
                 let value = require_value(&arg, iter.next())?;
                 if arg == "--tokens" && value.contains(',') {
                     return Err(
-                        "--tokens is the output budget; use --token-ids for raw token IDs"
-                            .into(),
+                        "--tokens is the output budget; use --token-ids for raw token IDs".into(),
                     );
                 }
                 parsed.n_predict = parse_positive_i32(&arg, &value)?;
@@ -277,9 +276,9 @@ fn prompt_text(args: &ShadowArgs) -> Result<String, String> {
             std::fs::read_to_string(path).map_err(|e| format!("prompt-file: {e}"))
         }
         (Some(_), Some(_)) => Err("specify only one prompt source".into()),
-        (None, None) => Err(
-            "one-shot generation requires -p or --prompt-file; REPL is not implemented".into(),
-        ),
+        (None, None) => {
+            Err("one-shot generation requires -p or --prompt-file; REPL is not implemented".into())
+        }
     }
 }
 
@@ -712,8 +711,8 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
         .ok_or_else(|| "missing -m/--model (or pass --help)".to_string())?;
 
     if args.identify {
-        let id = ds4_core::identify_gguf(std::path::Path::new(model_path))
-            .map_err(|e| e.to_string())?;
+        let id =
+            ds4_core::identify_gguf(std::path::Path::new(model_path)).map_err(|e| e.to_string())?;
         println!("{}", id.report_line(model_path));
         return Ok(0);
     }
@@ -743,7 +742,10 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
         return Ok(0);
     }
     if args.validate {
-        print!("{}", ds4_core::dump_validate(std::path::Path::new(model_path)));
+        print!(
+            "{}",
+            ds4_core::dump_validate(std::path::Path::new(model_path))
+        );
         return Ok(0);
     }
 
@@ -1178,16 +1180,10 @@ mod tests {
     #[test]
     fn formats_thinking_tags_split_across_pieces() {
         assert_eq!(
-            format_fragments(
-                true,
-                &[b"<thi", b"nk>plan", b"</thi", b"nk>answer"],
-            ),
+            format_fragments(true, &[b"<thi", b"nk>plan", b"</thi", b"nk>answer"],),
             b"plan\nanswer\n"
         );
-        assert_eq!(
-            format_fragments(true, &[b"<thi", b"x"]),
-            b"<thix\n"
-        );
+        assert_eq!(format_fragments(true, &[b"<thi", b"x"]), b"<thix\n");
     }
 
     #[test]
@@ -1197,16 +1193,10 @@ mod tests {
             b"answer\n"
         );
         assert_eq!(
-            format_fragments(
-                true,
-                &[b"plan\n</think>", b"\nanswer"],
-            ),
+            format_fragments(true, &[b"plan\n</think>", b"\nanswer"],),
             b"plan\n\nanswer\n"
         );
-        assert_eq!(
-            format_fragments(true, &[b"plan</thi"]),
-            b"plan</thi\n"
-        );
+        assert_eq!(format_fragments(true, &[b"plan</thi"]), b"plan</thi\n");
         assert_eq!(format_fragments(true, &[]), b"");
     }
 
@@ -1255,14 +1245,8 @@ mod tests {
 
     #[test]
     fn parses_session_plan() {
-        let parsed = parse_args(args(&[
-            "--session-plan",
-            "rewrite",
-            "1024",
-            "1100",
-            "1024",
-        ]))
-        .unwrap();
+        let parsed =
+            parse_args(args(&["--session-plan", "rewrite", "1024", "1100", "1024"])).unwrap();
         assert!(parsed.session_plan);
         assert_eq!(parsed.session_cmd.as_deref(), Some("rewrite"));
         assert_eq!(parsed.session_args, vec!["1024", "1100", "1024"]);

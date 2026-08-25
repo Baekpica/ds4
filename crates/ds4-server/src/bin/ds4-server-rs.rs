@@ -166,9 +166,7 @@ fn main() {
             engine = engine.with_store(store);
         }
         match lane {
-            Some(mut lane) => {
-                accept_loop_with_engine_cont(listener, cfg, &mut engine, &mut lane)
-            }
+            Some(mut lane) => accept_loop_with_engine_cont(listener, cfg, &mut engine, &mut lane),
             None => accept_loop_with_engine(listener, cfg, &mut engine),
         }
     } else {

@@ -36,7 +36,11 @@ impl Coordinator {
         Self {
             view,
             model_id,
-            activation_bits: if activation_bits == 0 { 32 } else { activation_bits },
+            activation_bits: if activation_bits == 0 {
+                32
+            } else {
+                activation_bits
+            },
             workers: Vec::new(),
             generation: 0,
         }
@@ -68,7 +72,11 @@ impl Coordinator {
         build_route_plan(&self.view, &self.workers)
     }
 
-    pub fn accept_hello<R: Read>(&mut self, r: &mut R, peer_host: &str) -> Result<(Hello, String), String> {
+    pub fn accept_hello<R: Read>(
+        &mut self,
+        r: &mut R,
+        peer_host: &str,
+    ) -> Result<(Hello, String), String> {
         let (typ, body) = read_frame(r).map_err(|e| e.to_string())?;
         if typ != MSG_HELLO {
             return Err(format!("expected HELLO frame, got type {typ}"));
@@ -167,8 +175,10 @@ pub fn dispatch_eval<S: Read + Write>(
             decode_logits_payload(&result.payload).map_err(|e| e.to_string())?,
         )),
         RESULT_HIDDEN_STATE => {
-            let hidden = decode_activation(&result.payload, result.hdr.payload_bits)
-                .ok_or_else(|| "distributed route returned invalid hidden-state size".to_string())?;
+            let hidden =
+                decode_activation(&result.payload, result.hdr.payload_bits).ok_or_else(|| {
+                    "distributed route returned invalid hidden-state size".to_string()
+                })?;
             Ok(EvalOutcome::Hidden(hidden))
         }
         _ => Err("distributed route did not return logits or hidden-state".into()),

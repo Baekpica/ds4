@@ -8,14 +8,14 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
-use std::path::Path;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::Path;
 use std::ptr::{self, NonNull};
 
 use ds4_sys::{
-    ds4_bridge_batch_ctx, ds4_bridge_batch_ctx_create_fit, ds4_bridge_batch_ctx_destroy,
-    ds4_bridge_batch_ctx_bank_load_payload_range, ds4_bridge_batch_ctx_bank_save_payload,
-    ds4_bridge_batch_ctx_bank_snapshot, ds4_bridge_batch_ctx_max_seq,
+    ds4_bridge_batch_ctx, ds4_bridge_batch_ctx_bank_load_payload_range,
+    ds4_bridge_batch_ctx_bank_save_payload, ds4_bridge_batch_ctx_bank_snapshot,
+    ds4_bridge_batch_ctx_create_fit, ds4_bridge_batch_ctx_destroy, ds4_bridge_batch_ctx_max_seq,
     ds4_bridge_batch_ctx_seq_cap, ds4_bridge_cont_request, ds4_bridge_cont_stats,
     ds4_bridge_continuous_generate,
 };
@@ -135,8 +135,8 @@ unsafe extern "C" fn tramp_admit(ud: *mut c_void, req: *mut ds4_bridge_cont_requ
 
 unsafe extern "C" fn tramp_on_token(ud: *mut c_void, user: *mut c_void, token: i32) -> c_int {
     let t = &mut *(ud as *mut TrampCtx);
-    let cont = catch_unwind(AssertUnwindSafe(|| t.driver.on_token(user as usize, token)))
-        .unwrap_or(false);
+    let cont =
+        catch_unwind(AssertUnwindSafe(|| t.driver.on_token(user as usize, token))).unwrap_or(false);
     i32::from(cont)
 }
 
@@ -472,10 +472,8 @@ mod tests {
     fn bank_payload_paths_stay_opaque() {
         TOKENS.with(|tokens| *tokens.borrow_mut() = vec![10, 20, 30]);
         let mut batch = fake_batch();
-        let path = std::env::temp_dir().join(format!(
-            "ds4-core-bank-payload-{}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ds4-core-bank-payload-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
         batch.save_bank_payload(1, &path).unwrap();

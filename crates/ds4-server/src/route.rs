@@ -180,10 +180,9 @@ pub fn route_decide(needs: u32, surf: WireSurface, env: &RouteEnv) -> RouteDecis
         d.reason = REASON_NEED_DURABLE;
         return d;
     }
-    let tools_promoted = (env.cont_anthropic
-        && env.cont_tools_anthropic
-        && surf == WireSurface::Anthropic)
-        || (env.cont_responses && env.cont_tools_responses && surf == WireSurface::Responses);
+    let tools_promoted =
+        (env.cont_anthropic && env.cont_tools_anthropic && surf == WireSurface::Anthropic)
+            || (env.cont_responses && env.cont_tools_responses && surf == WireSurface::Responses);
     if needs & NEED_LIVE_FRONTIER != 0 {
         d.reason = REASON_NEED_LIVE_FRONTIER;
         return d;
@@ -192,8 +191,7 @@ pub fn route_decide(needs: u32, surf: WireSurface, env: &RouteEnv) -> RouteDecis
         d.reason = REASON_NEED_LIVE_FRONTIER;
         return d;
     }
-    if needs & NEED_CONTINUATION_PUBLISH != 0
-        && !((needs & NEED_STREAMING) != 0 && tools_promoted)
+    if needs & NEED_CONTINUATION_PUBLISH != 0 && !((needs & NEED_STREAMING) != 0 && tools_promoted)
     {
         d.reason = REASON_NEED_CONTINUATION_PUBLISH;
         return d;
@@ -229,10 +227,7 @@ pub fn route_decide(needs: u32, surf: WireSurface, env: &RouteEnv) -> RouteDecis
     }
     let cont_promoted = (env.cont_anthropic && surf == WireSurface::Anthropic)
         || (env.cont_responses && surf == WireSurface::Responses);
-    if surf != WireSurface::OpenaiChat
-        && surf != WireSurface::OpenaiCompletion
-        && !cont_promoted
-    {
+    if surf != WireSurface::OpenaiChat && surf != WireSurface::OpenaiCompletion && !cont_promoted {
         d.reason = REASON_SURFACE;
         return d;
     }

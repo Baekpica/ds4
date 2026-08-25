@@ -4,7 +4,11 @@
 pub const BITS_DEFAULT: u32 = 32;
 
 pub fn bits_or_default(bits: u32) -> u32 {
-    if bits == 0 { BITS_DEFAULT } else { bits }
+    if bits == 0 {
+        BITS_DEFAULT
+    } else {
+        bits
+    }
 }
 
 pub fn bits_valid(bits: u32) -> bool {

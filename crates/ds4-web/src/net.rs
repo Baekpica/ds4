@@ -34,7 +34,10 @@ fn read_some(stream: &mut TcpStream, buf: &mut [u8], timeout_ms: u64) -> Result<
         .map_err(|e| e.to_string())?;
     match stream.read(buf) {
         Ok(n) => Ok(n),
-        Err(e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(e)
+            if e.kind() == std::io::ErrorKind::TimedOut
+                || e.kind() == std::io::ErrorKind::WouldBlock =>
+        {
             Ok(0)
         }
         Err(e) => Err(e.to_string()),
@@ -47,14 +50,22 @@ pub fn http_local(method: &str, port: i32, path: &str) -> Result<String, String>
     let mut fd = tcp_connect("127.0.0.1", port, CONNECT_TIMEOUT_MS)?;
     let req = http_request(method, port, path);
     if write_all(&mut fd, req.as_bytes()).is_err() {
-        return Err(format!("write HTTP request failed: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "write HTTP request failed: {}",
+            std::io::Error::last_os_error()
+        ));
     }
     let mut resp = Vec::new();
     let mut tmp = [0u8; 4096];
     loop {
         let n = match read_some(&mut fd, &mut tmp, CONNECT_TIMEOUT_MS) {
             Ok(n) => n,
-            Err(_) => return Err(format!("read HTTP response failed: {}", std::io::Error::last_os_error())),
+            Err(_) => {
+                return Err(format!(
+                    "read HTTP response failed: {}",
+                    std::io::Error::last_os_error()
+                ))
+            }
         };
         if n == 0 {
             break;
@@ -132,8 +143,12 @@ impl Ws {
         let mut mask = [0u8; 4];
         mask.copy_from_slice(&random_bytes(4));
         let frame = ws_text_frame(text.as_bytes(), mask);
-        write_all(&mut self.stream, &frame)
-            .map_err(|_| format!("websocket write failed: {}", std::io::Error::last_os_error()))
+        write_all(&mut self.stream, &frame).map_err(|_| {
+            format!(
+                "websocket write failed: {}",
+                std::io::Error::last_os_error()
+            )
+        })
     }
 
     fn send_pong(&mut self, payload: &[u8]) -> Result<(), String> {
@@ -169,11 +184,13 @@ impl Ws {
             let mut len = u64::from(h[1] & 0x7f);
             if len == 126 {
                 let mut x = [0u8; 2];
-                self.read_exact(&mut x).map_err(|_| "websocket frame read failed")?;
+                self.read_exact(&mut x)
+                    .map_err(|_| "websocket frame read failed")?;
                 len = (u64::from(x[0]) << 8) | u64::from(x[1]);
             } else if len == 127 {
                 let mut x = [0u8; 8];
-                self.read_exact(&mut x).map_err(|_| "websocket frame read failed")?;
+                self.read_exact(&mut x)
+                    .map_err(|_| "websocket frame read failed")?;
                 len = 0;
                 for b in x {
                     len = (len << 8) | u64::from(b);
@@ -181,14 +198,16 @@ impl Ws {
             }
             let mut mask = [0u8; 4];
             if masked {
-                self.read_exact(&mut mask).map_err(|_| "websocket frame read failed")?;
+                self.read_exact(&mut mask)
+                    .map_err(|_| "websocket frame read failed")?;
             }
             if len > MAX_RESULT_BYTES as u64 * 4 {
                 return Err("websocket message too large".into());
             }
             let mut payload = vec![0u8; len as usize];
             if len > 0 {
-                self.read_exact(&mut payload).map_err(|_| "websocket frame read failed")?;
+                self.read_exact(&mut payload)
+                    .map_err(|_| "websocket frame read failed")?;
             }
             if masked {
                 for i in 0..payload.len() {

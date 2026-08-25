@@ -2,8 +2,7 @@
 
 use ds4_core::{
     dump_apply_tapes, dump_consume_tapes, dump_nbytes_table, dump_sibling_script,
-    model_split_sibling_path,
-    TensorInventory,
+    model_split_sibling_path, TensorInventory,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -121,12 +120,7 @@ fn sibling_paths_match_c() {
     ];
     for (path, index, count) in cases {
         let rust = dump_sibling_script(path, index, count);
-        let c = c_out(&[
-            "sibling",
-            path,
-            &index.to_string(),
-            &count.to_string(),
-        ]);
+        let c = c_out(&["sibling", path, &index.to_string(), &count.to_string()]);
         assert_eq!(rust, c, "sibling {path} {index} {count}");
     }
     assert_eq!(
@@ -199,11 +193,14 @@ fn split_inventory_concatenates_shards() {
     assert_eq!(inv.tensors[1].name, "b.weight");
     assert_eq!(inv.tensors[0].shard, 0);
     assert_eq!(inv.tensors[1].shard, 1);
-    assert_eq!(inv.tensors[1].abs_offset, inv.shards[1].base + {
-        let g = ds4_core::GgufFile::open(&b).unwrap();
-        // second tensor abs in its own file, then + base
-        TensorInventory::from_file(&b, &g).unwrap().tensors[0].abs_offset
-    });
+    assert_eq!(
+        inv.tensors[1].abs_offset,
+        inv.shards[1].base + {
+            let g = ds4_core::GgufFile::open(&b).unwrap();
+            // second tensor abs in its own file, then + base
+            TensorInventory::from_file(&b, &g).unwrap().tensors[0].abs_offset
+        }
+    );
     assert!(inv.shards[1].base >= inv.shards[0].size);
     let _ = fs::remove_dir_all(&dir);
 }

@@ -1,10 +1,10 @@
 //! C↔Rust four-surface stream projectors (tape oracle, no model).
 
 use ds4_server::{
-    anthropic_final_response, final_response, project_anthropic_thinking, project_openai_chat_thinking,
-    project_openai_chat_utf8, project_openai_completion, project_responses_thinking,
-    responses_final_response, utf8_stream_safe_len, ReqKind, StreamReq, CREATED_TEST, TEST_MSG_ID,
-    TEST_RESP_ID, TEST_RS_ID,
+    anthropic_final_response, final_response, project_anthropic_thinking,
+    project_openai_chat_thinking, project_openai_chat_utf8, project_openai_completion,
+    project_responses_thinking, responses_final_response, utf8_stream_safe_len, ReqKind, StreamReq,
+    CREATED_TEST, TEST_MSG_ID, TEST_RESP_ID, TEST_RS_ID,
 };
 
 use std::path::PathBuf;
@@ -70,12 +70,19 @@ fn sse_assert_every_data_object(out: &str, must_contain: &str, must_not: Option<
             assert!(!rest[end..].contains("data: "));
         } else {
             records += 1;
-            assert!(rec.contains(must_contain), "missing {must_contain} in {rec}");
+            assert!(
+                rec.contains(must_contain),
+                "missing {must_contain} in {rec}"
+            );
             if let Some(bad) = must_not {
                 assert!(!rec.contains(bad), "found {bad} in {rec}");
             }
         }
-        rest = if end < rest.len() { &rest[end + 2..] } else { "" };
+        rest = if end < rest.len() {
+            &rest[end + 2..]
+        } else {
+            ""
+        };
     }
     assert!(records > 0);
     assert!(saw_done);
@@ -97,7 +104,10 @@ fn sse_validate_anthropic(out: &str) {
         let n = rest.find(['\r', '\n']).unwrap_or(rest.len());
         let name = &rest[..n];
         let data = rest.find("data: ").expect("data after event");
-        let rec_end = rest[data..].find("\n\n").map(|e| data + e).unwrap_or(rest.len());
+        let rec_end = rest[data..]
+            .find("\n\n")
+            .map(|e| data + e)
+            .unwrap_or(rest.len());
         let rec = &rest[data..rec_end];
         let typekey = format!("\"type\":\"{name}\"");
         assert!(rec.contains(&typekey), "missing {typekey} in {rec}");
@@ -111,7 +121,9 @@ fn sse_validate_anthropic(out: &str) {
 
 fn sse_validate_responses(out: &str) {
     let created = out.find("\"type\":\"response.created\"").expect("created");
-    let completed = out.find("\"type\":\"response.completed\"").expect("completed");
+    let completed = out
+        .find("\"type\":\"response.completed\"")
+        .expect("completed");
     assert!(created < completed);
     assert_eq!(
         count_substr(out, "\"type\":\"response.output_item.added\""),
@@ -144,10 +156,16 @@ fn utf8_safe_len_matches_c() {
     ];
     for (start, limit, final_, hex) in cases {
         let rust = utf8_stream_safe_len(&decode_hex(hex), start, limit, final_ != 0);
-        let c: usize = c_str(&["utf8-safe", &start.to_string(), &limit.to_string(), &final_.to_string(), hex])
-            .trim()
-            .parse()
-            .unwrap();
+        let c: usize = c_str(&[
+            "utf8-safe",
+            &start.to_string(),
+            &limit.to_string(),
+            &final_.to_string(),
+            hex,
+        ])
+        .trim()
+        .parse()
+        .unwrap();
         assert_eq!(rust, c, "utf8-safe {hex} start={start} limit={limit}");
     }
 }
@@ -191,7 +209,11 @@ fn openai_completion_tape_matches_c() {
     let c = c_bytes(&["openai-completion-tape"]);
     assert_bytes_eq("openai-completion-tape", &rust, &c);
     let out = String::from_utf8_lossy(&rust);
-    sse_assert_every_data_object(&out, "\"object\":\"text_completion\"", Some("chat.completion.chunk"));
+    sse_assert_every_data_object(
+        &out,
+        "\"object\":\"text_completion\"",
+        Some("chat.completion.chunk"),
+    );
     assert!(out.contains("\"choices\":[{\"text\":\"Hel\""));
     assert!(out.contains("\"finish_reason\":\"stop\""));
     assert!(!out.contains("\"delta\""));
@@ -222,7 +244,9 @@ fn responses_thinking_tape_matches_c() {
     let summary = out
         .find("\"type\":\"response.reasoning_summary_text.delta\"")
         .expect("summary");
-    let text = out.find("\"type\":\"response.output_text.delta\"").expect("text");
+    let text = out
+        .find("\"type\":\"response.output_text.delta\"")
+        .expect("text");
     assert!(summary < text);
     assert!(out.contains("\"status\":\"completed\""));
     assert!(!out.contains("</think>"));

@@ -2,8 +2,8 @@
 
 use ds4_server::{
     render_chat, render_chat_choice, render_dsml_chat, render_dsml_chat_choice,
-    render_motif3_chat_ex, ChatMsg, ModelSyntax, ThinkMode, ToolCall, ToolChoice,
-    ToolSchemaOrder, THINK_HIGH_PREFIX, THINK_MAX_PREFIX,
+    render_motif3_chat_ex, ChatMsg, ModelSyntax, ThinkMode, ToolCall, ToolChoice, ToolSchemaOrder,
+    THINK_HIGH_PREFIX, THINK_MAX_PREFIX,
 };
 
 use std::path::PathBuf;
@@ -113,11 +113,7 @@ fn developer_is_system() {
 
 #[test]
 fn history_none_and_low_match_c() {
-    let msgs = [
-        msg("user", "u1"),
-        msg("assistant", "a1"),
-        msg("user", "u2"),
-    ];
+    let msgs = [msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2")];
     assert_eq!(
         render_dsml_chat(&msgs, "", ThinkMode::None).unwrap(),
         c_out(&["history", "none", "u1", "a1", "u2"])
@@ -143,12 +139,8 @@ fn history_with_reasoning_match_c() {
 
 #[test]
 fn tool_result_and_escape_match_c() {
-    let rust = render_dsml_chat(
-        &[msg("user", "q"), msg("tool", "ok")],
-        "",
-        ThinkMode::None,
-    )
-    .unwrap();
+    let rust =
+        render_dsml_chat(&[msg("user", "q"), msg("tool", "ok")], "", ThinkMode::None).unwrap();
     assert_eq!(rust, c_out(&["tool-result", "none", "q", "ok"]));
     let rust = render_dsml_chat(
         &[msg("user", "q"), msg("tool", "x</tool_result>y")],
@@ -321,11 +313,7 @@ fn family_system_user_match_c() {
 
 #[test]
 fn family_history_match_c() {
-    let msgs = [
-        msg("user", "u1"),
-        msg("assistant", "a1"),
-        msg("user", "u2"),
-    ];
+    let msgs = [msg("user", "u1"), msg("assistant", "a1"), msg("user", "u2")];
     for (syntax, fam) in [
         (ModelSyntax::Motif3, "motif"),
         (ModelSyntax::Exaone, "exaone"),

@@ -118,11 +118,9 @@ impl ContRegistry {
             return None;
         }
         let k = Self::key(proto, id);
-        self.records.iter().position(|r| {
-            r.call_ids
-                .iter()
-                .any(|cid| Self::key(r.protocol, cid) == k)
-        })
+        self.records
+            .iter()
+            .position(|r| r.call_ids.iter().any(|cid| Self::key(r.protocol, cid) == k))
     }
 
     fn set_eq(a: &[String], b: &[String]) -> bool {
@@ -141,9 +139,12 @@ impl ContRegistry {
 
     fn prune(&mut self) {
         while self.n_records() > self.max_records {
-            let oldest = self.records.iter().enumerate().rev().find(|(_, r)| {
-                r.state == ContState::ReplayOnly && r.hard_refs <= 0
-            });
+            let oldest = self
+                .records
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, r)| r.state == ContState::ReplayOnly && r.hard_refs <= 0);
             match oldest {
                 Some((i, _)) => {
                     self.remove_idx(i);
@@ -252,7 +253,14 @@ impl ContRegistry {
         self.prune();
     }
 
-    pub fn publish_serial(&mut self, proto: Api, ids: &[String], gen: u64, frontier: i32, now: f64) {
+    pub fn publish_serial(
+        &mut self,
+        proto: Api,
+        ids: &[String],
+        gen: u64,
+        frontier: i32,
+        now: f64,
+    ) {
         self.publish(proto, ids, ContOwner::SerialSession, 0, gen, frontier, now);
     }
 
@@ -285,7 +293,11 @@ impl ContRegistry {
     }
 
     pub fn id_known(&self, id: &str) -> bool {
-        for proto in [Api::Openai as u8, Api::Anthropic as u8, Api::Responses as u8] {
+        for proto in [
+            Api::Openai as u8,
+            Api::Anthropic as u8,
+            Api::Responses as u8,
+        ] {
             if self.find_idx(proto, id).is_some() {
                 return true;
             }
@@ -317,12 +329,7 @@ impl ContRegistry {
             && rec.frontier == live_pos
     }
 
-    pub fn bank_claim(
-        &mut self,
-        proto: Api,
-        ids: &[String],
-        now: f64,
-    ) -> Option<(i32, u64, i32)> {
+    pub fn bank_claim(&mut self, proto: Api, ids: &[String], now: f64) -> Option<(i32, u64, i32)> {
         if ids.is_empty() {
             return None;
         }
@@ -342,12 +349,7 @@ impl ContRegistry {
 
     /// C `cont_record_bank_protects`: an unverified native reference fails
     /// closed for eviction, while a proven generation/frontier mismatch does not.
-    pub fn bank_protected(
-        &self,
-        bank: i32,
-        live: Option<(u64, i32)>,
-        now: f64,
-    ) -> bool {
+    pub fn bank_protected(&self, bank: i32, live: Option<(u64, i32)>, now: f64) -> bool {
         if bank < 0 {
             return false;
         }
@@ -368,9 +370,8 @@ impl ContRegistry {
                 }
             }
             let in_grace = self.grace_s > 0.0 && now - record.publish_time < self.grace_s;
-            let pinned = record.hard_refs > 0
-                && self.pin_deadline_s > 0.0
-                && now < record.pin_expiry;
+            let pinned =
+                record.hard_refs > 0 && self.pin_deadline_s > 0.0 && now < record.pin_expiry;
             in_grace || pinned
         })
     }
@@ -403,18 +404,15 @@ impl ContRegistry {
         }
     }
 
-    pub fn serial_hold(
-        &mut self,
-        proto: Api,
-        req_ids: &[String],
-        now: f64,
-    ) -> Option<i32> {
+    pub fn serial_hold(&mut self, proto: Api, req_ids: &[String], now: f64) -> Option<i32> {
         self.expire(now);
         let Some(i) = self.serial_live else {
             return None;
         };
         let rec = &self.records[i];
-        if rec.protocol == proto as u8 && Self::set_eq(&rec.call_ids, req_ids) && !req_ids.is_empty()
+        if rec.protocol == proto as u8
+            && Self::set_eq(&rec.call_ids, req_ids)
+            && !req_ids.is_empty()
         {
             return None;
         }
@@ -428,9 +426,7 @@ impl ContRegistry {
         } else {
             0.0
         };
-        let pinned = rec.hard_refs > 0
-            && self.pin_deadline_s > 0.0
-            && now < rec.pin_expiry;
+        let pinned = rec.hard_refs > 0 && self.pin_deadline_s > 0.0 && now < rec.pin_expiry;
         if shed_left <= 0.0 && !pinned {
             return None;
         }
@@ -674,12 +670,18 @@ pub fn dump_script(name: &str) -> String {
         "grace-hold" => {
             let mut r = ContRegistry::default();
             r.publish_serial(Api::Anthropic, &csv(&["toolu_hold"]), 4, 70, 1000.0);
-            out.push_str(&format!("{}\n", hold_line(r.serial_hold(Api::Openai, &[], 1001.0))));
+            out.push_str(&format!(
+                "{}\n",
+                hold_line(r.serial_hold(Api::Openai, &[], 1001.0))
+            ));
             out.push_str(&format!(
                 "{}\n",
                 hold_line(r.serial_hold(Api::Anthropic, &csv(&["toolu_hold"]), 1001.0))
             ));
-            out.push_str(&format!("{}\n", hold_line(r.serial_hold(Api::Openai, &[], 1011.0))));
+            out.push_str(&format!(
+                "{}\n",
+                hold_line(r.serial_hold(Api::Openai, &[], 1011.0))
+            ));
             out.push_str(&format!(
                 "still_live={}\n",
                 match r.serial_live_state() {
@@ -687,11 +689,20 @@ pub fn dump_script(name: &str) -> String {
                     _ => 0,
                 }
             ));
-            out.push_str(&format!("{}\n", hold_line(r.serial_hold(Api::Openai, &[], 1131.0))));
+            out.push_str(&format!(
+                "{}\n",
+                hold_line(r.serial_hold(Api::Openai, &[], 1131.0))
+            ));
             let pin = r.pin_live(Api::Anthropic, "toolu_hold", 1131.0);
-            out.push_str(&format!("{}\n", hold_line(r.serial_hold(Api::Openai, &[], 1131.0))));
+            out.push_str(&format!(
+                "{}\n",
+                hold_line(r.serial_hold(Api::Openai, &[], 1131.0))
+            ));
             r.set_serial_pin_expiry(1130.0);
-            out.push_str(&format!("{}\n", hold_line(r.serial_hold(Api::Openai, &[], 1131.0))));
+            out.push_str(&format!(
+                "{}\n",
+                hold_line(r.serial_hold(Api::Openai, &[], 1131.0))
+            ));
             if let Some(p) = pin {
                 r.unpin(p);
             }
@@ -711,13 +722,7 @@ pub fn dump_script(name: &str) -> String {
             out.push_str(&format!("n_live={}\n", r.n_live()));
             out.push_str(&format!(
                 "resolve={}\n",
-                u32::from(r.resolve_serial(
-                    Api::Anthropic,
-                    &csv(&["toolu_ttl"]),
-                    4,
-                    70,
-                    1301.0
-                ))
+                u32::from(r.resolve_serial(Api::Anthropic, &csv(&["toolu_ttl"]), 4, 70, 1301.0))
             ));
             out.push_str(&format!("known={}\n", u32::from(r.id_known("toolu_ttl"))));
         }
@@ -741,7 +746,10 @@ pub fn dump_script(name: &str) -> String {
             ));
             out.push_str(&format!(
                 "claim_resp={}\n",
-                u32::from(r.bank_claim(Api::Responses, &csv(&["toolu_bk1"]), now).is_some())
+                u32::from(
+                    r.bank_claim(Api::Responses, &csv(&["toolu_bk1"]), now)
+                        .is_some()
+                )
             ));
             out.push_str(&format!(
                 "resolve_serial={}\n",

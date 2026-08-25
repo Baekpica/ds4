@@ -14,18 +14,20 @@ use std::time::{Duration, Instant};
 use ds4_sys::{libc_atof, libc_atoi, libc_strtoull10};
 
 use crate::admit::{
-    enqueue, enqueue_release, enqueue_shed_error, next_job_id, preparse_shed, AdmitState, EnqVerdict,
-    queue_unlink_head, SHED_CONT_HOLD, SHED_QUEUE_AGE, SHED_SLOW_READER,
+    enqueue, enqueue_release, enqueue_shed_error, next_job_id, preparse_shed, queue_unlink_head,
+    AdmitState, EnqVerdict, SHED_CONT_HOLD, SHED_QUEUE_AGE, SHED_SLOW_READER,
 };
 use crate::cont::{monotonic_now, ContPin, ContRegistry};
 use crate::error::{http_response_bytes, wire_http_error_bytes};
 use crate::generate::{generate_terminal_at, DecodeIo, GenerateError, GenerateOutcome};
-use crate::http::{chunked_enabled, parse_surface_for_path, read_http_request, shed_surface_for_path};
-use crate::metrics::{
-    gov_modes_from_env, render_metrics, render_stats_json_ex, RouteMetrics, RuntimeMetrics,
+use crate::http::{
+    chunked_enabled, parse_surface_for_path, read_http_request, shed_surface_for_path,
 };
 #[cfg(feature = "native")]
 use crate::metrics::MemCell;
+use crate::metrics::{
+    gov_modes_from_env, render_metrics, render_stats_json_ex, RouteMetrics, RuntimeMetrics,
+};
 use crate::models::{model_id_known, model_one_json, models_list_json};
 use crate::parse::{parse_request, ParseEnv};
 use crate::route::{route_decide, Api, RouteEnv, ThinkMode, WireSurface, LANE_CONTINUOUS};
@@ -97,7 +99,11 @@ fn parse_f64_bound(value: Option<&OsStr>, default: f64) -> f64 {
     match value {
         Some(value) => {
             let value = libc_atof(os_str_bytes(value));
-            if value < 0.0 { 0.0 } else { value }
+            if value < 0.0 {
+                0.0
+            } else {
+                value
+            }
         }
         None => default,
     }
@@ -119,16 +125,10 @@ impl Default for ServerConfig {
             cors: false,
             codex_models_json: None,
             max_queue: env_i32_bound("DS4_SERVER_MAX_QUEUE", 256),
-            max_queue_bytes: env_u64_bound(
-                "DS4_SERVER_MAX_QUEUE_BYTES",
-                256 * 1024 * 1024,
-            ),
+            max_queue_bytes: env_u64_bound("DS4_SERVER_MAX_QUEUE_BYTES", 256 * 1024 * 1024),
             max_clients: env_i32_bound("DS4_SERVER_MAX_CLIENTS", 256),
             max_queue_age_s: env_f64_bound("DS4_SERVER_MAX_QUEUE_AGE_S", 600.0),
-            out_agg_cap_bytes: env_u64_bound(
-                "DS4_SERVER_OUT_AGG_CAP",
-                JOB_SINK_AGG_CAP_BYTES,
-            ),
+            out_agg_cap_bytes: env_u64_bound("DS4_SERVER_OUT_AGG_CAP", JOB_SINK_AGG_CAP_BYTES),
             out_agg_evict_min_bytes: env_u64_bound(
                 "DS4_SERVER_OUT_AGG_EVICT_MIN",
                 JOB_SINK_AGG_EVICT_MIN_BYTES,
@@ -371,11 +371,7 @@ trait TerminalSink: Write {
     ) -> TerminalCommit;
 }
 
-fn publish_tool_turn(
-    inner: &Mutex<ServerInner>,
-    api: Api,
-    generated: &GenerateOutcome,
-) {
+fn publish_tool_turn(inner: &Mutex<ServerInner>, api: Api, generated: &GenerateOutcome) {
     lock_inner(inner).creg.publish_serial(
         api,
         &generated.tool_ids,
@@ -454,18 +450,10 @@ impl TerminalSink for DirectSink<'_> {
         generated: &GenerateOutcome,
         terminal: Vec<u8>,
     ) -> TerminalCommit {
-        direct_terminal_commit(
-            inner,
-            api,
-            generated,
-            &terminal,
-            |action| match action {
-                DirectTerminalIo::Disconnected => Ok(client_disconnected(self.0)),
-                DirectTerminalIo::Send(bytes) => {
-                    send_all_nonblocking(self.0, bytes).map(|_| false)
-                }
-            },
-        )
+        direct_terminal_commit(inner, api, generated, &terminal, |action| match action {
+            DirectTerminalIo::Disconnected => Ok(client_disconnected(self.0)),
+            DirectTerminalIo::Send(bytes) => send_all_nonblocking(self.0, bytes).map(|_| false),
+        })
     }
 }
 
@@ -552,7 +540,12 @@ fn job_sink_with_probe(
         buffer: Mutex::new(SinkBuffer::default()),
         ready: Condvar::new(),
     });
-    (JobSink { state: Arc::clone(&state) }, state)
+    (
+        JobSink {
+            state: Arc::clone(&state),
+        },
+        state,
+    )
 }
 
 fn api_for_surface(surf: WireSurface) -> Api {
@@ -596,9 +589,18 @@ struct Settlement {
 }
 
 impl Settlement {
-    const COMPLETED: Self = Self { outcome: Settle::Completed, shed: None };
-    const FAILED: Self = Self { outcome: Settle::Failed, shed: None };
-    const CANCELED: Self = Self { outcome: Settle::Canceled, shed: None };
+    const COMPLETED: Self = Self {
+        outcome: Settle::Completed,
+        shed: None,
+    };
+    const FAILED: Self = Self {
+        outcome: Settle::Failed,
+        shed: None,
+    };
+    const CANCELED: Self = Self {
+        outcome: Settle::Canceled,
+        shed: None,
+    };
 
     fn shed(reason: u8) -> Self {
         Self {
@@ -657,11 +659,7 @@ struct JobLease {
 }
 
 impl JobLease {
-    fn new(
-        inner: Arc<Mutex<ServerInner>>,
-        body_bytes: u64,
-        pin: Option<ContPin>,
-    ) -> Self {
+    fn new(inner: Arc<Mutex<ServerInner>>, body_bytes: u64, pin: Option<ContPin>) -> Self {
         Self {
             inner,
             body_bytes,
@@ -800,9 +798,13 @@ pub fn handle_client_inner(
     };
     if let Some((reason, code, retry, msg)) = enqueue_shed_error(verdict) {
         lock_inner(inner).metrics.record_shed(reason);
-        let _ = out.write_all(
-            &wire_http_error_bytes(job.surface, code, msg, cfg.cors, Some(retry)),
-        );
+        let _ = out.write_all(&wire_http_error_bytes(
+            job.surface,
+            code,
+            msg,
+            cfg.cors,
+            Some(retry),
+        ));
         return;
     }
     let pin = BorrowedPin { inner, pin };
@@ -873,7 +875,13 @@ fn prepare_client(
         };
         write_all(
             stream,
-            &http_response_bytes(200, Some("text/plain; version=0.0.4"), None, cfg.cors, &body),
+            &http_response_bytes(
+                200,
+                Some("text/plain; version=0.0.4"),
+                None,
+                cfg.cors,
+                &body,
+            ),
         );
         return None;
     }
@@ -921,7 +929,11 @@ fn prepare_client(
             let body = std::str::from_utf8(&req.body).unwrap_or("");
             match parse_request(surf, &env, body) {
                 Err(e) => {
-                    let msg = if e.is_empty() { "invalid JSON request" } else { &e };
+                    let msg = if e.is_empty() {
+                        "invalid JSON request"
+                    } else {
+                        &e
+                    };
                     write_all(
                         stream,
                         &wire_http_error_bytes(surf, 400, msg, cfg.cors, None),
@@ -942,7 +954,13 @@ fn prepare_client(
     }
     write_all(
         stream,
-        &wire_http_error_bytes(WireSurface::OpenaiChat, 404, "unknown endpoint", cfg.cors, None),
+        &wire_http_error_bytes(
+            WireSurface::OpenaiChat,
+            404,
+            "unknown endpoint",
+            cfg.cors,
+            None,
+        ),
     );
     None
 }
@@ -965,12 +983,8 @@ fn run_prepared<W: TerminalSink>(
     let route_env = RouteEnv {
         coalesce: cont_gate.is_some(),
         have_cont: cont_gate.is_some(),
-        cont_anthropic: parse_default_on(
-            std::env::var_os("DS4_SERVER_CONT_ANTHROPIC").as_deref(),
-        ),
-        cont_responses: parse_default_on(
-            std::env::var_os("DS4_SERVER_CONT_RESPONSES").as_deref(),
-        ),
+        cont_anthropic: parse_default_on(std::env::var_os("DS4_SERVER_CONT_ANTHROPIC").as_deref()),
+        cont_responses: parse_default_on(std::env::var_os("DS4_SERVER_CONT_RESPONSES").as_deref()),
         cont_tools_anthropic: false,
         cont_tools_responses: false,
         seq_cap: cont_gate.map_or(cfg.ctx, |(_, cap)| cap),
@@ -980,17 +994,7 @@ fn run_prepared<W: TerminalSink>(
     let id = next_job_id(&mut lock_inner(inner).admit, job.parsed.kind);
     let arrived_at = arrived_at.unwrap_or_else(Instant::now);
     let (actual_lane, settlement) = match engine {
-        Some(engine) => run_engine(
-            cfg,
-            inner,
-            job,
-            &id,
-            dec,
-            engine,
-            cont,
-            out,
-            arrived_at,
-        ),
+        Some(engine) => run_engine(cfg, inner, job, &id, dec, engine, cont, out, arrived_at),
         None => {
             let msg = if cfg.have_engine {
                 "generation remains on C ds4-server"
@@ -1099,13 +1103,8 @@ fn run_serial<W: TerminalSink>(
     let pos = engine.pos();
     let resolved = {
         let mut g = lock_inner(inner);
-        g.creg.resolve_serial(
-            parsed.api,
-            &parsed.live_call_ids,
-            generation,
-            pos,
-            now,
-        )
+        g.creg
+            .resolve_serial(parsed.api, &parsed.live_call_ids, generation, pos, now)
     };
     let requires_live =
         parsed.anthropic_requires_live_tool_state || parsed.responses_requires_live_tool_state;
@@ -1261,7 +1260,12 @@ fn send_all_nonblocking(stream: &mut TcpStream, mut bytes: &[u8]) -> std::io::Re
     let mut deadline = Instant::now() + CLIENT_SEND_STALL_TIMEOUT;
     while !bytes.is_empty() {
         match stream.write(bytes) {
-            Ok(0) => return Err(Error::new(ErrorKind::WriteZero, "socket write returned zero")),
+            Ok(0) => {
+                return Err(Error::new(
+                    ErrorKind::WriteZero,
+                    "socket write returned zero",
+                ))
+            }
             Ok(n) => {
                 bytes = &bytes[n..];
                 deadline = Instant::now() + CLIENT_SEND_STALL_TIMEOUT;
@@ -1380,13 +1384,7 @@ fn queue_client(
         let mut job = err.0;
         let wrote = send_all_nonblocking(
             &mut stream,
-            &wire_http_error_bytes(
-                surface,
-                503,
-                "server is shutting down",
-                cfg.cors,
-                None,
-            ),
+            &wire_http_error_bytes(surface, 503, "server is shutting down", cfg.cors, None),
         )
         .is_ok();
         job.lease.settlement = if wrote {
@@ -1492,9 +1490,8 @@ fn owner_loop(
             let inner = Arc::clone(&accept_inner);
             let jobs = jobs_tx.clone();
             let client = ClientLease::new(Arc::clone(&inner));
-            let _ = thread::Builder::new().spawn(move || {
-                queue_client(cfg, inner, jobs, stream, client)
-            });
+            let _ = thread::Builder::new()
+                .spawn(move || queue_client(cfg, inner, jobs, stream, client));
         }
         lock_inner(&accept_inner).admit.stopping = true;
     });
@@ -1513,10 +1510,7 @@ fn owner_loop(
     shutdown_owner(engine, cont);
 }
 
-fn shutdown_owner(
-    engine: &mut dyn DecodeIo,
-    mut cont: Option<&mut dyn ContExec>,
-) {
+fn shutdown_owner(engine: &mut dyn DecodeIo, mut cont: Option<&mut dyn ContExec>) {
     if let Err(error) = engine.shutdown() {
         eprintln!("ds4-server-rs: serial shutdown checkpoint failed: {error}");
     }
@@ -1594,12 +1588,24 @@ mod owner_tests {
     }
 
     impl DecodeIo for DisconnectDecode {
-        fn model_id(&self) -> i32 { 0 }
-        fn tokenize_text(&self, _text: &str) -> Result<Vec<i32>, GenerateError> { Ok(vec![1]) }
-        fn tokenize_rendered_chat(&self, _text: &[u8]) -> Result<Vec<i32>, GenerateError> { Ok(vec![1]) }
-        fn tokenizes_control_literals(&self) -> bool { false }
-        fn token_text(&self, _token: i32) -> Result<Vec<u8>, GenerateError> { Ok(b"x".to_vec()) }
-        fn token_is_stop(&self, _token: i32) -> bool { false }
+        fn model_id(&self) -> i32 {
+            0
+        }
+        fn tokenize_text(&self, _text: &str) -> Result<Vec<i32>, GenerateError> {
+            Ok(vec![1])
+        }
+        fn tokenize_rendered_chat(&self, _text: &[u8]) -> Result<Vec<i32>, GenerateError> {
+            Ok(vec![1])
+        }
+        fn tokenizes_control_literals(&self) -> bool {
+            false
+        }
+        fn token_text(&self, _token: i32) -> Result<Vec<u8>, GenerateError> {
+            Ok(b"x".to_vec())
+        }
+        fn token_is_stop(&self, _token: i32) -> bool {
+            false
+        }
         fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError> {
             self.pos = tokens.len() as i32;
             Ok(())
@@ -1621,18 +1627,30 @@ mod owner_tests {
                 started.send(()).unwrap();
                 self.resume.recv_timeout(Duration::from_secs(1)).unwrap();
             }
-            if self.samples >= 5 { return -1; }
+            if self.samples >= 5 {
+                return -1;
+            }
             self.samples += 1;
             1
         }
-        fn pos(&self) -> i32 { self.pos }
-        fn ctx(&self) -> i32 { 8192 }
-        fn generation(&self) -> u64 { 1 }
-        fn invalidate(&mut self) { self.pos = 0; }
+        fn pos(&self) -> i32 {
+            self.pos
+        }
+        fn ctx(&self) -> i32 {
+            8192
+        }
+        fn generation(&self) -> u64 {
+            1
+        }
+        fn invalidate(&mut self) {
+            self.pos = 0;
+        }
     }
 
     impl DecodeIo for SlowPrepDecode {
-        fn model_id(&self) -> i32 { 0 }
+        fn model_id(&self) -> i32 {
+            0
+        }
         fn tokenize_text(&self, _text: &str) -> Result<Vec<i32>, GenerateError> {
             thread::sleep(Duration::from_millis(100));
             Ok(vec![1])
@@ -1640,9 +1658,15 @@ mod owner_tests {
         fn tokenize_rendered_chat(&self, _text: &[u8]) -> Result<Vec<i32>, GenerateError> {
             self.tokenize_text("")
         }
-        fn tokenizes_control_literals(&self) -> bool { false }
-        fn token_text(&self, _token: i32) -> Result<Vec<u8>, GenerateError> { Ok(b"x".to_vec()) }
-        fn token_is_stop(&self, _token: i32) -> bool { false }
+        fn tokenizes_control_literals(&self) -> bool {
+            false
+        }
+        fn token_text(&self, _token: i32) -> Result<Vec<u8>, GenerateError> {
+            Ok(b"x".to_vec())
+        }
+        fn token_is_stop(&self, _token: i32) -> bool {
+            false
+        }
         fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError> {
             thread::sleep(Duration::from_millis(40));
             self.pos = tokens.len() as i32;
@@ -1660,12 +1684,25 @@ mod owner_tests {
             _min_p: f32,
             _rng: &mut u64,
         ) -> i32 {
-            if self.sampled { -1 } else { self.sampled = true; 1 }
+            if self.sampled {
+                -1
+            } else {
+                self.sampled = true;
+                1
+            }
         }
-        fn pos(&self) -> i32 { self.pos }
-        fn ctx(&self) -> i32 { 8192 }
-        fn generation(&self) -> u64 { 1 }
-        fn invalidate(&mut self) { self.pos = 0; }
+        fn pos(&self) -> i32 {
+            self.pos
+        }
+        fn ctx(&self) -> i32 {
+            8192
+        }
+        fn generation(&self) -> u64 {
+            1
+        }
+        fn invalidate(&mut self) {
+            self.pos = 0;
+        }
         fn shutdown(&mut self) -> Result<(), GenerateError> {
             if let Some(order) = &self.shutdown_order {
                 order.lock().unwrap().push("serial");
@@ -1834,7 +1871,9 @@ mod owner_tests {
                 queue_client(client_cfg, client_inner, client_jobs, server, lease)
             }));
             for _ in 0..1000 {
-                if lock_inner(&inner).admit.queued == expected { break; }
+                if lock_inner(&inner).admit.queued == expected {
+                    break;
+                }
                 thread::sleep(Duration::from_millis(1));
             }
             assert_eq!(lock_inner(&inner).admit.queued, expected);
@@ -1842,7 +1881,9 @@ mod owner_tests {
         }
 
         let mut refused = TcpStream::connect(addr).unwrap();
-        refused.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        refused
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let (server, _) = listener.accept().unwrap();
         refused.write_all(request.as_bytes()).unwrap();
         let refuse_cfg = cfg.clone();
@@ -1863,7 +1904,11 @@ mod owner_tests {
         assert_eq!(lock_inner(&inner).admit.queued, 256);
 
         let jobs: Vec<_> = jobs_rx.try_iter().collect();
-        assert_eq!(jobs.len(), 256, "unbounded channel must be admission-bounded");
+        assert_eq!(
+            jobs.len(),
+            256,
+            "unbounded channel must be admission-bounded"
+        );
         drop(jobs);
         drop(clients);
         for thread in threads {
@@ -1983,7 +2028,10 @@ mod owner_tests {
 
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
         let g = lock_inner(&inner);
-        assert_eq!(g.metrics.route_requests[WireSurface::Anthropic as usize][1], 1);
+        assert_eq!(
+            g.metrics.route_requests[WireSurface::Anthropic as usize][1],
+            1
+        );
         assert_eq!(g.runtime.requests_serial, 0);
     }
 
@@ -2018,7 +2066,10 @@ mod owner_tests {
 
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
         let g = lock_inner(&inner);
-        assert_eq!(g.metrics.route_requests[WireSurface::Responses as usize][1], 1);
+        assert_eq!(
+            g.metrics.route_requests[WireSurface::Responses as usize][1],
+            1
+        );
         assert_eq!(g.runtime.requests_serial, 0);
     }
 
@@ -2064,7 +2115,10 @@ mod owner_tests {
         }
         assert_eq!(state.backlog_bytes(), expected.len() as u64);
         assert!(!state.slow());
-        assert_eq!(lock_inner(&inner).runtime.out_backlog_bytes, expected.len() as u64);
+        assert_eq!(
+            lock_inner(&inner).runtime.out_backlog_bytes,
+            expected.len() as u64
+        );
         assert_eq!(state.take(), expected);
         assert_eq!(state.backlog_bytes(), 0);
         assert_eq!(lock_inner(&inner).runtime.out_backlog_bytes, 0);
@@ -2090,13 +2144,18 @@ mod owner_tests {
         let wake = thread::spawn(move || {
             let mut buffer = clean_watch.lock();
             while buffer.bytes.is_empty() {
-                buffer = clean_watch.ready.wait(buffer).unwrap_or_else(|e| e.into_inner());
+                buffer = clean_watch
+                    .ready
+                    .wait(buffer)
+                    .unwrap_or_else(|e| e.into_inner());
             }
             drop(buffer);
             assert!(
-                lock_inner(&clean_registry)
-                    .creg
-                    .live_has_id(Api::Responses, "call-clean", monotonic_now()),
+                lock_inner(&clean_registry).creg.live_has_id(
+                    Api::Responses,
+                    "call-clean",
+                    monotonic_now()
+                ),
                 "terminal became drainable before publication"
             );
         });
@@ -2137,13 +2196,8 @@ mod owner_tests {
         let full_inner = Arc::new(Mutex::new(ServerInner::from_cfg(&cfg)));
         {
             let mut g = lock_inner(&full_inner);
-            g.creg.publish_serial(
-                Api::Responses,
-                &["call-old".into()],
-                1,
-                10,
-                monotonic_now(),
-            );
+            g.creg
+                .publish_serial(Api::Responses, &["call-old".into()], 1, 10, monotonic_now());
             g.runtime.out_backlog_bytes = g.out_agg_cap_bytes;
         }
         let (mut full, full_state) = job_sink(Arc::clone(&full_inner));
@@ -2174,8 +2228,7 @@ mod owner_tests {
         server.set_nonblocking(true).unwrap();
         client.shutdown(std::net::Shutdown::Both).unwrap();
         drop(client);
-        let (mut sink, state) =
-            job_sink_with_probe(Arc::clone(&inner), Some(server));
+        let (mut sink, state) = job_sink_with_probe(Arc::clone(&inner), Some(server));
 
         assert_eq!(
             sink.commit_tool_terminal(
@@ -2207,8 +2260,7 @@ mod owner_tests {
             server.set_nonblocking(true).unwrap();
             client.shutdown(std::net::Shutdown::Both).unwrap();
             drop(client);
-            let (mut sink, state) =
-                job_sink_with_probe(Arc::clone(&inner), Some(server));
+            let (mut sink, state) = job_sink_with_probe(Arc::clone(&inner), Some(server));
 
             assert_eq!(sink.flush().is_err(), expect_error);
             assert_eq!(state.gone(), expect_error);
@@ -2281,7 +2333,11 @@ mod owner_tests {
             .unwrap();
             let stable = [b"call_".as_slice(), b"toolu_".as_slice()]
                 .iter()
-                .filter_map(|needle| prefix.windows(needle.len()).position(|window| window == *needle))
+                .filter_map(|needle| {
+                    prefix
+                        .windows(needle.len())
+                        .position(|window| window == *needle)
+                })
                 .min()
                 .unwrap_or(prefix.len());
             assert!(full.starts_with(&prefix[..stable]));
@@ -2294,16 +2350,15 @@ mod owner_tests {
         let cfg = test_cfg();
         let inner = Mutex::new(ServerInner::from_cfg(&cfg));
         let outcome = tool_outcome("call-partial", 5, 50);
-        let result = direct_terminal_commit(
-            &inner,
-            Api::Responses,
-            &outcome,
-            b"terminal",
-            |action| match action {
-                DirectTerminalIo::Disconnected => Ok(false),
-                DirectTerminalIo::Send(_) => Err(Error::new(ErrorKind::BrokenPipe, "late failure")),
-            },
-        );
+        let result =
+            direct_terminal_commit(&inner, Api::Responses, &outcome, b"terminal", |action| {
+                match action {
+                    DirectTerminalIo::Disconnected => Ok(false),
+                    DirectTerminalIo::Send(_) => {
+                        Err(Error::new(ErrorKind::BrokenPipe, "late failure"))
+                    }
+                }
+            });
 
         assert_eq!(result, TerminalCommit::FailedAfterStart);
         let mut g = lock_inner(&inner);
@@ -2361,10 +2416,7 @@ mod owner_tests {
         assert_eq!(g.creg.n_live(), 0);
     }
 
-    fn admit_test_job(
-        inner: &Arc<Mutex<ServerInner>>,
-        prepared: &PreparedJob,
-    ) -> JobLease {
+    fn admit_test_job(inner: &Arc<Mutex<ServerInner>>, prepared: &PreparedJob) -> JobLease {
         let mut g = lock_inner(inner);
         assert_eq!(enqueue(&mut g.admit, prepared.body_bytes), EnqVerdict::Ok);
         let pin = acquire_continuation_pin(&mut g, &prepared.parsed, monotonic_now());
@@ -2473,13 +2525,8 @@ mod owner_tests {
         {
             let mut g = lock_inner(&inner);
             g.creg.ttl_s = 0.01;
-            g.creg.publish_serial(
-                Api::Responses,
-                &["call-1".into()],
-                1,
-                1,
-                now,
-            );
+            g.creg
+                .publish_serial(Api::Responses, &["call-1".into()], 1, 1, now);
         }
         let mut prepared = queued_completion("tool output", 19);
         prepared.surface = WireSurface::Responses;
@@ -2512,14 +2559,8 @@ mod owner_tests {
         {
             let mut g = lock_inner(&inner);
             g.creg.grace_s = 0.0;
-            g.creg.publish_bank(
-                Api::Responses,
-                &["call-bank".into()],
-                2,
-                7,
-                100,
-                now,
-            );
+            g.creg
+                .publish_bank(Api::Responses, &["call-bank".into()], 2, 7, 100, now);
         }
         let mut prepared = queued_completion("tool output", 19);
         prepared.surface = WireSurface::Responses;
@@ -2562,7 +2603,10 @@ mod owner_tests {
         run_owner_job(&cfg, &inner, &mut engine, None, job);
         let response = String::from_utf8(settle_drain(drain)).unwrap();
 
-        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"), "{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{response}"
+        );
         let g = lock_inner(&inner);
         assert_eq!(g.metrics.shed[SHED_CONT_HOLD as usize], 1);
         assert_eq!(g.runtime.requests_completed, 0);
@@ -2586,7 +2630,10 @@ mod owner_tests {
         run_owner_job(&cfg, &inner, &mut engine, None, job);
         let response = String::from_utf8(settle_drain(drain)).unwrap();
 
-        assert!(response.starts_with("HTTP/1.1 503 Service Unavailable"), "{response}");
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{response}"
+        );
         assert!(response.contains("Retry-After: 30"), "{response}");
         assert_eq!(engine.pos, 0);
         let g = lock_inner(&inner);
@@ -2698,7 +2745,10 @@ mod owner_tests {
 
         let response = String::from_utf8(response).unwrap();
         let ttft_ms = response_number(&response, "\"ttft_ms\":");
-        assert!(ttft_ms < 80.0, "body read leaked into ttft={ttft_ms}: {response}");
+        assert!(
+            ttft_ms < 80.0,
+            "body read leaked into ttft={ttft_ms}: {response}"
+        );
     }
 
     #[test]
@@ -2834,7 +2884,8 @@ mod owner_tests {
         prepared.parsed.stream = true;
         let lease = admit_test_job(&inner, &prepared);
         let (mut sink, state) = job_sink(Arc::clone(&inner));
-        sink.write_all(&vec![0; JOB_SINK_CAP_BYTES as usize]).unwrap();
+        sink.write_all(&vec![0; JOB_SINK_CAP_BYTES as usize])
+            .unwrap();
         let (done_tx, done_rx) = mpsc::channel();
         let job = OwnerJob {
             lease,
@@ -2921,7 +2972,11 @@ mod owner_tests {
         drain_thread.join().unwrap();
 
         assert!(state.gone(), "decode probe must observe the TCP disconnect");
-        assert!(engine.evals <= 1, "decode continued for {} tokens", engine.evals);
+        assert!(
+            engine.evals <= 1,
+            "decode continued for {} tokens",
+            engine.evals
+        );
         let g = lock_inner(&inner);
         assert_eq!(g.runtime.requests_canceled, 1);
         assert_eq!(g.runtime.requests_inflight, 0);

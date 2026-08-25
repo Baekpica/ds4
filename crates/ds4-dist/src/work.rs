@@ -52,9 +52,12 @@ pub fn decode_work_body(buf: &[u8]) -> Result<WorkBody, CodecError> {
     }
     let work = Work::decode(buf)?;
     let rest = &buf[WORK_FIXED_BYTES..];
-    let expected = work.token_bytes as usize + work.input_hc_bytes as usize + work.route_bytes as usize;
+    let expected =
+        work.token_bytes as usize + work.input_hc_bytes as usize + work.route_bytes as usize;
     if work.token_bytes as usize != work.n_tokens as usize * 4 || rest.len() != expected {
-        return Err(CodecError::Invalid("invalid distributed WORK payload sizes"));
+        return Err(CodecError::Invalid(
+            "invalid distributed WORK payload sizes",
+        ));
     }
     let (tok, rest) = rest.split_at(work.token_bytes as usize);
     let tokens = decode_tokens_be(tok)?;
@@ -102,7 +105,9 @@ pub fn encode_result_frame(body: &ResultBody) -> Result<Vec<u8>, CodecError> {
 
 pub fn decode_result_body(buf: &[u8]) -> Result<ResultBody, CodecError> {
     if buf.len() < RESULT_FIXED_BYTES {
-        return Err(CodecError::Invalid("distributed worker returned invalid frame"));
+        return Err(CodecError::Invalid(
+            "distributed worker returned invalid frame",
+        ));
     }
     let hdr = ResultHdr::decode(buf)?;
     let rest = &buf[RESULT_FIXED_BYTES..];
@@ -111,7 +116,9 @@ pub fn decode_result_body(buf: &[u8]) -> Result<ResultBody, CodecError> {
         || hdr.telemetry_bytes as usize > rest.len()
         || hdr.payload_bytes as usize != rest.len() - hdr.telemetry_bytes as usize
     {
-        return Err(CodecError::Invalid("distributed result telemetry metadata mismatch"));
+        return Err(CodecError::Invalid(
+            "distributed result telemetry metadata mismatch",
+        ));
     }
     let (tel, rest) = rest.split_at(hdr.telemetry_bytes as usize);
     let mut telemetry = Vec::new();

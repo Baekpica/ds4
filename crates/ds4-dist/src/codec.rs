@@ -133,37 +133,137 @@ macro_rules! rec {
     };
 }
 
-rec!(Hello, HELLO_FIXED_BYTES, [
-    model_id, quant_bits, layer_start, layer_end, has_output, has_hidden,
-    ctx_size, n_layers, listen_port, model_name_len
-]);
-rec!(Work, WORK_FIXED_BYTES, [
-    model_id, session_hi, session_lo, request_hi, request_lo,
-    prefix_hash_hi, prefix_hash_lo, result_hash_hi, result_hash_lo,
-    pos0, n_tokens, layer_start, layer_end, flags, token_bytes,
-    input_hc_bytes, input_hc_bits, route_count, route_index, route_bytes
-]);
-rec!(Route, ROUTE_FIXED_BYTES, [host_len, port, layer_start, layer_end, flags]);
-rec!(RouteReturn, ROUTE_RETURN_FIXED_BYTES, [kind, host_len, port]);
-rec!(ResultHdr, RESULT_FIXED_BYTES, [
-    request_hi, request_lo, result_hash_hi, result_hash_lo, status,
-    result_kind, telemetry_count, telemetry_bytes, payload_bytes, payload_bits
-]);
-rec!(Telemetry, TELEMETRY_FIXED_BYTES, [
-    layer_start, layer_end, route_index, pos0, n_tokens, eval_usec,
-    downstream_wait_usec, forward_send_usec, input_bytes, output_bytes
-]);
-rec!(SnapshotReq, SNAPSHOT_REQ_FIXED_BYTES, [
-    model_id, session_hi, session_lo, request_hi, request_lo,
-    token_hash_hi, token_hash_lo, token_count, layer_start, layer_end
-]);
-rec!(SnapshotBegin, SNAPSHOT_BEGIN_FIXED_BYTES, [
-    model_id, session_hi, session_lo, request_hi, request_lo,
-    token_hash_hi, token_hash_lo, token_count, layer_start, layer_end,
-    payload_hi, payload_lo, status, token_bytes, message_bytes
-]);
-rec!(SnapshotChunk, SNAPSHOT_CHUNK_FIXED_BYTES, [request_hi, request_lo, chunk_bytes]);
-rec!(SnapshotDone, SNAPSHOT_DONE_FIXED_BYTES, [request_hi, request_lo, status, message_bytes]);
+rec!(
+    Hello,
+    HELLO_FIXED_BYTES,
+    [
+        model_id,
+        quant_bits,
+        layer_start,
+        layer_end,
+        has_output,
+        has_hidden,
+        ctx_size,
+        n_layers,
+        listen_port,
+        model_name_len
+    ]
+);
+rec!(
+    Work,
+    WORK_FIXED_BYTES,
+    [
+        model_id,
+        session_hi,
+        session_lo,
+        request_hi,
+        request_lo,
+        prefix_hash_hi,
+        prefix_hash_lo,
+        result_hash_hi,
+        result_hash_lo,
+        pos0,
+        n_tokens,
+        layer_start,
+        layer_end,
+        flags,
+        token_bytes,
+        input_hc_bytes,
+        input_hc_bits,
+        route_count,
+        route_index,
+        route_bytes
+    ]
+);
+rec!(
+    Route,
+    ROUTE_FIXED_BYTES,
+    [host_len, port, layer_start, layer_end, flags]
+);
+rec!(
+    RouteReturn,
+    ROUTE_RETURN_FIXED_BYTES,
+    [kind, host_len, port]
+);
+rec!(
+    ResultHdr,
+    RESULT_FIXED_BYTES,
+    [
+        request_hi,
+        request_lo,
+        result_hash_hi,
+        result_hash_lo,
+        status,
+        result_kind,
+        telemetry_count,
+        telemetry_bytes,
+        payload_bytes,
+        payload_bits
+    ]
+);
+rec!(
+    Telemetry,
+    TELEMETRY_FIXED_BYTES,
+    [
+        layer_start,
+        layer_end,
+        route_index,
+        pos0,
+        n_tokens,
+        eval_usec,
+        downstream_wait_usec,
+        forward_send_usec,
+        input_bytes,
+        output_bytes
+    ]
+);
+rec!(
+    SnapshotReq,
+    SNAPSHOT_REQ_FIXED_BYTES,
+    [
+        model_id,
+        session_hi,
+        session_lo,
+        request_hi,
+        request_lo,
+        token_hash_hi,
+        token_hash_lo,
+        token_count,
+        layer_start,
+        layer_end
+    ]
+);
+rec!(
+    SnapshotBegin,
+    SNAPSHOT_BEGIN_FIXED_BYTES,
+    [
+        model_id,
+        session_hi,
+        session_lo,
+        request_hi,
+        request_lo,
+        token_hash_hi,
+        token_hash_lo,
+        token_count,
+        layer_start,
+        layer_end,
+        payload_hi,
+        payload_lo,
+        status,
+        token_bytes,
+        message_bytes
+    ]
+);
+rec!(
+    SnapshotChunk,
+    SNAPSHOT_CHUNK_FIXED_BYTES,
+    [request_hi, request_lo, chunk_bytes]
+);
+rec!(
+    SnapshotDone,
+    SNAPSHOT_DONE_FIXED_BYTES,
+    [request_hi, request_lo, status, message_bytes]
+);
 
 pub fn encode_hello_payload(h: &Hello, model_name: &str) -> Result<Vec<u8>, CodecError> {
     let name = model_name.as_bytes();

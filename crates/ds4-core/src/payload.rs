@@ -217,7 +217,10 @@ pub(crate) fn read_prefix_range(
 
 fn validate_layout(p: &HostPrefix) -> Result<(), PayloadError> {
     match p.layout() {
-        PayloadLayout::Solar | PayloadLayout::Exaone | PayloadLayout::Motif3 | PayloadLayout::Dots3 => {
+        PayloadLayout::Solar
+        | PayloadLayout::Exaone
+        | PayloadLayout::Motif3
+        | PayloadLayout::Dots3 => {
             if p.fields[12] != p.fields[7] {
                 return Err(err("session payload token count does not match live rows"));
             }
@@ -235,7 +238,9 @@ pub fn tail(bytes: &[u8]) -> Result<&[u8], PayloadError> {
 impl SessionLedger {
     pub fn apply_payload(&mut self, prefix: &HostPrefix) -> Result<(), PayloadError> {
         if prefix.layout().family() != self.family {
-            return Err(err("session payload was written for a different model family"));
+            return Err(err(
+                "session payload was written for a different model family",
+            ));
         }
         if prefix.tokens.len() >= self.ctx.max(0) as usize {
             return Err(err("session payload exceeds context"));
@@ -249,19 +254,7 @@ impl SessionLedger {
 fn fixture_deepseek() -> HostPrefix {
     HostPrefix {
         fields: [
-            MAGIC,
-            VERSION,
-            8192,
-            64,
-            8192,
-            512,
-            2048,
-            3,
-            61,
-            128,
-            64,
-            129280,
-            3,
+            MAGIC, VERSION, 8192, 64, 8192, 512, 2048, 3, 61, 128, 64, 129280, 3,
         ],
         tokens: vec![10, 20, 30],
     }
@@ -270,19 +263,7 @@ fn fixture_deepseek() -> HostPrefix {
 fn fixture_cpu() -> HostPrefix {
     HostPrefix {
         fields: [
-            MAGIC,
-            VERSION,
-            8192,
-            64,
-            8192,
-            8192,
-            2048,
-            2,
-            61,
-            128,
-            64,
-            129280,
-            2,
+            MAGIC, VERSION, 8192, 64, 8192, 8192, 2048, 2, 61, 128, 64, 129280, 2,
         ],
         tokens: vec![1, 2],
     }
@@ -554,25 +535,13 @@ mod tests {
         assert_eq!(err.to_string(), "truncated session payload");
 
         let mut cursor = Cursor::new(bytes.clone());
-        let err = read_prefix_range(
-            &mut cursor,
-            3,
-            range_len + 1,
-            ModelFamily::DeepSeek4,
-            8192,
-        )
-        .unwrap_err();
+        let err = read_prefix_range(&mut cursor, 3, range_len + 1, ModelFamily::DeepSeek4, 8192)
+            .unwrap_err();
         assert_eq!(err.to_string(), "truncated session payload range");
 
         let mut cursor = Cursor::new(bytes.clone());
-        let err = read_prefix_range(
-            &mut cursor,
-            u64::MAX,
-            2,
-            ModelFamily::DeepSeek4,
-            8192,
-        )
-        .unwrap_err();
+        let err =
+            read_prefix_range(&mut cursor, u64::MAX, 2, ModelFamily::DeepSeek4, 8192).unwrap_err();
         assert_eq!(err.to_string(), "session payload range overflows");
 
         let mut cursor = Cursor::new(bytes.clone());

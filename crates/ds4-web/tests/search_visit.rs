@@ -59,9 +59,7 @@ impl Drop for MockCdp {
 }
 
 fn handle_conn(mut stream: TcpStream, port: i32) {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let mut buf = Vec::new();
     let mut tmp = [0u8; 2048];
     loop {

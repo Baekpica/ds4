@@ -186,12 +186,21 @@ fn flash_ok<'a>(
     for (k, n) in FLASH_DIMS {
         v.push((*k, Val::U32(*n)));
     }
-    v.push(("deepseek4.attention.compress_ratios", Val::ArrayU32(compress)));
+    v.push((
+        "deepseek4.attention.compress_ratios",
+        Val::ArrayU32(compress),
+    ));
     v.push(("deepseek4.swiglu_clamp_exp", Val::ArrayF32(swiglu)));
     v.push(("deepseek4.rope.freq_base", Val::F32(10000.0)));
-    v.push(("deepseek4.attention.compress_rope_freq_base", Val::F32(160000.0)));
+    v.push((
+        "deepseek4.attention.compress_rope_freq_base",
+        Val::F32(160000.0),
+    ));
     v.push(("deepseek4.expert_weights_scale", Val::F32(1.5)));
-    v.push(("deepseek4.attention.layer_norm_rms_epsilon", Val::F32(1.0e-6)));
+    v.push((
+        "deepseek4.attention.layer_norm_rms_epsilon",
+        Val::F32(1.0e-6),
+    ));
     v.push(("deepseek4.hyper_connection.epsilon", Val::F32(1.0e-6)));
     v.push(("deepseek4.expert_weights_norm", Val::Bool(true)));
     v
@@ -213,12 +222,21 @@ fn pro_ok<'a>(compress: &'a [u32], swiglu: &'a [f32]) -> Vec<(&'a str, Val<'a>)>
         };
         v.push((*k, Val::U32(n)));
     }
-    v.push(("deepseek4.attention.compress_ratios", Val::ArrayU32(compress)));
+    v.push((
+        "deepseek4.attention.compress_ratios",
+        Val::ArrayU32(compress),
+    ));
     v.push(("deepseek4.swiglu_clamp_exp", Val::ArrayF32(swiglu)));
     v.push(("deepseek4.rope.freq_base", Val::F32(10000.0)));
-    v.push(("deepseek4.attention.compress_rope_freq_base", Val::F32(160000.0)));
+    v.push((
+        "deepseek4.attention.compress_rope_freq_base",
+        Val::F32(160000.0),
+    ));
     v.push(("deepseek4.expert_weights_scale", Val::F32(2.5)));
-    v.push(("deepseek4.attention.layer_norm_rms_epsilon", Val::F32(1.0e-6)));
+    v.push((
+        "deepseek4.attention.layer_norm_rms_epsilon",
+        Val::F32(1.0e-6),
+    ));
     v.push(("deepseek4.hyper_connection.epsilon", Val::F32(1.0e-6)));
     v.push(("deepseek4.expert_weights_norm", Val::Bool(true)));
     v
@@ -269,7 +287,10 @@ fn motif_ok() -> Vec<(&'static str, Val<'static>)> {
         ("motif3.polynorm.output_scale", Val::F32(0.5)),
         ("motif3.polynorm.bias_clamp", Val::F32(0.5)),
         ("motif3.hidden_clamp", Val::F32(1_000_000.0)),
-        ("motif3.attention.sliding_window_pattern", Val::Str("interleave")),
+        (
+            "motif3.attention.sliding_window_pattern",
+            Val::Str("interleave"),
+        ),
         ("motif3.rope.scaling.type", Val::Str("yarn")),
         ("motif3.activation", Val::Str("poly_norm")),
         (
@@ -306,7 +327,10 @@ fn dots3_ok() -> Vec<(&'static str, Val<'static>)> {
         ("dots3-note.mtp.present", Val::Bool(true)),
         ("dots3-note.rope.freq_base", Val::F32(80_000_000.0)),
         ("dots3-note.rope.freq_base_swa", Val::F32(50_000.0)),
-        ("dots3-note.attention.layer_norm_rms_epsilon", Val::F32(1.0e-5)),
+        (
+            "dots3-note.attention.layer_norm_rms_epsilon",
+            Val::F32(1.0e-5),
+        ),
         (
             "dots3-note.source.config_sha256",
             Val::Str("99b7de680dd456111c36efb8749f8ae7177328e97b65a3e39a6700cbc1173833"),
@@ -333,7 +357,10 @@ fn solar_ok(sched: &[u32]) -> Vec<(&str, Val<'_>)> {
         ("solar-open2.ssm.conv_kernel", Val::U32(4)),
         ("solar-open2.kda.head_dim", Val::U32(128)),
         ("solar-open2.expert_gating_func", Val::U32(2)),
-        ("solar-open2.attention.layer_norm_rms_epsilon", Val::F32(1.0e-5)),
+        (
+            "solar-open2.attention.layer_norm_rms_epsilon",
+            Val::F32(1.0e-5),
+        ),
         ("solar-open2.expert_weights_scale", Val::F32(1.0)),
         ("solar-open2.expert_weights_norm", Val::Bool(true)),
         ("solar-open2.rope.freq_base", Val::F32(10000.0)),
@@ -356,7 +383,10 @@ fn exaone_ok(pattern: &[bool]) -> Vec<(&str, Val<'_>)> {
         ("exaone-moe.expert_count", Val::U32(128)),
         ("exaone-moe.expert_used_count", Val::U32(8)),
         ("exaone-moe.expert_feed_forward_length", Val::U32(2048)),
-        ("exaone-moe.expert_shared_feed_forward_length", Val::U32(2048)),
+        (
+            "exaone-moe.expert_shared_feed_forward_length",
+            Val::U32(2048),
+        ),
         ("exaone-moe.expert_shared_count", Val::U32(1)),
         ("exaone-moe.expert_group_count", Val::U32(1)),
         ("exaone-moe.expert_group_used_count", Val::U32(1)),
@@ -365,7 +395,10 @@ fn exaone_ok(pattern: &[bool]) -> Vec<(&str, Val<'_>)> {
         ("exaone-moe.nextn_predict_layers", Val::U32(1)),
         ("exaone-moe.attention.sliding_window", Val::U32(128)),
         ("exaone-moe.rope.freq_base", Val::F32(1_000_000.0)),
-        ("exaone-moe.attention.layer_norm_rms_epsilon", Val::F32(1.0e-5)),
+        (
+            "exaone-moe.attention.layer_norm_rms_epsilon",
+            Val::F32(1.0e-5),
+        ),
         ("exaone-moe.expert_weights_scale", Val::F32(2.5)),
         ("exaone-moe.expert_weights_norm", Val::Bool(true)),
         (

@@ -336,9 +336,9 @@ fn run_sweep<W: Write>(
 
         if args.gen_tokens > 0 && frontier < args.ctx_max {
             if distributed {
-                session.sync(&prefix).map_err(|e| {
-                    format!("distributed replay restore at {frontier} failed: {e}")
-                })?;
+                session
+                    .sync(&prefix)
+                    .map_err(|e| format!("distributed replay restore at {frontier} failed: {e}"))?;
             } else {
                 let snapshot = snapshot
                     .as_ref()

@@ -83,9 +83,7 @@ fn hello_matches_c() {
     let rust = encode_hello_payload(&rec, "motif-3").unwrap();
     assert_eq!(
         hex(&rust),
-        c_out(&[
-            "hello", "3", "2", "2", "51", "1", "1", "8192", "53", "7000", "motif-3"
-        ])
+        c_out(&["hello", "3", "2", "2", "51", "1", "1", "8192", "53", "7000", "motif-3"])
     );
     let (back, name) = decode_hello_payload(&rust).unwrap();
     assert_eq!(name, "motif-3");
@@ -125,7 +123,10 @@ fn work_and_tokens_match_c() {
         ])
     );
     let tokens = [7i32, -1, 256];
-    assert_eq!(hex(&encode_tokens_be(&tokens)), c_out(&["tokens", "7", "-1", "256"]));
+    assert_eq!(
+        hex(&encode_tokens_be(&tokens)),
+        c_out(&["tokens", "7", "-1", "256"])
+    );
 }
 
 #[test]

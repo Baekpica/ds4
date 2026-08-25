@@ -4,11 +4,11 @@
 
 use crate::parse::ToolSchemaOrder;
 use crate::render::{
-    append_solar_tool_response_text, append_tool_result_text, solar_role_open,
-    ModelSyntax, SOLAR_IM_CONTENT, SOLAR_IM_END, SOLAR_IM_START, SOLAR_THINK_END,
-    SOLAR_THINK_START, SOLAR_TOOL_ARG_END, SOLAR_TOOL_ARG_START, SOLAR_TOOL_ARG_VALUE,
-    SOLAR_TOOL_CALL_END, SOLAR_TOOL_CALLS, SOLAR_TOOL_RESPONSE_END, SOLAR_TOOL_RESPONSE_START,
-    THINK_HIGH_PREFIX, THINK_MAX_PREFIX,
+    append_solar_tool_response_text, append_tool_result_text, solar_role_open, ModelSyntax,
+    SOLAR_IM_CONTENT, SOLAR_IM_END, SOLAR_IM_START, SOLAR_THINK_END, SOLAR_THINK_START,
+    SOLAR_TOOL_ARG_END, SOLAR_TOOL_ARG_START, SOLAR_TOOL_ARG_VALUE, SOLAR_TOOL_CALLS,
+    SOLAR_TOOL_CALL_END, SOLAR_TOOL_RESPONSE_END, SOLAR_TOOL_RESPONSE_START, THINK_HIGH_PREFIX,
+    THINK_MAX_PREFIX,
 };
 use crate::route::{think_mode_enabled, ThinkMode};
 use crate::stream::{think_end, ChatFormat};
@@ -132,7 +132,8 @@ pub fn try_repair_dsml(s: &[u8]) -> Option<Vec<u8>> {
     } else {
         s
     };
-    let (ts, te, is, ie, ps, pe) = if find_substr(scan, DSML_TOOL_CALLS_START.as_bytes()).is_some() {
+    let (ts, te, is, ie, ps, pe) = if find_substr(scan, DSML_TOOL_CALLS_START.as_bytes()).is_some()
+    {
         (
             DSML_TOOL_CALLS_START.as_bytes(),
             DSML_TOOL_CALLS_END.as_bytes(),
@@ -561,15 +562,7 @@ pub fn dump_script(name: &str) -> String {
         ),
         "decide-parse-motif" => format!(
             "{}\n",
-            parse_failure_should_retry(
-                ModelSyntax::Motif3,
-                false,
-                false,
-                "stop",
-                true,
-                true,
-                true
-            )
+            parse_failure_should_retry(ModelSyntax::Motif3, false, false, "stop", true, true, true)
         ),
         _ => "ERROR unknown-script\n".into(),
     }

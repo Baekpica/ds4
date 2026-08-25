@@ -84,7 +84,10 @@ fn repair_and_decide_match_c() {
         retry_dump_script("decide-unterminated-stop").trim(),
         "retry-unterminated"
     );
-    assert_eq!(retry_dump_script("decide-unterminated-length").trim(), "none");
+    assert_eq!(
+        retry_dump_script("decide-unterminated-length").trim(),
+        "none"
+    );
     assert_eq!(retry_dump_script("decide-parse-retry").trim(), "true");
     assert_eq!(retry_dump_script("decide-parse-motif").trim(), "false");
 }

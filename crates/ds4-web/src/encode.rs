@@ -20,8 +20,7 @@ pub fn url_encode_bytes(s: &[u8]) -> String {
 }
 
 pub fn base64(data: &[u8]) -> String {
-    const TAB: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TAB: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     let mut i = 0;
     while i < data.len() {

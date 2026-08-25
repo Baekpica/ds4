@@ -22,29 +22,30 @@ mod tensors;
 mod tok;
 mod validate;
 
+pub use batch::{
+    cont_sample_token, BankSnapshot, BatchCtx, ContAdmit, ContDriver, CONT_SAMPLE_GREEDY,
+    CONT_SAMPLE_NONE,
+};
 pub use bind::{
     bind_dspark_names, bind_mtp_names, bind_names, catalog_from_bind_name,
     dots3_layer_is_full_attention, dump_bind_check_oracle, dump_bind_dspark_shape,
     dump_bind_lookup_tapes, dump_bind_match_oracle, dump_bind_mtp_shape, dump_bind_names,
     dump_bind_names_shape, dump_bind_names_variant, dump_bind_support, expected_compress_ratio,
-    host_bind_lookup, match_plans, solar_layer_is_gqa, variant_from_bind_name, BindError,
-    BindName, BindNeed,
-    BindPlan, BindSlot, HostBindLook, SupportCatalog, DSPARK_MARKOV_RANK, DSPARK_N_LAYER,
+    host_bind_lookup, match_plans, solar_layer_is_gqa, variant_from_bind_name, BindError, BindName,
+    BindNeed, BindPlan, BindSlot, HostBindLook, SupportCatalog, DSPARK_MARKOV_RANK, DSPARK_N_LAYER,
     HOST_BIND_MISS,
-};
-pub use batch::{
-    cont_sample_token, BankSnapshot, BatchCtx, ContAdmit, ContDriver, CONT_SAMPLE_GREEDY,
-    CONT_SAMPLE_NONE,
 };
 pub use gguf::{GgufError, GgufFile};
 pub use identify::{dump_parse, identify_file, identify_gguf, Identified, IdentifyError};
-pub use mem::{snapshot_mem, MemCell as HostMemCell, MemCensus, MemObserve, MemSnap, MEMC_COUNT, MEMD_COUNT};
 pub use layout::{
     dump_expected_dspark_shape, dump_expected_layouts, dump_expected_layouts_shape,
     dump_expected_layouts_variant, dump_expected_mtp_shape, dump_expected_support,
     dump_layout_check_tapes, expected_dspark_layouts, expected_layouts, expected_mtp_layouts,
     validate_dspark_layouts, validate_layouts, validate_mtp_layouts, validate_support_layouts,
     LayoutError, LayoutSpec, TypeClass,
+};
+pub use mem::{
+    snapshot_mem, MemCell as HostMemCell, MemCensus, MemObserve, MemSnap, MEMC_COUNT, MEMD_COUNT,
 };
 pub use payload::{
     dump_cmd as payload_dump_cmd, dump_script as payload_dump_script, encode_fields, parse_prefix,
@@ -53,23 +54,22 @@ pub use payload::{
     U32_FIELDS as PAYLOAD_U32_FIELDS, VERSION as PAYLOAD_VERSION,
 };
 pub use progress::PrefillCheckpoint;
+pub use session::{
+    dump_cmd as session_dump_cmd, RewriteKind, SessionBackend, SessionLedger, SyncPlan,
+};
 pub use shape::{
     dump_oracle, route_architecture, select_shape_from_metadata, shape_for_variant, ArchRoute,
     DeepSeekDims, ModelFamily, Shape, Variant, SHAPE_DOTS3_NOTE_PREV, SHAPE_FLASH,
     SHAPE_KEXAONE_236B, SHAPE_MOTIF3, SHAPE_PRO, SHAPE_SOLAR_OPEN2_250B,
 };
-pub use session::{
-    dump_cmd as session_dump_cmd, RewriteKind, SessionBackend, SessionLedger, SyncPlan,
+pub use tensors::{
+    apply_host_dir, consume_host_dir, dump_apply_tapes, dump_consume_tapes, dump_nbytes_table,
+    dump_sibling_script, model_split_sibling_path, tensor_nbytes, tensor_type_name, TensorError,
+    TensorInfo, TensorInventory,
 };
 pub use tok::{dump_cmd, dump_vocab_apply_tapes, ChatThinkMode, TokError, Vocab};
 pub use validate::{
     dump_validate, host_compress_ratios, validate_file, validate_gguf, ValidateError,
-};
-pub use tensors::{
-    apply_host_dir, consume_host_dir, dump_apply_tapes, dump_consume_tapes, dump_nbytes_table,
-    dump_sibling_script,
-    model_split_sibling_path, tensor_nbytes, tensor_type_name, TensorError, TensorInfo,
-    TensorInventory,
 };
 
 use std::ffi::CString;
@@ -82,33 +82,23 @@ use std::ptr::{self, NonNull};
 
 use ds4_sys::{
     ds4_bridge_bind_plan, ds4_bridge_bind_plan_check, ds4_bridge_bind_slot,
-    ds4_bridge_distributed_options,
-    ds4_bridge_encode_chat_prompt, ds4_bridge_eval, ds4_bridge_model,
-    ds4_bridge_model_boot_prewarm, ds4_bridge_model_free, ds4_bridge_model_id,
-    ds4_bridge_model_open_distributed, ds4_bridge_model_run_distributed_worker,
-    ds4_bridge_model_routed_quant_bits,
-    ds4_bridge_model_open, ds4_bridge_model_open_options, ds4_bridge_session,
-    ds4_bridge_session_argmax, ds4_bridge_session_argmax_excluding,
-    ds4_bridge_session_create,
-    ds4_bridge_session_ctx,
-    ds4_bridge_session_exaone_rewind_span, ds4_bridge_session_free,
-    ds4_bridge_session_generation, ds4_bridge_session_invalidate,
-    ds4_bridge_session_load_payload, ds4_bridge_session_load_payload_range,
-    ds4_bridge_session_prefill_cap,
-    ds4_bridge_session_distributed_route_ready,
-    ds4_bridge_session_rewind, ds4_bridge_session_sample,
-    ds4_bridge_session_load_snapshot, ds4_bridge_session_save_payload,
-    ds4_bridge_session_save_snapshot, ds4_bridge_session_sync,
+    ds4_bridge_distributed_options, ds4_bridge_encode_chat_prompt, ds4_bridge_eval,
+    ds4_bridge_model, ds4_bridge_model_boot_prewarm, ds4_bridge_model_free, ds4_bridge_model_id,
+    ds4_bridge_model_open, ds4_bridge_model_open_distributed, ds4_bridge_model_open_options,
+    ds4_bridge_model_routed_quant_bits, ds4_bridge_model_run_distributed_worker,
+    ds4_bridge_session, ds4_bridge_session_argmax, ds4_bridge_session_argmax_excluding,
+    ds4_bridge_session_create, ds4_bridge_session_ctx, ds4_bridge_session_distributed_route_ready,
+    ds4_bridge_session_exaone_rewind_span, ds4_bridge_session_free, ds4_bridge_session_generation,
+    ds4_bridge_session_invalidate, ds4_bridge_session_load_payload,
+    ds4_bridge_session_load_payload_range, ds4_bridge_session_load_snapshot,
+    ds4_bridge_session_prefill_cap, ds4_bridge_session_rewind, ds4_bridge_session_sample,
+    ds4_bridge_session_save_payload, ds4_bridge_session_save_snapshot, ds4_bridge_session_sync,
     ds4_bridge_session_top_logprobs, ds4_bridge_shard, ds4_bridge_snapshot,
     ds4_bridge_snapshot_create, ds4_bridge_snapshot_free, ds4_bridge_snapshot_len,
-    ds4_bridge_token_score,
-    ds4_host_bind_look, ds4_host_bind_map, ds4_host_shape, ds4_host_str, ds4_host_tensor,
-    ds4_host_tensor_dir, ds4_host_vocab,
-    DS4_BRIDGE_BACKEND_CPU,
-    DS4_BRIDGE_BACKEND_CUDA,
-    DS4_BRIDGE_BACKEND_METAL, DS4_BRIDGE_DISTRIBUTED_COORDINATOR,
-    DS4_BRIDGE_DISTRIBUTED_NONE, DS4_BRIDGE_DISTRIBUTED_WORKER,
-    DS4_BRIDGE_MAX_DIMS,
+    ds4_bridge_token_score, ds4_host_bind_look, ds4_host_bind_map, ds4_host_shape, ds4_host_str,
+    ds4_host_tensor, ds4_host_tensor_dir, ds4_host_vocab, DS4_BRIDGE_BACKEND_CPU,
+    DS4_BRIDGE_BACKEND_CUDA, DS4_BRIDGE_BACKEND_METAL, DS4_BRIDGE_DISTRIBUTED_COORDINATOR,
+    DS4_BRIDGE_DISTRIBUTED_NONE, DS4_BRIDGE_DISTRIBUTED_WORKER, DS4_BRIDGE_MAX_DIMS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -584,11 +574,7 @@ impl SessionSnapshot {
         let mut raw = ptr::null_mut();
         let mut err = [0u8; 256];
         let rc = unsafe {
-            ds4_bridge_snapshot_create(
-                &mut raw,
-                err.as_mut_ptr() as *mut c_char,
-                err.len(),
-            )
+            ds4_bridge_snapshot_create(&mut raw, err.as_mut_ptr() as *mut c_char, err.len())
         };
         if rc != 0 {
             return Err(fail(rc, &err));
@@ -642,10 +628,13 @@ fn cstring_payload_path(path: &Path) -> Result<CString> {
     #[cfg(unix)]
     let bytes = path.as_os_str().as_bytes();
     #[cfg(not(unix))]
-    let bytes = path.to_str().ok_or_else(|| Error {
-        code: 1,
-        message: "payload path is not UTF-8".into(),
-    })?.as_bytes();
+    let bytes = path
+        .to_str()
+        .ok_or_else(|| Error {
+            code: 1,
+            message: "payload path is not UTF-8".into(),
+        })?
+        .as_bytes();
     CString::new(bytes).map_err(|_| Error {
         code: 1,
         message: "payload path contains NUL".into(),
@@ -683,17 +672,11 @@ fn save_payload_checked(
             message: format!("failed to measure session payload: {e}"),
         })?
         .len();
-    let prefix = crate::payload::read_prefix_range(
-        &mut file,
-        0,
-        payload_bytes,
-        family,
-        ctx,
-    )
-    .map_err(|e| Error {
-        code: 1,
-        message: e.to_string(),
-    })?;
+    let prefix = crate::payload::read_prefix_range(&mut file, 0, payload_bytes, family, ctx)
+        .map_err(|e| Error {
+            code: 1,
+            message: e.to_string(),
+        })?;
     let expected: Vec<u32> = expected.iter().map(|&token| token as u32).collect();
     if prefix.tokens != expected {
         return Err(Error {
@@ -875,11 +858,7 @@ impl Model {
         };
         let mut err = [0u8; 512];
         let check = unsafe {
-            ds4_bridge_bind_plan_check(
-                ffi_plan.as_c(),
-                err.as_mut_ptr() as *mut c_char,
-                err.len(),
-            )
+            ds4_bridge_bind_plan_check(ffi_plan.as_c(), err.as_mut_ptr() as *mut c_char, err.len())
         };
         if check != 0 {
             return Err(fail(check, &err));
@@ -996,12 +975,7 @@ impl Model {
         };
         Ok(Session {
             raw,
-            host: SessionLedger::new(
-                self.family,
-                host_backend,
-                ctx_size,
-                prefill.max(0) as u32,
-            ),
+            host: SessionLedger::new(self.family, host_backend, ctx_size, prefill.max(0) as u32),
             _model: PhantomData,
             _not_send: PhantomData,
         })
@@ -1092,7 +1066,9 @@ impl Model {
     }
 
     pub fn tokenize_rendered_chat(&self, text: &str) -> Result<TokenBuffer> {
-        Ok(TokenBuffer::from_tokens(self.vocab.encode_rendered_chat(text)))
+        Ok(TokenBuffer::from_tokens(
+            self.vocab.encode_rendered_chat(text),
+        ))
     }
 
     pub fn token_text(&self, token: i32) -> Result<Vec<u8>> {
@@ -1176,7 +1152,9 @@ impl Session<'_> {
             return Err(fail(rc, &err));
         }
         self.host.commit_eval(token);
-        Ok(EvalResult { pos: self.host.pos() })
+        Ok(EvalResult {
+            pos: self.host.pos(),
+        })
     }
 
     pub fn rewind(&mut self, pos: i32) {
@@ -1267,14 +1245,7 @@ impl Session<'_> {
         rng: &mut u64,
     ) -> i32 {
         unsafe {
-            ds4_bridge_session_sample(
-                self.raw.as_ptr(),
-                temperature,
-                top_k,
-                top_p,
-                min_p,
-                rng,
-            )
+            ds4_bridge_session_sample(self.raw.as_ptr(), temperature, top_k, top_p, min_p, rng)
         }
     }
 
@@ -1500,12 +1471,7 @@ mod tests {
     fn session_ctx_uses_native_effective_ctx_not_configured_ledger_ctx() {
         let session = std::mem::ManuallyDrop::new(Session {
             raw: NonNull::<ds4_bridge_session>::dangling(),
-            host: SessionLedger::new(
-                ModelFamily::DeepSeek4,
-                SessionBackend::Cuda,
-                8192,
-                1,
-            ),
+            host: SessionLedger::new(ModelFamily::DeepSeek4, SessionBackend::Cuda, 8192, 1),
             _model: PhantomData,
             _not_send: PhantomData,
         });

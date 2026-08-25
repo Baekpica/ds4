@@ -61,9 +61,7 @@ impl std::error::Error for GgufError {}
 
 impl From<std::io::Error> for GgufError {
     fn from(e: std::io::Error) -> Self {
-        if e.kind() == std::io::ErrorKind::InvalidData
-            && e.to_string().contains("too small")
-        {
+        if e.kind() == std::io::ErrorKind::InvalidData && e.to_string().contains("too small") {
             GgufError::TooSmall
         } else {
             GgufError::Io(e)
@@ -419,13 +417,17 @@ impl GgufFile {
             GGUF_VALUE_FLOAT32 => {
                 for _ in 0..arr.len {
                     let b = c.read_exact(4)?;
-                    out.push(f32::from_le_bytes(b.try_into().map_err(|_| GgufError::Truncated)?));
+                    out.push(f32::from_le_bytes(
+                        b.try_into().map_err(|_| GgufError::Truncated)?,
+                    ));
                 }
             }
             GGUF_VALUE_FLOAT64 => {
                 for _ in 0..arr.len {
                     let b = c.read_exact(8)?;
-                    out.push(f64::from_le_bytes(b.try_into().map_err(|_| GgufError::Truncated)?) as f32);
+                    out.push(
+                        f64::from_le_bytes(b.try_into().map_err(|_| GgufError::Truncated)?) as f32,
+                    );
                 }
             }
             _ => return Err(GgufError::Type),

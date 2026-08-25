@@ -3,10 +3,10 @@
 use ds4_server::{
     anthropic_error_body, anthropic_error_type, handle_client, header_accepts_json, header_chunked,
     header_end, http_head, json_escape, json_models_array_dup, model_alias_known,
-    model_id_from_gguf_path, model_one_json, models_list_json, openai_error_body, openai_error_type,
-    output_format_type_supported, parse_output_config_effort, parse_output_format_value,
-    parse_responses_text_value, read_http_request, retry_after_header, wire_http_error_bytes, Json,
-    ServerConfig, WireSurface,
+    model_id_from_gguf_path, model_one_json, models_list_json, openai_error_body,
+    openai_error_type, output_format_type_supported, parse_output_config_effort,
+    parse_output_format_value, parse_responses_text_value, read_http_request, retry_after_header,
+    wire_http_error_bytes, Json, ServerConfig, WireSurface,
 };
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -72,7 +72,10 @@ fn json_escape_matches_c() {
 fn error_envelopes_match_c() {
     let codes = [400, 404, 409, 429, 500, 503];
     for code in codes {
-        assert_eq!(openai_error_type(code), c_str(&["openai-type", &code.to_string()]).trim());
+        assert_eq!(
+            openai_error_type(code),
+            c_str(&["openai-type", &code.to_string()]).trim()
+        );
         assert_eq!(
             anthropic_error_type(code),
             c_str(&["anth-type", &code.to_string()]).trim()
@@ -108,10 +111,23 @@ fn http_head_and_wire_error_match_c() {
 
     let extra = retry_after_header(5);
     let rust = http_head(429, Some("application/json"), Some(&extra), false, 3);
-    let c = c_str(&["http-head", "429", "application/json", "0", "Retry-After: 5\r\n", "3"]);
+    let c = c_str(&[
+        "http-head",
+        "429",
+        "application/json",
+        "0",
+        "Retry-After: 5\r\n",
+        "3",
+    ]);
     assert_eq!(rust, c);
 
-    let rust = wire_http_error_bytes(WireSurface::OpenaiChat, 400, "bad HTTP request", false, None);
+    let rust = wire_http_error_bytes(
+        WireSurface::OpenaiChat,
+        400,
+        "bad HTTP request",
+        false,
+        None,
+    );
     let c = c_out(&["wire-http", "0", "400", "0", "-1", "bad HTTP request"]);
     assert_eq!(rust, c);
 
@@ -133,7 +149,11 @@ fn fmt_c(field: &str, json: &str) -> Result<(), String> {
     if s.starts_with("OK\n") {
         Ok(())
     } else {
-        Err(s.strip_prefix("ERROR\n").unwrap_or(&s).trim_end_matches('\n').to_string())
+        Err(s
+            .strip_prefix("ERROR\n")
+            .unwrap_or(&s)
+            .trim_end_matches('\n')
+            .to_string())
     }
 }
 
@@ -171,13 +191,21 @@ fn schema_format_refusal_matches_c() {
         assert_eq!(fmt_rust(field, json).is_ok(), ok, "rust {json}");
         assert_eq!(fmt_c(field, json).is_ok(), ok, "c {json}");
         if !ok {
-            assert_eq!(fmt_rust(field, json).unwrap_err(), fmt_c(field, json).unwrap_err(), "{json}");
+            assert_eq!(
+                fmt_rust(field, json).unwrap_err(),
+                fmt_c(field, json).unwrap_err(),
+                "{json}"
+            );
         }
     }
 
-    let mut p = Json::new("{\"format\":{\"type\":\"json_schema\",\"name\":\"x\"},\"verbosity\":\"low\"}");
+    let mut p =
+        Json::new("{\"format\":{\"type\":\"json_schema\",\"name\":\"x\"},\"verbosity\":\"low\"}");
     let rust = parse_responses_text_value(&mut p);
-    let c = c_str(&["text-value", "{\"format\":{\"type\":\"json_schema\",\"name\":\"x\"},\"verbosity\":\"low\"}"]);
+    let c = c_str(&[
+        "text-value",
+        "{\"format\":{\"type\":\"json_schema\",\"name\":\"x\"},\"verbosity\":\"low\"}",
+    ]);
     assert!(rust.is_err());
     assert!(c.starts_with("ERROR"));
     assert_eq!(
@@ -188,7 +216,10 @@ fn schema_format_refusal_matches_c() {
 
     let mut p = Json::new("{\"effort\":\"high\",\"format\":{\"type\":\"json_object\"}}");
     let rust = parse_output_config_effort(&mut p);
-    let c = c_str(&["output-config", "{\"effort\":\"high\",\"format\":{\"type\":\"json_object\"}}"]);
+    let c = c_str(&[
+        "output-config",
+        "{\"effort\":\"high\",\"format\":{\"type\":\"json_object\"}}",
+    ]);
     assert!(rust.is_err());
     assert_eq!(
         rust.unwrap_err(),
@@ -197,7 +228,11 @@ fn schema_format_refusal_matches_c() {
 
     let mut p = Json::new("{\"effort\":\"banana\",\"format\":{\"type\":\"text\"}}");
     assert!(parse_output_config_effort(&mut p).is_err());
-    assert!(c_str(&["output-config", "{\"effort\":\"banana\",\"format\":{\"type\":\"text\"}}"]).starts_with("ERROR"));
+    assert!(c_str(&[
+        "output-config",
+        "{\"effort\":\"banana\",\"format\":{\"type\":\"text\"}}"
+    ])
+    .starts_with("ERROR"));
 }
 
 #[test]
@@ -268,11 +303,17 @@ fn header_helpers_match_c() {
         );
         assert_eq!(
             ds4_server::http::content_length(h),
-            c_str(&["content-length", &hx]).trim().parse::<i64>().unwrap()
+            c_str(&["content-length", &hx])
+                .trim()
+                .parse::<i64>()
+                .unwrap()
         );
         assert_eq!(
             header_chunked(h) as i32,
-            c_str(&["header-chunked", &hx]).trim().parse::<i32>().unwrap()
+            c_str(&["header-chunked", &hx])
+                .trim()
+                .parse::<i32>()
+                .unwrap()
         );
         assert_eq!(
             header_accepts_json(h) as i32,
@@ -293,7 +334,8 @@ fn read_http_content_length_and_chunked() {
     let req = read_http_request(&mut &raw[..], true).unwrap();
     assert_eq!(req.path, "/v1/models");
 
-    let raw = b"POST /v1/messages HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    let raw =
+        b"POST /v1/messages HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     let req = read_http_request(&mut &raw[..], true).unwrap();
     assert_eq!(req.body, b"hello");
 
@@ -301,7 +343,8 @@ fn read_http_content_length_and_chunked() {
     let req = read_http_request(&mut &raw[..], true).unwrap();
     assert_eq!(req.body, b"hello");
 
-    let raw = b"POST /v1/messages HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+    let raw =
+        b"POST /v1/messages HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
     assert!(read_http_request(&mut &raw[..], false).is_some());
     let req = read_http_request(&mut &raw[..], false).unwrap();
     assert!(req.body.is_empty());
@@ -342,13 +385,24 @@ fn tcp_models_options_unknown_bad_http() {
     let s = String::from_utf8_lossy(&out);
     assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
     assert!(s.contains("Access-Control-Allow-Origin: *"));
-    let body = models_list_json(&cfg.model_id, &cfg.model_name, cfg.ctx, cfg.default_tokens, None);
+    let body = models_list_json(
+        &cfg.model_id,
+        &cfg.model_name,
+        cfg.ctx,
+        cfg.default_tokens,
+        None,
+    );
     assert!(s.ends_with(&body));
 
     let out = one_shot(&cfg, b"GET /v1/models/motif-3 HTTP/1.1\r\n\r\n");
     let s = String::from_utf8_lossy(&out);
     assert!(s.starts_with("HTTP/1.1 200 OK"));
-    assert!(s.contains(&model_one_json("motif-3", &cfg.model_name, cfg.ctx, cfg.default_tokens)));
+    assert!(s.contains(&model_one_json(
+        "motif-3",
+        &cfg.model_name,
+        cfg.ctx,
+        cfg.default_tokens
+    )));
 
     let out = one_shot(&cfg, b"OPTIONS /v1/chat/completions HTTP/1.1\r\n\r\n");
     let rust_head = http_head(204, None, None, true, 0);
@@ -380,7 +434,10 @@ fn tcp_models_options_unknown_bad_http() {
         wire_http_error_bytes(WireSurface::OpenaiChat, 503, "model not loaded", true, None)
     );
 
-    let out = one_shot(&cfg, b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}");
+    let out = one_shot(
+        &cfg,
+        b"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}",
+    );
     assert_eq!(
         out,
         wire_http_error_bytes(WireSurface::OpenaiChat, 400, "missing messages", true, None)

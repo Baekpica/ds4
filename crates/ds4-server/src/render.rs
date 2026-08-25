@@ -120,8 +120,7 @@ fn tool_schema_orders_find<'a>(
 }
 
 fn json_args_find_unused(args: &[crate::json::JsonArg], key: &str) -> Option<usize> {
-    args.iter()
-        .position(|a| !a.used && a.key == key)
+    args.iter().position(|a| !a.used && a.key == key)
 }
 
 fn append_sentinel_escape(out: &mut Vec<u8>, s: &[u8], end: &[u8], repl: &[u8]) {
@@ -262,7 +261,10 @@ fn append_dsml_tool_calls_text(out: &mut Vec<u8>, m: &ChatMsg) {
         append_dsml_attr_escaped(out, &tc.name);
         put(out, "\">\n");
         if !append_dsml_arguments_from_json(out, &tc.arguments, None) {
-            put(out, "<｜DSML｜parameter name=\"arguments\" string=\"true\">");
+            put(
+                out,
+                "<｜DSML｜parameter name=\"arguments\" string=\"true\">",
+            );
             append_dsml_parameter_text(out, &tc.arguments);
             put(out, "</｜DSML｜parameter>\n");
         }
@@ -383,7 +385,14 @@ fn append_solar_tool_calls_text(out: &mut Vec<u8>, m: &ChatMsg, orders: &[ToolSc
             put(out, SOLAR_TOOL_ARG_START);
             put(out, "arguments");
             put(out, SOLAR_TOOL_ARG_VALUE);
-            put(out, if tc.arguments.is_empty() { "{}" } else { &tc.arguments });
+            put(
+                out,
+                if tc.arguments.is_empty() {
+                    "{}"
+                } else {
+                    &tc.arguments
+                },
+            );
             put(out, SOLAR_TOOL_ARG_END);
             out.push(b'\n');
         }
@@ -845,7 +854,11 @@ fn collect_tool_result_message<'a>(m: &'a ChatMsg, views: &mut Vec<ToolResultVie
 }
 
 /// Official Motif-3 path (`render_motif3_chat_prompt_text`).
-pub fn render_motif3_chat(msgs: &[ChatMsg], tool_schemas: &str, think_mode: ThinkMode) -> Result<Vec<u8>, RenderError> {
+pub fn render_motif3_chat(
+    msgs: &[ChatMsg],
+    tool_schemas: &str,
+    think_mode: ThinkMode,
+) -> Result<Vec<u8>, RenderError> {
     render_motif3_chat_ex(msgs, tool_schemas, &[], think_mode)
 }
 
@@ -897,8 +910,8 @@ pub fn render_motif3_chat_ex(
             append_motif3_tool_calls_text(&mut out, m, true);
             put(&mut out, "<|endofturn|>");
         } else if m.role == "tool" || m.role == "function" {
-            let group_start = i == 0
-                || (msgs[i - 1].role != "tool" && msgs[i - 1].role != "function");
+            let group_start =
+                i == 0 || (msgs[i - 1].role != "tool" && msgs[i - 1].role != "function");
             let group_end = i + 1 == msgs.len()
                 || (msgs[i + 1].role != "tool" && msgs[i + 1].role != "function");
             if group_start {
@@ -958,7 +971,11 @@ fn trim_ws_range(s: &str) -> &str {
 }
 
 /// Official dots3-note path (`render_dots3_chat_prompt_text`).
-pub fn render_dots3_chat(msgs: &[ChatMsg], tool_schemas: &str, think_mode: ThinkMode) -> Result<Vec<u8>, RenderError> {
+pub fn render_dots3_chat(
+    msgs: &[ChatMsg],
+    tool_schemas: &str,
+    think_mode: ThinkMode,
+) -> Result<Vec<u8>, RenderError> {
     let think = think_mode_enabled(think_mode);
     let have_tools = !tool_schemas.is_empty();
     let first_system = msgs.first().is_some_and(|m| role_is_system(&m.role));
@@ -1007,8 +1024,8 @@ pub fn render_dots3_chat(msgs: &[ChatMsg], tool_schemas: &str, think_mode: Think
             append_dots3_tool_calls_text(&mut out, m);
             put(&mut out, "<|endofassistant|>");
         } else if m.role == "tool" || m.role == "function" {
-            let group_start = i == 0
-                || (msgs[i - 1].role != "tool" && msgs[i - 1].role != "function");
+            let group_start =
+                i == 0 || (msgs[i - 1].role != "tool" && msgs[i - 1].role != "function");
             let group_end = i + 1 == msgs.len()
                 || (msgs[i + 1].role != "tool" && msgs[i + 1].role != "function");
             if group_start {
@@ -1030,7 +1047,11 @@ pub fn render_dots3_chat(msgs: &[ChatMsg], tool_schemas: &str, think_mode: Think
 }
 
 /// K-EXAONE path (`render_exaone_chat_prompt_text`).
-pub fn render_exaone_chat(msgs: &[ChatMsg], tool_schemas: &str, think_mode: ThinkMode) -> Result<Vec<u8>, RenderError> {
+pub fn render_exaone_chat(
+    msgs: &[ChatMsg],
+    tool_schemas: &str,
+    think_mode: ThinkMode,
+) -> Result<Vec<u8>, RenderError> {
     let mut last_user_idx = -1i32;
     for (i, m) in msgs.iter().enumerate() {
         if m.role == "user" && !chat_msg_is_model_tool_result(m) {
@@ -1107,7 +1128,11 @@ pub(crate) fn append_solar_tool_response_text(out: &mut Vec<u8>, s: &[u8]) {
 }
 
 /// Solar-Open2 path (`render_solar_chat_prompt_text_choice`).
-pub fn render_solar_chat(msgs: &[ChatMsg], tool_schemas: &str, think_mode: ThinkMode) -> Result<Vec<u8>, RenderError> {
+pub fn render_solar_chat(
+    msgs: &[ChatMsg],
+    tool_schemas: &str,
+    think_mode: ThinkMode,
+) -> Result<Vec<u8>, RenderError> {
     render_solar_chat_ex(msgs, tool_schemas, &[], think_mode)
 }
 

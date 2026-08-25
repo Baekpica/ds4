@@ -160,6 +160,8 @@ fn anthropic_think_then_tool_match_c() {
     let text = out.find("\"text\":\"Hello.\"").expect("text");
     let tool = out.find("\"type\":\"tool_use\"").expect("tool");
     let stop = out.find("event: message_stop").expect("stop");
-    assert!(start < thinking && thinking < signature && signature < text && text < tool && tool < stop);
+    assert!(
+        start < thinking && thinking < signature && signature < text && text < tool && tool < stop
+    );
     assert!(!out.contains(DSML_TOOL_CALLS_START));
 }

@@ -10,15 +10,7 @@ fn model_exposes_routed_quant_bits() {
 }
 
 fn open_distributed(config: &DistributedConfig) {
-    let _ = Model::open_distributed(
-        "model.gguf",
-        Backend::Cpu,
-        0,
-        true,
-        None,
-        None,
-        config,
-    );
+    let _ = Model::open_distributed("model.gguf", Backend::Cpu, 0, true, None, None, config);
 }
 
 fn run_worker(model: &Model) {
