@@ -4,6 +4,84 @@
 
 use std::collections::{HashSet, VecDeque};
 
+use crate::metrics::REJECT_REASON_NAMES;
+
+/// Existing serial-cont 503 body for an engine/governor admit refuse.
+/// Rolling must reuse this string; do not invent a new HTTP body.
+pub(crate) const CONT_ADMIT_REFUSED: &str = "continuous admission rejected; serial fallback";
+
+/// C `ds4_gov_status` (ds4_mem_gov.h). ADMIT never reaches a tick site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GovStatus {
+    Admit = 0,
+    RefuseClass = 1,
+    RefuseLive = 2,
+    RetryObs = 3,
+    Unsupported = 4,
+    Fault = 5,
+}
+
+/// C `DS4_REJECT_*` / `/metrics` `ds4_requests_rejected_total{reason=}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum RejectReason {
+    ClassBudget = 0,
+    LiveHeadroom = 1,
+    ObsRetry = 2,
+    Unsupported = 3,
+    Fault = 4,
+    DeepPolicy = 5,
+    LaneDisabled = 6,
+}
+
+impl RejectReason {
+    pub(crate) const fn name(self) -> &'static str {
+        REJECT_REASON_NAMES[self as usize]
+    }
+}
+
+/// C `ds4_reject_reason_from_gov`: ADMIT is not a refusal; every other
+/// governed status maps 1:1 onto the typed reject family.
+pub(crate) const fn reject_reason_from_gov(status: GovStatus) -> Option<RejectReason> {
+    match status {
+        GovStatus::Admit => None,
+        GovStatus::RefuseClass => Some(RejectReason::ClassBudget),
+        GovStatus::RefuseLive => Some(RejectReason::LiveHeadroom),
+        GovStatus::RetryObs => Some(RejectReason::ObsRetry),
+        GovStatus::Unsupported => Some(RejectReason::Unsupported),
+        GovStatus::Fault => Some(RejectReason::Fault),
+    }
+}
+
+/// Host-side charge for one rolling admit. Production `AdmitAlways` lets
+/// the engine's existing `cont_admit` governor decide; tests inject a
+/// budget that refuses with a C status.
+pub(crate) trait ContMemGov {
+    fn charge(&mut self, prompt_n: i32, max_new: i32) -> GovStatus;
+}
+
+/// Production hook: do not second-guess the engine's fund check.
+pub(crate) struct AdmitAlways;
+
+impl ContMemGov for AdmitAlways {
+    fn charge(&mut self, _prompt_n: i32, _max_new: i32) -> GovStatus {
+        GovStatus::Admit
+    }
+}
+
+/// Charge one rolling admit. `Ok` means place the job; `Err` is the same
+/// typed reason C/serial-cont would tick on `/metrics`.
+pub(crate) fn charge_roll_admit(
+    gov: &mut dyn ContMemGov,
+    prompt_n: i32,
+    max_new: i32,
+) -> Result<(), RejectReason> {
+    match reject_reason_from_gov(gov.charge(prompt_n, max_new)) {
+        None => Ok(()),
+        Some(reason) => Err(reason),
+    }
+}
+
 /// Banks already claimed by a prior rolling prepare. The next `prepare_slot`
 /// ORs these onto the continuation-hold mask so fork/pin/evict cannot spend
 /// a live target or drop protected saturation.
@@ -85,7 +163,10 @@ impl ContRoll {
 
 #[cfg(test)]
 mod tests {
-    use super::ContRoll;
+    use super::{
+        charge_roll_admit, reject_reason_from_gov, AdmitAlways, ContMemGov, ContRoll, GovStatus,
+        RejectReason, CONT_ADMIT_REFUSED,
+    };
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct FakeJob {
@@ -145,5 +226,119 @@ mod tests {
         let mut reserve = super::RollReserve::new();
         reserve.note_place(0);
         assert_eq!(reserve.protect(&[false, false]), vec![false, false]);
+    }
+
+    struct BudgetGov {
+        remaining: u32,
+        refuse: GovStatus,
+    }
+
+    impl ContMemGov for BudgetGov {
+        fn charge(&mut self, _prompt_n: i32, _max_new: i32) -> GovStatus {
+            if self.remaining == 0 {
+                return self.refuse;
+            }
+            self.remaining -= 1;
+            GovStatus::Admit
+        }
+    }
+
+    #[test]
+    fn reject_reason_from_gov_matches_c_serial_cont() {
+        // Given: C ds4_reject_reason_from_gov
+        // When: each governed status is mapped
+        // Then: ADMIT has no tick; refusals use the frozen /metrics names
+        assert_eq!(reject_reason_from_gov(GovStatus::Admit), None);
+        assert_eq!(
+            reject_reason_from_gov(GovStatus::RefuseClass).map(RejectReason::name),
+            Some("class_budget")
+        );
+        assert_eq!(
+            reject_reason_from_gov(GovStatus::RefuseLive).map(RejectReason::name),
+            Some("live_headroom")
+        );
+        assert_eq!(
+            reject_reason_from_gov(GovStatus::RetryObs).map(RejectReason::name),
+            Some("obs_retry")
+        );
+        assert_eq!(
+            reject_reason_from_gov(GovStatus::Unsupported).map(RejectReason::name),
+            Some("unsupported")
+        );
+        assert_eq!(
+            reject_reason_from_gov(GovStatus::Fault).map(RejectReason::name),
+            Some("fault")
+        );
+        assert_eq!(RejectReason::DeepPolicy.name(), "deep_policy");
+        assert_eq!(RejectReason::LaneDisabled.name(), "lane_disabled");
+        assert_eq!(charge_roll_admit(&mut AdmitAlways, 1, 1), Ok(()));
+    }
+
+    #[test]
+    fn rolling_admit_charges_when_budget_allows() {
+        // Given: governor still has one admission
+        let mut gov = BudgetGov {
+            remaining: 1,
+            refuse: GovStatus::RefuseLive,
+        };
+
+        // When: a rolling admit charges
+        let charged = charge_roll_admit(&mut gov, 128, 32);
+
+        // Then: the job is admitted
+        assert_eq!(charged, Ok(()));
+    }
+
+    #[test]
+    fn rolling_admit_typed_refuses_live_headroom_when_budget_exhausted() {
+        // Given: governor has no remaining budget
+        let mut gov = BudgetGov {
+            remaining: 0,
+            refuse: GovStatus::RefuseLive,
+        };
+
+        // When: a rolling admit charges
+        let refused = charge_roll_admit(&mut gov, 128, 32);
+
+        // Then: typed refuse is live_headroom, HTTP body stays the serial-cont one
+        assert_eq!(refused, Err(RejectReason::LiveHeadroom));
+        assert_eq!(RejectReason::LiveHeadroom.name(), "live_headroom");
+        assert_eq!(
+            CONT_ADMIT_REFUSED,
+            "continuous admission rejected; serial fallback"
+        );
+    }
+
+    #[test]
+    fn rolling_admit_typed_refuses_class_budget() {
+        // Given: class-cap refuse (never retried)
+        let mut gov = BudgetGov {
+            remaining: 0,
+            refuse: GovStatus::RefuseClass,
+        };
+
+        // When: a rolling admit charges
+        let refused = charge_roll_admit(&mut gov, 4096, 32768);
+
+        // Then: typed refuse is class_budget
+        assert_eq!(refused, Err(RejectReason::ClassBudget));
+        assert_eq!(RejectReason::ClassBudget.name(), "class_budget");
+    }
+
+    #[test]
+    fn rolling_second_admit_typed_refuses_after_first_charges() {
+        // Given: budget for one live job
+        let mut gov = BudgetGov {
+            remaining: 1,
+            refuse: GovStatus::RefuseLive,
+        };
+
+        // When: two rolling admits charge
+        let first = charge_roll_admit(&mut gov, 64, 16);
+        let second = charge_roll_admit(&mut gov, 64, 16);
+
+        // Then: first admits; second is the same live_headroom refuse
+        assert_eq!(first, Ok(()));
+        assert_eq!(second, Err(RejectReason::LiveHeadroom));
     }
 }

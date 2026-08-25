@@ -867,6 +867,7 @@ mod native {
         warm_fork: bool,
         warm_pin_min: i32,
         warm_checkpoint: bool,
+        memgov: Box<dyn crate::serve_cont_roll::ContMemGov>,
     }
 
     struct WarmAdmitPlan {
@@ -1106,6 +1107,7 @@ mod native {
                 warm_fork,
                 warm_pin_min,
                 warm_checkpoint,
+                memgov: Box::new(crate::serve_cont_roll::AdmitAlways),
             }
         }
 
@@ -1405,6 +1407,12 @@ mod native {
             );
             let (temperature, top_k, top_p, min_p) = stepper.sampling(parsed);
             let capture_done = bank_scope(parsed);
+            crate::serve_cont_roll::charge_roll_admit(
+                &mut *self.memgov,
+                prompt_n,
+                stepper.max_tokens,
+            )
+            .map_err(|_| GenerateError::Unsupported(crate::serve_cont_roll::CONT_ADMIT_REFUSED))?;
             let (hold, hold_retry) = self.protected_banks(bank_hold_retry);
             let protected = reserve.protect(&hold);
             let warm = if capture_done {
