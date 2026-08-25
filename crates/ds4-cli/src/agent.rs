@@ -39,6 +39,9 @@ pub struct AgentArgs {
     seed: u64,
     think: ds4_core::ChatThinkMode,
     chdir: Option<String>,
+    mtp: Option<String>,
+    mtp_draft: i32,
+    mtp_margin: f32,
     non_interactive: bool,
     help: bool,
 }
@@ -59,6 +62,9 @@ impl Default for AgentArgs {
             seed: 0,
             think: ds4_core::ChatThinkMode::Low,
             chdir: None,
+            mtp: None,
+            mtp_draft: 1,
+            mtp_margin: 3.0,
             non_interactive: false,
             help: false,
         }
@@ -164,10 +170,16 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AgentArgs, S
                 parsed.threads = parse_positive_i32(&arg, value)?;
             }
             "--chdir" => parsed.chdir = Some(need_value(&arg, args.next())?),
+            "--mtp" => parsed.mtp = Some(need_value(&arg, args.next())?),
+            "--mtp-draft" => {
+                let value = need_value(&arg, args.next())?;
+                parsed.mtp_draft = parse_positive_i32(&arg, value)?;
+            }
+            "--mtp-margin" => {
+                let value = need_value(&arg, args.next())?;
+                parsed.mtp_margin = parse_f32_range(&arg, value, 0.0, 1000.0)?;
+            }
             "--trace"
-            | "--mtp"
-            | "--mtp-draft"
-            | "--mtp-margin"
             | "--quality"
             | "--power"
             | "--warm-weights"
@@ -193,6 +205,19 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AgentArgs, S
         return Err("--non-interactive requires -p/--prompt in this one-turn shadow".into());
     }
     Ok(parsed)
+}
+
+fn use_mtp_spec(temp: f32, mtp: Option<&str>, draft: i32) -> bool {
+    temp <= 0.0 && mtp.is_some() && draft > 1 && std::env::var_os("DS4_MTP_SPEC_DISABLE").is_none()
+}
+
+fn mtp_open_options(args: &AgentArgs) -> Vec<ds4_core::ModelOpenOption> {
+    let mut options = Vec::new();
+    if args.mtp.is_some() {
+        options.push(ds4_core::ModelOpenOption::MtpDraftTokens(args.mtp_draft));
+        options.push(ds4_core::ModelOpenOption::MtpMargin(args.mtp_margin));
+    }
+    options
 }
 
 const THINK_EFFORT_MIN_CONTEXT: i32 = 393216;
@@ -307,8 +332,16 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
         );
     }
 
-    let model = ds4_core::Model::open(&args.model, args.backend, args.threads, false)
-        .map_err(|error| error.to_string())?;
+    let model = ds4_core::Model::open_with_support_options(
+        &args.model,
+        args.backend,
+        args.threads,
+        false,
+        args.mtp.as_deref(),
+        None,
+        &mtp_open_options(&args),
+    )
+    .map_err(|error| error.to_string())?;
     let mut session = model.session(args.ctx).map_err(|error| error.to_string())?;
     let mut transcript = build_system_transcript(model.vocab(), &args, think)?;
     session
@@ -345,20 +378,44 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
             .saturating_sub(session.pos())
             .saturating_sub(1);
         let max_tokens = args.tokens.min(room).max(0);
+        let use_mtp = use_mtp_spec(args.temp, args.mtp.as_deref(), args.mtp_draft);
+        let eos = model.token_eos();
         let mut raw = Vec::new();
-        for _ in 0..max_tokens {
+        let mut generated = 0i32;
+        while generated < max_tokens {
             let token = session.sample(args.temp, 0, args.top_p, args.min_p, &mut rng);
             if token < 0 {
                 return Err("failed to sample the next token".into());
             }
-            if token == model.token_eos() {
+            if token == eos || model.token_is_stop(token) {
                 break;
             }
-            session.eval(token).map_err(|error| error.to_string())?;
-            transcript.push(token);
-            let piece = model.token_text(token).map_err(|error| error.to_string())?;
-            raw.extend_from_slice(&piece);
-            if web_tools::block_complete(&raw) {
+            let accepted = if use_mtp {
+                session
+                    .eval_speculative_argmax(token, max_tokens - generated, eos)
+                    .map_err(|error| error.to_string())?
+            } else {
+                session.eval(token).map_err(|error| error.to_string())?;
+                vec![token]
+            };
+            let mut stop = false;
+            for accepted in accepted {
+                if accepted == eos || model.token_is_stop(accepted) {
+                    stop = true;
+                    break;
+                }
+                transcript.push(accepted);
+                let piece = model
+                    .token_text(accepted)
+                    .map_err(|error| error.to_string())?;
+                raw.extend_from_slice(&piece);
+                generated += 1;
+                if web_tools::block_complete(&raw) || generated >= max_tokens {
+                    stop = true;
+                    break;
+                }
+            }
+            if stop {
                 break;
             }
         }
@@ -406,7 +463,7 @@ fn help_text(name: &str) -> String {
         "Usage: {name} --non-interactive -p TEXT [options]\n\
          \n\
          One-turn ds4-agent shadow. Supports google_search, visit_page, read, more, list, search, write, edit, bash, bash_status, and bash_stop. \
-         Use ./ds4-agent for other tools, interactive, KV, MTP, or distributed execution.\n\
+         Use ./ds4-agent for other tools, interactive, KV, or distributed execution.\n\
          \n\
          Options:\n\
            -m, --model FILE        GGUF model path. Default: ds4flash.gguf\n\
@@ -422,6 +479,9 @@ fn help_text(name: &str) -> String {
            --think                Normal thinking mode. Default.\n\
            --think-max            High effort when ctx >= 393216.\n\
            --nothink              Disable thinking.\n\
+           --mtp FILE             Optional MTP support GGUF.\n\
+           --mtp-draft N          Maximum MTP draft tokens. Default: 1\n\
+           --mtp-margin F         MTP verifier margin. Default: 3\n\
            --backend NAME         metal, cuda, or cpu.\n\
            --metal, --cuda, --cpu Select backend explicitly.\n\
            -t, --threads N        CPU helper threads.\n\
@@ -679,9 +739,6 @@ mod tests {
             .contains("-p/--prompt"));
         for flag in [
             "--trace",
-            "--mtp",
-            "--mtp-draft",
-            "--mtp-margin",
             "--quality",
             "--power",
             "--warm-weights",
@@ -692,6 +749,35 @@ mod tests {
                 .unwrap_err();
             assert!(error.contains("not implemented"), "{flag}: {error}");
         }
+    }
+
+    #[test]
+    fn parses_mtp_flags_and_follows_c_gates() {
+        let parsed = parse_args(argv(&[
+            "--non-interactive",
+            "-p",
+            "hello",
+            "--temp",
+            "0",
+            "--mtp",
+            "mtp.gguf",
+            "--mtp-draft",
+            "2",
+            "--mtp-margin",
+            "4.5",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.mtp.as_deref(), Some("mtp.gguf"));
+        assert_eq!(parsed.mtp_draft, 2);
+        assert_eq!(parsed.mtp_margin, 4.5);
+        assert!(use_mtp_spec(
+            parsed.temp,
+            parsed.mtp.as_deref(),
+            parsed.mtp_draft
+        ));
+        assert!(!use_mtp_spec(0.0, None, 2));
+        assert!(!use_mtp_spec(0.0, Some("mtp.gguf"), 1));
+        assert!(!use_mtp_spec(0.5, Some("mtp.gguf"), 2));
     }
 
     #[test]
