@@ -111,6 +111,7 @@ pub struct ParsedRequest {
     pub responses_requires_live_reasoning: bool,
     pub anthropic_requires_live_tool_state: bool,
     pub live_state_bank_owned: bool,
+    pub directed_bank: Option<i32>,
     pub live_call_ids: Vec<String>,
     pub messages: Vec<ChatMsg>,
     pub tool_schemas: String,
@@ -148,6 +149,7 @@ impl ParsedRequest {
             responses_requires_live_reasoning: false,
             anthropic_requires_live_tool_state: false,
             live_state_bank_owned: false,
+            directed_bank: None,
             live_call_ids: Vec::new(),
             messages: Vec::new(),
             tool_schemas: String::new(),
@@ -157,7 +159,7 @@ impl ParsedRequest {
         }
     }
 
-    fn finish_needs(&mut self) {
+    pub(crate) fn finish_needs(&mut self) {
         self.needs = compute_needs(&NeedInput {
             api: self.api,
             kind: self.kind,

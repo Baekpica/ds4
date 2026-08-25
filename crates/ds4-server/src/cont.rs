@@ -423,6 +423,13 @@ impl ContRegistry {
         Some(ContPin(self.records[i].record_id))
     }
 
+    pub fn pin_owner(&self, pin: ContPin) -> Option<ContOwner> {
+        self.records
+            .iter()
+            .find(|record| record.record_id == pin.0)
+            .map(|record| record.owner)
+    }
+
     pub fn unpin(&mut self, pin: ContPin) {
         if let Some(rec) = self
             .records
@@ -575,6 +582,31 @@ pub fn live_tool_result_ids(api: Api, messages: &[crate::parse::ChatMsg]) -> Vec
         Api::Openai => Vec::new(),
     }
 }
+
+/// C `cont_bank_continuation_admit` equality: a live claim stays on its
+/// bank only when generation and frontier still match. Any miss is the
+/// protocol-native 409 full-replay surface.
+pub fn place_bank_continuation(
+    claim: Option<(i32, u64, i32)>,
+    live: Option<(u64, i32)>,
+) -> Result<i32, BankContConflict> {
+    let Some((bank, generation, frontier)) = claim else {
+        return Err(BankContConflict);
+    };
+    if bank < 0 || frontier <= 0 {
+        return Err(BankContConflict);
+    }
+    let Some((live_generation, live_frontier)) = live else {
+        return Err(BankContConflict);
+    };
+    if live_generation != generation || live_frontier != frontier {
+        return Err(BankContConflict);
+    }
+    Ok(bank)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BankContConflict;
 
 fn csv(ids: &[&str]) -> Vec<String> {
     ids.iter().map(|s| (*s).to_string()).collect()
@@ -868,6 +900,15 @@ pub fn dump_script(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::http_response_bytes;
+    use crate::generate::{GenerateError, GenerateOutcome, ScriptedDecode};
+    use crate::serve::{handle_client_inner, ServerConfig, ServerInner};
+    use crate::serve_cont::ContExec;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Instant;
 
     #[test]
     fn bank_protection_requires_a_current_reference_or_a_live_pin() {
@@ -924,5 +965,246 @@ mod tests {
         let first = monotonic_now();
         let second = monotonic_now();
         assert!(second >= first);
+    }
+
+    #[test]
+    fn place_bank_continuation_stays_on_claimed_bank_when_live_matches() {
+        let mut registry = ContRegistry::default();
+        let ids = csv(&["toolu_follow"]);
+        registry.publish_bank(Api::Anthropic, &ids, 2, 7, 100, 1000.0);
+
+        let claim = registry.bank_claim(Api::Anthropic, &ids, 1000.0);
+        let placed = place_bank_continuation(claim, Some((7, 100)));
+
+        assert_eq!(placed, Ok(2));
+    }
+
+    #[test]
+    fn place_bank_continuation_conflicts_when_generation_or_frontier_moved() {
+        let mut registry = ContRegistry::default();
+        let ids = csv(&["toolu_follow"]);
+        registry.publish_bank(Api::Anthropic, &ids, 2, 7, 100, 1000.0);
+        let claim = registry.bank_claim(Api::Anthropic, &ids, 1000.0);
+
+        assert_eq!(
+            place_bank_continuation(claim, Some((8, 100))),
+            Err(BankContConflict)
+        );
+        assert_eq!(
+            place_bank_continuation(claim, Some((7, 101))),
+            Err(BankContConflict)
+        );
+    }
+
+    #[test]
+    fn pin_owner_reports_bank_owned_live_record() {
+        let mut registry = ContRegistry::default();
+        registry.publish_bank(Api::Anthropic, &csv(&["toolu_pin"]), 3, 4, 50, 1.0);
+        let pin = registry
+            .pin_live(Api::Anthropic, "toolu_pin", 1.0)
+            .expect("live bank record pins");
+        assert_eq!(registry.pin_owner(pin), Some(ContOwner::BatchBank));
+    }
+
+    struct BankLane {
+        live: Option<(u64, i32)>,
+        bank: i32,
+        generated: Arc<Mutex<bool>>,
+        tool_ids: Vec<String>,
+        generation: u64,
+        frontier: i32,
+    }
+
+    impl ContExec for BankLane {
+        fn model_id(&self) -> i32 {
+            0
+        }
+        fn seq_cap(&self) -> i32 {
+            8192
+        }
+        fn encode_chat(&self, _rendered: &[u8]) -> Vec<i32> {
+            vec![1]
+        }
+        fn encode_text(&self, _text: &str) -> Vec<i32> {
+            vec![1]
+        }
+        fn generate(
+            &mut self,
+            parsed: &crate::parse::ParsedRequest,
+            _job_id: &str,
+            _created: i64,
+            cors: bool,
+            _default_tokens: i32,
+            _t_arrive: Instant,
+            _bank_hold_retry: &mut dyn FnMut(i32, Option<(u64, i32)>) -> Option<i32>,
+            _store: Option<&mut ds4_kv::Store>,
+            out: &mut dyn Write,
+        ) -> Result<GenerateOutcome, GenerateError> {
+            *self.generated.lock().expect("generated lock") = true;
+            if let Some(bank) = parsed.directed_bank {
+                assert_eq!(bank, self.bank);
+            }
+            out.write_all(&http_response_bytes(
+                200,
+                Some("application/json"),
+                None,
+                cors,
+                "{}",
+            ))
+            .map_err(|_| GenerateError::Io)?;
+            Ok(GenerateOutcome {
+                tool_ids: self.tool_ids.clone(),
+                generation: self.generation,
+                frontier: self.frontier,
+                finish: if self.tool_ids.is_empty() {
+                    "stop".into()
+                } else {
+                    "tool_calls".into()
+                },
+            })
+        }
+        fn bank_live(&self, bank: i32) -> Option<(u64, i32)> {
+            if bank == self.bank {
+                self.live
+            } else {
+                None
+            }
+        }
+        fn placed_bank(&self) -> Option<i32> {
+            Some(self.bank)
+        }
+    }
+
+    fn http_post(addr: std::net::SocketAddr, path: &str, body: &str) -> String {
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let req = format!(
+            "POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        client.write_all(req.as_bytes()).expect("write");
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).expect("read");
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn streaming_anthropic_tool_turn_stays_on_its_bank_for_output_only_follow_up() {
+        let cfg = ServerConfig {
+            have_engine: true,
+            default_tokens: 16,
+            ..ServerConfig::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let generated = Arc::new(Mutex::new(false));
+        let seen = Arc::clone(&generated);
+        let h = thread::spawn(move || {
+            let inner = Mutex::new(ServerInner::from_cfg(&cfg));
+            let mut engine = ScriptedDecode::from_pieces(&[b"ok"]);
+            let mut cont = BankLane {
+                live: None,
+                bank: 2,
+                generated: Arc::clone(&seen),
+                tool_ids: vec!["toolu_bankturn".into()],
+                generation: 7,
+                frontier: 100,
+            };
+            {
+                let (mut first, _) = listener.accept().expect("accept first");
+                handle_client_inner(&cfg, &inner, &mut first, Some(&mut engine), Some(&mut cont));
+            }
+            {
+                let mut g = inner.lock().expect("inner");
+                assert_eq!(
+                    g.creg
+                        .bank_claim(Api::Anthropic, &["toolu_bankturn".into()], monotonic_now()),
+                    Some((2, 7, 100))
+                );
+            }
+            cont.live = Some((7, 100));
+            cont.tool_ids.clear();
+            *seen.lock().expect("generated lock") = false;
+            {
+                let (mut second, _) = listener.accept().expect("accept follow-up");
+                handle_client_inner(
+                    &cfg,
+                    &inner,
+                    &mut second,
+                    Some(&mut engine),
+                    Some(&mut cont),
+                );
+            }
+            assert!(*seen.lock().expect("generated lock"));
+            let mut g = inner.lock().expect("inner");
+            assert_eq!(
+                g.creg
+                    .bank_claim(Api::Anthropic, &["toolu_bankturn".into()], monotonic_now()),
+                Some((2, 7, 100))
+            );
+        });
+        let tools = r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":16,"stream":true,"thinking":{"type":"disabled"},"tools":[{"name":"bash","input_schema":{"type":"object"}}]}"#;
+        let first = http_post(addr, "/v1/messages", tools);
+        assert!(first.starts_with("HTTP/1.1 200 "), "{first}");
+        let follow = http_post(
+            addr,
+            "/v1/messages",
+            r#"{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bankturn","content":"ok"}]}],"max_tokens":8}"#,
+        );
+        h.join().expect("server thread");
+        assert!(follow.starts_with("HTTP/1.1 200 "), "{follow}");
+    }
+
+    #[test]
+    fn streaming_anthropic_bank_follow_up_conflicts_when_frontier_moved() {
+        let cfg = ServerConfig {
+            have_engine: true,
+            default_tokens: 16,
+            ..ServerConfig::default()
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let generated = Arc::new(Mutex::new(false));
+        let seen = Arc::clone(&generated);
+        let h = thread::spawn(move || {
+            let inner = Mutex::new(ServerInner::from_cfg(&cfg));
+            {
+                let mut g = inner.lock().expect("inner");
+                g.creg.publish_bank(
+                    Api::Anthropic,
+                    &["toolu_moved".into()],
+                    2,
+                    7,
+                    100,
+                    monotonic_now(),
+                );
+            }
+            let mut engine = ScriptedDecode::from_pieces(&[b"ok"]);
+            let mut cont = BankLane {
+                live: Some((8, 100)),
+                bank: 2,
+                generated: seen,
+                tool_ids: Vec::new(),
+                generation: 8,
+                frontier: 100,
+            };
+            let (mut s, _) = listener.accept().expect("accept");
+            handle_client_inner(&cfg, &inner, &mut s, Some(&mut engine), Some(&mut cont));
+            assert!(!*generated.lock().expect("generated lock"));
+        });
+        let follow = http_post(
+            addr,
+            "/v1/messages",
+            r#"{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_moved","content":"ok"}]}],"max_tokens":8}"#,
+        );
+        h.join().expect("server thread");
+        assert!(follow.starts_with("HTTP/1.1 409 "), "{follow}");
+        assert!(
+            follow.contains("Anthropic continuation state is not available"),
+            "{follow}"
+        );
+        assert!(
+            follow.contains("replaying the full messages history"),
+            "{follow}"
+        );
     }
 }

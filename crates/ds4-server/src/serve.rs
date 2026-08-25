@@ -17,7 +17,7 @@ use crate::admit::{
     enqueue, enqueue_release, enqueue_shed_error, next_job_id, preparse_shed, queue_unlink_head,
     AdmitState, EnqVerdict, SHED_CONT_HOLD, SHED_QUEUE_AGE, SHED_SLOW_READER,
 };
-use crate::cont::{monotonic_now, ContPin, ContRegistry};
+use crate::cont::{monotonic_now, place_bank_continuation, ContOwner, ContPin, ContRegistry};
 use crate::error::{http_response_bytes, wire_http_error_bytes};
 use crate::generate::{generate_terminal_at, DecodeIo, GenerateError, GenerateOutcome};
 use crate::http::{
@@ -32,6 +32,7 @@ use crate::models::{model_id_known, model_one_json, models_list_json};
 use crate::parse::{parse_request, ParseEnv};
 use crate::route::{
     route_decide, Api, RouteEnv, ThinkMode, WireSurface, LANE_CONTINUOUS, LANE_STATIC,
+    NEED_BANK_FRONTIER,
 };
 use crate::serve_cont::{cont_prompt_tokens, ContExec};
 use crate::serve_static::{
@@ -589,6 +590,89 @@ fn continuation_conflict_msg(api: Api) -> &'static str {
     }
 }
 
+fn refuse_bank_continuation<W: Write>(
+    cfg: &ServerConfig,
+    inner: &Mutex<ServerInner>,
+    job: &mut PreparedJob,
+    exec: &dyn ContExec,
+    out: &mut W,
+) -> Option<Settlement> {
+    if job.parsed.needs & NEED_BANK_FRONTIER == 0 {
+        return None;
+    }
+    let now = monotonic_now();
+    let claim = lock_inner(inner)
+        .creg
+        .bank_claim(job.parsed.api, &job.parsed.live_call_ids, now);
+    let live = claim.and_then(|(bank, _, _)| exec.bank_live(bank));
+    match place_bank_continuation(claim, live) {
+        Ok(bank) => {
+            job.parsed.directed_bank = Some(bank);
+            None
+        }
+        Err(_) => Some(write_continuation_conflict(cfg, job, out)),
+    }
+}
+
+fn write_continuation_conflict<W: Write>(
+    cfg: &ServerConfig,
+    job: &PreparedJob,
+    out: &mut W,
+) -> Settlement {
+    let ok = out
+        .write_all(&wire_http_error_bytes(
+            job.surface,
+            409,
+            continuation_conflict_msg(job.parsed.api),
+            cfg.cors,
+            None,
+        ))
+        .is_ok();
+    if ok {
+        Settlement::COMPLETED
+    } else {
+        Settlement::CANCELED
+    }
+}
+
+fn publish_continuous_tool_turn(
+    inner: &Mutex<ServerInner>,
+    api: Api,
+    bank: Option<i32>,
+    generated: &GenerateOutcome,
+) {
+    if !matches!(api, Api::Anthropic | Api::Responses) {
+        return;
+    }
+    if generated.tool_ids.is_empty() || generated.finish == "error" || generated.finish == "length"
+    {
+        return;
+    }
+    let Some(bank) = bank.filter(|bank| *bank >= 0) else {
+        return;
+    };
+    lock_inner(inner).creg.publish_bank(
+        api,
+        &generated.tool_ids,
+        bank,
+        generated.generation,
+        generated.frontier,
+        monotonic_now(),
+    );
+}
+
+fn settle_bank_continuation<W: Write>(
+    cfg: &ServerConfig,
+    job: &PreparedJob,
+    result: Result<GenerateOutcome, GenerateError>,
+    out: &mut W,
+) -> Settlement {
+    match result {
+        Err(GenerateError::Unsupported(_)) => write_continuation_conflict(cfg, job, out),
+        other => settle_generation_result(cfg, job, other, out),
+    }
+}
+
 struct PreparedJob {
     parsed: crate::parse::ParsedRequest,
     surface: WireSurface,
@@ -651,12 +735,17 @@ impl Settlement {
 
 fn acquire_continuation_pin(
     inner: &mut ServerInner,
-    parsed: &crate::parse::ParsedRequest,
+    parsed: &mut crate::parse::ParsedRequest,
     now: f64,
 ) -> Option<ContPin> {
-    inner
+    let pin = inner
         .creg
-        .pin_live(parsed.api, parsed.live_call_ids.first()?, now)
+        .pin_live(parsed.api, parsed.live_call_ids.first()?, now)?;
+    if inner.creg.pin_owner(pin) == Some(ContOwner::BatchBank) {
+        parsed.live_state_bank_owned = true;
+        parsed.finish_needs();
+    }
+    Some(pin)
 }
 
 struct BorrowedPin<'a> {
@@ -801,7 +890,7 @@ pub fn handle_client_inner(
     engine: Option<&mut dyn DecodeIo>,
     cont: Option<&mut dyn ContExec>,
 ) {
-    let Some(job) = prepare_client(cfg, inner, stream) else {
+    let Some(mut job) = prepare_client(cfg, inner, stream) else {
         return;
     };
     let _ = stream.set_nonblocking(true);
@@ -812,7 +901,7 @@ pub fn handle_client_inner(
         let mut g = lock_inner(inner);
         let verdict = enqueue(&mut g.admit, body_bytes);
         let pin = if verdict == EnqVerdict::Ok && have_engine {
-            acquire_continuation_pin(&mut g, &job.parsed, monotonic_now())
+            acquire_continuation_pin(&mut g, &mut job.parsed, monotonic_now())
         } else {
             None
         };
@@ -830,7 +919,7 @@ pub fn handle_client_inner(
         return;
     }
     let pin = BorrowedPin { inner, pin };
-    let settlement = run_prepared(cfg, inner, &job, engine, cont, &mut out, None);
+    let settlement = run_prepared(cfg, inner, &mut job, engine, cont, &mut out, None);
     if let Some(reason) = settlement.shed {
         lock_inner(inner).metrics.record_shed(reason);
     }
@@ -990,7 +1079,7 @@ fn prepare_client(
 fn run_prepared<W: TerminalSink>(
     cfg: &ServerConfig,
     inner: &Mutex<ServerInner>,
-    job: &PreparedJob,
+    job: &mut PreparedJob,
     engine: Option<&mut dyn DecodeIo>,
     cont: Option<&mut dyn ContExec>,
     out: &mut W,
@@ -1055,7 +1144,7 @@ fn run_prepared<W: TerminalSink>(
 fn run_engine<W: TerminalSink>(
     cfg: &ServerConfig,
     inner: &Mutex<ServerInner>,
-    job: &PreparedJob,
+    job: &mut PreparedJob,
     id: &str,
     dec: crate::route::RouteDecision,
     engine: &mut dyn DecodeIo,
@@ -1065,6 +1154,9 @@ fn run_engine<W: TerminalSink>(
 ) -> (u8, Settlement) {
     if dec.lane == LANE_CONTINUOUS {
         if let Some(exec) = cont.as_mut() {
+            if let Some(settlement) = refuse_bank_continuation(cfg, inner, job, *exec, out) {
+                return (LANE_CONTINUOUS, settlement);
+            }
             let store = engine.kv_store_mut();
             let mut bank_hold_retry = |bank, live| {
                 lock_inner(inner)
@@ -1082,11 +1174,17 @@ fn run_engine<W: TerminalSink>(
                 store,
                 out,
             );
-            if !matches!(result, Err(GenerateError::Unsupported(_))) {
-                return (
-                    LANE_CONTINUOUS,
-                    settle_generation_result(cfg, job, result, out),
-                );
+            if let Ok(outcome) = &result {
+                publish_continuous_tool_turn(inner, job.parsed.api, exec.placed_bank(), outcome);
+            }
+            let bank_follow = job.parsed.needs & NEED_BANK_FRONTIER != 0;
+            if bank_follow || !matches!(result, Err(GenerateError::Unsupported(_))) {
+                let settlement = if bank_follow {
+                    settle_bank_continuation(cfg, job, result, out)
+                } else {
+                    settle_generation_result(cfg, job, result, out)
+                };
+                return (LANE_CONTINUOUS, settlement);
             }
         }
     }
@@ -1472,7 +1570,7 @@ fn queue_client(
 ) {
     let _ = stream.set_nodelay(true);
     configure_client_socket(&stream);
-    let Some(prepared) = prepare_client(&cfg, &inner, &mut stream) else {
+    let Some(mut prepared) = prepare_client(&cfg, &inner, &mut stream) else {
         return;
     };
     let surface = prepared.surface;
@@ -1505,7 +1603,7 @@ fn queue_client(
         );
         return;
     }
-    let pin = acquire_continuation_pin(&mut g, &prepared.parsed, monotonic_now());
+    let pin = acquire_continuation_pin(&mut g, &mut prepared.parsed, monotonic_now());
     g.runtime.requests_started += 1;
     g.runtime.requests_inflight += 1;
     let lease = JobLease::new(Arc::clone(&inner), body_bytes, pin);
@@ -1537,7 +1635,7 @@ fn run_owner_job(
     job: OwnerJob,
 ) {
     let OwnerJob {
-        prepared,
+        mut prepared,
         mut sink,
         done,
         mut lease,
@@ -1564,7 +1662,7 @@ fn run_owner_job(
         run_prepared(
             cfg,
             inner,
-            &prepared,
+            &mut prepared,
             Some(engine),
             cont,
             &mut sink,
@@ -2588,13 +2686,13 @@ mod owner_tests {
             r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":16,"thinking":{"type":"disabled"},"tools":[{"name":"bash","input_schema":{"type":"object"}}]}"#,
         )
         .unwrap();
-        let prepared = PreparedJob {
+        let mut prepared = PreparedJob {
             parsed,
             surface: WireSurface::Anthropic,
             body_bytes: 11,
             arrived_at: Instant::now(),
         };
-        let lease = admit_test_job(&inner, &prepared);
+        let lease = admit_test_job(&inner, &mut prepared);
         let (job, drain) = owner_job(prepared, lease);
         let block = concat!(
             "<｜DSML｜tool_calls>\n",
@@ -2617,10 +2715,10 @@ mod owner_tests {
         assert_eq!(g.creg.n_live(), 0);
     }
 
-    fn admit_test_job(inner: &Arc<Mutex<ServerInner>>, prepared: &PreparedJob) -> JobLease {
+    fn admit_test_job(inner: &Arc<Mutex<ServerInner>>, prepared: &mut PreparedJob) -> JobLease {
         let mut g = lock_inner(inner);
         assert_eq!(enqueue(&mut g.admit, prepared.body_bytes), EnqVerdict::Ok);
-        let pin = acquire_continuation_pin(&mut g, &prepared.parsed, monotonic_now());
+        let pin = acquire_continuation_pin(&mut g, &mut prepared.parsed, monotonic_now());
         g.runtime.requests_started += 1;
         g.runtime.requests_inflight += 1;
         drop(g);
@@ -2668,10 +2766,10 @@ mod owner_tests {
     fn owner_fifo_settles_body_once() {
         let cfg = test_cfg();
         let inner = Arc::new(Mutex::new(ServerInner::from_cfg(&cfg)));
-        let first = queued_completion("first", 10);
-        let second = queued_completion("second", 20);
-        let first_lease = admit_test_job(&inner, &first);
-        let second_lease = admit_test_job(&inner, &second);
+        let mut first = queued_completion("first", 10);
+        let mut second = queued_completion("second", 20);
+        let first_lease = admit_test_job(&inner, &mut first);
+        let second_lease = admit_test_job(&inner, &mut second);
         let (first, first_drain) = owner_job(first, first_lease);
         let (second, second_drain) = owner_job(second, second_lease);
         let (tx, rx) = mpsc::channel();
@@ -2734,7 +2832,7 @@ mod owner_tests {
         prepared.parsed.api = Api::Responses;
         prepared.parsed.live_call_ids = vec!["call-1".into()];
         prepared.parsed.responses_requires_live_tool_state = true;
-        let lease = admit_test_job(&inner, &prepared);
+        let lease = admit_test_job(&inner, &mut prepared);
         assert_eq!(lock_inner(&inner).creg.serial_live_hard_refs(), 1);
         thread::sleep(Duration::from_millis(20));
         let (job, drain) = owner_job(prepared, lease);
@@ -2768,7 +2866,7 @@ mod owner_tests {
         prepared.parsed.api = Api::Responses;
         prepared.parsed.live_call_ids = vec!["call-bank".into()];
         prepared.parsed.responses_requires_live_tool_state = true;
-        let lease = admit_test_job(&inner, &prepared);
+        let lease = admit_test_job(&inner, &mut prepared);
         assert!(lock_inner(&inner)
             .creg
             .bank_protected(2, Some((7, 100)), monotonic_now()));
@@ -2796,8 +2894,8 @@ mod owner_tests {
             1,
             monotonic_now(),
         );
-        let prepared = queued_completion("unrelated", 17);
-        let lease = admit_test_job(&inner, &prepared);
+        let mut prepared = queued_completion("unrelated", 17);
+        let lease = admit_test_job(&inner, &mut prepared);
         let (job, drain) = owner_job(prepared, lease);
         let mut engine = ScriptedDecode::from_pieces(&[]);
 
@@ -2824,7 +2922,7 @@ mod owner_tests {
         let inner = Arc::new(Mutex::new(ServerInner::from_cfg(&cfg)));
         let mut prepared = queued_completion("stale", 17);
         prepared.arrived_at = Instant::now() - Duration::from_millis(20);
-        let lease = admit_test_job(&inner, &prepared);
+        let lease = admit_test_job(&inner, &mut prepared);
         let (job, drain) = owner_job(prepared, lease);
         let mut engine = ScriptedDecode::from_pieces(&[]);
 
@@ -2852,7 +2950,7 @@ mod owner_tests {
         prepared.parsed.kind = crate::route::ReqKind::Chat;
         prepared.parsed.prompt_text = None;
         prepared.parsed.needs = 0;
-        let lease = admit_test_job(&inner, &prepared);
+        let lease = admit_test_job(&inner, &mut prepared);
         let (job, drain) = owner_job(prepared, lease);
         let mut engine = ScriptedDecode::from_pieces(&[]);
         let mut cont = TestCont::Fail;
@@ -2879,7 +2977,7 @@ mod owner_tests {
         prepared.parsed.max_tokens = 1;
         prepared.parsed.max_tokens_set = true;
         prepared.arrived_at = Instant::now() - Duration::from_millis(100);
-        let lease = admit_test_job(&inner, &prepared);
+        let lease = admit_test_job(&inner, &mut prepared);
         let (job, drain) = owner_job(prepared, lease);
         let mut engine = ScriptedDecode::from_pieces(&[b"x"]);
 
@@ -2896,7 +2994,7 @@ mod owner_tests {
         let mut prepared = queued_completion("timed", 15);
         prepared.parsed.max_tokens = 1;
         prepared.parsed.max_tokens_set = true;
-        let lease = admit_test_job(&inner, &prepared);
+        let lease = admit_test_job(&inner, &mut prepared);
         let (job, drain) = owner_job(prepared, lease);
         let mut engine = SlowPrepDecode {
             sampled: false,
@@ -3083,7 +3181,7 @@ mod owner_tests {
         let inner = Arc::new(Mutex::new(ServerInner::from_cfg(&cfg)));
         let mut prepared = queued_completion("slow", 31);
         prepared.parsed.stream = true;
-        let lease = admit_test_job(&inner, &prepared);
+        let lease = admit_test_job(&inner, &mut prepared);
         let (mut sink, state) = job_sink(Arc::clone(&inner));
         sink.write_all(&vec![0; JOB_SINK_CAP_BYTES as usize])
             .unwrap();
@@ -3113,8 +3211,8 @@ mod owner_tests {
     fn disconnected_drain_cancels_and_releases_body() {
         let cfg = test_cfg();
         let inner = Arc::new(Mutex::new(ServerInner::from_cfg(&cfg)));
-        let prepared = queued_completion("gone", 23);
-        let lease = admit_test_job(&inner, &prepared);
+        let mut prepared = queued_completion("gone", 23);
+        let lease = admit_test_job(&inner, &mut prepared);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
@@ -3143,7 +3241,7 @@ mod owner_tests {
         let mut prepared = queued_completion("gone-after-start", 23);
         prepared.parsed.max_tokens = 5;
         prepared.parsed.max_tokens_set = true;
-        let lease = admit_test_job(&inner, &prepared);
+        let lease = admit_test_job(&inner, &mut prepared);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();

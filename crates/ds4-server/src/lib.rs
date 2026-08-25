@@ -35,8 +35,9 @@ pub use admit::{
     SHED_QUEUE_AGE, SHED_QUEUE_BYTES, SHED_QUEUE_DEPTH, SHED_REASONS, SHED_SLOW_READER,
 };
 pub use cont::{
-    dump_script, live_tool_result_ids, ContOwner, ContRecord, ContRegistry, ContState,
-    CONT_GRACE_S, CONT_HOLD_SHED_S, CONT_PIN_DEADLINE_S, CONT_REGISTRY_MAX_DEFAULT, CONT_TTL_S,
+    dump_script, live_tool_result_ids, place_bank_continuation, BankContConflict, ContOwner,
+    ContRecord, ContRegistry, ContState, CONT_GRACE_S, CONT_HOLD_SHED_S, CONT_PIN_DEADLINE_S,
+    CONT_REGISTRY_MAX_DEFAULT, CONT_TTL_S,
 };
 pub use dist_cli::DistArgs;
 pub use dsml::{

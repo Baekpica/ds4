@@ -819,6 +819,14 @@ pub trait ContExec {
 
     fn shutdown(&mut self, _store: Option<&mut KvStore>) {}
 
+    fn bank_live(&self, _bank: i32) -> Option<(u64, i32)> {
+        None
+    }
+
+    fn placed_bank(&self) -> Option<i32> {
+        None
+    }
+
     /// Static owner when this lane also holds a `BatchCtx`.
     fn as_static(&mut self) -> Option<&mut dyn crate::serve_static::StaticExec> {
         None
@@ -867,6 +875,7 @@ mod native {
         warm_fork: bool,
         warm_pin_min: i32,
         warm_checkpoint: bool,
+        last_bank: Option<i32>,
         memgov: Box<dyn crate::serve_cont_roll::ContMemGov>,
     }
 
@@ -1107,6 +1116,7 @@ mod native {
                 warm_fork,
                 warm_pin_min,
                 warm_checkpoint,
+                last_bank: None,
                 memgov: Box::new(crate::serve_cont_roll::AdmitAlways),
             }
         }
@@ -1413,37 +1423,46 @@ mod native {
                 stepper.max_tokens,
             )
             .map_err(|_| GenerateError::Unsupported(crate::serve_cont_roll::CONT_ADMIT_REFUSED))?;
-            let (hold, hold_retry) = self.protected_banks(bank_hold_retry);
-            let protected = reserve.protect(&hold);
-            let warm = if capture_done {
-                self.warm_plan(&stepper.prompt).or_else(|| {
-                    store
-                        .as_deref_mut()
-                        .and_then(|store| self.disk_plan(store, &stepper.prompt, &protected))
-                })
-            } else {
-                None
-            };
-            let placement = warm
-                .as_ref()
-                .and_then(|plan| self.place_warm(plan, &protected, store.as_deref_mut()));
-            let mut admit = if let (Some(plan), Some(placement)) = (warm, placement) {
-                let mut admit = ContAdmit::cold(1, plan.tokens, stepper.max_tokens.max(1));
-                admit.place_bank = i32::try_from(placement.target + 1).unwrap_or(0);
-                admit.n_cached = plan.cached;
-                if placement.fork {
-                    admit.fork_bank = i32::try_from(placement.source + 1).unwrap_or(0);
+            let mut admit = if let Some(bank) = parsed.directed_bank.filter(|bank| *bank >= 0) {
+                let mut admit = ContAdmit::cold(1, tokens, stepper.max_tokens.max(1));
+                admit.place_bank = bank.saturating_add(1);
+                if let Some(live) = self.bank_live(bank) {
+                    admit.n_cached = live.1;
                 }
                 admit
             } else {
-                let target = self.place_cold(&protected, store.as_deref_mut()).ok_or(
-                    GenerateError::ContinuationHold {
-                        retry_after: hold_retry.unwrap_or(1),
-                    },
-                )?;
-                let mut admit = ContAdmit::cold(1, tokens, stepper.max_tokens.max(1));
-                admit.place_bank = i32::try_from(target + 1).unwrap_or(0);
-                admit
+                let (hold, hold_retry) = self.protected_banks(bank_hold_retry);
+                let protected = reserve.protect(&hold);
+                let warm = if capture_done {
+                    self.warm_plan(&stepper.prompt).or_else(|| {
+                        store
+                            .as_deref_mut()
+                            .and_then(|store| self.disk_plan(store, &stepper.prompt, &protected))
+                    })
+                } else {
+                    None
+                };
+                let placement = warm
+                    .as_ref()
+                    .and_then(|plan| self.place_warm(plan, &protected, store.as_deref_mut()));
+                if let (Some(plan), Some(placement)) = (warm, placement) {
+                    let mut admit = ContAdmit::cold(1, plan.tokens, stepper.max_tokens.max(1));
+                    admit.place_bank = i32::try_from(placement.target + 1).unwrap_or(0);
+                    admit.n_cached = plan.cached;
+                    if placement.fork {
+                        admit.fork_bank = i32::try_from(placement.source + 1).unwrap_or(0);
+                    }
+                    admit
+                } else {
+                    let target = self.place_cold(&protected, store.as_deref_mut()).ok_or(
+                        GenerateError::ContinuationHold {
+                            retry_after: hold_retry.unwrap_or(1),
+                        },
+                    )?;
+                    let mut admit = ContAdmit::cold(1, tokens, stepper.max_tokens.max(1));
+                    admit.place_bank = i32::try_from(target + 1).unwrap_or(0);
+                    admit
+                }
             };
             admit.eos = self.eos;
             admit.temperature = temperature;
@@ -1494,6 +1513,7 @@ mod native {
             let done_tokens = std::mem::take(&mut job.done_tokens);
             let admitted = job.admitted;
             let actual_bank = job.bank;
+            self.last_bank = actual_bank;
             let capture_done = job.capture_done;
             if let Some(bank) = retired_bank(
                 capture_done,
@@ -1576,6 +1596,19 @@ mod native {
 
         fn encode_text(&self, text: &str) -> Vec<i32> {
             self.vocab.encode_text(text)
+        }
+
+        fn bank_live(&self, bank: i32) -> Option<(u64, i32)> {
+            let snapshot = self.batch.bank_snapshot(bank).ok()?;
+            let frontier = i32::try_from(snapshot.tokens.len()).ok()?;
+            if frontier <= 0 {
+                return None;
+            }
+            Some((snapshot.generation, frontier))
+        }
+
+        fn placed_bank(&self) -> Option<i32> {
+            self.last_bank
         }
 
         fn generate(
