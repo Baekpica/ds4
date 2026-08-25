@@ -216,9 +216,6 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AgentArgs, S
     if !parsed.non_interactive {
         return Err("this shadow requires --non-interactive".into());
     }
-    if parsed.prompt.is_none() {
-        return Err("--non-interactive requires -p/--prompt in this one-turn shadow".into());
-    }
     ds4_dist::prepare_engine_options(&parsed.dist)?;
     if parsed.dist.role == ds4_dist::Role::Worker {
         return Err("--role worker is a serving mode; start workers with ./ds4".into());
@@ -346,13 +343,14 @@ fn append_user_turn(
     vocab: &ds4_core::Vocab,
     transcript: &mut ds4_core::TokenBuffer,
     prompt: &str,
-    when: &str,
+    datetime: Option<&str>,
     think: ds4_core::ChatThinkMode,
 ) -> Result<(), String> {
-    let datetime = format_datetime_context(when);
-    vocab
-        .chat_append_message(transcript, "system", datetime.as_bytes())
-        .map_err(|error| error.to_string())?;
+    if let Some(datetime) = datetime {
+        vocab
+            .chat_append_message(transcript, "system", datetime.as_bytes())
+            .map_err(|error| error.to_string())?;
+    }
     vocab
         .chat_append_message(transcript, "user", prompt.as_bytes())
         .map_err(|error| error.to_string())?;
@@ -435,43 +433,6 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
     ))?;
     log.tokens("initial_system_prompt", &model, transcript.as_slice(), 0)?;
 
-    let sys = build_system_transcript(model.vocab(), &args, think)?;
-    compact::compact_if_needed(
-        &model,
-        &mut session,
-        model.vocab(),
-        args.ctx,
-        &sys,
-        &mut transcript,
-        "soft limit before user turn",
-    )?;
-
-    let prompt = args
-        .prompt
-        .as_deref()
-        .ok_or_else(|| "--non-interactive requires -p/--prompt".to_string())?;
-    let when = current_local_datetime();
-    let datetime = format_datetime_context(&when);
-    append_user_turn(model.vocab(), &mut transcript, prompt, &when, think)?;
-    log.text("datetime-context", datetime.as_bytes())?;
-    log.text("user", prompt.as_bytes())?;
-    let cached = session.pos();
-    let prompt_len = i32::try_from(transcript.len()).unwrap_or(i32::MAX);
-    let suffix = prompt_len.saturating_sub(cached);
-    log.event(&format!(
-        "prefill tool_round=0 transcript={prompt_len} prompt={prompt_len} cached={cached} suffix={suffix} think={}",
-        trace::think_mode_name(think)
-    ))?;
-    log.tokens(
-        "prefill_suffix",
-        &model,
-        transcript.as_slice(),
-        cached.max(0) as usize,
-    )?;
-    session
-        .sync(&transcript)
-        .map_err(|error| error.to_string())?;
-
     let mut rng = if args.seed == 0 {
         random_seed()
     } else {
@@ -480,124 +441,263 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
     let mut web = web_tools::non_interactive_web();
     let mut read_cursor = web_tools::ReadCursor::default();
     let mut bash_jobs = bash::BashTable::default();
-    let mut output = Vec::new();
+    let one_shot = args.prompt.clone();
+    let mut first_turn = true;
     loop {
-        let room = session
-            .ctx()
-            .saturating_sub(session.pos())
-            .saturating_sub(1);
-        let max_tokens = args.tokens.min(room).max(0);
-        let use_mtp = use_mtp_spec(args.temp, args.mtp.as_deref(), args.mtp_draft);
-        let eos = model.token_eos();
-        let mut raw = Vec::new();
-        let mut generated = 0i32;
-        while generated < max_tokens {
-            let token = session.sample(args.temp, 0, args.top_p, args.min_p, &mut rng);
-            if token < 0 {
-                return Err("failed to sample the next token".into());
-            }
-            if token == eos || model.token_is_stop(token) {
+        let prompt = if let Some(prompt) = one_shot.as_ref() {
+            if !first_turn {
                 break;
             }
-            let accepted = if use_mtp {
-                session
-                    .eval_speculative_argmax(token, max_tokens - generated, eos)
-                    .map_err(|error| error.to_string())?
-            } else {
-                session.eval(token).map_err(|error| error.to_string())?;
-                vec![token]
-            };
-            let mut stop = false;
-            for accepted in accepted {
-                if accepted == eos || model.token_is_stop(accepted) {
-                    stop = true;
+            prompt.clone()
+        } else {
+            match read_stdin_prompt()? {
+                Some(prompt) if !prompt.is_empty() => prompt,
+                Some(_) => continue,
+                None => break,
+            }
+        };
+        let sys = build_system_transcript(model.vocab(), &args, think)?;
+        compact::compact_if_needed(
+            &model,
+            &mut session,
+            model.vocab(),
+            args.ctx,
+            &sys,
+            &mut transcript,
+            "soft limit before user turn",
+        )?;
+        let datetime = if first_turn {
+            Some(format_datetime_context(&current_local_datetime()))
+        } else {
+            None
+        };
+        if let Some(datetime) = datetime.as_deref() {
+            log.text("datetime-context", datetime.as_bytes())?;
+        }
+        append_user_turn(
+            model.vocab(),
+            &mut transcript,
+            &prompt,
+            datetime.as_deref(),
+            think,
+        )?;
+        log.text("user", prompt.as_bytes())?;
+        let cached = session.pos();
+        let prompt_len = i32::try_from(transcript.len()).unwrap_or(i32::MAX);
+        let suffix = prompt_len.saturating_sub(cached);
+        log.event(&format!(
+            "prefill tool_round=0 transcript={prompt_len} prompt={prompt_len} cached={cached} suffix={suffix} think={}",
+            trace::think_mode_name(think)
+        ))?;
+        log.tokens(
+            "prefill_suffix",
+            &model,
+            transcript.as_slice(),
+            cached.max(0) as usize,
+        )?;
+        session
+            .sync(&transcript)
+            .map_err(|error| error.to_string())?;
+        let mut output = Vec::new();
+        loop {
+            let room = session
+                .ctx()
+                .saturating_sub(session.pos())
+                .saturating_sub(1);
+            let max_tokens = args.tokens.min(room).max(0);
+            let use_mtp = use_mtp_spec(args.temp, args.mtp.as_deref(), args.mtp_draft);
+            let eos = model.token_eos();
+            let mut raw = Vec::new();
+            let mut generated = 0i32;
+            while generated < max_tokens {
+                let token = session.sample(args.temp, 0, args.top_p, args.min_p, &mut rng);
+                if token < 0 {
+                    return Err("failed to sample the next token".into());
+                }
+                if token == eos || model.token_is_stop(token) {
                     break;
                 }
-                transcript.push(accepted);
-                let piece = model
-                    .token_text(accepted)
+                let accepted = if use_mtp {
+                    session
+                        .eval_speculative_argmax(token, max_tokens - generated, eos)
+                        .map_err(|error| error.to_string())?
+                } else {
+                    session.eval(token).map_err(|error| error.to_string())?;
+                    vec![token]
+                };
+                let mut stop = false;
+                for accepted in accepted {
+                    if accepted == eos || model.token_is_stop(accepted) {
+                        stop = true;
+                        break;
+                    }
+                    transcript.push(accepted);
+                    let piece = model
+                        .token_text(accepted)
+                        .map_err(|error| error.to_string())?;
+                    log.token(accepted, &piece, generated + 1)?;
+                    raw.extend_from_slice(&piece);
+                    generated += 1;
+                    if web_tools::block_complete(&raw) || generated >= max_tokens {
+                        stop = true;
+                        break;
+                    }
+                }
+                if stop {
+                    break;
+                }
+            }
+            transcript.push(model.token_eos());
+
+            if web_tools::has_block(&raw) {
+                let sys = build_system_transcript(model.vocab(), &args, think)?;
+                compact::compact_if_needed(
+                    &model,
+                    &mut session,
+                    model.vocab(),
+                    args.ctx,
+                    &sys,
+                    &mut transcript,
+                    "soft limit before tool continuation",
+                )?;
+                let round = web_tools::handle_round_with_tools(
+                    &raw,
+                    &mut web,
+                    &mut read_cursor,
+                    &mut bash_jobs,
+                )
+                .map_err(|_| TOOL_UNSUPPORTED_ERROR.to_string())?;
+                output.extend_from_slice(&project_output(&[&round.visible])?);
+                let observation = fit_tool_observation(
+                    &model,
+                    &mut session,
+                    model.vocab(),
+                    &args,
+                    think,
+                    &mut transcript,
+                    round.observation,
+                )?;
+                model
+                    .vocab()
+                    .chat_append_message(&mut transcript, "tool", &observation)
                     .map_err(|error| error.to_string())?;
-                log.token(accepted, &piece, generated + 1)?;
-                raw.extend_from_slice(&piece);
-                generated += 1;
-                if web_tools::block_complete(&raw) || generated >= max_tokens {
-                    stop = true;
+                model
+                    .vocab()
+                    .chat_append_assistant_prefix(&mut transcript, think)
+                    .map_err(|error| error.to_string())?;
+                session
+                    .sync(&transcript)
+                    .map_err(|error| error.to_string())?;
+                continue;
+            }
+            output.extend_from_slice(&project_output(&[&raw])?);
+            break;
+        }
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        stdout
+            .write_all(&output)
+            .map_err(|error| error.to_string())?;
+        stdout.flush().map_err(|error| error.to_string())?;
+        first_turn = false;
+        if one_shot.is_some() {
+            break;
+        }
+    }
+    Ok(0)
+}
+
+fn read_stdin_prompt() -> Result<Option<String>, String> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    eprint!("+DWARFSTAR_WAITING\n");
+    let stdin = std::io::stdin();
+    let fd = stdin.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err("ds4-agent: nonblocking stdin".into());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
+        return Err("ds4-agent: nonblocking stdin".into());
+    }
+    let restore = || unsafe {
+        libc::fcntl(fd, libc::F_SETFL, flags);
+    };
+
+    let mut buf = Vec::new();
+    let mut last_data = None;
+    let mut eof = false;
+    loop {
+        let mut chunk = [0u8; 4096];
+        match stdin.lock().read(&mut chunk) {
+            Ok(0) => {
+                eof = true;
+            }
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                last_data = Some(Instant::now());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                restore();
+                return Err(format!("ds4-agent: read stdin: {error}"));
+            }
+        }
+        if eof {
+            break;
+        }
+        let timeout_ms = match last_data {
+            None => -1,
+            Some(at) => {
+                let elapsed = at.elapsed();
+                let quiet = Duration::from_millis(200);
+                if elapsed >= quiet {
                     break;
                 }
+                i32::try_from((quiet - elapsed).as_millis()).unwrap_or(1)
             }
-            if stop {
-                break;
+        };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let prc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if prc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
             }
+            restore();
+            return Err(format!("ds4-agent: poll: {err}"));
         }
-        transcript.push(model.token_eos());
-
-        if web_tools::has_block(&raw) {
-            let sys = build_system_transcript(model.vocab(), &args, think)?;
-            compact::compact_if_needed(
-                &model,
-                &mut session,
-                model.vocab(),
-                args.ctx,
-                &sys,
-                &mut transcript,
-                "soft limit before tool continuation",
-            )?;
-            let round = web_tools::handle_round_with_tools(
-                &raw,
-                &mut web,
-                &mut read_cursor,
-                &mut bash_jobs,
-            )
-            .map_err(|_| TOOL_UNSUPPORTED_ERROR.to_string())?;
-            output.extend_from_slice(&project_output(&[&round.visible])?);
-            let observation = fit_tool_observation(
-                &model,
-                &mut session,
-                model.vocab(),
-                &args,
-                think,
-                &mut transcript,
-                round.observation,
-            )?;
-            model
-                .vocab()
-                .chat_append_message(&mut transcript, "tool", &observation)
-                .map_err(|error| error.to_string())?;
-            model
-                .vocab()
-                .chat_append_assistant_prefix(&mut transcript, think)
-                .map_err(|error| error.to_string())?;
-            session
-                .sync(&transcript)
-                .map_err(|error| error.to_string())?;
-            continue;
+        if prc == 0 && !buf.is_empty() {
+            break;
         }
-        output.extend_from_slice(&project_output(&[&raw])?);
-        break;
     }
-
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
-    stdout
-        .write_all(&output)
-        .map_err(|error| error.to_string())?;
-    stdout.flush().map_err(|error| error.to_string())?;
-    Ok(0)
+    restore();
+    if buf.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
 }
 
 fn help_text(name: &str) -> String {
     format!(
-        "Usage: {name} --non-interactive -p TEXT [options]\n\
+        "Usage: {name} --non-interactive [-p TEXT] [options]\n\
          \n\
-         One-turn ds4-agent shadow. Supports google_search, visit_page, read, more, list, search, write, edit, bash, bash_status, and bash_stop. \
-         Use ./ds4-agent for other tools or interactive KV. Coordinator --role/--layers/--listen are accepted.\n\
+         Non-interactive ds4-agent shadow. Supports google_search, visit_page, read, more, list, search, write, edit, bash, bash_status, and bash_stop. \
+         Use ./ds4-agent for the TUI or interactive KV. Coordinator --role/--layers/--listen are accepted.\n\
          \n\
          Options:\n\
            -m, --model FILE        GGUF model path. Default: ds4flash.gguf\n\
            -c, --ctx N            Context size. Default: 100000\n\
            -n, --tokens N         Max generated tokens. Default: 50000\n\
-           -p, --prompt TEXT      Required one-turn prompt.\n\
-           --non-interactive      Required shadow mode.\n\
+           -p, --prompt TEXT      One-shot prompt; omit to read repeated stdin prompts.\n\
+           --non-interactive      Required shadow mode. Without -p, read stdin prompts.\n\
            -sys, --system TEXT    Extra system prompt.\n\
            --temp F               Sampling temperature. Default: 1\n\
            --top-p F              Nucleus probability. Default: 1\n\
@@ -899,9 +999,9 @@ mod tests {
         assert!(parse_args(argv(&["-p", "hello"]))
             .unwrap_err()
             .contains("--non-interactive"));
-        assert!(parse_args(argv(&["--non-interactive"]))
-            .unwrap_err()
-            .contains("-p/--prompt"));
+        let stdin_repeat = parse_args(argv(&["--non-interactive"])).unwrap();
+        assert!(stdin_repeat.non_interactive);
+        assert!(stdin_repeat.prompt.is_none());
         for flag in ["--dir-steering-file"] {
             let error = parse_args(argv(&["--non-interactive", "-p", "hello", flag, "ignored"]))
                 .unwrap_err();
