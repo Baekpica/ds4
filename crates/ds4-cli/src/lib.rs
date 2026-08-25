@@ -32,6 +32,8 @@ fn distributed_config(opt: &ds4_dist::Options) -> Option<ds4_core::DistributedCo
 pub struct ShadowArgs {
     pub model: Option<String>,
     pub mtp: Option<String>,
+    pub mtp_draft: i32,
+    pub mtp_margin: f32,
     pub dspark: Option<String>,
     pub backend: Backend,
     pub ctx: i32,
@@ -78,6 +80,8 @@ impl Default for ShadowArgs {
         Self {
             model: Some("ds4flash.gguf".into()),
             mtp: None,
+            mtp_draft: 1,
+            mtp_margin: 3.0,
             dspark: None,
             backend: default_backend(),
             ctx: 32768,
@@ -134,6 +138,13 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
             }
             "--mtp" => {
                 parsed.mtp = Some(require_value(&arg, iter.next())?);
+            }
+            "--mtp-draft" => {
+                parsed.mtp_draft = parse_positive_i32(&arg, &require_value(&arg, iter.next())?)?;
+            }
+            "--mtp-margin" => {
+                parsed.mtp_margin =
+                    parse_f32_range(&arg, &require_value(&arg, iter.next())?, 0.0, 1000.0)?;
             }
             "--dspark" => {
                 parsed.dspark = Some(require_value(&arg, iter.next())?);
@@ -1019,6 +1030,38 @@ mod tests {
         assert_eq!(parsed.min_p, 0.05);
         assert_eq!(parsed.seed, 0);
         assert!(!parsed.nothink);
+        assert_eq!(parsed.mtp_draft, 1);
+        assert_eq!(parsed.mtp_margin, 3.0);
+    }
+
+    #[test]
+    fn parses_mtp_draft_and_margin() {
+        let parsed = parse_args(args(&[
+            "--mtp",
+            "draft.gguf",
+            "--mtp-draft",
+            "2",
+            "--mtp-margin",
+            "4.5",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.mtp.as_deref(), Some("draft.gguf"));
+        assert_eq!(parsed.mtp_draft, 2);
+        assert_eq!(parsed.mtp_margin, 4.5);
+    }
+
+    #[test]
+    fn rejects_mtp_draft_and_margin_outside_c_ranges() {
+        for bad in [
+            ["--mtp-draft", "0"],
+            ["--mtp-draft", "-1"],
+            ["--mtp-draft", "x"],
+            ["--mtp-margin", "-0.1"],
+            ["--mtp-margin", "1000.1"],
+            ["--mtp-margin", "NaN"],
+        ] {
+            assert!(parse_args(args(&bad)).is_err(), "accepted {bad:?}");
+        }
     }
 
     #[test]
