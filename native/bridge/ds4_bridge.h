@@ -109,6 +109,9 @@ typedef struct {
     const ds4_host_bind_map *dspark_bind; /* optional; borrowed */
     int32_t mtp_draft_tokens;             /* 0 => native default 1 */
     float mtp_margin;
+    const char *directional_steering_file; /* optional; borrowed */
+    float directional_steering_attn;
+    float directional_steering_ffn;
 } ds4_bridge_model_open_options;
 
 /* All functions: 0 on success, nonzero on failure.  err is optional; when

@@ -112,22 +112,28 @@ pub enum Backend {
     Cpu,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ModelOpenOption {
     Quality,
     WarmWeights,
     PowerPercent(u8),
     MtpDraftTokens(i32),
     MtpMargin(f32),
+    SteeringFile(String),
+    SteeringAttn(f32),
+    SteeringFfn(f32),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug)]
 struct OpenTuning {
     quality: bool,
     warm_weights: bool,
     power_percent: i32,
     mtp_draft_tokens: i32,
     mtp_margin: f32,
+    steering_file: Option<String>,
+    steering_attn: f32,
+    steering_ffn: f32,
 }
 
 impl Default for OpenTuning {
@@ -138,6 +144,9 @@ impl Default for OpenTuning {
             power_percent: 100,
             mtp_draft_tokens: 1,
             mtp_margin: 3.0,
+            steering_file: None,
+            steering_attn: 0.0,
+            steering_ffn: 0.0,
         }
     }
 }
@@ -146,11 +155,11 @@ fn open_tuning(options: &[ModelOpenOption]) -> Result<OpenTuning> {
     let mut tuning = OpenTuning::default();
 
     for option in options {
-        match *option {
+        match option {
             ModelOpenOption::Quality => tuning.quality = true,
             ModelOpenOption::WarmWeights => tuning.warm_weights = true,
-            ModelOpenOption::PowerPercent(percent) if (1..=100).contains(&percent) => {
-                tuning.power_percent = i32::from(percent);
+            ModelOpenOption::PowerPercent(percent) if (1..=100).contains(percent) => {
+                tuning.power_percent = i32::from(*percent);
             }
             ModelOpenOption::PowerPercent(_) => {
                 return Err(Error {
@@ -158,15 +167,15 @@ fn open_tuning(options: &[ModelOpenOption]) -> Result<OpenTuning> {
                     message: "power percent must be between 1 and 100".into(),
                 });
             }
-            ModelOpenOption::MtpDraftTokens(n) if n > 0 => tuning.mtp_draft_tokens = n,
+            ModelOpenOption::MtpDraftTokens(n) if *n > 0 => tuning.mtp_draft_tokens = *n,
             ModelOpenOption::MtpDraftTokens(_) => {
                 return Err(Error {
                     code: 1,
                     message: "mtp draft tokens must be positive".into(),
                 });
             }
-            ModelOpenOption::MtpMargin(margin) if (0.0..=1000.0).contains(&margin) => {
-                tuning.mtp_margin = margin;
+            ModelOpenOption::MtpMargin(margin) if (0.0..=1000.0).contains(margin) => {
+                tuning.mtp_margin = *margin;
             }
             ModelOpenOption::MtpMargin(_) => {
                 return Err(Error {
@@ -174,7 +183,42 @@ fn open_tuning(options: &[ModelOpenOption]) -> Result<OpenTuning> {
                     message: "mtp margin must be between 0 and 1000".into(),
                 });
             }
+            ModelOpenOption::SteeringFile(path) if !path.is_empty() => {
+                tuning.steering_file = Some(path.clone());
+            }
+            ModelOpenOption::SteeringFile(_) => {
+                return Err(Error {
+                    code: 1,
+                    message: "directional steering needs --dir-steering-file".into(),
+                });
+            }
+            ModelOpenOption::SteeringAttn(scale) if (-100.0..=100.0).contains(scale) => {
+                tuning.steering_attn = *scale;
+            }
+            ModelOpenOption::SteeringAttn(_) => {
+                return Err(Error {
+                    code: 1,
+                    message: "dir-steering-attn must be between -100 and 100".into(),
+                });
+            }
+            ModelOpenOption::SteeringFfn(scale) if (-100.0..=100.0).contains(scale) => {
+                tuning.steering_ffn = *scale;
+            }
+            ModelOpenOption::SteeringFfn(_) => {
+                return Err(Error {
+                    code: 1,
+                    message: "dir-steering-ffn must be between -100 and 100".into(),
+                });
+            }
         }
+    }
+
+    if (tuning.steering_attn != 0.0 || tuning.steering_ffn != 0.0) && tuning.steering_file.is_none()
+    {
+        return Err(Error {
+            code: 1,
+            message: "directional steering needs --dir-steering-file".into(),
+        });
     }
 
     Ok(tuning)
@@ -1024,6 +1068,11 @@ impl Model {
             return Err(fail(check, &err));
         }
         let c_path = cstring_path(path)?;
+        let steering_file = tuning
+            .steering_file
+            .as_deref()
+            .map(cstring_path)
+            .transpose()?;
         let (mtp_path_ptr, mtp_bind_ptr) = match mtp_support.as_mut() {
             Some(s) => (s.path.as_ptr(), s.map.as_c()),
             None => (ptr::null(), ptr::null()),
@@ -1051,6 +1100,12 @@ impl Model {
             dspark_bind: dspark_bind_ptr,
             mtp_draft_tokens: tuning.mtp_draft_tokens,
             mtp_margin: tuning.mtp_margin,
+            directional_steering_file: steering_file
+                .as_ref()
+                .map(|path| path.as_ptr())
+                .unwrap_or(ptr::null()),
+            directional_steering_attn: tuning.steering_attn,
+            directional_steering_ffn: tuning.steering_ffn,
         };
         let mut ffi_distributed = distributed.map(pack_distributed).transpose()?;
         let mut raw = ptr::null_mut();
@@ -1827,6 +1882,31 @@ mod tests {
         assert_eq!(configured.power_percent, 37);
         assert!(open_tuning(&[ModelOpenOption::PowerPercent(0)]).is_err());
         assert!(open_tuning(&[ModelOpenOption::PowerPercent(101)]).is_err());
+    }
+
+    #[test]
+    fn model_open_tuning_applies_directional_steering() {
+        let defaults = open_tuning(&[]).unwrap();
+        assert!(defaults.steering_file.is_none());
+        assert_eq!(defaults.steering_attn, 0.0);
+        assert_eq!(defaults.steering_ffn, 0.0);
+
+        let configured = open_tuning(&[
+            ModelOpenOption::SteeringFile("dirs.bin".into()),
+            ModelOpenOption::SteeringAttn(0.5),
+            ModelOpenOption::SteeringFfn(-1.25),
+        ])
+        .unwrap();
+        assert_eq!(configured.steering_file.as_deref(), Some("dirs.bin"));
+        assert_eq!(configured.steering_attn, 0.5);
+        assert_eq!(configured.steering_ffn, -1.25);
+        assert_eq!(
+            open_tuning(&[ModelOpenOption::SteeringFfn(1.0)])
+                .unwrap_err()
+                .message,
+            "directional steering needs --dir-steering-file"
+        );
+        assert!(open_tuning(&[ModelOpenOption::SteeringAttn(101.0)]).is_err());
     }
 
     #[no_mangle]

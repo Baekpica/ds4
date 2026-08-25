@@ -230,6 +230,9 @@ static int model_open_impl(ds4_bridge_model **out,
     eopt.dspark_path = opt->dspark_path;
     eopt.mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
     eopt.mtp_margin = opt->mtp_margin;
+    eopt.directional_steering_file = opt->directional_steering_file;
+    eopt.directional_steering_attn = opt->directional_steering_attn;
+    eopt.directional_steering_ffn = opt->directional_steering_ffn;
     if (map_backend(opt->backend, &eopt.backend, err, errlen) != 0) return 1;
     if (distributed) {
         if (map_distributed_options(distributed, &dist, err, errlen) != 0 ||

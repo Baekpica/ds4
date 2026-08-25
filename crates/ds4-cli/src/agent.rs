@@ -46,6 +46,9 @@ pub struct AgentArgs {
     quality: bool,
     warm_weights: bool,
     power_percent: i32,
+    steering_file: Option<String>,
+    steering_attn: f32,
+    steering_ffn: f32,
     trace: Option<String>,
     dist: ds4_dist::Options,
     non_interactive: bool,
@@ -74,6 +77,9 @@ impl Default for AgentArgs {
             quality: false,
             warm_weights: false,
             power_percent: 100,
+            steering_file: None,
+            steering_attn: 0.0,
+            steering_ffn: 0.0,
             trace: None,
             dist: ds4_dist::Options::default(),
             non_interactive: false,
@@ -118,14 +124,9 @@ fn parse_seed(option: &str, value: String) -> Result<u64, String> {
         .ok_or_else(|| format!("invalid value for {option}: {value}"))
 }
 
-fn unsupported(option: &str) -> Result<AgentArgs, String> {
-    Err(format!(
-        "{option} is not implemented in the ds4-agent-rs one-turn shadow; use ./ds4-agent"
-    ))
-}
-
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AgentArgs, String> {
     let mut parsed = AgentArgs::default();
+    let mut steering_scale_set = false;
     let mut args = args.into_iter();
     let _argv0 = args.next();
     while let Some(arg) = args.next() {
@@ -201,8 +202,18 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AgentArgs, S
                 parsed.power_percent = parsed_power;
             }
             "--trace" => parsed.trace = Some(need_value(&arg, args.next())?),
-            "--dir-steering-file" | "--dir-steering-ffn" | "--dir-steering-attn" => {
-                return unsupported(&arg);
+            "--dir-steering-file" => {
+                parsed.steering_file = Some(need_value(&arg, args.next())?);
+            }
+            "--dir-steering-ffn" => {
+                let value = need_value(&arg, args.next())?;
+                parsed.steering_ffn = parse_f32_range(&arg, value, -100.0, 100.0)?;
+                steering_scale_set = true;
+            }
+            "--dir-steering-attn" => {
+                let value = need_value(&arg, args.next())?;
+                parsed.steering_attn = parse_f32_range(&arg, value, -100.0, 100.0)?;
+                steering_scale_set = true;
             }
             other => match ds4_dist::parse_cli_arg(other, &mut args, &mut parsed.dist)? {
                 ds4_dist::CliResult::Matched => {}
@@ -212,6 +223,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AgentArgs, S
                 ds4_dist::CliResult::Error => unreachable!(),
             },
         }
+    }
+    if parsed.steering_file.is_some() && !steering_scale_set {
+        parsed.steering_ffn = 1.0;
     }
     if !parsed.non_interactive {
         return Err("this shadow requires --non-interactive".into());
@@ -280,6 +294,15 @@ fn mtp_open_options(args: &AgentArgs) -> Vec<ds4_core::ModelOpenOption> {
     options.push(ds4_core::ModelOpenOption::PowerPercent(
         args.power_percent as u8,
     ));
+    if let Some(file) = &args.steering_file {
+        options.push(ds4_core::ModelOpenOption::SteeringFile(file.clone()));
+    }
+    if args.steering_attn != 0.0 {
+        options.push(ds4_core::ModelOpenOption::SteeringAttn(args.steering_attn));
+    }
+    if args.steering_ffn != 0.0 {
+        options.push(ds4_core::ModelOpenOption::SteeringFfn(args.steering_ffn));
+    }
     options
 }
 
@@ -711,8 +734,11 @@ fn help_text(name: &str) -> String {
            --mtp-margin F         MTP verifier margin. Default: 3\n\
            --quality              Prefer exact kernels where available.\n\
            --warm-weights         Touch mapped tensor pages before generation.\n\
-           --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n\
-           --backend NAME         metal, cuda, or cpu.\n\
+            --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n\
+            --dir-steering-file FILE  Directional steering vector file.\n\
+            --dir-steering-ffn F   FFN steering scale, -100..100. Default: 1 with a file.\n\
+            --dir-steering-attn F  Attention steering scale, -100..100.\n\
+            --backend NAME         metal, cuda, or cpu.\n\
            --metal, --cuda, --cpu Select backend explicitly.\n\
            -t, --threads N        CPU helper threads.\n\
            --chdir DIR            Change directory before model load.\n\
@@ -1110,6 +1136,58 @@ mod tests {
             .unwrap_err(),
             "--power must be between 1 and 100"
         );
+    }
+
+    #[test]
+    fn parses_dir_steering_open_options() {
+        let file_only = parse_args(argv(&[
+            "--non-interactive",
+            "-p",
+            "hello",
+            "--dir-steering-file",
+            "dirs.bin",
+        ]))
+        .unwrap();
+        assert_eq!(file_only.steering_file.as_deref(), Some("dirs.bin"));
+        assert_eq!(file_only.steering_ffn, 1.0);
+        assert_eq!(file_only.steering_attn, 0.0);
+        let options = mtp_open_options(&file_only);
+        assert!(options.contains(&ds4_core::ModelOpenOption::SteeringFile("dirs.bin".into())));
+        assert!(options.contains(&ds4_core::ModelOpenOption::SteeringFfn(1.0)));
+        assert!(!options
+            .iter()
+            .any(|option| matches!(option, ds4_core::ModelOpenOption::SteeringAttn(_))));
+
+        let with_attn = parse_args(argv(&[
+            "--non-interactive",
+            "-p",
+            "hello",
+            "--dir-steering-file",
+            "dirs.bin",
+            "--dir-steering-attn",
+            "0.5",
+        ]))
+        .unwrap();
+        assert_eq!(with_attn.steering_ffn, 0.0);
+        assert_eq!(with_attn.steering_attn, 0.5);
+        let options = mtp_open_options(&with_attn);
+        assert!(options.contains(&ds4_core::ModelOpenOption::SteeringAttn(0.5)));
+        assert!(!options
+            .iter()
+            .any(|option| matches!(option, ds4_core::ModelOpenOption::SteeringFfn(_))));
+
+        assert_eq!(
+            parse_args(argv(&[
+                "--non-interactive",
+                "-p",
+                "hello",
+                "--dir-steering-ffn",
+                "101"
+            ]))
+            .unwrap_err(),
+            "invalid value for --dir-steering-ffn: 101"
+        );
+        assert!(help_text("ds4-agent-rs").contains("--dir-steering-file FILE"));
     }
 
     #[test]

@@ -219,6 +219,9 @@ pub struct ds4_bridge_model_open_options {
     pub dspark_bind: *const ds4_host_bind_map,
     pub mtp_draft_tokens: i32,
     pub mtp_margin: c_float,
+    pub directional_steering_file: *const c_char,
+    pub directional_steering_attn: c_float,
+    pub directional_steering_ffn: c_float,
 }
 
 #[repr(C)]
