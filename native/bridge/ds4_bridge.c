@@ -500,6 +500,16 @@ int ds4_bridge_session_eval_layer_slice(ds4_bridge_session *s,
                                         errlen);
 }
 
+int ds4_bridge_session_layer_slice_reset(ds4_bridge_session *s,
+                                         char *err, size_t errlen)
+{
+    if (!s || !s->session) {
+        set_err(err, errlen, "session is NULL");
+        return 1;
+    }
+    return ds4_session_layer_slice_reset(s->session, err, errlen);
+}
+
 int ds4_bridge_eval_speculative_argmax(ds4_bridge_session *s,
                                        int32_t first_token,
                                        int32_t max_tokens,

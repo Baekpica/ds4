@@ -88,6 +88,11 @@ impl SliceExec for SessionSliceExec<'_> {
     }
 
     fn eval(&mut self, req: &WorkRequest) -> Result<WorkOutput, String> {
+        if req.reset {
+            self.session
+                .layer_slice_reset()
+                .map_err(|error| error.to_string())?;
+        }
         let mut output_hc = if req.produce_hidden {
             Some(vec![
                 0.0;

@@ -426,6 +426,12 @@ extern "C" {
         errlen: usize,
     ) -> c_int;
 
+    pub fn ds4_bridge_session_layer_slice_reset(
+        s: *mut ds4_bridge_session,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
     pub fn ds4_bridge_session_argmax(s: *mut ds4_bridge_session) -> c_int;
 
     pub fn ds4_bridge_session_argmax_excluding(

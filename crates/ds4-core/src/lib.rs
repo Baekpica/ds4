@@ -91,11 +91,11 @@ use ds4_sys::{
     ds4_bridge_session_copy_logits, ds4_bridge_session_create, ds4_bridge_session_ctx,
     ds4_bridge_session_distributed_route_ready, ds4_bridge_session_eval_layer_slice,
     ds4_bridge_session_exaone_rewind_span, ds4_bridge_session_free, ds4_bridge_session_generation,
-    ds4_bridge_session_invalidate, ds4_bridge_session_load_layer_payload,
-    ds4_bridge_session_load_payload, ds4_bridge_session_load_payload_range,
-    ds4_bridge_session_load_snapshot, ds4_bridge_session_output_head_bench,
-    ds4_bridge_session_power, ds4_bridge_session_prefill_cap, ds4_bridge_session_rewind,
-    ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
+    ds4_bridge_session_invalidate, ds4_bridge_session_layer_slice_reset,
+    ds4_bridge_session_load_layer_payload, ds4_bridge_session_load_payload,
+    ds4_bridge_session_load_payload_range, ds4_bridge_session_load_snapshot,
+    ds4_bridge_session_output_head_bench, ds4_bridge_session_power, ds4_bridge_session_prefill_cap,
+    ds4_bridge_session_rewind, ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
     ds4_bridge_session_save_payload, ds4_bridge_session_save_snapshot,
     ds4_bridge_session_set_power, ds4_bridge_session_sync, ds4_bridge_session_top_logprobs,
     ds4_bridge_shard, ds4_bridge_snapshot, ds4_bridge_snapshot_create, ds4_bridge_snapshot_free,
@@ -1428,6 +1428,25 @@ impl Session<'_> {
         Ok(())
     }
 
+    pub fn layer_slice_reset(&mut self) -> Result<()> {
+        let mut err = [0u8; 512];
+        // SAFETY: [Category 8 — FFI] `raw` is a live session from create. err is
+        // a stack buffer whose length is passed to native. The bridge does not
+        // retain the pointers.
+        let rc = unsafe {
+            ds4_bridge_session_layer_slice_reset(
+                self.raw.as_ptr(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(fail(rc, &err));
+        }
+        self.host.invalidate();
+        Ok(())
+    }
+
     pub fn eval_speculative_argmax(
         &mut self,
         first: i32,
@@ -2017,6 +2036,29 @@ mod tests {
             })
             .unwrap();
         assert_eq!(session.host().tokens(), &[1, 2, 4, 5]);
+    }
+
+    #[no_mangle]
+    extern "C" fn ds4_bridge_session_layer_slice_reset(
+        s: *mut ds4_bridge_session,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        i32::from(s.is_null())
+    }
+
+    #[test]
+    fn layer_slice_reset_clears_host_timeline() {
+        let mut session = std::mem::ManuallyDrop::new(Session {
+            raw: NonNull::<ds4_bridge_session>::dangling(),
+            host: SessionLedger::new(ModelFamily::DeepSeek4, SessionBackend::Cuda, 4096, 1),
+            _model: PhantomData,
+            _not_send: PhantomData,
+        });
+        session.host.replace_checkpoint(&[1, 2, 3]);
+        session.layer_slice_reset().unwrap();
+        assert!(session.host().tokens().is_empty());
+        assert_eq!(session.host().live_len(), 0);
     }
 
     #[test]

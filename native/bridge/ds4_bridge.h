@@ -174,6 +174,8 @@ int ds4_bridge_session_eval_layer_slice(ds4_bridge_session *s,
                                         int32_t output_logits,
                                         float *logits,
                                         char *err, size_t errlen);
+int ds4_bridge_session_layer_slice_reset(ds4_bridge_session *s,
+                                         char *err, size_t errlen);
 int ds4_bridge_session_argmax(ds4_bridge_session *s);
 int ds4_bridge_session_argmax_excluding(ds4_bridge_session *s,
                                         int32_t excluded_id);
