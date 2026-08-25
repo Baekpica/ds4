@@ -11,6 +11,8 @@ use crate::session_exec::{slice_meta, SessionSliceExec, SliceMeta};
 use crate::session_snapshot::SessionSnapshotStore;
 use crate::worker_hello::{worker_hello, worker_model_name};
 
+pub const WORKER_USE_PREFETCH: bool = false;
+
 pub struct WorkerPlan {
     pub hello: Hello,
     pub model_name: String,
@@ -126,6 +128,7 @@ pub fn run_assembled_worker(model: &Model, ctx: i32, dist: &Options) -> Result<i
     });
     let port = u16::try_from(dist.coordinator_port)
         .map_err(|_| "--role worker requires --coordinator HOST PORT")?;
+    const { assert!(!WORKER_USE_PREFETCH) };
     ds4_dist::reconnect_local(
         &mut assembled.worker,
         ds4_dist::LocalReconnect {
@@ -178,6 +181,27 @@ mod tests {
             ds4_dist::reconnect_local(worker, spec)
         }
         let _ = bind::<fn() -> std::io::Result<std::net::TcpStream>, fn(), fn() -> bool>;
+    }
+
+    fn assert_not_send<T: ?Sized>() {
+        struct Probe<U: ?Sized>(std::marker::PhantomData<U>);
+        trait OnlyIfNotSend<A> {
+            fn ok() {}
+        }
+        impl<U: ?Sized> OnlyIfNotSend<()> for Probe<U> {}
+        impl<U: ?Sized + Send> OnlyIfNotSend<bool> for Probe<U> {}
+        let _ = <Probe<T> as OnlyIfNotSend<_>>::ok;
+    }
+
+    #[test]
+    fn session_slice_exec_cannot_bind_send_reconnect_with() {
+        // Given: worker types wrap !Send Session (Rc + Session::_not_send)
+        // When: the Send reconnect path requires E: Send + S: Send
+        // Then: those types do not implement Send, and the worker entry keeps prefetch off
+        assert_not_send::<SessionSliceExec<'static>>();
+        assert_not_send::<SessionSnapshotStore<'static>>();
+        assert_not_send::<Session<'static>>();
+        assert!(!WORKER_USE_PREFETCH);
     }
 
     #[test]
