@@ -21,7 +21,7 @@ static void oracle_usage(void)
             "read2 PATH | more PATH READ_COUNT RAW [COUNT...] | "
             "more-none [COUNT] | more-error PATH | list [PATH] | "
             "search [QUERY [PATH [MODE [GLOB [CASE [CONTEXT [MAX]]]]]]] | "
-            "write [PATH [CONTENT]]\n");
+            "write [PATH [CONTENT]] | edit [PATH [OLD [NEW]]]\n");
     exit(2);
 }
 
@@ -208,6 +208,27 @@ int main(int argc, char **argv)
             }
         }
         char *result = agent_tool_search(NULL, &call);
+        print_hex(result, strlen(result));
+        free(result);
+        agent_tool_call_free(&call);
+        return 0;
+    }
+
+    if (argc >= 2 && argc <= 5 && strcmp(argv[1], "edit") == 0) {
+        agent_tool_call call = {.name = xstrdup("edit")};
+        if (argc >= 3 && strcmp(argv[2], "-") != 0) {
+            agent_tool_call_add_arg(&call, "path", argv[2], strlen(argv[2]),
+                                    true);
+        }
+        if (argc >= 4 && strcmp(argv[3], "-") != 0) {
+            agent_tool_call_add_arg(&call, "old", argv[3], strlen(argv[3]),
+                                    true);
+        }
+        if (argc >= 5 && strcmp(argv[4], "-") != 0) {
+            agent_tool_call_add_arg(&call, "new", argv[4], strlen(argv[4]),
+                                    true);
+        }
+        char *result = agent_tool_edit(NULL, &call);
         print_hex(result, strlen(result));
         free(result);
         agent_tool_call_free(&call);

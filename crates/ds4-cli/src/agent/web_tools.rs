@@ -23,8 +23,8 @@ const START_LINE_ARG: &str = "start_line";
 const MAX_LINES_ARG: &str = "max_lines";
 const WHOLE_ARG: &str = "whole";
 const RAW_ARG: &str = "raw";
-const FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
-const RESULT_MAX_BYTES: usize = 128 * 1024;
+pub(super) const FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const RESULT_MAX_BYTES: usize = 128 * 1024;
 const READ_ERROR_MAX_BYTES: usize = 255;
 const READ_DEFAULT_LINES: usize = 500;
 const LIST_MAX_ENTRIES: usize = 300;
@@ -338,7 +338,7 @@ fn read_error(message: String) -> Vec<u8> {
     error
 }
 
-fn read_bytes(path: &str) -> Result<Vec<u8>, Vec<u8>> {
+pub(super) fn read_bytes(path: &str) -> Result<Vec<u8>, Vec<u8>> {
     let file = File::open(path)
         .map_err(|error| read_error(format!("open {path}: {}", io_detail(&error))))?;
     let mut data = Vec::new();
@@ -675,6 +675,9 @@ pub(super) fn handle_round_with_cursor<B: Browser>(
             LIST_DIR => list_result(call),
             super::write::WRITE => {
                 super::write::write_result(call.arg(PATH_ARG), call.arg("content"))
+            }
+            super::edit::EDIT => {
+                super::edit::edit_result(call.arg(PATH_ARG), call.arg("old"), call.arg("new"))
             }
             super::search::SEARCH => match super::search::search_result(super::search::SearchArgs {
                 query: call.arg(QUERY_ARG),
