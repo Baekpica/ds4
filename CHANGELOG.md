@@ -5,7 +5,7 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
-## Unreleased
+## v0.6.3.1 — 2026-08-25
 
 - **Client reasoning_effort compat-mapping (field issue #18)** — the
   OpenAI-surface `reasoning_effort` field no longer reaches the
