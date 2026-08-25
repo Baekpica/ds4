@@ -1,7 +1,7 @@
 //! Coordinator: accept HELLO, register workers, build a route, dispatch WORK.
 
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 
 use crate::activation::decode_activation;
@@ -107,6 +107,12 @@ pub fn open_data_listener(host: Option<&str>, port: u16) -> std::io::Result<(Tcp
         ));
     }
     Ok((listener, bound))
+}
+
+pub fn accept_data_client(listener: &TcpListener) -> std::io::Result<TcpStream> {
+    let (stream, _) = listener.accept()?;
+    stream.set_nodelay(true)?;
+    Ok(stream)
 }
 
 /// Dispatch one remote eval on an already-connected first-hop stream.

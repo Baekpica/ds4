@@ -640,3 +640,28 @@ fn open_data_listener_assigns_ephemeral_port() {
     assert_eq!(listener.local_addr().unwrap().port(), port);
     let _stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
 }
+
+#[test]
+fn open_data_listener_accept_data_client_returns_client() {
+    let (listener, port) = ds4_dist::open_data_listener(Some("127.0.0.1"), 0).unwrap();
+    let connector = thread::spawn(move || TcpStream::connect(("127.0.0.1", port)).unwrap());
+    let client = ds4_dist::accept_data_client(&listener).unwrap();
+    let _peer = connector.join().unwrap();
+    assert!(client.nodelay().unwrap());
+}
+
+#[test]
+fn open_data_listener_accept_data_client_errors_after_close() {
+    use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+
+    let (listener, _port) = ds4_dist::open_data_listener(Some("127.0.0.1"), 0).unwrap();
+    let raw = listener.into_raw_fd();
+    // SAFETY: `raw` is exclusively owned; OwnedFd closes it.
+    drop(unsafe { OwnedFd::from_raw_fd(raw) });
+    // SAFETY: `raw` is a closed fd. Reconstruct only so accept observes the
+    // error, then forget so Drop does not close twice.
+    let listener = unsafe { TcpListener::from_raw_fd(raw) };
+    let err = ds4_dist::accept_data_client(&listener);
+    std::mem::forget(listener);
+    assert!(err.is_err());
+}
