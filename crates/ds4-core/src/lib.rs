@@ -93,15 +93,16 @@ use ds4_sys::{
     ds4_bridge_session_free, ds4_bridge_session_generation, ds4_bridge_session_invalidate,
     ds4_bridge_session_load_layer_payload, ds4_bridge_session_load_payload,
     ds4_bridge_session_load_payload_range, ds4_bridge_session_load_snapshot,
-    ds4_bridge_session_output_head_bench, ds4_bridge_session_prefill_cap,
+    ds4_bridge_session_output_head_bench, ds4_bridge_session_power, ds4_bridge_session_prefill_cap,
     ds4_bridge_session_rewind, ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
-    ds4_bridge_session_save_payload, ds4_bridge_session_save_snapshot, ds4_bridge_session_sync,
-    ds4_bridge_session_top_logprobs, ds4_bridge_shard, ds4_bridge_snapshot,
-    ds4_bridge_snapshot_create, ds4_bridge_snapshot_free, ds4_bridge_snapshot_len,
-    ds4_bridge_token_score, ds4_host_bind_look, ds4_host_bind_map, ds4_host_shape, ds4_host_str,
-    ds4_host_tensor, ds4_host_tensor_dir, ds4_host_vocab, DS4_BRIDGE_BACKEND_CPU,
-    DS4_BRIDGE_BACKEND_CUDA, DS4_BRIDGE_BACKEND_METAL, DS4_BRIDGE_DISTRIBUTED_COORDINATOR,
-    DS4_BRIDGE_DISTRIBUTED_NONE, DS4_BRIDGE_DISTRIBUTED_WORKER, DS4_BRIDGE_MAX_DIMS,
+    ds4_bridge_session_save_payload, ds4_bridge_session_save_snapshot,
+    ds4_bridge_session_set_power, ds4_bridge_session_sync, ds4_bridge_session_top_logprobs,
+    ds4_bridge_shard, ds4_bridge_snapshot, ds4_bridge_snapshot_create, ds4_bridge_snapshot_free,
+    ds4_bridge_snapshot_len, ds4_bridge_token_score, ds4_host_bind_look, ds4_host_bind_map,
+    ds4_host_shape, ds4_host_str, ds4_host_tensor, ds4_host_tensor_dir, ds4_host_vocab,
+    DS4_BRIDGE_BACKEND_CPU, DS4_BRIDGE_BACKEND_CUDA, DS4_BRIDGE_BACKEND_METAL,
+    DS4_BRIDGE_DISTRIBUTED_COORDINATOR, DS4_BRIDGE_DISTRIBUTED_NONE, DS4_BRIDGE_DISTRIBUTED_WORKER,
+    DS4_BRIDGE_MAX_DIMS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1480,6 +1481,21 @@ impl Session<'_> {
 
     pub fn ctx(&self) -> i32 {
         unsafe { ds4_bridge_session_ctx(self.raw.as_ptr()) }
+    }
+
+    pub fn power(&self) -> i32 {
+        unsafe { ds4_bridge_session_power(self.raw.as_ptr()) }
+    }
+
+    pub fn set_power(&mut self, power_percent: i32) -> Result<()> {
+        let rc = unsafe { ds4_bridge_session_set_power(self.raw.as_ptr(), power_percent) };
+        if rc != 0 {
+            return Err(Error {
+                code: rc,
+                message: "failed to set /power".into(),
+            });
+        }
+        Ok(())
     }
 
     pub fn sample(

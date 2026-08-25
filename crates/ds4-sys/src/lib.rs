@@ -419,6 +419,10 @@ extern "C" {
 
     pub fn ds4_bridge_session_ctx(s: *mut ds4_bridge_session) -> c_int;
 
+    pub fn ds4_bridge_session_power(s: *mut ds4_bridge_session) -> c_int;
+
+    pub fn ds4_bridge_session_set_power(s: *mut ds4_bridge_session, power_percent: c_int) -> c_int;
+
     pub fn ds4_bridge_session_rewind(s: *mut ds4_bridge_session, pos: c_int);
 
     pub fn ds4_bridge_session_invalidate(s: *mut ds4_bridge_session);

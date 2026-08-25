@@ -165,6 +165,8 @@ int ds4_bridge_session_argmax_excluding(ds4_bridge_session *s,
                                         int32_t excluded_id);
 int ds4_bridge_session_pos(ds4_bridge_session *s);
 int ds4_bridge_session_ctx(ds4_bridge_session *s);
+int ds4_bridge_session_power(ds4_bridge_session *s);
+int ds4_bridge_session_set_power(ds4_bridge_session *s, int power_percent);
 void ds4_bridge_session_rewind(ds4_bridge_session *s, int pos);
 void ds4_bridge_session_invalidate(ds4_bridge_session *s);
 uint64_t ds4_bridge_session_generation(ds4_bridge_session *s);

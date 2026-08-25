@@ -514,6 +514,18 @@ int ds4_bridge_session_ctx(ds4_bridge_session *s)
     return ds4_session_ctx(s->session);
 }
 
+int ds4_bridge_session_power(ds4_bridge_session *s)
+{
+    if (!s || !s->session) return 100;
+    return ds4_session_power(s->session);
+}
+
+int ds4_bridge_session_set_power(ds4_bridge_session *s, int power_percent)
+{
+    if (!s || !s->session) return 1;
+    return ds4_session_set_power(s->session, power_percent);
+}
+
 void ds4_bridge_session_rewind(ds4_bridge_session *s, int pos)
 {
     if (!s || !s->session) return;

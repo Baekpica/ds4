@@ -1096,10 +1096,14 @@ fn run_repl(model: &ds4_core::Model, mut args: ShadowArgs) -> Result<i32, String
                 apply_effort_prefix(vocab, &mut chat, Some(&mut session));
             }
             Ok(repl::ReplLine::Power(None)) => {
-                println!("Power: 100%.");
+                println!("Power: {}%.", session.power());
             }
             Ok(repl::ReplLine::Power(Some(n))) => {
-                println!("Power: {n}%.");
+                if session.set_power(n).is_err() {
+                    eprint!("ds4: failed to set /power\n");
+                } else {
+                    println!("Power: {n}%.");
+                }
             }
             Ok(repl::ReplLine::Read(path)) => {
                 let text = std::fs::read_to_string(&path)
