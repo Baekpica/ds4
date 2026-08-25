@@ -1034,10 +1034,117 @@ int ds4_bridge_batch_ctx_max_seq(ds4_bridge_batch_ctx *c)
     return ds4_batch_ctx_max_seq(c->ctx);
 }
 
+int ds4_bridge_batch_ctx_raw_cap(ds4_bridge_batch_ctx *c)
+{
+    if (!c || !c->ctx) return 0;
+    return ds4_batch_ctx_raw_cap(c->ctx);
+}
+
 int ds4_bridge_batch_ctx_seq_cap(ds4_bridge_batch_ctx *c)
 {
     if (!c || !c->ctx) return 0;
     return ds4_batch_ctx_seq_cap(c->ctx);
+}
+
+int ds4_bridge_batch_ctx_generate_static(
+        ds4_bridge_batch_ctx *c,
+        const int32_t *const *prompt_tokens,
+        const int32_t *prompt_lengths,
+        const int32_t *max_new_tokens,
+        const int32_t *eos_ids,
+        int32_t n,
+        int32_t *out_tokens,
+        int32_t out_tokens_cap,
+        int32_t *out_lengths,
+        int32_t *out_finish,
+        char *err, size_t errlen)
+{
+    ds4_tokens *prompts = NULL;
+    ds4_batch_gen_result *results = NULL;
+    size_t total = 0;
+    int rc = 1;
+
+    if (!c || !c->ctx) {
+        set_err(err, errlen, "static batch ctx is NULL");
+        return 1;
+    }
+    if (n <= 0 || n > ds4_batch_ctx_max_seq(c->ctx)) {
+        set_err(err, errlen, "static batch request count is out of range");
+        return 1;
+    }
+    if (out_lengths)
+        memset(out_lengths, 0, (size_t)n * sizeof(*out_lengths));
+    if (out_finish)
+        memset(out_finish, 0, (size_t)n * sizeof(*out_finish));
+    if (!prompt_tokens || !prompt_lengths || !max_new_tokens || !eos_ids) {
+        set_err(err, errlen, "static batch request arrays are NULL");
+        return 1;
+    }
+    if (!out_lengths || !out_finish || out_tokens_cap < 0 ||
+        (out_tokens_cap > 0 && !out_tokens)) {
+        set_err(err, errlen, "static batch output is invalid");
+        return 1;
+    }
+
+    prompts = calloc((size_t)n, sizeof(*prompts));
+    results = calloc((size_t)n, sizeof(*results));
+    if (!prompts || !results) {
+        set_err(err, errlen, "out of memory");
+        goto done;
+    }
+    for (int32_t i = 0; i < n; i++) {
+        if (prompt_lengths[i] > 0 && !prompt_tokens[i]) {
+            set_err(err, errlen, "static batch prompt tokens are NULL");
+            goto done;
+        }
+        prompts[i].v = (int *)prompt_tokens[i];
+        prompts[i].len = prompt_lengths[i];
+        prompts[i].cap = prompt_lengths[i];
+    }
+
+    rc = ds4_engine_batched_generate_ctx(c->ctx, prompts, n,
+                                         max_new_tokens, eos_ids,
+                                         results, err, errlen);
+    if (rc != 0) goto done;
+
+    for (int32_t i = 0; i < n; i++) {
+        const int32_t len = results[i].n_tokens;
+        const int32_t limit = max_new_tokens[i] > 0 ? max_new_tokens[i] : 1;
+        if (len < 0 || (len > 0 && !results[i].tokens) ||
+            len > limit ||
+            (results[i].finish != 0 && results[i].finish != 1)) {
+            set_err(err, errlen, "static batch native result is invalid");
+            rc = 1;
+            goto done;
+        }
+        if ((size_t)len > (size_t)out_tokens_cap - total) {
+            set_err(err, errlen, "static batch output buffer is too small");
+            rc = 1;
+            goto done;
+        }
+        total += (size_t)len;
+    }
+
+    total = 0;
+    for (int32_t i = 0; i < n; i++) {
+        const int32_t len = results[i].n_tokens;
+        if (len > 0) {
+            memcpy(out_tokens + total, results[i].tokens,
+                   (size_t)len * sizeof(*out_tokens));
+        }
+        out_lengths[i] = len;
+        out_finish[i] = results[i].finish;
+        total += (size_t)len;
+    }
+    rc = 0;
+
+done:
+    if (results) {
+        for (int32_t i = 0; i < n; i++) free(results[i].tokens);
+    }
+    free(results);
+    free(prompts);
+    return rc;
 }
 
 int ds4_bridge_batch_ctx_bank_snapshot(ds4_bridge_batch_ctx *c, int32_t bank,

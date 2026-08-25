@@ -551,7 +551,24 @@ extern "C" {
 
     pub fn ds4_bridge_batch_ctx_max_seq(c: *mut ds4_bridge_batch_ctx) -> c_int;
 
+    pub fn ds4_bridge_batch_ctx_raw_cap(c: *mut ds4_bridge_batch_ctx) -> c_int;
+
     pub fn ds4_bridge_batch_ctx_seq_cap(c: *mut ds4_bridge_batch_ctx) -> c_int;
+
+    pub fn ds4_bridge_batch_ctx_generate_static(
+        c: *mut ds4_bridge_batch_ctx,
+        prompt_tokens: *const *const i32,
+        prompt_lengths: *const i32,
+        max_new_tokens: *const i32,
+        eos_ids: *const i32,
+        n: i32,
+        out_tokens: *mut i32,
+        out_tokens_cap: i32,
+        out_lengths: *mut i32,
+        out_finish: *mut i32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
 
     pub fn ds4_bridge_batch_ctx_bank_snapshot(
         c: *mut ds4_bridge_batch_ctx,

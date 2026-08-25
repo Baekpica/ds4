@@ -26,6 +26,11 @@ unsigned bridge_progress_sets;
 unsigned bridge_progress_clears;
 int bridge_progress_active;
 int bridge_batch_max_seq;
+int bridge_static_batch_calls;
+int bridge_static_batch_n;
+int bridge_static_batch_prompt_lens[8];
+int bridge_static_batch_max_new[8];
+int bridge_static_batch_eos[8];
 int bridge_bank_committed;
 int bridge_bank_tokens[8];
 uint64_t bridge_bank_generation;
@@ -199,7 +204,42 @@ int ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx) {
     (void)ctx;
     return bridge_batch_max_seq;
 }
+int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
+int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx,
+                                    const ds4_tokens *prompts, int n,
+                                    const int *max_new_tokens,
+                                    const int *eos_ids,
+                                    ds4_batch_gen_result *out,
+                                    char *err, size_t errlen) {
+    (void)ctx; (void)err; (void)errlen;
+    bridge_static_batch_calls++;
+    bridge_static_batch_n = n;
+    for (int i = 0; i < n; i++) {
+        bridge_static_batch_prompt_lens[i] = prompts[i].len;
+        bridge_static_batch_max_new[i] = max_new_tokens[i];
+        bridge_static_batch_eos[i] = eos_ids[i];
+    }
+    out[0].tokens = malloc(2 * sizeof(*out[0].tokens));
+    out[1].tokens = malloc(3 * sizeof(*out[1].tokens));
+    if (!out[0].tokens || !out[1].tokens) {
+        free(out[0].tokens);
+        free(out[1].tokens);
+        out[0].tokens = NULL;
+        out[1].tokens = NULL;
+        return 1;
+    }
+    out[0].tokens[0] = 101;
+    out[0].tokens[1] = 102;
+    out[0].n_tokens = 2;
+    out[0].finish = 1;
+    out[1].tokens[0] = 201;
+    out[1].tokens[1] = 202;
+    out[1].tokens[2] = 203;
+    out[1].n_tokens = 3;
+    out[1].finish = 0;
+    return 0;
+}
 int ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank,
                                  const int **tokens) {
     (void)ctx;

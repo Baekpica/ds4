@@ -22,6 +22,11 @@ extern unsigned bridge_progress_sets;
 extern unsigned bridge_progress_clears;
 extern int bridge_progress_active;
 extern int bridge_batch_max_seq;
+extern int bridge_static_batch_calls;
+extern int bridge_static_batch_n;
+extern int bridge_static_batch_prompt_lens[8];
+extern int bridge_static_batch_max_new[8];
+extern int bridge_static_batch_eos[8];
 extern int bridge_bank_committed;
 extern int bridge_bank_tokens[8];
 extern uint64_t bridge_bank_generation;
@@ -405,12 +410,27 @@ int main(void) {
         if (!strstr(err, "NULL")) fail("batch_ctx err");
         ds4_bridge_batch_ctx_destroy(NULL);
         if (ds4_bridge_batch_ctx_max_seq(NULL) != 0) fail("batch max_seq");
+        if (ds4_bridge_batch_ctx_raw_cap(NULL) != 0) fail("batch raw_cap");
         if (ds4_bridge_batch_ctx_seq_cap(NULL) != 0) fail("batch seq_cap");
         memset(err, 0, sizeof(err));
         if (ds4_bridge_continuous_generate(NULL, NULL, NULL, NULL, NULL,
                                            err, sizeof(err)) == 0)
             fail("cont NULL ctx");
         if (!strstr(err, "NULL")) fail("cont err");
+        {
+            const int32_t *prompt_ptrs[1] = {toks};
+            const int32_t prompt_lens[1] = {1};
+            const int32_t max_new[1] = {1};
+            const int32_t eos[1] = {-1};
+            int32_t out_lens[1] = {-1};
+            int32_t out_finish[1] = {-1};
+            if (ds4_bridge_batch_ctx_generate_static(
+                    NULL, prompt_ptrs, prompt_lens, max_new, eos, 1,
+                    toks, 4, out_lens, out_finish, err, sizeof(err)) == 0)
+                fail("static batch NULL ctx");
+            if (out_lens[0] != -1 || out_finish[0] != -1)
+                fail("static batch NULL touched outputs");
+        }
 
         n = -1;
         memset(err, 0, sizeof(err));
@@ -480,6 +500,53 @@ int main(void) {
                 fail("cont stats values");
             }
             bridge_cont_run = 0;
+
+            {
+                const int32_t first[] = {10, 11};
+                const int32_t second[] = {20, 21, 22};
+                const int32_t *prompt_ptrs[] = {first, second};
+                const int32_t prompt_lens[] = {2, 3};
+                const int32_t max_new[] = {2, 3};
+                const int32_t eos[] = {99, -1};
+                int32_t generated[5] = {0};
+                int32_t out_lens[2] = {-1, -1};
+                int32_t out_finish[2] = {-1, -1};
+
+                bridge_static_batch_calls = 0;
+                if (ds4_bridge_batch_ctx_generate_static(
+                        &fake, prompt_ptrs, prompt_lens, max_new, eos, 2,
+                        generated, 5, out_lens, out_finish,
+                        err, sizeof(err)) != 0)
+                    fail("static batch generate");
+                if (bridge_static_batch_calls != 1 ||
+                    bridge_static_batch_n != 2 ||
+                    bridge_static_batch_prompt_lens[0] != 2 ||
+                    bridge_static_batch_prompt_lens[1] != 3 ||
+                    bridge_static_batch_max_new[0] != 2 ||
+                    bridge_static_batch_max_new[1] != 3 ||
+                    bridge_static_batch_eos[0] != 99 ||
+                    bridge_static_batch_eos[1] != -1)
+                    fail("static batch native inputs");
+                if (out_lens[0] != 2 || out_lens[1] != 3 ||
+                    out_finish[0] != 1 || out_finish[1] != 0 ||
+                    generated[0] != 101 || generated[1] != 102 ||
+                    generated[2] != 201 || generated[3] != 202 ||
+                    generated[4] != 203)
+                    fail("static batch copied outputs");
+
+                memset(err, 0, sizeof(err));
+                out_lens[0] = out_lens[1] = -1;
+                out_finish[0] = out_finish[1] = -1;
+                if (ds4_bridge_batch_ctx_generate_static(
+                        &fake, prompt_ptrs, prompt_lens, max_new, eos, 2,
+                        generated, 4, out_lens, out_finish,
+                        err, sizeof(err)) == 0)
+                    fail("static batch short output");
+                if (!strstr(err, "small") || out_lens[0] != 0 ||
+                    out_lens[1] != 0 || out_finish[0] != 0 ||
+                    out_finish[1] != 0)
+                    fail("static batch short output contract");
+            }
 
             int fd = mkstemp(path);
             if (fd < 0) fail("bank payload fixture");

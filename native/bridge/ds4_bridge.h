@@ -268,7 +268,26 @@ int ds4_bridge_batch_ctx_create_fit(ds4_bridge_model *m, int ctx_size,
                                     char *err, size_t errlen);
 void ds4_bridge_batch_ctx_destroy(ds4_bridge_batch_ctx *c);
 int ds4_bridge_batch_ctx_max_seq(ds4_bridge_batch_ctx *c);
+int ds4_bridge_batch_ctx_raw_cap(ds4_bridge_batch_ctx *c);
 int ds4_bridge_batch_ctx_seq_cap(ds4_bridge_batch_ctx *c);
+
+/* Static greedy batch over the persistent native context.  Prompts and output
+ * arrays are caller-owned.  Successful token streams are copied contiguously,
+ * in request order, into out_tokens; out_lengths partitions that buffer and
+ * out_finish uses 1=EOS, 0=budget.  Native ds4_batch_gen_result allocations are
+ * always released inside the bridge before return. */
+int ds4_bridge_batch_ctx_generate_static(
+        ds4_bridge_batch_ctx *c,
+        const int32_t *const *prompt_tokens,
+        const int32_t *prompt_lengths,
+        const int32_t *max_new_tokens,
+        const int32_t *eos_ids,
+        int32_t n,
+        int32_t *out_tokens,
+        int32_t out_tokens_cap,
+        int32_t *out_lengths,
+        int32_t *out_finish,
+        char *err, size_t errlen);
 
 /* Opaque durable-bank seam.  Host metadata stays outside the native batch;
  * committed tokens are copied into caller storage and payload bytes move only

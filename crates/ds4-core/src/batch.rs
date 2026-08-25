@@ -15,9 +15,10 @@ use std::ptr::{self, NonNull};
 use ds4_sys::{
     ds4_bridge_batch_ctx, ds4_bridge_batch_ctx_bank_load_payload_range,
     ds4_bridge_batch_ctx_bank_save_payload, ds4_bridge_batch_ctx_bank_snapshot,
-    ds4_bridge_batch_ctx_create_fit, ds4_bridge_batch_ctx_destroy, ds4_bridge_batch_ctx_max_seq,
-    ds4_bridge_batch_ctx_seq_cap, ds4_bridge_cont_request, ds4_bridge_cont_stats,
-    ds4_bridge_continuous_generate,
+    ds4_bridge_batch_ctx_create_fit, ds4_bridge_batch_ctx_destroy,
+    ds4_bridge_batch_ctx_generate_static, ds4_bridge_batch_ctx_max_seq,
+    ds4_bridge_batch_ctx_raw_cap, ds4_bridge_batch_ctx_seq_cap, ds4_bridge_cont_request,
+    ds4_bridge_cont_stats, ds4_bridge_continuous_generate,
 };
 
 use crate::{cstring_payload_path, fail, Error, Model, Result};
@@ -210,6 +211,29 @@ pub struct BankSnapshot {
     pub generation: u64,
 }
 
+/// One greedy request for [`BatchCtx::generate_static`].  The native engine
+/// borrows `tokens` only for the duration of the call.  A non-positive budget
+/// keeps the C contract and generates at most one token.
+#[derive(Clone, Copy, Debug)]
+pub struct StaticBatchRequest<'a> {
+    pub tokens: &'a [i32],
+    pub max_new_tokens: i32,
+    /// `< 0` selects the engine/family default EOS.
+    pub eos: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaticBatchFinish {
+    Budget,
+    Eos,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticBatchResult {
+    pub tokens: Vec<i32>,
+    pub finish: StaticBatchFinish,
+}
+
 impl Model {
     /// `ds4_batch_ctx_create_fit`: `max_seq` is a cap; the engine sizes the
     /// bank count down to the memory budget. Read the width back with
@@ -255,6 +279,148 @@ impl BatchCtx<'_> {
 
     pub fn seq_cap(&self) -> i32 {
         unsafe { ds4_bridge_batch_ctx_seq_cap(self.raw.as_ptr()) }
+    }
+
+    /// Runs one fixed group to completion on the persistent native context.
+    /// Native result allocations are copied and released inside the bridge;
+    /// every returned token buffer is owned by Rust.
+    pub fn generate_static(
+        &mut self,
+        requests: &[StaticBatchRequest<'_>],
+    ) -> Result<Vec<StaticBatchResult>> {
+        if requests.is_empty() {
+            return Err(Error {
+                code: 1,
+                message: "static batch requires at least one request".into(),
+            });
+        }
+        let max_seq = self.max_seq();
+        if max_seq <= 0 || requests.len() > max_seq as usize {
+            return Err(Error {
+                code: 1,
+                message: format!(
+                    "static batch request count {} exceeds context width {}",
+                    requests.len(),
+                    max_seq
+                ),
+            });
+        }
+        let static_token_cap = unsafe { ds4_bridge_batch_ctx_raw_cap(self.raw.as_ptr()) };
+        if static_token_cap <= 0 {
+            return Err(Error {
+                code: 1,
+                message: "static batch context has no raw token capacity".into(),
+            });
+        }
+
+        let mut prompt_tokens = Vec::with_capacity(requests.len());
+        let mut prompt_lengths = Vec::with_capacity(requests.len());
+        let mut max_new_tokens = Vec::with_capacity(requests.len());
+        let mut eos_ids = Vec::with_capacity(requests.len());
+        let mut output_cap = 0usize;
+        for (index, request) in requests.iter().enumerate() {
+            if request.tokens.is_empty() {
+                return Err(Error {
+                    code: 1,
+                    message: format!("static batch prompt {index} is empty"),
+                });
+            }
+            let prompt_len = i32::try_from(request.tokens.len()).map_err(|_| Error {
+                code: 1,
+                message: format!("static batch prompt {index} is too large"),
+            })?;
+            let requested_cap = if request.max_new_tokens > 0 {
+                request.max_new_tokens as usize
+            } else {
+                1
+            };
+            let context_room = if static_token_cap > prompt_len {
+                (static_token_cap - prompt_len) as usize
+            } else {
+                1
+            };
+            let request_cap = requested_cap.min(context_room);
+            output_cap = output_cap.checked_add(request_cap).ok_or_else(|| Error {
+                code: 1,
+                message: "static batch output capacity overflows".into(),
+            })?;
+            prompt_tokens.push(request.tokens.as_ptr());
+            prompt_lengths.push(prompt_len);
+            max_new_tokens.push(request.max_new_tokens);
+            eos_ids.push(request.eos);
+        }
+        let output_cap_i32 = i32::try_from(output_cap).map_err(|_| Error {
+            code: 1,
+            message: "static batch output capacity exceeds native ABI".into(),
+        })?;
+        let n = requests.len() as i32;
+        let mut flat_tokens = Vec::new();
+        flat_tokens
+            .try_reserve_exact(output_cap)
+            .map_err(|_| Error {
+                code: 1,
+                message: "failed to allocate static batch output".into(),
+            })?;
+        flat_tokens.resize(output_cap, 0);
+        let mut output_lengths = vec![0; requests.len()];
+        let mut output_finish = vec![0; requests.len()];
+        let mut err = [0u8; 512];
+        let rc = unsafe {
+            ds4_bridge_batch_ctx_generate_static(
+                self.raw.as_ptr(),
+                prompt_tokens.as_ptr(),
+                prompt_lengths.as_ptr(),
+                max_new_tokens.as_ptr(),
+                eos_ids.as_ptr(),
+                n,
+                flat_tokens.as_mut_ptr(),
+                output_cap_i32,
+                output_lengths.as_mut_ptr(),
+                output_finish.as_mut_ptr(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(fail(rc, &err));
+        }
+
+        let mut cursor = 0usize;
+        let mut results = Vec::with_capacity(requests.len());
+        for (index, (&length, &finish)) in
+            output_lengths.iter().zip(output_finish.iter()).enumerate()
+        {
+            let length = usize::try_from(length).map_err(|_| Error {
+                code: 1,
+                message: format!("invalid native static batch length at {index}"),
+            })?;
+            let end = cursor.checked_add(length).ok_or_else(|| Error {
+                code: 1,
+                message: "native static batch length overflow".into(),
+            })?;
+            if end > flat_tokens.len() {
+                return Err(Error {
+                    code: 1,
+                    message: format!("native static batch output {index} exceeds its buffer"),
+                });
+            }
+            let finish = match finish {
+                0 => StaticBatchFinish::Budget,
+                1 => StaticBatchFinish::Eos,
+                _ => {
+                    return Err(Error {
+                        code: 1,
+                        message: format!("invalid native static batch finish at {index}"),
+                    })
+                }
+            };
+            results.push(StaticBatchResult {
+                tokens: flat_tokens[cursor..end].to_vec(),
+                finish,
+            });
+            cursor = end;
+        }
+        Ok(results)
     }
 
     /// Copies the native committed frontier; no C token pointer escapes.
@@ -387,11 +553,55 @@ mod tests {
         static TOKENS: RefCell<Vec<i32>> = RefCell::new(vec![10, 20, 30]);
         static LOAD: RefCell<Option<(i32, String, u64, u64)>> = const { RefCell::new(None) };
         static SAVE_BANK: Cell<i32> = const { Cell::new(-1) };
+        static STATIC_INPUT: RefCell<Vec<(Vec<i32>, i32, i32)>> = const { RefCell::new(Vec::new()) };
+        static STATIC_OUTPUT_CAP: Cell<i32> = const { Cell::new(0) };
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_batch_ctx_generate_static(
+        _c: *mut ds4_bridge_batch_ctx,
+        prompt_tokens: *const *const i32,
+        prompt_lengths: *const i32,
+        max_new_tokens: *const i32,
+        eos_ids: *const i32,
+        n: i32,
+        out_tokens: *mut i32,
+        out_tokens_cap: i32,
+        out_lengths: *mut i32,
+        out_finish: *mut i32,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> c_int {
+        let mut seen = Vec::new();
+        for i in 0..n as usize {
+            let len = *prompt_lengths.add(i) as usize;
+            let tokens = std::slice::from_raw_parts(*prompt_tokens.add(i), len).to_vec();
+            seen.push((tokens, *max_new_tokens.add(i), *eos_ids.add(i)));
+        }
+        STATIC_INPUT.with(|input| *input.borrow_mut() = seen);
+        STATIC_OUTPUT_CAP.with(|cap| cap.set(out_tokens_cap));
+        if out_tokens_cap < 3 {
+            return 1;
+        }
+        std::ptr::copy_nonoverlapping([101, 102, 201].as_ptr(), out_tokens, 3);
+        std::ptr::copy_nonoverlapping([2, 1].as_ptr(), out_lengths, 2);
+        std::ptr::copy_nonoverlapping([1, 0].as_ptr(), out_finish, 2);
+        0
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_batch_ctx_max_seq(_c: *mut ds4_bridge_batch_ctx) -> c_int {
+        8
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_batch_ctx_raw_cap(_c: *mut ds4_bridge_batch_ctx) -> c_int {
+        8
     }
 
     #[no_mangle]
     unsafe extern "C" fn ds4_bridge_batch_ctx_seq_cap(_c: *mut ds4_bridge_batch_ctx) -> c_int {
-        8
+        10
     }
 
     #[no_mangle]
@@ -484,5 +694,37 @@ mod tests {
         assert_eq!((load.0, load.2, load.3), (1, 7, 11));
         assert_eq!(restored.tokens, [10, 20, 30]);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn static_batch_results_are_owned_and_hide_the_native_layout() {
+        let batch = &mut *fake_batch();
+        let first = vec![10, 20];
+        let second = vec![30];
+        let requests = [
+            StaticBatchRequest {
+                tokens: &first,
+                max_new_tokens: 8,
+                eos: 99,
+            },
+            StaticBatchRequest {
+                tokens: &second,
+                max_new_tokens: 1,
+                eos: -1,
+            },
+        ];
+
+        let results = batch.generate_static(&requests).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].tokens, [101, 102]);
+        assert_eq!(results[0].finish, StaticBatchFinish::Eos);
+        assert_eq!(results[1].tokens, [201]);
+        assert_eq!(results[1].finish, StaticBatchFinish::Budget);
+        assert_eq!(STATIC_OUTPUT_CAP.with(Cell::get), 7);
+        assert_eq!(
+            STATIC_INPUT.with(|input| input.borrow().clone()),
+            vec![(vec![10, 20], 8, 99), (vec![30], 1, -1)]
+        );
     }
 }
