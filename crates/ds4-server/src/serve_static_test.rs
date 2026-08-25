@@ -1,129 +1,8 @@
+use super::harness::{drive_static_chat, drive_static_chat_with, pair_jobs, SpyStatic};
 use super::*;
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::Mutex;
-
-use crate::generate::{GenerateError, GenerateOutcome, ScriptedDecode};
-use crate::parse::ParsedRequest;
+use crate::generate::GenerateError;
 use crate::route::LANE_STATIC;
-use crate::serve::{handle_client_inner, ServerConfig, ServerInner};
-use crate::serve_cont::ContExec;
 use crate::WireSurface;
-
-struct SpyStatic {
-    calls: usize,
-    siblings: Vec<OwnedStaticJob>,
-}
-
-impl StaticExec for SpyStatic {
-    fn generate_static(&mut self, jobs: &[StaticJob<'_>]) -> Result<Vec<StaticRow>, GenerateError> {
-        self.calls += 1;
-        Ok(jobs
-            .iter()
-            .map(|job| StaticRow {
-                tokens: job.tokens.to_vec(),
-            })
-            .collect())
-    }
-
-    fn pending_siblings(&self) -> &[OwnedStaticJob] {
-        &self.siblings
-    }
-}
-
-struct ForceStaticCont;
-
-impl ContExec for ForceStaticCont {
-    fn model_id(&self) -> i32 {
-        0
-    }
-    fn seq_cap(&self) -> i32 {
-        0
-    }
-    fn encode_chat(&self, _rendered: &[u8]) -> Vec<i32> {
-        vec![1]
-    }
-    fn encode_text(&self, _text: &str) -> Vec<i32> {
-        vec![1]
-    }
-    fn generate(
-        &mut self,
-        _parsed: &ParsedRequest,
-        _job_id: &str,
-        _created: i64,
-        _cors: bool,
-        _default_tokens: i32,
-        _t_arrive: std::time::Instant,
-        _bank_hold_retry: &mut dyn FnMut(i32, Option<(u64, i32)>) -> Option<i32>,
-        _store: Option<&mut ds4_kv::Store>,
-        _out: &mut dyn Write,
-    ) -> Result<GenerateOutcome, GenerateError> {
-        panic!("continuous generate must not run on a static-routed request");
-    }
-}
-
-impl ContExec for SpyStatic {
-    fn model_id(&self) -> i32 {
-        0
-    }
-    fn seq_cap(&self) -> i32 {
-        0
-    }
-    fn encode_chat(&self, _rendered: &[u8]) -> Vec<i32> {
-        vec![1]
-    }
-    fn encode_text(&self, _text: &str) -> Vec<i32> {
-        vec![1]
-    }
-    fn generate(
-        &mut self,
-        _parsed: &ParsedRequest,
-        _job_id: &str,
-        _created: i64,
-        _cors: bool,
-        _default_tokens: i32,
-        _t_arrive: std::time::Instant,
-        _bank_hold_retry: &mut dyn FnMut(i32, Option<(u64, i32)>) -> Option<i32>,
-        _store: Option<&mut ds4_kv::Store>,
-        _out: &mut dyn Write,
-    ) -> Result<GenerateOutcome, GenerateError> {
-        panic!("continuous generate must not run on a static-routed request");
-    }
-    fn as_static(&mut self) -> Option<&mut dyn StaticExec> {
-        Some(self)
-    }
-}
-
-fn drive_static_chat() -> (Vec<u8>, ServerInner) {
-    let mut cont = ForceStaticCont;
-    drive_static_chat_with(&mut cont)
-}
-
-fn drive_static_chat_with(cont: &mut dyn ContExec) -> (Vec<u8>, ServerInner) {
-    let cfg = ServerConfig {
-        have_engine: true,
-        default_tokens: 8,
-        ..ServerConfig::default()
-    };
-    let inner = Mutex::new(ServerInner::from_cfg(&cfg));
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let body = r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"},"temperature":0}"#;
-    write!(
-        client,
-        "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
-    client.shutdown(std::net::Shutdown::Write).unwrap();
-    let (mut server, _) = listener.accept().unwrap();
-    let mut engine = ScriptedDecode::from_pieces(&[b"serial-fallback"]);
-    handle_client_inner(&cfg, &inner, &mut server, Some(&mut engine), Some(cont));
-    drop(server);
-    let mut response = Vec::new();
-    client.read_to_end(&mut response).unwrap();
-    (response, inner.into_inner().unwrap())
-}
 
 #[test]
 fn static_width_error_matches_c_bridge_string_when_n_lt_2() {
@@ -156,10 +35,7 @@ fn run_static_returns_c_error_string_when_n_eq_1() {
         max_new_tokens: 8,
         eos: 99,
     }];
-    let mut spy = SpyStatic {
-        calls: 0,
-        siblings: Vec::new(),
-    };
+    let mut spy = SpyStatic::default();
 
     // When
     let err = run_static(&mut spy, &jobs).unwrap_err();
@@ -177,31 +53,19 @@ fn run_static_invokes_generate_static_when_n_eq_2() {
     // Given: two fixture rows (no GGUF)
     let first = [10, 20];
     let second = [30];
-    let jobs = [
-        StaticJob {
-            tokens: &first,
-            max_new_tokens: 8,
-            eos: 99,
-        },
-        StaticJob {
-            tokens: &second,
-            max_new_tokens: 1,
-            eos: -1,
-        },
-    ];
-    let mut spy = SpyStatic {
-        calls: 0,
-        siblings: Vec::new(),
-    };
+    let jobs = pair_jobs(&first, &second);
+    let mut spy = SpyStatic::default();
 
     // When
     let rows = run_static(&mut spy, &jobs).unwrap();
 
-    // Then
+    // Then: per-row lengths stay ragged; fallback stays cold
     assert_eq!(spy.calls, 1);
+    assert_eq!(spy.fallbacks, 0);
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].tokens, first);
     assert_eq!(rows[1].tokens, second);
+    assert_eq!([rows[0].tokens.len(), rows[1].tokens.len()], [2, 1]);
 }
 
 #[test]
@@ -236,12 +100,12 @@ fn static_routed_request_returns_c_width_error_not_serial() {
 fn static_routed_request_invokes_generate_static_when_n_eq_2() {
     // Given: route_decide picked LANE_STATIC and one sibling is waiting
     let mut spy = SpyStatic {
-        calls: 0,
         siblings: vec![OwnedStaticJob {
             tokens: vec![30],
             max_new_tokens: 1,
             eos: -1,
         }],
+        ..Default::default()
     };
 
     // When: the HTTP request is served through handle_client_inner

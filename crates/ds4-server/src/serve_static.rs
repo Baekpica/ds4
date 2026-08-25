@@ -5,6 +5,9 @@ use crate::generate::GenerateError;
 /// C `ds4_bridge_batch_ctx_generate_static` when `n` is not a legal width.
 pub const STATIC_WIDTH_ERR: &str = "static batch request count is out of range";
 
+/// C `generate_batch_jobs` when the batched `err` buffer is empty.
+pub const STATIC_FALLBACK_ERR: &str = "out of memory";
+
 /// C `generate_batch_jobs` admission: coalesced group only.
 pub const STATIC_N_MIN: usize = 2;
 
@@ -36,6 +39,24 @@ pub trait StaticExec {
     /// Extra rows already waiting (coalesce). Default: none.
     fn pending_siblings(&self) -> &[OwnedStaticJob] {
         &[]
+    }
+
+    /// C per-call fallback after `generate_static` fails. Default: C err text.
+    fn fallback_static(&mut self, err: GenerateError) -> Result<Vec<StaticRow>, GenerateError> {
+        Err(static_fallback_error(err))
+    }
+}
+
+/// Map a failed `generate_static` onto C `generate_batch_jobs` err text.
+pub fn static_fallback_error(err: GenerateError) -> GenerateError {
+    match err {
+        GenerateError::Engine(msg) if !msg.is_empty() => GenerateError::Engine(msg),
+        GenerateError::Engine(_)
+        | GenerateError::Unsupported(_)
+        | GenerateError::Io
+        | GenerateError::ContinuationHold { .. } => {
+            GenerateError::Engine(STATIC_FALLBACK_ERR.to_string())
+        }
     }
 }
 
@@ -96,7 +117,7 @@ pub const fn static_width_error(n: usize) -> Option<&'static str> {
 }
 
 /// Owner entry: refuse `n<2` with the C width string; otherwise call
-/// [`StaticExec::generate_static`].
+/// [`StaticExec::generate_static`]. On err, C fallback text — never serial.
 pub fn run_static(
     exec: &mut dyn StaticExec,
     jobs: &[StaticJob<'_>],
@@ -104,7 +125,10 @@ pub fn run_static(
     if let Some(msg) = static_width_error(jobs.len()) {
         return Err(GenerateError::Engine(msg.to_string()));
     }
-    exec.generate_static(jobs)
+    match exec.generate_static(jobs) {
+        Ok(rows) => Ok(rows),
+        Err(err) => exec.fallback_static(err),
+    }
 }
 
 /// Routed owner: current request plus any [`StaticExec::pending_siblings`].
@@ -126,5 +150,13 @@ pub fn run_static_routed(
 }
 
 #[cfg(test)]
+#[path = "serve_static_harness.rs"]
+mod harness;
+
+#[cfg(test)]
 #[path = "serve_static_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "serve_static_fallback_test.rs"]
+mod fallback_tests;
