@@ -1047,8 +1047,6 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
 }
 
 fn run_repl(model: &ds4_core::Model, mut args: ShadowArgs) -> Result<i32, String> {
-    use std::io::{self, BufRead, Write};
-
     let mut chat = repl::ReplChat::new(args.nothink, args.ctx);
     let vocab = model.vocab();
     vocab
@@ -1062,33 +1060,30 @@ fn run_repl(model: &ds4_core::Model, mut args: ShadowArgs) -> Result<i32, String
     }
     let mut session = session_ready(model, &args, chat.ctx)?;
     let _sigint = repl::InterruptGuard::install();
-    let mut history = repl::History::load(repl::history_file_path());
+    let history_path = repl::history_file_path();
+    let tty = repl::stdin_is_tty();
+    if tty {
+        repl::init_linenoise_history(&history_path);
+    }
+    let mut history = repl::History::load(history_path.clone());
 
     print!("{}", repl::REPL_HELP);
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
     loop {
-        write!(stdout, "ds4> ").map_err(|e| e.to_string())?;
-        stdout.flush().map_err(|e| e.to_string())?;
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => {
-                if repl::interrupt_requested() {
-                    repl::interrupt_clear();
-                    continue;
-                }
-                break;
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+        let line = match repl::read_repl_line("ds4> ")? {
+            repl::ReplRead::Eof => break,
+            repl::ReplRead::Interrupted => {
                 repl::interrupt_clear();
                 continue;
             }
-            Err(error) => return Err(error.to_string()),
-        }
+            repl::ReplRead::Line(line) => line,
+        };
         let cmd = repl::trim_inplace(&line);
-        if !cmd.is_empty() && history.add(cmd.to_string()) {
-            let _ = history.save();
+        if !cmd.is_empty() {
+            if tty {
+                repl::remember_linenoise_line(&history_path, cmd);
+            } else if history.add(cmd.to_string()) {
+                let _ = history.save();
+            }
         }
         match repl::parse_repl_line(&line) {
             Ok(repl::ReplLine::Empty) => {}

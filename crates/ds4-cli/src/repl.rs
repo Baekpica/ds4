@@ -64,6 +64,91 @@ pub fn interrupt_end(interrupted: bool, generated: i32) -> InterruptEnd {
     }
 }
 
+unsafe extern "C" {
+    fn linenoise(prompt: *const libc::c_char) -> *mut libc::c_char;
+    fn linenoiseFree(ptr: *mut libc::c_void);
+    fn linenoiseSetMultiLine(ml: libc::c_int);
+    fn linenoiseHistorySetMaxLen(len: libc::c_int) -> libc::c_int;
+    fn linenoiseHistoryLoad(filename: *const libc::c_char) -> libc::c_int;
+    fn linenoiseHistoryAdd(line: *const libc::c_char) -> libc::c_int;
+    fn linenoiseHistorySave(filename: *const libc::c_char) -> libc::c_int;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplRead {
+    Line(String),
+    Eof,
+    Interrupted,
+}
+
+pub fn stdin_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+}
+
+pub fn init_linenoise_history(path: &std::path::Path) {
+    let Some(c_path) = path.to_str().and_then(|p| std::ffi::CString::new(p).ok()) else {
+        return;
+    };
+    unsafe {
+        linenoiseSetMultiLine(1);
+        linenoiseHistorySetMaxLen(HISTORY_MAX_LEN as libc::c_int);
+        linenoiseHistoryLoad(c_path.as_ptr());
+    }
+}
+
+pub fn remember_linenoise_line(path: &std::path::Path, line: &str) {
+    let Ok(c_line) = std::ffi::CString::new(line) else {
+        return;
+    };
+    let Some(c_path) = path.to_str().and_then(|p| std::ffi::CString::new(p).ok()) else {
+        return;
+    };
+    unsafe {
+        linenoiseHistoryAdd(c_line.as_ptr());
+        linenoiseHistorySave(c_path.as_ptr());
+    }
+}
+
+pub fn read_repl_line(prompt: &str) -> Result<ReplRead, String> {
+    if stdin_is_tty() {
+        return read_linenoise_line(prompt);
+    }
+    read_plain_line()
+}
+
+fn read_linenoise_line(prompt: &str) -> Result<ReplRead, String> {
+    let c_prompt = std::ffi::CString::new(prompt).map_err(|_| "prompt contains NUL".to_string())?;
+    let ptr = unsafe { linenoise(c_prompt.as_ptr()) };
+    if ptr.is_null() {
+        if interrupt_requested()
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+        {
+            return Ok(ReplRead::Interrupted);
+        }
+        return Ok(ReplRead::Eof);
+    }
+    let line = unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { linenoiseFree(ptr.cast()) };
+    Ok(ReplRead::Line(line))
+}
+
+fn read_plain_line() -> Result<ReplRead, String> {
+    use std::io::{self, BufRead, Write};
+    let mut stdout = io::stdout();
+    write!(stdout, "ds4> ").map_err(|e| e.to_string())?;
+    stdout.flush().map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    match io::stdin().lock().read_line(&mut line) {
+        Ok(0) if interrupt_requested() => Ok(ReplRead::Interrupted),
+        Ok(0) => Ok(ReplRead::Eof),
+        Ok(_) => Ok(ReplRead::Line(line)),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(ReplRead::Interrupted),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 pub const HISTORY_MAX_LEN: usize = 512;
 
 pub fn history_file_path() -> std::path::PathBuf {
