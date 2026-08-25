@@ -6,7 +6,11 @@ const THINK_CLOSE: &[u8] = b"</think>";
 const TOOL_UNSUPPORTED_ERROR: &str =
     "tool execution is not implemented in ds4-agent-rs; use ./ds4-agent";
 
+mod search;
 mod web_tools;
+
+#[cfg(test)]
+mod search_parity;
 
 #[derive(Debug)]
 pub struct AgentArgs {
@@ -381,7 +385,7 @@ fn help_text(name: &str) -> String {
     format!(
         "Usage: {name} --non-interactive -p TEXT [options]\n\
          \n\
-         One-turn ds4-agent shadow. Supports google_search, visit_page, read, more, and list. \
+         One-turn ds4-agent shadow. Supports google_search, visit_page, read, more, list, and search. \
          Use ./ds4-agent for other tools, interactive, KV, MTP, or distributed execution.\n\
          \n\
          Options:\n\
@@ -656,7 +660,7 @@ mod tests {
     #[test]
     fn help_names_the_supported_tool_subset() {
         let help = help_text("ds4-agent-rs");
-        assert!(help.contains("google_search, visit_page, read, more, and list"));
+        assert!(help.contains("google_search, visit_page, read, more, list, and search"));
         assert!(!help.contains("Tool calls are rejected"));
     }
 }

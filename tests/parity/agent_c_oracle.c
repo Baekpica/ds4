@@ -19,7 +19,8 @@ static void oracle_usage(void)
             "usage: agent_c_oracle prompt | datetime WHEN | dsml TEXT | "
             "project THINK CHUNK... | read PATH START MAX WHOLE RAW | "
             "read2 PATH | more PATH READ_COUNT RAW [COUNT...] | "
-            "more-none [COUNT] | more-error PATH | list [PATH]\n");
+            "more-none [COUNT] | more-error PATH | list [PATH] | "
+            "search [QUERY [PATH [MODE [GLOB [CASE [CONTEXT [MAX]]]]]]]\n");
     exit(2);
 }
 
@@ -186,6 +187,26 @@ int main(int argc, char **argv)
                                     true);
         }
         char *result = agent_tool_list(&call);
+        print_hex(result, strlen(result));
+        free(result);
+        agent_tool_call_free(&call);
+        return 0;
+    }
+
+    if (argc >= 2 && argc <= 9 && strcmp(argv[1], "search") == 0) {
+        static const char *names[] = {
+            "query", "path", "mode", "glob", "case_sensitive", "context",
+            "max_results"
+        };
+        agent_tool_call call = {.name = xstrdup("search")};
+        for (int i = 0; i < 7 && i + 2 < argc; i++) {
+            const char *value = argv[i + 2];
+            if (strcmp(value, "-") != 0) {
+                agent_tool_call_add_arg(&call, names[i], value, strlen(value),
+                                        i <= 3);
+            }
+        }
+        char *result = agent_tool_search(NULL, &call);
         print_hex(result, strlen(result));
         free(result);
         agent_tool_call_free(&call);

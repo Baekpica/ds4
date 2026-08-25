@@ -309,7 +309,7 @@ fn parse_read_int(value: Option<&str>, default: usize) -> usize {
     parsed.clamp(1, i128::from(i32::MAX)) as usize
 }
 
-fn parse_bool(value: Option<&str>, default: bool) -> bool {
+pub(crate) fn parse_bool(value: Option<&str>, default: bool) -> bool {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return default;
     };
@@ -673,6 +673,20 @@ pub(super) fn handle_round_with_cursor<B: Browser>(
             READ_FILE => read_result(call, cursor),
             MORE_FILE => more_result(call, cursor),
             LIST_DIR => list_result(call),
+            super::search::SEARCH => match super::search::search_result(super::search::SearchArgs {
+                query: call.arg(QUERY_ARG),
+                path: call.arg(PATH_ARG),
+                mode: call.arg("mode"),
+                glob: call.arg("glob"),
+                case_sensitive: call.arg("case_sensitive"),
+                context: call.arg("context"),
+                max_results: call.arg("max_results"),
+            }) {
+                super::search::SearchOutcome::Output(bytes) => bytes,
+                super::search::SearchOutcome::Unsupported => {
+                    return Err(TOOL_UNSUPPORTED_ERROR.into());
+                }
+            },
             _ => return Err(TOOL_UNSUPPORTED_ERROR.into()),
         };
         observation.append(format!("Tool result {} ({}):\n", index + 1, call.name).as_bytes());
