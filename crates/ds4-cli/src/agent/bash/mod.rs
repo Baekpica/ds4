@@ -66,8 +66,10 @@ impl Drop for BashTable {
 impl BashJob {
     fn kill_group(&self, sig: i32) {
         if self.pid > 0 {
+            // SAFETY: [Category 8 — FFI] `pid` is a process group we created with
+            // `process_group(0)`. Negative pid signals the group; the second call
+            // covers the leader. libc does not retain the pid.
             unsafe {
-                // SAFETY: pid is a process group we created with process_group(0).
                 kill(-self.pid, sig);
                 kill(self.pid, sig);
             }
@@ -118,6 +120,9 @@ pub(crate) fn parse_timeout(value: Option<&str>) -> i32 {
         return DEFAULT_TIMEOUT;
     };
     let mut end = std::ptr::null_mut();
+    // SAFETY: [Category 8 — FFI] `c_value` is a live CString; `end` is a
+    // stack `*mut c_char` written by libc. `strtod` does not retain either
+    // pointer. Matches C `strtod` timeout parse.
     let parsed = unsafe { strtod(c_value.as_ptr(), &mut end) };
     if end == c_value.as_ptr().cast_mut() || !parsed.is_finite() || parsed <= 0.0 {
         return DEFAULT_TIMEOUT;

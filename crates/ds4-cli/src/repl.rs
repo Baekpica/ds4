@@ -23,15 +23,20 @@ pub struct InterruptGuard {
 impl InterruptGuard {
     pub fn install() -> Self {
         interrupt_clear();
+        // SAFETY: [Category 4 — Uninitialized Memory] `sigaction` is a C POD;
+        // all-zero is a valid bit pattern. `old` is written by `sigaction`
+        // before any field is read; `sa` is filled (handler, mask) before install.
         let mut old = unsafe { std::mem::zeroed::<libc::sigaction>() };
         let mut sa = unsafe { std::mem::zeroed::<libc::sigaction>() };
         sa.sa_sigaction = sigint_handler as *const () as usize;
-        // SAFETY: `sigemptyset` only writes the caller-owned mask.
+        // SAFETY: [Category 8 — FFI] `sigemptyset` only writes the caller-owned
+        // mask; the pointer is not retained.
         unsafe {
             libc::sigemptyset(&mut sa.sa_mask);
         }
-        // SAFETY: installs a process-wide SIGINT handler and copies the
-        // previous action into `old` so Drop can restore it.
+        // SAFETY: [Category 8 — FFI] installs a process-wide SIGINT handler and
+        // copies the previous action into `old` so Drop can restore it. `sa` is
+        // fully initialized; both pointers are stack-owned for the call only.
         let rc = unsafe { libc::sigaction(libc::SIGINT, &sa, &mut old) };
         Self {
             old: (rc == 0).then_some(old),
@@ -42,7 +47,9 @@ impl InterruptGuard {
 impl Drop for InterruptGuard {
     fn drop(&mut self) {
         if let Some(old) = self.old.take() {
-            // SAFETY: restores the previous SIGINT action captured at install.
+            // SAFETY: [Category 8 — FFI] restores the previous SIGINT action
+            // captured at install. `old` is a complete `sigaction`; NULL oact
+            // is allowed by POSIX.
             unsafe {
                 libc::sigaction(libc::SIGINT, &old, std::ptr::null_mut());
             }
@@ -82,6 +89,8 @@ pub enum ReplRead {
 }
 
 pub fn stdin_is_tty() -> bool {
+    // SAFETY: [Category 8 — FFI] `STDIN_FILENO` is the process stdin; `isatty`
+    // only inspects the descriptor and does not retain it.
     unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
 }
 
@@ -89,6 +98,9 @@ pub fn init_linenoise_history(path: &std::path::Path) {
     let Some(c_path) = path.to_str().and_then(|p| std::ffi::CString::new(p).ok()) else {
         return;
     };
+    // SAFETY: [Category 8 — FFI] linenoise config/load take a NUL-terminated
+    // path borrowed for the call. The C library copies what it needs; `c_path`
+    // outlives the three calls.
     unsafe {
         linenoiseSetMultiLine(1);
         linenoiseHistorySetMaxLen(HISTORY_MAX_LEN as libc::c_int);
@@ -103,6 +115,9 @@ pub fn remember_linenoise_line(path: &std::path::Path, line: &str) {
     let Some(c_path) = path.to_str().and_then(|p| std::ffi::CString::new(p).ok()) else {
         return;
     };
+    // SAFETY: [Category 8 — FFI] both pointers are live CStrings borrowed for
+    // the call. linenoise copies the line into its history; it does not retain
+    // the path pointer after return.
     unsafe {
         linenoiseHistoryAdd(c_line.as_ptr());
         linenoiseHistorySave(c_path.as_ptr());
@@ -118,6 +133,8 @@ pub fn read_repl_line(prompt: &str) -> Result<ReplRead, String> {
 
 fn read_linenoise_line(prompt: &str) -> Result<ReplRead, String> {
     let c_prompt = std::ffi::CString::new(prompt).map_err(|_| "prompt contains NUL".to_string())?;
+    // SAFETY: [Category 8 — FFI] prompt is a live CString; linenoise does not
+    // retain it. A non-NULL return is a heap C string owned until `linenoiseFree`.
     let ptr = unsafe { linenoise(c_prompt.as_ptr()) };
     if ptr.is_null() {
         if interrupt_requested()
@@ -127,9 +144,13 @@ fn read_linenoise_line(prompt: &str) -> Result<ReplRead, String> {
         }
         return Ok(ReplRead::Eof);
     }
+    // SAFETY: [Category 8 — FFI] `ptr` is non-null (checked) and NUL-terminated
+    // by linenoise; we copy to an owned String before free.
     let line = unsafe { std::ffi::CStr::from_ptr(ptr) }
         .to_string_lossy()
         .into_owned();
+    // SAFETY: [Category 12 — Double free] exclusive ownership of the linenoise
+    // allocation; this is the only free, after the CStr copy.
     unsafe { linenoiseFree(ptr.cast()) };
     Ok(ReplRead::Line(line))
 }

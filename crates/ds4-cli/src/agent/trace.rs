@@ -130,8 +130,9 @@ fn format_trace_time() -> String {
         tv_sec: now.as_secs() as libc::time_t,
         tv_nsec: i64::from(now.subsec_nanos()),
     };
-    // SAFETY: `clock_gettime` writes a valid `timespec` on success; on failure
-    // we keep the SystemTime fallback already stored in `ts`.
+    // SAFETY: [Category 8 — FFI] `clock_gettime` writes a valid `timespec` on
+    // success into the caller-owned `ts`; on failure we keep the SystemTime
+    // fallback already stored there. The pointer is not retained.
     unsafe {
         libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts);
     }
@@ -148,7 +149,9 @@ fn format_trace_time() -> String {
         tm_gmtoff: 0,
         tm_zone: std::ptr::null(),
     };
-    // SAFETY: `localtime_r` fills the caller-owned `tm` from `ts.tv_sec`.
+    // SAFETY: [Category 8 — FFI] `localtime_r` fills the caller-owned `tm` from
+    // `ts.tv_sec`. Both pointers are stack-owned for the call; libc does not
+    // retain them. `tm_zone` stays null; we never dereference it.
     unsafe {
         libc::localtime_r(&ts.tv_sec, &mut tm);
     }

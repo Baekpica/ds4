@@ -68,6 +68,9 @@ fn create_output_file() -> Result<(PathBuf, File), String> {
     let mut tmpl = CString::new("/tmp/ds4_agent_output_XXXXXX")
         .map_err(|_| "failed to create temporary output file: invalid template".to_string())?
         .into_bytes_with_nul();
+    // SAFETY: [Category 8 — FFI] `tmpl` is an exclusive CString buffer ending
+    // in `XXXXXX\0`; `mkstemp` rewrites those six bytes in place and does not
+    // retain the pointer.
     let fd = unsafe { mkstemp(tmpl.as_mut_ptr().cast()) };
     if fd < 0 {
         return Err(format!(
@@ -79,5 +82,8 @@ fn create_output_file() -> Result<(PathBuf, File), String> {
         .map_err(|_| "failed to create temporary output file: invalid path".to_string())?
         .into_string()
         .map_err(|_| "failed to create temporary output file: invalid path".to_string())?;
+    // SAFETY: [Category 13 — Library / unsafe contract] `fd` is a live exclusive
+    // descriptor from `mkstemp` (fd >= 0 checked). `File` takes ownership; no
+    // other close path exists.
     Ok((PathBuf::from(path), unsafe { File::from_raw_fd(fd) }))
 }

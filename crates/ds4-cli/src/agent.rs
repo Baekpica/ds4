@@ -718,13 +718,19 @@ fn read_stdin_prompt() -> Result<Option<String>, String> {
     eprint!("+DWARFSTAR_WAITING\n");
     let stdin = std::io::stdin();
     let fd = stdin.as_raw_fd();
+    // SAFETY: [Category 8 — FFI] `fd` is the live stdin descriptor from
+    // `AsRawFd`; `fcntl(F_GETFL)` only reads flags and does not retain `fd`.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
         return Err("ds4-agent: nonblocking stdin".into());
     }
+    // SAFETY: [Category 8 — FFI] same live stdin `fd`; `F_SETFL` applies the
+    // captured flags plus `O_NONBLOCK`. The restore closure resets those flags.
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
         return Err("ds4-agent: nonblocking stdin".into());
     }
+    // SAFETY: [Category 8 — FFI] restores the flags captured before SETFL on
+    // the same stdin `fd`; the descriptor outlives this closure.
     let restore = || unsafe {
         libc::fcntl(fd, libc::F_SETFL, flags);
     };
@@ -768,6 +774,8 @@ fn read_stdin_prompt() -> Result<Option<String>, String> {
             events: libc::POLLIN,
             revents: 0,
         };
+        // SAFETY: [Category 8 — FFI] `pfd` is a stack-owned `pollfd` of length 1;
+        // `fd` is still the live stdin descriptor. libc does not retain the pointer.
         let prc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
         if prc < 0 {
             let err = std::io::Error::last_os_error();
