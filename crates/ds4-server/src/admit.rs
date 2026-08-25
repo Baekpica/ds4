@@ -135,10 +135,13 @@ pub fn next_job_id(s: &mut AdmitState, kind: ReqKind) -> String {
     mint_job_id(kind, s.seq)
 }
 
+/// C `client_main` enqueue Stopping body (`ds4_server.c`).
+pub const SERVER_SHUTTING_DOWN: &str = "server shutting down";
+
 pub fn enqueue_shed_error(v: EnqVerdict) -> Option<(u8, i32, i32, &'static str)> {
     match v {
         EnqVerdict::Ok => None,
-        EnqVerdict::Stopping => Some((SHED_CLIENTS, 503, 10, "server is shutting down")),
+        EnqVerdict::Stopping => Some((SHED_CLIENTS, 503, 10, SERVER_SHUTTING_DOWN)),
         EnqVerdict::ShedQueueDepth => Some((
             SHED_QUEUE_DEPTH,
             429,
@@ -151,5 +154,23 @@ pub fn enqueue_shed_error(v: EnqVerdict) -> Option<(u8, i32, i32, &'static str)>
             5,
             "server request-body budget exhausted; retry later",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stopping_503_body_matches_c_client_main() {
+        // Given: C enqueue Stopping at ds4_server.c client_main
+        // When: the shed mapper runs
+        let shed = enqueue_shed_error(EnqVerdict::Stopping).expect("stopping sheds");
+
+        // Then: exact C production bytes, not the invented "is"
+        assert_eq!(shed.0, SHED_CLIENTS);
+        assert_eq!(shed.1, 503);
+        assert_eq!(shed.3, "server shutting down");
+        assert_ne!(shed.3, "server is shutting down");
     }
 }

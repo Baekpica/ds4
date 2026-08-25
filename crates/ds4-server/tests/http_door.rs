@@ -429,7 +429,13 @@ fn tcp_models_options_unknown_bad_http() {
     );
     assert_eq!(
         out,
-        wire_http_error_bytes(WireSurface::OpenaiChat, 503, "model not loaded", true, None)
+        wire_http_error_bytes(
+            WireSurface::OpenaiChat,
+            503,
+            "server shutting down",
+            true,
+            None,
+        )
     );
 
     let out = one_shot(

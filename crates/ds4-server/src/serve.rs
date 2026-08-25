@@ -15,7 +15,7 @@ use ds4_sys::{libc_atof, libc_atoi, libc_strtoull10};
 
 use crate::admit::{
     enqueue, enqueue_release, enqueue_shed_error, next_job_id, preparse_shed, queue_unlink_head,
-    AdmitState, EnqVerdict, SHED_CONT_HOLD, SHED_QUEUE_AGE, SHED_SLOW_READER,
+    AdmitState, EnqVerdict, SERVER_SHUTTING_DOWN, SHED_CONT_HOLD, SHED_QUEUE_AGE, SHED_SLOW_READER,
 };
 use crate::cont::{monotonic_now, place_bank_continuation, ContOwner, ContPin, ContRegistry};
 use crate::error::{http_response_bytes, wire_http_error_bytes};
@@ -1135,16 +1135,11 @@ fn run_prepared<W: TerminalSink>(
     let (actual_lane, settlement) = match engine {
         Some(engine) => run_engine(cfg, inner, job, &id, dec, engine, cont, out, arrived_at),
         None => {
-            let msg = if cfg.have_engine {
-                "generation remains on C ds4-server"
-            } else {
-                "model not loaded"
-            };
             let ok = out
                 .write_all(&wire_http_error_bytes(
                     job.surface,
                     503,
-                    msg,
+                    SERVER_SHUTTING_DOWN,
                     cfg.cors,
                     None,
                 ))
@@ -1634,13 +1629,7 @@ fn queue_client(
         Err(_) => {
             let _ = send_all_nonblocking(
                 &mut stream,
-                &wire_http_error_bytes(
-                    surface,
-                    503,
-                    "server could not track the client connection",
-                    cfg.cors,
-                    None,
-                ),
+                &wire_http_error_bytes(surface, 503, SERVER_SHUTTING_DOWN, cfg.cors, None),
             );
             return;
         }
@@ -1668,7 +1657,7 @@ fn queue_client(
         let mut job = err.0;
         let wrote = send_all_nonblocking(
             &mut stream,
-            &wire_http_error_bytes(surface, 503, "server is shutting down", cfg.cors, None),
+            &wire_http_error_bytes(surface, 503, SERVER_SHUTTING_DOWN, cfg.cors, None),
         )
         .is_ok();
         job.lease.settlement = if wrote {
