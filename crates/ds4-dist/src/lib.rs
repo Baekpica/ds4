@@ -9,6 +9,7 @@ mod hash;
 mod options;
 mod plan;
 mod route;
+mod snapshot;
 mod transport;
 mod work;
 mod worker;
@@ -48,6 +49,7 @@ pub use plan::{build_route_plan, register_worker, CoordinatorView, RoutePlan, Wo
 pub use route::{
     decode_route_blob, encode_route_blob, validate_route_blob, ReturnTarget, RouteEntry,
 };
+pub use snapshot::{coordinator_load_snapshot, coordinator_save_snapshot, SnapshotMeta};
 pub use transport::{read_frame, write_frame};
 pub use work::{
     decode_logits_payload, decode_result_body, decode_work_body, encode_logits_payload,
