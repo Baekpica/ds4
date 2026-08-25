@@ -2,6 +2,7 @@
 
 pub mod admit;
 pub mod cont;
+pub mod dist_cli;
 pub mod dsml;
 pub mod error;
 pub mod format;
@@ -32,6 +33,7 @@ pub use cont::{
     dump_script, live_tool_result_ids, ContOwner, ContRecord, ContRegistry, ContState,
     CONT_GRACE_S, CONT_HOLD_SHED_S, CONT_PIN_DEADLINE_S, CONT_REGISTRY_MAX_DEFAULT, CONT_TTL_S,
 };
+pub use dist_cli::DistArgs;
 pub use dsml::{
     agent_turn_reasoning_cap, dsml_decode_state_for_text, dump_script as dsml_dump_script,
     DsmlDecodeState, DsmlDecodeTracker, SampleOverride, SamplePolicy, SAMPLE_OVERRIDE_GREEDY,

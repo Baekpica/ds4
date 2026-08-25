@@ -2,12 +2,35 @@
 //! native FFI when `-m` opens a model. Continuation registry is host-owned.
 //! Incremental live DSML tool projection is host-owned.
 
-use ds4_core::{Backend, Model};
+use ds4_core::{Backend, DistributedConfig, DistributedRole, Model};
 use ds4_server::kv_cli::DiskKvArgs;
 use ds4_server::{
     accept_loop, accept_loop_with_engine, accept_loop_with_engine_cont, listen,
-    model_id_from_gguf_path, ContLane, NativeDecode, ServerConfig,
+    model_id_from_gguf_path, ContLane, DistArgs, NativeDecode, ServerConfig,
 };
+
+fn distributed_config(opt: &ds4_dist::Options) -> Option<DistributedConfig> {
+    let role = match opt.role {
+        ds4_dist::Role::None => return None,
+        ds4_dist::Role::Coordinator => DistributedRole::Coordinator,
+        ds4_dist::Role::Worker => DistributedRole::Worker,
+    };
+    Some(DistributedConfig {
+        role,
+        layer_start: opt.layers.start,
+        layer_end: opt.layers.end,
+        has_output: opt.layers.has_output,
+        listen_host: opt.listen_host.clone(),
+        listen_port: opt.listen_port,
+        coordinator_host: opt.coordinator_host.clone(),
+        coordinator_port: opt.coordinator_port,
+        prefill_chunk: opt.prefill_chunk,
+        prefill_window: opt.prefill_window,
+        activation_bits: opt.activation_bits,
+        replay_check: opt.replay_check,
+        debug: opt.debug,
+    })
+}
 
 fn main() {
     let mut cfg = ServerConfig::default();
@@ -16,8 +39,15 @@ fn main() {
     let mut n_threads = 0i32;
     let mut cont_width = 2i32;
     let mut kv = DiskKvArgs::default();
+    let mut dist = DistArgs::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        if dist
+            .parse_arg(&arg, &mut args)
+            .unwrap_or_else(|error| cli_error(&format!("ds4-server-rs: {error}")))
+        {
+            continue;
+        }
         if kv
             .parse_arg(&arg, &mut args)
             .unwrap_or_else(|error| cli_error(&error))
@@ -25,8 +55,8 @@ fn main() {
             continue;
         }
         match arg.as_str() {
-            "--listen" => {
-                cfg.listen_host = args.next().unwrap_or_else(|| usage());
+            "--host" => cfg.listen_host = args.next().unwrap_or_else(|| usage()),
+            "--port" => {
                 cfg.listen_port = args
                     .next()
                     .and_then(|p| p.parse().ok())
@@ -86,23 +116,48 @@ fn main() {
         }
     }
     kv.validate().unwrap_or_else(|error| cli_error(&error));
+    dist.finish(&mut cfg.listen_host, &mut cfg.listen_port)
+        .unwrap_or_else(|error| cli_error(&format!("ds4-server-rs: {error}")));
     if cfg.model_name == "ds4" {
         cfg.model_name = cfg.model_id.clone();
     }
 
+    let native_dist = distributed_config(&dist.opt);
+    let worker = dist.opt.role == ds4_dist::Role::Worker;
     let model = match model_path.as_deref() {
-        Some(path) => match Model::open(path, backend, n_threads, true) {
-            Ok(m) => {
-                cfg.have_engine = true;
-                Some(m)
+        Some(path) => {
+            let opened = match native_dist.as_ref() {
+                Some(config) => {
+                    Model::open_distributed(path, backend, n_threads, true, None, None, config)
+                }
+                None => Model::open(path, backend, n_threads, true),
+            };
+            match opened {
+                Ok(m) => {
+                    cfg.have_engine = true;
+                    Some(m)
+                }
+                Err(e) => {
+                    eprintln!("ds4-server-rs: open {path}: {e}");
+                    std::process::exit(1);
+                }
             }
-            Err(e) => {
-                eprintln!("ds4-server-rs: open {path}: {e}");
-                std::process::exit(1);
-            }
-        },
+        }
         None => None,
     };
+    if worker {
+        let Some(model) = model else {
+            cli_error("ds4-server-rs: --role worker requires -m/--model");
+        };
+        model.boot_prewarm();
+        match model.run_distributed_worker(cfg.ctx) {
+            Ok(rc) => std::process::exit(rc),
+            Err(e) => {
+                eprintln!("ds4-server-rs: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let kv_store = if model.is_some() { kv.open() } else { None };
 
     let lane = if let Some(ref model) = model {
@@ -181,12 +236,14 @@ fn cli_error(message: &str) -> ! {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: ds4-server-rs --listen HOST PORT [--model-id ID] [-m GGUF] [--backend cuda|cpu|metal] [--tokens N] [-c N] [-t N] [--cont-width N] [--cors]\n\
+        "usage: ds4-server-rs [--host HOST] [--port PORT] [--listen HOST PORT] [--model-id ID] [-m GGUF] [--backend cuda|cpu|metal] [--tokens N] [-c N] [-t N] [--cont-width N] [--cors]\n\
          Disk KV: [--kv-disk-dir DIR] [--kv-disk-space-mb N] [--kv-cache-min-tokens N]\n\
          [--kv-cache-cold-max-tokens N] [--kv-cache-continued-interval-tokens N]\n\
          [--kv-cache-boundary-trim-tokens N]\n\
          [--kv-cache-boundary-align-tokens N]\n\
-         [--kv-cache-reject-different-quant]"
+         [--kv-cache-reject-different-quant]\n\
+         Distributed: [--role coordinator|worker] [--layers A:B] [--listen HOST PORT] [--coordinator HOST PORT]\n\
+         [--dist-prefill-chunk N] [--dist-prefill-window N] [--dist-activation-bits N] [--dist-replay-check] [--debug]"
     );
     std::process::exit(2);
 }
