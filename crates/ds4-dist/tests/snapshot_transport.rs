@@ -3,9 +3,11 @@ use std::io::{self, Cursor, Read, Write};
 use ds4_dist::{
     coordinator_load_snapshot, coordinator_save_snapshot, decode_snapshot_chunk_body,
     decode_snapshot_load_begin_body, encode_frame_header, encode_snapshot_begin_body,
-    encode_snapshot_chunk_body, encode_snapshot_done_body, read_frame, write_frame, SnapshotBegin,
-    SnapshotMeta, SnapshotReq, MSG_SNAPSHOT_BEGIN, MSG_SNAPSHOT_CHUNK, MSG_SNAPSHOT_DONE,
-    MSG_SNAPSHOT_LOAD_BEGIN, MSG_SNAPSHOT_SAVE_REQ, SNAPSHOT_CHUNK_BYTES,
+    encode_snapshot_chunk_body, encode_snapshot_done_body, read_frame, token_hash_prefix,
+    worker_handle_snapshot_load, worker_handle_snapshot_save, write_frame, SnapshotBegin,
+    SnapshotMeta, SnapshotReq, WorkerSnapshotIdentity, MSG_SNAPSHOT_BEGIN, MSG_SNAPSHOT_CHUNK,
+    MSG_SNAPSHOT_DONE, MSG_SNAPSHOT_LOAD_BEGIN, MSG_SNAPSHOT_SAVE_REQ, SNAPSHOT_CHUNK_BYTES,
+    SNAPSHOT_REQ_FIXED_BYTES,
 };
 
 #[derive(Default)]
@@ -433,4 +435,212 @@ fn coordinator_zero_payload_does_not_require_or_send_chunks() {
     let (typ, _) = read_frame(&mut written).unwrap();
     assert_eq!(typ, MSG_SNAPSHOT_LOAD_BEGIN);
     assert!(read_frame(&mut written).is_err());
+}
+
+fn identity(meta: SnapshotMeta) -> WorkerSnapshotIdentity {
+    WorkerSnapshotIdentity {
+        model_id: meta.model_id,
+        layer_start: meta.layer_start,
+        layer_end: meta.layer_end,
+        ctx_size: 128,
+    }
+}
+
+fn hashed_meta(tokens: &[i32]) -> SnapshotMeta {
+    let mut meta = meta();
+    meta.token_hash = token_hash_prefix(tokens);
+    meta
+}
+
+#[cfg(unix)]
+fn duplex_save(meta: SnapshotMeta, tokens: &[i32], payload: Vec<u8>) -> (Vec<u8>, u64) {
+    let (mut coord, mut worker) = std::os::unix::net::UnixStream::pair().unwrap();
+    let identity = identity(meta);
+    let sent = payload.clone();
+    let handle = std::thread::spawn(move || {
+        let (typ, body) = read_frame(&mut worker).unwrap();
+        assert_eq!(typ, MSG_SNAPSHOT_SAVE_REQ);
+        let mut src = Cursor::new(sent);
+        let len = src.get_ref().len() as u64;
+        worker_handle_snapshot_save(&mut worker, identity, &body, Ok((&mut src, len))).unwrap();
+    });
+    let mut saved = Vec::new();
+    let n = coordinator_save_snapshot(&mut coord, meta, tokens, &mut saved).unwrap();
+    handle.join().unwrap();
+    (saved, n)
+}
+
+#[cfg(unix)]
+fn duplex_load(meta: SnapshotMeta, tokens: &[i32], payload: Vec<u8>) -> Vec<u8> {
+    let (mut coord, mut worker) = std::os::unix::net::UnixStream::pair().unwrap();
+    let identity = identity(meta);
+    let handle = std::thread::spawn(move || {
+        let (typ, body) = read_frame(&mut worker).unwrap();
+        assert_eq!(typ, MSG_SNAPSHOT_LOAD_BEGIN);
+        let mut restored = Vec::new();
+        let offer =
+            worker_handle_snapshot_load(&mut worker, identity, &body, 32, &mut restored).unwrap();
+        (restored, offer)
+    });
+    coordinator_load_snapshot(
+        &mut coord,
+        meta,
+        tokens,
+        &mut Cursor::new(&payload),
+        payload.len() as u64,
+    )
+    .unwrap();
+    let (restored, offer) = handle.join().unwrap();
+    assert_eq!(offer.session_id, meta.session_id);
+    assert_eq!(offer.request_id, meta.request_id);
+    assert_eq!(offer.token_hash, meta.token_hash);
+    assert_eq!(offer.tokens, tokens);
+    restored
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_save_answers_coordinator_with_c_frame_order() {
+    let tokens = [7, 8];
+    let meta = hashed_meta(&tokens);
+    let mut payload = vec![0x5a; SNAPSHOT_CHUNK_BYTES + 3];
+    payload[SNAPSHOT_CHUNK_BYTES] = 1;
+    payload[SNAPSHOT_CHUNK_BYTES + 1] = 2;
+    payload[SNAPSHOT_CHUNK_BYTES + 2] = 3;
+    let (saved, n) = duplex_save(meta, &tokens, payload.clone());
+    assert_eq!(n, payload.len() as u64);
+    assert_eq!(saved, payload);
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_load_accepts_coordinator_chunks_and_reports_tokens() {
+    let tokens = [7, 8];
+    let meta = hashed_meta(&tokens);
+    let mut payload = vec![0x5a; SNAPSHOT_CHUNK_BYTES + 3];
+    payload[SNAPSHOT_CHUNK_BYTES] = 9;
+    let restored = duplex_load(meta, &tokens, payload.clone());
+    assert_eq!(restored, payload);
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_zero_payload_round_trips_without_chunks() {
+    let meta = hashed_meta(&[]);
+    let (saved, n) = duplex_save(meta, &[], Vec::new());
+    assert_eq!(n, 0);
+    assert!(saved.is_empty());
+    assert!(duplex_load(meta, &[], Vec::new()).is_empty());
+}
+
+#[test]
+fn worker_save_rejects_bad_size_and_identity_with_c_text() {
+    let meta = meta();
+    let identity = identity(meta);
+    let mut stream = ScriptedStream::new(Vec::new());
+    worker_handle_snapshot_save::<_, Cursor<Vec<u8>>>(
+        &mut stream,
+        identity,
+        &[0; SNAPSHOT_REQ_FIXED_BYTES - 1],
+        Err("unused".into()),
+    )
+    .unwrap();
+    let mut written = Cursor::new(stream.written);
+    let (typ, body) = read_frame(&mut written).unwrap();
+    assert_eq!(typ, MSG_SNAPSHOT_BEGIN);
+    let (begin, _, message) = ds4_dist::decode_snapshot_begin_body(&body).unwrap();
+    assert_eq!(begin.status, 1);
+    assert_eq!(message, b"invalid distributed snapshot save request");
+
+    let mut request = ScriptedStream::new(Vec::new());
+    let mut unused = Vec::new();
+    coordinator_save_snapshot(&mut request, meta, &[7], &mut unused).unwrap_err();
+    let mut written = Cursor::new(request.written);
+    let (typ, body) = read_frame(&mut written).unwrap();
+    assert_eq!(typ, MSG_SNAPSHOT_SAVE_REQ);
+    let mut wrong = identity;
+    wrong.layer_end += 1;
+    let mut reply = ScriptedStream::new(Vec::new());
+    worker_handle_snapshot_save::<_, Cursor<Vec<u8>>>(
+        &mut reply,
+        wrong,
+        &body,
+        Err("unused".into()),
+    )
+    .unwrap();
+    let mut written = Cursor::new(reply.written);
+    let (typ, body) = read_frame(&mut written).unwrap();
+    assert_eq!(typ, MSG_SNAPSHOT_BEGIN);
+    let (begin, _, message) = ds4_dist::decode_snapshot_begin_body(&body).unwrap();
+    assert_eq!(begin.status, 1);
+    assert_eq!(
+        std::str::from_utf8(&message).unwrap(),
+        "snapshot save request does not match worker state"
+    );
+}
+
+#[test]
+fn worker_save_forwards_session_error_text() {
+    let meta = meta();
+    let mut request = ScriptedStream::new(Vec::new());
+    let mut unused = Vec::new();
+    coordinator_save_snapshot(&mut request, meta, &[7], &mut unused).unwrap_err();
+    let mut written = Cursor::new(request.written);
+    let (_, body) = read_frame(&mut written).unwrap();
+    let mut reply = ScriptedStream::new(Vec::new());
+    worker_handle_snapshot_save::<_, Cursor<Vec<u8>>>(
+        &mut reply,
+        identity(meta),
+        &body,
+        Err("worker has no distributed session to snapshot".into()),
+    )
+    .unwrap();
+    let mut written = Cursor::new(reply.written);
+    let (_, body) = read_frame(&mut written).unwrap();
+    let (begin, _, message) = ds4_dist::decode_snapshot_begin_body(&body).unwrap();
+    assert_eq!(begin.status, 1);
+    assert_eq!(
+        std::str::from_utf8(&message).unwrap(),
+        "worker has no distributed session to snapshot"
+    );
+}
+
+#[test]
+fn worker_load_rejects_header_hash_and_identity_with_c_text() {
+    let identity = identity(meta());
+    let mut stream = ScriptedStream::new(Vec::new());
+    assert_eq!(
+        worker_handle_snapshot_load(&mut stream, identity, &[0; 8], 32, &mut Vec::new())
+            .unwrap_err(),
+        "invalid distributed snapshot load header"
+    );
+    assert!(stream.written.is_empty());
+
+    let tokens = [7, 8];
+    let mut meta = hashed_meta(&tokens);
+    meta.token_hash ^= 1;
+    let mut request = ScriptedStream::new({
+        let mut done = Vec::new();
+        push_frame(
+            &mut done,
+            MSG_SNAPSHOT_DONE,
+            &encode_snapshot_done_body(meta.request_id, 0, b"").unwrap(),
+        );
+        done
+    });
+    coordinator_load_snapshot(&mut request, meta, &tokens, &mut Cursor::new(b""), 0).unwrap();
+    let mut written = Cursor::new(request.written);
+    let (typ, body) = read_frame(&mut written).unwrap();
+    assert_eq!(typ, MSG_SNAPSHOT_LOAD_BEGIN);
+    let mut reply = ScriptedStream::new(Vec::new());
+    assert_eq!(
+        worker_handle_snapshot_load(&mut reply, identity, &body, 32, &mut Vec::new()).unwrap_err(),
+        "snapshot load token hash mismatch"
+    );
+    let mut written = Cursor::new(reply.written);
+    let (typ, body) = read_frame(&mut written).unwrap();
+    assert_eq!(typ, MSG_SNAPSHOT_DONE);
+    let (done, message) = ds4_dist::decode_snapshot_done_body(&body, meta.request_id).unwrap();
+    assert_eq!(done.status, 1);
+    assert_eq!(message, b"snapshot load token hash mismatch");
 }

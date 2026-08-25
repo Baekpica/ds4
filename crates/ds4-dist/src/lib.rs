@@ -13,6 +13,7 @@ mod snapshot;
 mod transport;
 mod work;
 mod worker;
+mod worker_snapshot;
 
 pub use activation::{
     bits_or_default, bits_valid, decode_activation, encode_activation, f16_to_f32, f32_to_f16,
@@ -58,3 +59,7 @@ pub use work::{
     WorkBody,
 };
 pub use worker::{recv_hello, send_hello, Worker};
+pub use worker_snapshot::{
+    worker_handle_snapshot_load, worker_handle_snapshot_save, WorkerLoadOffer,
+    WorkerSnapshotIdentity,
+};
