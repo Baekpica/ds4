@@ -296,9 +296,6 @@ fn validate_one_shot_args(args: &ShadowArgs) -> Result<(), String> {
     if args.prompt.is_none() && args.prompt_file.is_none() {
         return Err("one-shot generation requires -p or --prompt-file".into());
     }
-    if args.dspark.is_some() {
-        return Err("one-shot generation with --dspark is not implemented in ds4-rs".into());
-    }
     Ok(())
 }
 
@@ -1325,9 +1322,8 @@ mod tests {
             "draft.gguf",
         ]))
         .unwrap();
-        assert!(validate_one_shot_args(&dspark)
-            .unwrap_err()
-            .contains("--dspark"));
+        assert!(validate_one_shot_args(&dspark).is_ok());
+        assert_eq!(dspark.dspark.as_deref(), Some("draft.gguf"));
     }
 
     #[test]
