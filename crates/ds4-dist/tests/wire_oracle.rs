@@ -1,11 +1,15 @@
 //! C↔Rust DS4D wire bytes. No `#[repr(C)]` on the Rust side.
 
 use ds4_dist::{
-    decode_frame_header, decode_hello_payload, encode_activation, encode_frame_header,
-    encode_hello_payload, encode_route_blob, encode_tokens_be, f32_to_f16, f32_to_f8_e4m3,
-    read_frame, token_hash_prefix, validate_route_blob, write_frame, Hello, ResultHdr,
-    ReturnTarget, RouteEntry, Work, FRAME_HEADER_BYTES, HELLO_FIXED_BYTES, MAGIC, MSG_HELLO,
-    MSG_WORK, RESULT_FIXED_BYTES, ROUTE_RETURN_UPSTREAM, WORK_FIXED_BYTES,
+    decode_frame_header, decode_hello_payload, decode_snapshot_begin_body,
+    decode_snapshot_chunk_body, decode_snapshot_done_body, decode_snapshot_load_begin_body,
+    encode_activation, encode_frame_header, encode_hello_payload, encode_route_blob,
+    encode_snapshot_begin_body, encode_snapshot_chunk_body, encode_snapshot_done_body,
+    encode_tokens_be, f32_to_f16, f32_to_f8_e4m3, read_frame, token_hash_prefix,
+    validate_route_blob, write_frame, Hello, ResultHdr, ReturnTarget, RouteEntry, SnapshotBegin,
+    SnapshotChunk, SnapshotDone, SnapshotReq, Work, FRAME_HEADER_BYTES, HELLO_FIXED_BYTES, MAGIC,
+    MSG_HELLO, MSG_WORK, RESULT_FIXED_BYTES, ROUTE_RETURN_UPSTREAM, SNAPSHOT_CHUNK_BYTES,
+    WORK_FIXED_BYTES,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -254,4 +258,141 @@ fn activation_f32_is_le_host_layout() {
     expect.extend_from_slice(&1.0f32.to_bits().to_le_bytes());
     expect.extend_from_slice(&(-2.5f32).to_bits().to_le_bytes());
     assert_eq!(wire, expect);
+}
+
+#[test]
+fn snapshot_records_match_c() {
+    let req = SnapshotReq {
+        model_id: 3,
+        session_hi: 1,
+        session_lo: 2,
+        request_hi: 3,
+        request_lo: 4,
+        token_hash_hi: 5,
+        token_hash_lo: 6,
+        token_count: 7,
+        layer_start: 8,
+        layer_end: 9,
+    };
+    assert_eq!(
+        hex(&req.encode()),
+        c_out(&[
+            "snapshot-req",
+            "3",
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "7",
+            "8",
+            "9"
+        ])
+    );
+
+    let begin = SnapshotBegin {
+        model_id: 3,
+        session_hi: 1,
+        session_lo: 2,
+        request_hi: 3,
+        request_lo: 4,
+        token_hash_hi: 5,
+        token_hash_lo: 6,
+        token_count: 2,
+        layer_start: 8,
+        layer_end: 9,
+        payload_hi: 10,
+        payload_lo: 11,
+        status: 0,
+        token_bytes: 8,
+        message_bytes: 0,
+    };
+    assert_eq!(
+        hex(&begin.encode()),
+        c_out(&[
+            "snapshot-begin",
+            "3",
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "2",
+            "8",
+            "9",
+            "10",
+            "11",
+            "0",
+            "8",
+            "0"
+        ])
+    );
+
+    let chunk = SnapshotChunk {
+        request_hi: 3,
+        request_lo: 4,
+        chunk_bytes: 5,
+    };
+    assert_eq!(
+        hex(&chunk.encode()),
+        c_out(&["snapshot-chunk", "3", "4", "5"])
+    );
+
+    let done = SnapshotDone {
+        request_hi: 3,
+        request_lo: 4,
+        status: 1,
+        message_bytes: 5,
+    };
+    assert_eq!(
+        hex(&done.encode()),
+        c_out(&["snapshot-done", "3", "4", "1", "5"])
+    );
+}
+
+#[test]
+fn snapshot_bodies_enforce_c_lengths_and_ids() {
+    let begin = SnapshotBegin {
+        model_id: 3,
+        session_hi: 0,
+        session_lo: 2,
+        request_hi: 0,
+        request_lo: 4,
+        token_hash_hi: 0,
+        token_hash_lo: 6,
+        token_count: 2,
+        layer_start: 8,
+        layer_end: 9,
+        payload_hi: 0,
+        payload_lo: 5,
+        status: 0,
+        token_bytes: 8,
+        message_bytes: 0,
+    };
+    let body = encode_snapshot_begin_body(&begin, &[7, 8], b"").unwrap();
+    let (back, tokens, message) = decode_snapshot_load_begin_body(&body).unwrap();
+    assert_eq!(back, begin);
+    assert_eq!(tokens, [7, 8]);
+    assert!(message.is_empty());
+
+    let mut bad = begin;
+    bad.token_bytes = 4;
+    assert!(encode_snapshot_begin_body(&bad, &[7, 8], b"").is_err());
+    assert!(decode_snapshot_begin_body(&body[..body.len() - 1]).is_err());
+
+    let payload = b"kv-shard";
+    let chunk = encode_snapshot_chunk_body(4, payload).unwrap();
+    let (_, decoded) = decode_snapshot_chunk_body(&chunk, 4, payload.len() as u64).unwrap();
+    assert_eq!(decoded, payload);
+    assert!(decode_snapshot_chunk_body(&chunk, 5, payload.len() as u64).is_err());
+    assert!(decode_snapshot_chunk_body(&chunk, 4, (payload.len() - 1) as u64).is_err());
+    assert!(encode_snapshot_chunk_body(4, &vec![0; SNAPSHOT_CHUNK_BYTES + 1]).is_err());
+
+    let done = encode_snapshot_done_body(4, 1, b"failed").unwrap();
+    let (header, message) = decode_snapshot_done_body(&done, 4).unwrap();
+    assert_eq!(header.status, 1);
+    assert_eq!(message, b"failed");
+    assert!(decode_snapshot_done_body(&done, 5).is_err());
 }

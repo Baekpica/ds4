@@ -36,6 +36,7 @@ pub const SNAPSHOT_REQ_FIXED_BYTES: usize = 40;
 pub const SNAPSHOT_BEGIN_FIXED_BYTES: usize = 60;
 pub const SNAPSHOT_CHUNK_FIXED_BYTES: usize = 12;
 pub const SNAPSHOT_DONE_FIXED_BYTES: usize = 16;
+pub const SNAPSHOT_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 pub const NI_MAXHOST: usize = 1025;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,4 +317,167 @@ pub fn encode_error_frame(msg: &str) -> Vec<u8> {
     let mut out = encode_frame_header(MSG_ERROR, bytes.len() as u32).to_vec();
     out.extend_from_slice(bytes);
     out
+}
+
+fn snapshot_token_bytes(count: u32) -> Result<usize, CodecError> {
+    let bytes = (count as usize).checked_mul(4).ok_or(CodecError::Invalid(
+        "invalid distributed snapshot token length",
+    ))?;
+    if bytes > u32::MAX as usize {
+        return Err(CodecError::Invalid(
+            "invalid distributed snapshot token length",
+        ));
+    }
+    Ok(bytes)
+}
+
+pub fn encode_snapshot_begin_body(
+    begin: &SnapshotBegin,
+    tokens: &[i32],
+    message: &[u8],
+) -> Result<Vec<u8>, CodecError> {
+    let token_bytes = snapshot_token_bytes(begin.token_count)?;
+    if tokens.len() != begin.token_count as usize
+        || begin.token_bytes as usize != token_bytes
+        || begin.message_bytes as usize != message.len()
+    {
+        return Err(CodecError::Invalid(
+            "invalid distributed snapshot begin lengths",
+        ));
+    }
+    let len = SNAPSHOT_BEGIN_FIXED_BYTES
+        .checked_add(token_bytes)
+        .and_then(|n| n.checked_add(message.len()))
+        .filter(|&n| n <= u32::MAX as usize)
+        .ok_or(CodecError::Invalid(
+            "distributed snapshot begin frame is too large",
+        ))?;
+    let mut out = Vec::with_capacity(len);
+    out.extend_from_slice(&begin.encode());
+    out.extend_from_slice(&encode_tokens_be(tokens));
+    out.extend_from_slice(message);
+    Ok(out)
+}
+
+fn decode_snapshot_begin_inner(
+    buf: &[u8],
+    load: bool,
+) -> Result<(SnapshotBegin, Vec<i32>, Vec<u8>), CodecError> {
+    let begin = SnapshotBegin::decode(buf)?;
+    let token_bytes = snapshot_token_bytes(begin.token_count)?;
+    let body = buf
+        .len()
+        .checked_sub(SNAPSHOT_BEGIN_FIXED_BYTES)
+        .ok_or(CodecError::Truncated)?;
+    let used = token_bytes
+        .checked_add(begin.message_bytes as usize)
+        .ok_or(CodecError::Invalid(
+            "invalid distributed snapshot response header",
+        ))?;
+    if begin.token_bytes as usize != token_bytes
+        || used > body
+        || (load && (begin.message_bytes != 0 || used != body))
+    {
+        return Err(CodecError::Invalid(if load {
+            "invalid distributed snapshot load header"
+        } else {
+            "invalid distributed snapshot response header"
+        }));
+    }
+    let tokens_at = SNAPSHOT_BEGIN_FIXED_BYTES;
+    let message_at = tokens_at + token_bytes;
+    let tokens = decode_tokens_be(&buf[tokens_at..message_at])?;
+    let message = buf[message_at..message_at + begin.message_bytes as usize].to_vec();
+    Ok((begin, tokens, message))
+}
+
+pub fn decode_snapshot_begin_body(
+    buf: &[u8],
+) -> Result<(SnapshotBegin, Vec<i32>, Vec<u8>), CodecError> {
+    decode_snapshot_begin_inner(buf, false)
+}
+
+pub fn decode_snapshot_load_begin_body(
+    buf: &[u8],
+) -> Result<(SnapshotBegin, Vec<i32>, Vec<u8>), CodecError> {
+    decode_snapshot_begin_inner(buf, true)
+}
+
+pub fn encode_snapshot_chunk_body(request_id: u64, payload: &[u8]) -> Result<Vec<u8>, CodecError> {
+    if payload.len() > SNAPSHOT_CHUNK_BYTES {
+        return Err(CodecError::Invalid("invalid distributed snapshot chunk"));
+    }
+    let (request_hi, request_lo) = u64_to_halves(request_id);
+    let chunk = SnapshotChunk {
+        request_hi,
+        request_lo,
+        chunk_bytes: payload.len() as u32,
+    };
+    let mut out = Vec::with_capacity(SNAPSHOT_CHUNK_FIXED_BYTES + payload.len());
+    out.extend_from_slice(&chunk.encode());
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+pub fn decode_snapshot_chunk_body(
+    buf: &[u8],
+    request_id: u64,
+    remaining: u64,
+) -> Result<(SnapshotChunk, &[u8]), CodecError> {
+    let chunk = SnapshotChunk::decode(buf)?;
+    let payload = buf
+        .get(SNAPSHOT_CHUNK_FIXED_BYTES..)
+        .ok_or(CodecError::Truncated)?;
+    if u64_from_halves(chunk.request_hi, chunk.request_lo) != request_id
+        || chunk.chunk_bytes as usize != payload.len()
+        || payload.len() > SNAPSHOT_CHUNK_BYTES
+        || payload.len() as u64 > remaining
+    {
+        return Err(CodecError::Invalid("invalid distributed snapshot chunk"));
+    }
+    Ok((chunk, payload))
+}
+
+pub fn encode_snapshot_done_body(
+    request_id: u64,
+    status: u32,
+    message: &[u8],
+) -> Result<Vec<u8>, CodecError> {
+    if message.len() > u32::MAX as usize {
+        return Err(CodecError::Invalid(
+            "distributed snapshot completion message is too large",
+        ));
+    }
+    let (request_hi, request_lo) = u64_to_halves(request_id);
+    let done = SnapshotDone {
+        request_hi,
+        request_lo,
+        status,
+        message_bytes: message.len() as u32,
+    };
+    let mut out = Vec::with_capacity(SNAPSHOT_DONE_FIXED_BYTES + message.len());
+    out.extend_from_slice(&done.encode());
+    out.extend_from_slice(message);
+    Ok(out)
+}
+
+pub fn decode_snapshot_done_body(
+    buf: &[u8],
+    request_id: u64,
+) -> Result<(SnapshotDone, &[u8]), CodecError> {
+    let done = SnapshotDone::decode(buf)?;
+    let body = buf
+        .get(SNAPSHOT_DONE_FIXED_BYTES..)
+        .ok_or(CodecError::Truncated)?;
+    let message = body
+        .get(..done.message_bytes as usize)
+        .ok_or(CodecError::Invalid(
+            "invalid distributed snapshot completion message",
+        ))?;
+    if u64_from_halves(done.request_hi, done.request_lo) != request_id {
+        return Err(CodecError::Invalid(
+            "distributed snapshot completion request mismatch",
+        ));
+    }
+    Ok((done, message))
 }

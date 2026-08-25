@@ -528,6 +528,34 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 10; i++) p[i] = need_u32(argv[2 + i]);
         dist_result_to_wire(&r);
         print_hex(&r, sizeof(r));
+    } else if (!strcmp(cmd, "snapshot-req")) {
+        if (argc < 12) die("snapshot-req 10 fields");
+        ds4_dist_snapshot_req_fixed r;
+        uint32_t *p = (uint32_t *)&r;
+        for (int i = 0; i < 10; i++) p[i] = need_u32(argv[2 + i]);
+        dist_snapshot_req_to_wire(&r);
+        print_hex(&r, sizeof(r));
+    } else if (!strcmp(cmd, "snapshot-begin")) {
+        if (argc < 17) die("snapshot-begin 15 fields");
+        ds4_dist_snapshot_begin_fixed r;
+        uint32_t *p = (uint32_t *)&r;
+        for (int i = 0; i < 15; i++) p[i] = need_u32(argv[2 + i]);
+        dist_snapshot_begin_to_wire(&r);
+        print_hex(&r, sizeof(r));
+    } else if (!strcmp(cmd, "snapshot-chunk")) {
+        if (argc < 5) die("snapshot-chunk 3 fields");
+        ds4_dist_snapshot_chunk_fixed r = {
+            need_u32(argv[2]), need_u32(argv[3]), need_u32(argv[4])
+        };
+        dist_snapshot_chunk_to_wire(&r);
+        print_hex(&r, sizeof(r));
+    } else if (!strcmp(cmd, "snapshot-done")) {
+        if (argc < 6) die("snapshot-done 4 fields");
+        ds4_dist_snapshot_done_fixed r = {
+            need_u32(argv[2]), need_u32(argv[3]), need_u32(argv[4]), need_u32(argv[5])
+        };
+        dist_snapshot_done_to_wire(&r);
+        print_hex(&r, sizeof(r));
     } else if (!strcmp(cmd, "f16")) {
         if (argc < 3) die("f16 F32HEX");
         uint16_t h = dist_f32_to_f16(bits_to_f32(argv[2]));
