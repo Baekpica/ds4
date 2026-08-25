@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod bench;
 pub mod repl;
+pub mod session_snapshot;
 
 use ds4_core::{Backend, ModelOpenOption};
 

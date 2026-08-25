@@ -7,14 +7,13 @@ use crate::codec::{
     u64_from_halves, SnapshotReq, MSG_SNAPSHOT_LOAD_BEGIN, MSG_SNAPSHOT_SAVE_REQ,
     SNAPSHOT_REQ_FIXED_BYTES,
 };
-use crate::snapshot_temp::{create_temp, LOAD_PREFIX};
 use crate::worker_snapshot::{
     worker_handle_snapshot_load_restore, worker_handle_snapshot_save, WorkerLoadOffer,
     WorkerSnapshotIdentity,
 };
 
 pub use crate::memory_snapshot::{MemorySnapshotStore, SnapshotLoad, SnapshotSave, SnapshotStore};
-pub use crate::snapshot_temp::TempShard;
+pub use crate::snapshot_temp::{copy_chunked, create_temp, TempShard, LOAD_PREFIX, SAVE_PREFIX};
 
 pub fn prepare_snapshot_save<Store: SnapshotStore>(
     store: &mut Store,

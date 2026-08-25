@@ -14,6 +14,12 @@ pub struct TempShard {
     pub(crate) path: PathBuf,
 }
 
+impl TempShard {
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
 impl Drop for TempShard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);

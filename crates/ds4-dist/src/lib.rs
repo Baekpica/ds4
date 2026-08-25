@@ -58,8 +58,9 @@ pub use forward::{
 pub use hash::{token_hash_prefix, token_hash_update, token_hash_update_span, TOKEN_HASH_INIT};
 pub use hops::ForwarderPool;
 pub use native_snapshot::{
-    apply_snapshot_load, dispatch_worker_snapshot, prepare_snapshot_save, MemorySnapshotStore,
-    SnapshotLoad, SnapshotSave, SnapshotStore, TempShard,
+    apply_snapshot_load, copy_chunked, create_temp, dispatch_worker_snapshot,
+    prepare_snapshot_save, MemorySnapshotStore, SnapshotLoad, SnapshotSave, SnapshotStore,
+    TempShard, LOAD_PREFIX, SAVE_PREFIX,
 };
 pub use options::{
     parse_cli, parse_cli_arg, parse_layers, parse_role, prepare_engine_options, resolved_layer_end,
