@@ -9,6 +9,7 @@ const TOOL_UNSUPPORTED_ERROR: &str =
 mod bash;
 mod compact;
 mod edit;
+mod kv;
 mod search;
 mod trace;
 mod tui;
@@ -444,6 +445,10 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
     }
     .map_err(|error| error.to_string())?;
     let mut session = session_ready(&model, &args)?;
+    let cache_dir = kv::default_cache_dir();
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let store = kv::SessionStore::open(cache_dir, u8::try_from(model.model_id()).unwrap_or(0));
+    let mut identity = kv::SessionIdentity::default();
     let mut transcript = build_system_transcript(model.vocab(), &args, think)?;
     session
         .sync(&transcript)
@@ -481,6 +486,22 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
                 None => break,
             }
         };
+        if one_shot.is_none() {
+            if let Some(message) = kv::handle_slash(
+                prompt.trim(),
+                kv::Live {
+                    store: &store,
+                    identity: &mut identity,
+                    model: &model,
+                    session: &mut session,
+                    transcript: &mut transcript,
+                },
+            ) {
+                print!("{message}");
+                continue;
+            }
+        }
+        identity.note_user_prompt(&prompt, kv::unix_now());
         let sys = build_system_transcript(model.vocab(), &args, think)?;
         compact::compact_if_needed(
             &model,
