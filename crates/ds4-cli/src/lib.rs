@@ -6,7 +6,7 @@ pub mod repl;
 
 use ds4_core::{Backend, ModelOpenOption};
 
-fn distributed_config(opt: &ds4_dist::Options) -> Option<ds4_core::DistributedConfig> {
+pub(crate) fn distributed_config(opt: &ds4_dist::Options) -> Option<ds4_core::DistributedConfig> {
     let role = match opt.role {
         ds4_dist::Role::None => return None,
         ds4_dist::Role::Coordinator => ds4_core::DistributedRole::Coordinator,

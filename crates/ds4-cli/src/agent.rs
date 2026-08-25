@@ -47,6 +47,7 @@ pub struct AgentArgs {
     warm_weights: bool,
     power_percent: i32,
     trace: Option<String>,
+    dist: ds4_dist::Options,
     non_interactive: bool,
     help: bool,
 }
@@ -74,6 +75,7 @@ impl Default for AgentArgs {
             warm_weights: false,
             power_percent: 100,
             trace: None,
+            dist: ds4_dist::Options::default(),
             non_interactive: false,
             help: false,
         }
@@ -199,19 +201,16 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AgentArgs, S
                 parsed.power_percent = parsed_power;
             }
             "--trace" => parsed.trace = Some(need_value(&arg, args.next())?),
-            "--dir-steering-file"
-            | "--dir-steering-ffn"
-            | "--dir-steering-attn"
-            | "--role"
-            | "--layers"
-            | "--listen"
-            | "--coordinator"
-            | "--dist-prefill-chunk"
-            | "--dist-prefill-window"
-            | "--dist-activation-bits"
-            | "--dist-replay-check"
-            | "--debug" => return unsupported(&arg),
-            _ => return Err(format!("unknown option: {arg}")),
+            "--dir-steering-file" | "--dir-steering-ffn" | "--dir-steering-attn" => {
+                return unsupported(&arg);
+            }
+            other => match ds4_dist::parse_cli_arg(other, &mut args, &mut parsed.dist)? {
+                ds4_dist::CliResult::Matched => {}
+                ds4_dist::CliResult::NotMatched => {
+                    return Err(format!("unknown option: {other}"));
+                }
+                ds4_dist::CliResult::Error => unreachable!(),
+            },
         }
     }
     if !parsed.non_interactive {
@@ -220,7 +219,49 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AgentArgs, S
     if parsed.prompt.is_none() {
         return Err("--non-interactive requires -p/--prompt in this one-turn shadow".into());
     }
+    ds4_dist::prepare_engine_options(&parsed.dist)?;
+    if parsed.dist.role == ds4_dist::Role::Worker {
+        return Err("--role worker is a serving mode; start workers with ./ds4".into());
+    }
     Ok(parsed)
+}
+
+fn session_ready<'m>(
+    model: &'m ds4_core::Model,
+    args: &AgentArgs,
+) -> Result<ds4_core::Session<'m>, String> {
+    let session = model.session(args.ctx).map_err(|error| error.to_string())?;
+    if args.dist.role != ds4_dist::Role::Coordinator {
+        return Ok(session);
+    }
+    let mut ticks = 0u32;
+    let mut last = String::new();
+    loop {
+        match session.distributed_route_ready() {
+            Ok(true) => {
+                if ticks != 0 {
+                    eprintln!("ds4-agent: distributed route ready");
+                }
+                return Ok(session);
+            }
+            Ok(false) => {
+                let why = "route incomplete";
+                if last != why || ticks % 20 == 0 {
+                    eprintln!("ds4-agent: waiting for distributed route: {why}");
+                    last = why.into();
+                }
+            }
+            Err(error) => {
+                let why = error.to_string();
+                if last != why || ticks % 20 == 0 {
+                    eprintln!("ds4-agent: waiting for distributed route: {why}");
+                    last = why;
+                }
+            }
+        }
+        ticks = ticks.wrapping_add(1);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 fn use_mtp_spec(temp: f32, mtp: Option<&str>, draft: i32) -> bool {
@@ -358,17 +399,29 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
     }
 
     let mut log = trace::Trace::open(args.trace.as_deref(), name)?;
-    let model = ds4_core::Model::open_with_support_options(
-        &args.model,
-        args.backend,
-        args.threads,
-        false,
-        args.mtp.as_deref(),
-        None,
-        &mtp_open_options(&args),
-    )
+    let model = match crate::distributed_config(&args.dist) {
+        Some(config) => ds4_core::Model::open_distributed_options(
+            &args.model,
+            args.backend,
+            args.threads,
+            false,
+            args.mtp.as_deref(),
+            None,
+            &config,
+            &mtp_open_options(&args),
+        ),
+        None => ds4_core::Model::open_with_support_options(
+            &args.model,
+            args.backend,
+            args.threads,
+            false,
+            args.mtp.as_deref(),
+            None,
+            &mtp_open_options(&args),
+        ),
+    }
     .map_err(|error| error.to_string())?;
-    let mut session = model.session(args.ctx).map_err(|error| error.to_string())?;
+    let mut session = session_ready(&model, &args)?;
     let mut transcript = build_system_transcript(model.vocab(), &args, think)?;
     session
         .sync(&transcript)
@@ -509,7 +562,7 @@ fn help_text(name: &str) -> String {
         "Usage: {name} --non-interactive -p TEXT [options]\n\
          \n\
          One-turn ds4-agent shadow. Supports google_search, visit_page, read, more, list, search, write, edit, bash, bash_status, and bash_stop. \
-         Use ./ds4-agent for other tools, interactive, KV, or distributed execution.\n\
+         Use ./ds4-agent for other tools or interactive KV. Coordinator --role/--layers/--listen are accepted.\n\
          \n\
          Options:\n\
            -m, --model FILE        GGUF model path. Default: ds4flash.gguf\n\
@@ -536,6 +589,9 @@ fn help_text(name: &str) -> String {
            -t, --threads N        CPU helper threads.\n\
            --chdir DIR            Change directory before model load.\n\
            --trace FILE           Write prompt, token, and DSML debug trace.\n\
+           --role coordinator     Distributed coordinator; workers stay on ./ds4.\n\
+           --layers A:B           Inclusive coordinator layer slice.\n\
+           --listen HOST PORT     Coordinator TCP listen address.\n\
            -h, --help             Show this help.\n"
     )
 }
@@ -787,11 +843,49 @@ mod tests {
         assert!(parse_args(argv(&["--non-interactive"]))
             .unwrap_err()
             .contains("-p/--prompt"));
-        for flag in ["--dir-steering-file", "--role"] {
+        for flag in ["--dir-steering-file"] {
             let error = parse_args(argv(&["--non-interactive", "-p", "hello", flag, "ignored"]))
                 .unwrap_err();
             assert!(error.contains("not implemented"), "{flag}: {error}");
         }
+    }
+
+    #[test]
+    fn parses_coordinator_flags_and_rejects_worker() {
+        let parsed = parse_args(argv(&[
+            "--non-interactive",
+            "-p",
+            "hello",
+            "--role",
+            "coordinator",
+            "--layers",
+            "0:19",
+            "--listen",
+            "127.0.0.1",
+            "1234",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.dist.role, ds4_dist::Role::Coordinator);
+        assert_eq!(parsed.dist.layers.start, 0);
+        assert_eq!(parsed.dist.layers.end, 19);
+        assert_eq!(parsed.dist.listen_host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(parsed.dist.listen_port, 1234);
+        assert!(crate::distributed_config(&parsed.dist).is_some());
+
+        let worker = parse_args(argv(&[
+            "--non-interactive",
+            "-p",
+            "hello",
+            "--role",
+            "worker",
+            "--layers",
+            "20:output",
+            "--coordinator",
+            "127.0.0.1",
+            "1234",
+        ]))
+        .unwrap_err();
+        assert!(worker.contains("--role worker is a serving mode"));
     }
 
     #[test]
