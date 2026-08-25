@@ -10,6 +10,7 @@ mod bash;
 mod compact;
 mod edit;
 mod search;
+mod trace;
 mod web_tools;
 mod write;
 
@@ -45,6 +46,7 @@ pub struct AgentArgs {
     quality: bool,
     warm_weights: bool,
     power_percent: i32,
+    trace: Option<String>,
     non_interactive: bool,
     help: bool,
 }
@@ -71,6 +73,7 @@ impl Default for AgentArgs {
             quality: false,
             warm_weights: false,
             power_percent: 100,
+            trace: None,
             non_interactive: false,
             help: false,
         }
@@ -195,8 +198,8 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AgentArgs, S
                 }
                 parsed.power_percent = parsed_power;
             }
-            "--trace"
-            | "--dir-steering-file"
+            "--trace" => parsed.trace = Some(need_value(&arg, args.next())?),
+            "--dir-steering-file"
             | "--dir-steering-ffn"
             | "--dir-steering-attn"
             | "--role"
@@ -354,6 +357,7 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
         );
     }
 
+    let mut log = trace::Trace::open(args.trace.as_deref(), name)?;
     let model = ds4_core::Model::open_with_support_options(
         &args.model,
         args.backend,
@@ -369,17 +373,36 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
     session
         .sync(&transcript)
         .map_err(|error| error.to_string())?;
+    log.event(&format!(
+        "agent worker start ctx={} backend={} model={} trace={}",
+        args.ctx,
+        trace::backend_name(args.backend),
+        args.model,
+        args.trace.as_deref().unwrap_or("")
+    ))?;
+    log.tokens("initial_system_prompt", &model, transcript.as_slice(), 0)?;
 
     let prompt = args
         .prompt
         .as_deref()
         .ok_or_else(|| "--non-interactive requires -p/--prompt".to_string())?;
-    append_user_turn(
-        model.vocab(),
-        &mut transcript,
-        prompt,
-        &current_local_datetime(),
-        think,
+    let when = current_local_datetime();
+    let datetime = format_datetime_context(&when);
+    append_user_turn(model.vocab(), &mut transcript, prompt, &when, think)?;
+    log.text("datetime-context", datetime.as_bytes())?;
+    log.text("user", prompt.as_bytes())?;
+    let cached = session.pos();
+    let prompt_len = i32::try_from(transcript.len()).unwrap_or(i32::MAX);
+    let suffix = prompt_len.saturating_sub(cached);
+    log.event(&format!(
+        "prefill tool_round=0 transcript={prompt_len} prompt={prompt_len} cached={cached} suffix={suffix} think={}",
+        trace::think_mode_name(think)
+    ))?;
+    log.tokens(
+        "prefill_suffix",
+        &model,
+        transcript.as_slice(),
+        cached.max(0) as usize,
     )?;
     session
         .sync(&transcript)
@@ -430,6 +453,7 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
                 let piece = model
                     .token_text(accepted)
                     .map_err(|error| error.to_string())?;
+                log.token(accepted, &piece, generated + 1)?;
                 raw.extend_from_slice(&piece);
                 generated += 1;
                 if web_tools::block_complete(&raw) || generated >= max_tokens {
@@ -511,6 +535,7 @@ fn help_text(name: &str) -> String {
            --metal, --cuda, --cpu Select backend explicitly.\n\
            -t, --threads N        CPU helper threads.\n\
            --chdir DIR            Change directory before model load.\n\
+           --trace FILE           Write prompt, token, and DSML debug trace.\n\
            -h, --help             Show this help.\n"
     )
 }
@@ -762,7 +787,7 @@ mod tests {
         assert!(parse_args(argv(&["--non-interactive"]))
             .unwrap_err()
             .contains("-p/--prompt"));
-        for flag in ["--trace", "--dir-steering-file", "--role"] {
+        for flag in ["--dir-steering-file", "--role"] {
             let error = parse_args(argv(&["--non-interactive", "-p", "hello", flag, "ignored"]))
                 .unwrap_err();
             assert!(error.contains("not implemented"), "{flag}: {error}");
@@ -832,6 +857,20 @@ mod tests {
             .unwrap_err(),
             "--power must be between 1 and 100"
         );
+    }
+
+    #[test]
+    fn parses_trace_path() {
+        let parsed = parse_args(argv(&[
+            "--non-interactive",
+            "-p",
+            "hello",
+            "--trace",
+            "/tmp/ds4-agent.trace",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.trace.as_deref(), Some("/tmp/ds4-agent.trace"));
+        assert!(help_text("ds4-agent-rs").contains("--trace FILE"));
     }
 
     #[test]
