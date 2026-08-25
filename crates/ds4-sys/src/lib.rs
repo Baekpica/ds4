@@ -97,6 +97,10 @@ pub const DS4_BRIDGE_BACKEND_CUDA: ds4_bridge_backend = 0;
 pub const DS4_BRIDGE_BACKEND_METAL: ds4_bridge_backend = 1;
 pub const DS4_BRIDGE_BACKEND_CPU: ds4_bridge_backend = 2;
 
+pub const DS4_BRIDGE_DISTRIBUTED_NONE: c_int = 0;
+pub const DS4_BRIDGE_DISTRIBUTED_COORDINATOR: c_int = 1;
+pub const DS4_BRIDGE_DISTRIBUTED_WORKER: c_int = 2;
+
 pub const DS4_BRIDGE_MAX_DIMS: usize = 8;
 pub const DS4_BRIDGE_MEMC_COUNT: usize = 17;
 pub const DS4_BRIDGE_MEMD_COUNT: usize = 2;
@@ -107,6 +111,24 @@ pub struct ds4_bridge_token_score {
     pub id: i32,
     pub logit: c_float,
     pub logprob: c_float,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ds4_bridge_distributed_options {
+    pub role: i32,
+    pub layer_start: u32,
+    pub layer_end: u32,
+    pub has_output: i32,
+    pub listen_host: *const c_char,
+    pub listen_port: i32,
+    pub coordinator_host: *const c_char,
+    pub coordinator_port: i32,
+    pub prefill_chunk: u32,
+    pub prefill_window: u32,
+    pub activation_bits: u32,
+    pub replay_check: i32,
+    pub debug: i32,
 }
 
 #[repr(C)]
@@ -316,6 +338,21 @@ extern "C" {
         errlen: usize,
     ) -> c_int;
 
+    pub fn ds4_bridge_model_open_distributed(
+        out: *mut *mut ds4_bridge_model,
+        opt: *const ds4_bridge_model_open_options,
+        distributed: *const ds4_bridge_distributed_options,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_model_run_distributed_worker(
+        m: *mut ds4_bridge_model,
+        ctx_size: i32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
     pub fn ds4_bridge_model_boot_prewarm(m: *mut ds4_bridge_model);
 
     pub fn ds4_bridge_model_free(m: *mut ds4_bridge_model);
@@ -375,6 +412,12 @@ extern "C" {
     pub fn ds4_bridge_session_prefill_cap(s: *mut ds4_bridge_session) -> c_int;
 
     pub fn ds4_bridge_session_exaone_rewind_span(s: *mut ds4_bridge_session) -> c_int;
+
+    pub fn ds4_bridge_session_distributed_route_ready(
+        s: *mut ds4_bridge_session,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
 
     pub fn ds4_bridge_session_sample(
         s: *mut ds4_bridge_session,

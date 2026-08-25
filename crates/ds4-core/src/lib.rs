@@ -82,8 +82,10 @@ use std::ptr::{self, NonNull};
 
 use ds4_sys::{
     ds4_bridge_bind_plan, ds4_bridge_bind_plan_check, ds4_bridge_bind_slot,
+    ds4_bridge_distributed_options,
     ds4_bridge_encode_chat_prompt, ds4_bridge_eval, ds4_bridge_model,
     ds4_bridge_model_boot_prewarm, ds4_bridge_model_free, ds4_bridge_model_id,
+    ds4_bridge_model_open_distributed, ds4_bridge_model_run_distributed_worker,
     ds4_bridge_model_routed_quant_bits,
     ds4_bridge_model_open, ds4_bridge_model_open_options, ds4_bridge_session,
     ds4_bridge_session_argmax, ds4_bridge_session_argmax_excluding,
@@ -93,6 +95,7 @@ use ds4_sys::{
     ds4_bridge_session_generation, ds4_bridge_session_invalidate,
     ds4_bridge_session_load_payload, ds4_bridge_session_load_payload_range,
     ds4_bridge_session_prefill_cap,
+    ds4_bridge_session_distributed_route_ready,
     ds4_bridge_session_rewind, ds4_bridge_session_sample,
     ds4_bridge_session_load_snapshot, ds4_bridge_session_save_payload,
     ds4_bridge_session_save_snapshot, ds4_bridge_session_sync,
@@ -103,7 +106,9 @@ use ds4_sys::{
     ds4_host_tensor_dir, ds4_host_vocab,
     DS4_BRIDGE_BACKEND_CPU,
     DS4_BRIDGE_BACKEND_CUDA,
-    DS4_BRIDGE_BACKEND_METAL, DS4_BRIDGE_MAX_DIMS,
+    DS4_BRIDGE_BACKEND_METAL, DS4_BRIDGE_DISTRIBUTED_COORDINATOR,
+    DS4_BRIDGE_DISTRIBUTED_NONE, DS4_BRIDGE_DISTRIBUTED_WORKER,
+    DS4_BRIDGE_MAX_DIMS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +126,40 @@ impl Backend {
             Backend::Cpu => DS4_BRIDGE_BACKEND_CPU,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DistributedRole {
+    None,
+    Coordinator,
+    Worker,
+}
+
+impl DistributedRole {
+    fn to_c(self) -> i32 {
+        match self {
+            Self::None => DS4_BRIDGE_DISTRIBUTED_NONE,
+            Self::Coordinator => DS4_BRIDGE_DISTRIBUTED_COORDINATOR,
+            Self::Worker => DS4_BRIDGE_DISTRIBUTED_WORKER,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DistributedConfig {
+    pub role: DistributedRole,
+    pub layer_start: u32,
+    pub layer_end: u32,
+    pub has_output: bool,
+    pub listen_host: Option<String>,
+    pub listen_port: i32,
+    pub coordinator_host: Option<String>,
+    pub coordinator_port: i32,
+    pub prefill_chunk: u32,
+    pub prefill_window: u32,
+    pub activation_bits: u32,
+    pub replay_check: bool,
+    pub debug: bool,
 }
 
 #[derive(Debug)]
@@ -198,7 +237,57 @@ pub struct Model {
     inventory: TensorInventory,
     bind_plan: BindPlan,
     vocab: Vocab,
+    _distributed: Option<FfiDistributed>,
     _not_send: PhantomData<*const ()>,
+}
+
+struct FfiDistributed {
+    _listen_host: Option<CString>,
+    _coordinator_host: Option<CString>,
+    raw: ds4_bridge_distributed_options,
+}
+
+fn pack_distributed(config: &DistributedConfig) -> Result<FfiDistributed> {
+    let listen_host = config
+        .listen_host
+        .as_deref()
+        .map(CString::new)
+        .transpose()
+        .map_err(|_| Error {
+            code: 1,
+            message: "distributed listen host contains NUL".into(),
+        })?;
+    let coordinator_host = config
+        .coordinator_host
+        .as_deref()
+        .map(CString::new)
+        .transpose()
+        .map_err(|_| Error {
+            code: 1,
+            message: "distributed coordinator host contains NUL".into(),
+        })?;
+    let raw = ds4_bridge_distributed_options {
+        role: config.role.to_c(),
+        layer_start: config.layer_start,
+        layer_end: config.layer_end,
+        has_output: i32::from(config.has_output),
+        listen_host: listen_host.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+        listen_port: config.listen_port,
+        coordinator_host: coordinator_host
+            .as_ref()
+            .map_or(ptr::null(), |s| s.as_ptr()),
+        coordinator_port: config.coordinator_port,
+        prefill_chunk: config.prefill_chunk,
+        prefill_window: config.prefill_window,
+        activation_bits: config.activation_bits,
+        replay_check: i32::from(config.replay_check),
+        debug: i32::from(config.debug),
+    };
+    Ok(FfiDistributed {
+        _listen_host: listen_host,
+        _coordinator_host: coordinator_host,
+        raw,
+    })
 }
 
 struct FfiBindMap {
@@ -671,6 +760,46 @@ impl Model {
         mtp_path: Option<&str>,
         dspark_path: Option<&str>,
     ) -> Result<Self> {
+        Self::open_impl(
+            path,
+            backend,
+            n_threads,
+            defer_boot_prewarm,
+            mtp_path,
+            dspark_path,
+            None,
+        )
+    }
+
+    pub fn open_distributed(
+        path: &str,
+        backend: Backend,
+        n_threads: i32,
+        defer_boot_prewarm: bool,
+        mtp_path: Option<&str>,
+        dspark_path: Option<&str>,
+        distributed: &DistributedConfig,
+    ) -> Result<Self> {
+        Self::open_impl(
+            path,
+            backend,
+            n_threads,
+            defer_boot_prewarm,
+            mtp_path,
+            dspark_path,
+            Some(distributed),
+        )
+    }
+
+    fn open_impl(
+        path: &str,
+        backend: Backend,
+        n_threads: i32,
+        defer_boot_prewarm: bool,
+        mtp_path: Option<&str>,
+        dspark_path: Option<&str>,
+        distributed: Option<&DistributedConfig>,
+    ) -> Result<Self> {
         let identified = identify_gguf(std::path::Path::new(path)).map_err(|e| Error {
             code: 1,
             message: format!("identify failed: {}", e.token()),
@@ -779,14 +908,24 @@ impl Model {
             mtp_bind: mtp_bind_ptr,
             dspark_bind: dspark_bind_ptr,
         };
+        let mut ffi_distributed = distributed.map(pack_distributed).transpose()?;
         let mut raw = ptr::null_mut();
         let rc = unsafe {
-            ds4_bridge_model_open(
-                &mut raw,
-                &opt,
-                err.as_mut_ptr() as *mut c_char,
-                err.len(),
-            )
+            match ffi_distributed.as_mut() {
+                Some(distributed) => ds4_bridge_model_open_distributed(
+                    &mut raw,
+                    &opt,
+                    &distributed.raw,
+                    err.as_mut_ptr() as *mut c_char,
+                    err.len(),
+                ),
+                None => ds4_bridge_model_open(
+                    &mut raw,
+                    &opt,
+                    err.as_mut_ptr() as *mut c_char,
+                    err.len(),
+                ),
+            }
         };
         if rc != 0 {
             return Err(fail(rc, &err));
@@ -802,6 +941,7 @@ impl Model {
             inventory,
             bind_plan,
             vocab,
+            _distributed: ffi_distributed,
             _not_send: PhantomData,
         })
     }
@@ -877,6 +1017,22 @@ impl Model {
 
     pub fn routed_quant_bits(&self) -> i32 {
         unsafe { ds4_bridge_model_routed_quant_bits(self.raw.as_ptr()) }
+    }
+
+    pub fn run_distributed_worker(&self, ctx_size: i32) -> Result<i32> {
+        let mut err = [0u8; 512];
+        let rc = unsafe {
+            ds4_bridge_model_run_distributed_worker(
+                self.raw.as_ptr(),
+                ctx_size,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(fail(rc, &err));
+        }
+        Ok(rc)
     }
 
     pub fn token_eos(&self) -> i32 {
@@ -1039,6 +1195,22 @@ impl Session<'_> {
 
     pub fn native_generation(&self) -> u64 {
         unsafe { ds4_bridge_session_generation(self.raw.as_ptr()) }
+    }
+
+    pub fn distributed_route_ready(&self) -> Result<bool> {
+        let mut err = [0u8; 512];
+        let rc = unsafe {
+            ds4_bridge_session_distributed_route_ready(
+                self.raw.as_ptr(),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        match rc {
+            1 => Ok(true),
+            0 => Ok(false),
+            _ => Err(fail(rc, &err)),
+        }
     }
 
     pub fn argmax(&self) -> i32 {

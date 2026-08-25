@@ -2,6 +2,7 @@
  * without the CUDA engine. NULL-handle tests never reach these. */
 
 #include "ds4.h"
+#include "ds4_distributed.h"
 #include "native/bridge/ds4_host_load.h"
 
 #include <stdio.h>
@@ -35,6 +36,14 @@ int64_t bridge_bank_load_offset;
 uint64_t bridge_bank_load_bytes;
 int bridge_cont_run;
 ds4_cont_seq_stats bridge_cont_stats;
+int bridge_dist_open_enabled;
+int bridge_dist_prepare_calls;
+int bridge_dist_run_calls;
+int bridge_dist_run_ctx;
+int bridge_dist_run_result;
+int bridge_dist_route_ready;
+ds4_engine_options bridge_dist_engine_options;
+ds4_dist_options bridge_dist_run_options;
 
 static ds4_session_progress_fn bridge_progress;
 static void *bridge_progress_ud;
@@ -53,9 +62,19 @@ void ds4_host_dspark_bind_map_install(const ds4_host_bind_map *m) { (void)m; }
 void ds4_host_dspark_bind_map_clear(void) {}
 
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
-    (void)out; (void)opt; STUB("ds4_engine_open");
+    if (!bridge_dist_open_enabled || !out || !opt) {
+        STUB("ds4_engine_open");
+    }
+    bridge_dist_engine_options = *opt;
+    *out = malloc(1);
+    return *out ? 0 : 1;
 }
-void ds4_engine_close(ds4_engine *e) { (void)e; STUB("ds4_engine_close"); }
+void ds4_engine_close(ds4_engine *e) {
+    if (!bridge_dist_open_enabled || !e) {
+        STUB("ds4_engine_close");
+    }
+    free(e);
+}
 void ds4_engine_boot_prewarm(ds4_engine *e) {
     if (!e) STUB("ds4_engine_boot_prewarm");
     bridge_boot_prewarm_calls++;
@@ -110,6 +129,13 @@ uint64_t ds4_session_generation(const ds4_session *s) {
 int ds4_session_prefill_cap(ds4_session *s) { (void)s; STUB("ds4_session_prefill_cap"); }
 int ds4_session_exaone_rewind_span(ds4_session *s) {
     (void)s; STUB("ds4_session_exaone_rewind_span");
+}
+int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen) {
+    (void)err; (void)errlen;
+    if (!s) {
+        STUB("ds4_session_distributed_route_ready");
+    }
+    return bridge_dist_route_ready;
 }
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p,
                        float min_p, uint64_t *rng) {
@@ -251,3 +277,33 @@ int ds4_gpu_mem_observe(ds4_mem_observation *out) {
     return 1;
 }
 uint64_t ds4_gpu_substrate_outstanding(void) { return 0; }
+
+int ds4_dist_prepare_engine_options(const ds4_dist_options *opt,
+                                    ds4_engine_options *engine,
+                                    char *err, size_t errlen) {
+    (void)err; (void)errlen;
+    if (!opt || !engine) {
+        STUB("ds4_dist_prepare_engine_options");
+    }
+    bridge_dist_prepare_calls++;
+    engine->distributed = *opt;
+    if (opt->role != DS4_DISTRIBUTED_NONE) {
+        engine->load_slice = true;
+        engine->load_layer_start = opt->layers.start;
+        engine->load_layer_end = opt->layers.has_output ? UINT32_MAX : opt->layers.end;
+        engine->load_output = opt->layers.has_output ||
+                              opt->role == DS4_DISTRIBUTED_COORDINATOR;
+    }
+    return 0;
+}
+
+int ds4_dist_run(ds4_engine *engine, const ds4_dist_options *opt,
+                 const ds4_dist_generation_options *gen) {
+    if (!engine || !opt || !gen) {
+        STUB("ds4_dist_run");
+    }
+    bridge_dist_run_calls++;
+    bridge_dist_run_options = *opt;
+    bridge_dist_run_ctx = gen->ctx_size;
+    return bridge_dist_run_result;
+}

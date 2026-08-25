@@ -7,6 +7,7 @@ name = "ds4-cli"
 version = "0.6.3"
 dependencies = [
  "ds4-core",
+ "ds4-dist",
  "ds4-web",
 ]
 

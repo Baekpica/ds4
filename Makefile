@@ -279,7 +279,7 @@ ds4.o: ds4.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distri
 # Not linked into the C oracles. Phase 3 shadows link this object plus CORE_OBJS.
 rust-bridge: native/bridge/ds4_bridge.o
 
-native/bridge/ds4_bridge.o: native/bridge/ds4_bridge.c native/bridge/ds4_bridge.h native/bridge/ds4_host_load.h ds4.h
+native/bridge/ds4_bridge.o: native/bridge/ds4_bridge.c native/bridge/ds4_bridge.h native/bridge/ds4_host_load.h ds4.h ds4_distributed.h
 	$(CC) $(CFLAGS) -I. -c -o $@ native/bridge/ds4_bridge.c
 
 # Phase 3 shadows: Rust main, existing C/CUDA objects. Do not replace ./ds4.
@@ -364,7 +364,7 @@ tests/parity/admit_c_oracle: tests/parity/admit_c_oracle.c
 tests/parity/render_c_oracle: tests/parity/render_c_oracle.c tests/parity/render_tools_inc.c
 	$(CC) $(CFLAGS) -o $@ tests/parity/render_c_oracle.c
 
-tests/parity/bridge_null_oracle: tests/parity/bridge_null_oracle.c tests/parity/bridge_null_stubs.c native/bridge/ds4_bridge.c native/bridge/ds4_bridge.h
+tests/parity/bridge_null_oracle: tests/parity/bridge_null_oracle.c tests/parity/bridge_null_stubs.c native/bridge/ds4_bridge.c native/bridge/ds4_bridge.h ds4_distributed.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/parity/bridge_null_oracle.c tests/parity/bridge_null_stubs.c native/bridge/ds4_bridge.c $(LDLIBS)
 
 tests/parity/cont_c_oracle: tests/parity/cont_c_oracle.c

@@ -130,7 +130,11 @@ fn parse_positive_u32(s: &str, name: &str) -> Result<u32, String> {
     Ok(v as u32)
 }
 
-pub fn parse_cli_arg(arg: &str, rest: &mut std::vec::IntoIter<String>, opt: &mut Options) -> Result<CliResult, String> {
+pub fn parse_cli_arg(
+    arg: &str,
+    rest: &mut impl Iterator<Item = String>,
+    opt: &mut Options,
+) -> Result<CliResult, String> {
     match arg {
         "--role" => {
             let role = rest.next().ok_or_else(|| "--role requires an argument".to_string())?;

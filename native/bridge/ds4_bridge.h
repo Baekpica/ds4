@@ -27,6 +27,31 @@ enum {
     DS4_BRIDGE_BACKEND_CPU = 2
 };
 
+enum {
+    DS4_BRIDGE_DISTRIBUTED_NONE = 0,
+    DS4_BRIDGE_DISTRIBUTED_COORDINATOR = 1,
+    DS4_BRIDGE_DISTRIBUTED_WORKER = 2
+};
+
+/* Rust owns these strings for the lifetime of the returned model.  The
+ * structure is translated into ds4_distributed_options inside the bridge;
+ * neither its layout nor the ds4.h layout crosses into Rust application code. */
+typedef struct {
+    int32_t role;              /* DS4_BRIDGE_DISTRIBUTED_* */
+    uint32_t layer_start;
+    uint32_t layer_end;
+    int32_t has_output;
+    const char *listen_host;   /* optional; borrowed for model lifetime */
+    int32_t listen_port;
+    const char *coordinator_host; /* optional; borrowed for model lifetime */
+    int32_t coordinator_port;
+    uint32_t prefill_chunk;
+    uint32_t prefill_window;
+    uint32_t activation_bits;
+    int32_t replay_check;
+    int32_t debug;
+} ds4_bridge_distributed_options;
+
 #define DS4_BRIDGE_MAX_DIMS 8
 
 typedef struct {
@@ -94,6 +119,17 @@ int ds4_bridge_bind_plan_match(const ds4_bridge_bind_plan *host,
 int ds4_bridge_model_open(ds4_bridge_model **out,
                           const ds4_bridge_model_open_options *opt,
                           char *err, size_t errlen);
+int ds4_bridge_model_open_distributed(
+        ds4_bridge_model **out,
+        const ds4_bridge_model_open_options *opt,
+        const ds4_bridge_distributed_options *distributed,
+        char *err, size_t errlen);
+/* Worker mode stays on the proven C DS4D runtime for this first strangler
+ * slice.  Rust owns parsing/lifecycle; wire bytes, reconnect, telemetry,
+ * prefetch, forwarding, and snapshot behavior remain unchanged. */
+int ds4_bridge_model_run_distributed_worker(ds4_bridge_model *m,
+                                            int32_t ctx_size,
+                                            char *err, size_t errlen);
 void ds4_bridge_model_boot_prewarm(ds4_bridge_model *m);
 void ds4_bridge_model_free(ds4_bridge_model *m);
 
@@ -122,6 +158,9 @@ void ds4_bridge_session_invalidate(ds4_bridge_session *s);
 uint64_t ds4_bridge_session_generation(ds4_bridge_session *s);
 int ds4_bridge_session_prefill_cap(ds4_bridge_session *s);
 int ds4_bridge_session_exaone_rewind_span(ds4_bridge_session *s);
+/* 1 ready, 0 still incomplete, -1 error (same as ds4.h). */
+int ds4_bridge_session_distributed_route_ready(ds4_bridge_session *s,
+                                               char *err, size_t errlen);
 int ds4_bridge_session_sample(ds4_bridge_session *s,
                               float temperature, int top_k, float top_p, float min_p,
                               uint64_t *rng);

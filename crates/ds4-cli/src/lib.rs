@@ -5,6 +5,29 @@ pub mod bench;
 
 use ds4_core::Backend;
 
+fn distributed_config(opt: &ds4_dist::Options) -> Option<ds4_core::DistributedConfig> {
+    let role = match opt.role {
+        ds4_dist::Role::None => return None,
+        ds4_dist::Role::Coordinator => ds4_core::DistributedRole::Coordinator,
+        ds4_dist::Role::Worker => ds4_core::DistributedRole::Worker,
+    };
+    Some(ds4_core::DistributedConfig {
+        role,
+        layer_start: opt.layers.start,
+        layer_end: opt.layers.end,
+        has_output: opt.layers.has_output,
+        listen_host: opt.listen_host.clone(),
+        listen_port: opt.listen_port,
+        coordinator_host: opt.coordinator_host.clone(),
+        coordinator_port: opt.coordinator_port,
+        prefill_chunk: opt.prefill_chunk,
+        prefill_window: opt.prefill_window,
+        activation_bits: opt.activation_bits,
+        replay_check: opt.replay_check,
+        debug: opt.debug,
+    })
+}
+
 #[derive(Debug)]
 pub struct ShadowArgs {
     pub model: Option<String>,
@@ -46,6 +69,7 @@ pub struct ShadowArgs {
     pub validate: bool,
     pub layout: bool,
     pub layout_variant: Option<String>,
+    pub dist: ds4_dist::Options,
     pub help: bool,
 }
 
@@ -91,6 +115,7 @@ impl Default for ShadowArgs {
             validate: false,
             layout: false,
             layout_variant: None,
+            dist: ds4_dist::Options::default(),
             help: false,
         }
     }
@@ -226,9 +251,16 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
                 parsed.layout = true;
                 parsed.layout_variant = Some(require_value(&arg, iter.next())?);
             }
-            other => return Err(format!("unknown argument: {other}")),
+            other => match ds4_dist::parse_cli_arg(other, &mut iter, &mut parsed.dist)? {
+                ds4_dist::CliResult::Matched => {}
+                ds4_dist::CliResult::NotMatched => {
+                    return Err(format!("unknown argument: {other}"));
+                }
+                ds4_dist::CliResult::Error => unreachable!(),
+            },
         }
     }
+    ds4_dist::prepare_engine_options(&parsed.dist)?;
     Ok(parsed)
 }
 
@@ -271,6 +303,34 @@ fn generation_limit(ctx: i32, pos: i32, requested: i32) -> i32 {
 fn sampled_generation_limit(ctx: i32, pos: i32, requested: i32) -> i32 {
     let room = ctx.saturating_sub(pos).saturating_sub(1);
     requested.min(room).max(0)
+}
+
+fn session_ready<'m>(
+    model: &'m ds4_core::Model,
+    args: &ShadowArgs,
+    ctx: i32,
+) -> Result<ds4_core::Session<'m>, String> {
+    let session = model.session(ctx).map_err(|e| e.to_string())?;
+    if args.dist.role != ds4_dist::Role::Coordinator {
+        return Ok(session);
+    }
+    let mut ticks = 0u32;
+    loop {
+        if session
+            .distributed_route_ready()
+            .map_err(|e| e.to_string())?
+        {
+            if ticks != 0 {
+                eprintln!("ds4-rs: distributed route ready");
+            }
+            return Ok(session);
+        }
+        if ticks % 4 == 0 {
+            eprintln!("ds4-rs: waiting for distributed route");
+        }
+        ticks = ticks.wrapping_add(1);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 const THINK_OPEN: &[u8] = b"<think>";
@@ -364,7 +424,7 @@ fn run_one_shot(model: &ds4_core::Model, args: &ShadowArgs, text: &str) -> Resul
     }
     .map_err(|e| e.to_string())?;
 
-    let mut session = model.session(args.ctx).map_err(|e| e.to_string())?;
+    let mut session = session_ready(model, args, args.ctx)?;
     session.sync(&prompt).map_err(|e| e.to_string())?;
 
     let sampled = args.temp > 0.0;
@@ -463,7 +523,7 @@ fn run_logprob_dump(
     } else {
         args.ctx.max(n_prompt + args.n_predict + 8)
     };
-    let mut session = model.session(ctx).map_err(|e| e.to_string())?;
+    let mut session = session_ready(model, args, ctx)?;
     session.sync(&prompt).map_err(|e| e.to_string())?;
 
     let path = args.dump_logprobs.as_deref().unwrap();
@@ -578,6 +638,10 @@ Thinking tags follow the C non-TTY byte contract; ANSI coloring is omitted.
 --tokens is the C-compatible output budget; --token-ids is the shadow-only
 raw token-ID diagnostic.
 
+Distributed worker/coordinator options use the frozen C DS4D runtime behind
+the Rust-owned CLI/model lifecycle in this first production integration slice:
+{dist_usage}
+
 --identify mmaps GGUF metadata only (no CUDA, no ds4_bridge_model_open).
 --inventory mmaps the tensor directory + split remap (no CUDA, no engine open).
 --bind-names dumps the host weights_bind catalog (no GGUF, no engine open).
@@ -593,7 +657,8 @@ or DeepSeek sibling mtp-flash|mtp-pro|dspark-flash|dspark-pro.
 --session-payload dumps the host DSV4 prefix codec (no engine open).
 FAMILY is deepseek4|motif3|solar-open2|exaone-moe|dots3-note.
 CMD is specials | encode HEX | render HEX | decode ID | stop ID.
-"
+",
+        dist_usage = ds4_dist::USAGE,
     )
 }
 
@@ -702,28 +767,48 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
         return Ok(0);
     }
 
+    let worker = args.dist.role == ds4_dist::Role::Worker;
     let raw_token_diagnostic = !args.tokens.is_empty() || args.predict > 0;
-    let generation_text = if args.prompt.is_some() || args.prompt_file.is_some() {
+    let generation_text = if !worker && (args.prompt.is_some() || args.prompt_file.is_some()) {
         Some(prompt_text(&args)?)
     } else {
         None
     };
-    if args.dump_logprobs.is_none() && !args.lifecycle_only && !raw_token_diagnostic {
+    if !worker && args.dump_logprobs.is_none() && !args.lifecycle_only && !raw_token_diagnostic {
         validate_one_shot_args(&args)?;
     }
-    if args.dump_logprobs.is_some() && generation_text.is_none() {
+    if !worker && args.dump_logprobs.is_some() && generation_text.is_none() {
         return Err("--dump-logprobs requires -p or --prompt-file".into());
     }
 
-    let model = ds4_core::Model::open_with_support(
-        model_path,
-        args.backend,
-        args.threads,
-        true,
-        args.mtp.as_deref(),
-        args.dspark.as_deref(),
-    )
+    let native_dist = distributed_config(&args.dist);
+    let model = match native_dist.as_ref() {
+        Some(config) => ds4_core::Model::open_distributed(
+            model_path,
+            args.backend,
+            args.threads,
+            true,
+            args.mtp.as_deref(),
+            args.dspark.as_deref(),
+            config,
+        ),
+        None => ds4_core::Model::open_with_support(
+            model_path,
+            args.backend,
+            args.threads,
+            true,
+            args.mtp.as_deref(),
+            args.dspark.as_deref(),
+        ),
+    }
     .map_err(|e| e.to_string())?;
+
+    if worker {
+        model.boot_prewarm();
+        return model
+            .run_distributed_worker(args.ctx)
+            .map_err(|e| e.to_string());
+    }
 
     if args.dump_logprobs.is_some() {
         return run_logprob_dump(&model, &args, generation_text.as_deref().unwrap());
@@ -741,7 +826,7 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
     }
 
     if !args.tokens.is_empty() {
-        let mut session = model.session(args.ctx).map_err(|e| e.to_string())?;
+        let mut session = session_ready(&model, &args, args.ctx)?;
         let buf = ds4_core::TokenBuffer::from_tokens(args.tokens);
         session.sync(&buf).map_err(|e| e.to_string())?;
         print!("{}", session.argmax());
@@ -857,6 +942,65 @@ mod tests {
         assert_eq!(parsed.ctx, 4096);
         assert!(parsed.lifecycle_only);
         assert_eq!(parsed.backend, default_backend());
+    }
+
+    #[test]
+    fn parses_distributed_worker_options_for_native_oracle_runtime() {
+        let parsed = parse_args(args(&[
+            "--role",
+            "worker",
+            "--layers",
+            "21:output",
+            "--listen",
+            "0.0.0.0",
+            "7100",
+            "--coordinator",
+            "10.0.0.1",
+            "7000",
+        ]))
+        .unwrap();
+
+        assert_eq!(parsed.dist.role, ds4_dist::Role::Worker);
+        assert_eq!(parsed.dist.layers.start, 21);
+        assert!(parsed.dist.layers.has_output);
+        assert_eq!(parsed.dist.listen_host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(parsed.dist.listen_port, 7100);
+        assert_eq!(parsed.dist.coordinator_host.as_deref(), Some("10.0.0.1"));
+        assert_eq!(parsed.dist.coordinator_port, 7000);
+
+        let native = distributed_config(&parsed.dist).unwrap();
+        assert_eq!(native.role, ds4_core::DistributedRole::Worker);
+        assert_eq!(native.layer_start, 21);
+        assert_eq!(native.layer_end, u32::MAX);
+        assert!(native.has_output);
+    }
+
+    #[test]
+    fn maps_distributed_coordinator_options_to_native_oracle_runtime() {
+        let parsed = parse_args(args(&[
+            "--role",
+            "coordinator",
+            "--layers",
+            "0:20",
+            "--listen",
+            "127.0.0.1",
+            "7000",
+            "--dist-prefill-chunk",
+            "4096",
+            "--dist-prefill-window",
+            "4",
+            "--dist-activation-bits",
+            "16",
+        ]))
+        .unwrap();
+
+        let native = distributed_config(&parsed.dist).unwrap();
+        assert_eq!(native.role, ds4_core::DistributedRole::Coordinator);
+        assert_eq!(native.layer_start, 0);
+        assert_eq!(native.layer_end, 20);
+        assert_eq!(native.prefill_chunk, 4096);
+        assert_eq!(native.prefill_window, 4);
+        assert_eq!(native.activation_bits, 16);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 #include "ds4_bridge.h"
 
 #include "ds4.h"
+#include "ds4_distributed.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -14,6 +15,8 @@
 
 struct ds4_bridge_model {
     ds4_engine *engine;
+    ds4_dist_options distributed;
+    int distributed_set;
 };
 
 struct ds4_bridge_session {
@@ -151,11 +154,54 @@ int ds4_bridge_bind_plan_match(const ds4_bridge_bind_plan *host,
     return 0;
 }
 
-int ds4_bridge_model_open(ds4_bridge_model **out,
-                          const ds4_bridge_model_open_options *opt,
-                          char *err, size_t errlen)
+static int map_distributed_options(
+        const ds4_bridge_distributed_options *src,
+        ds4_dist_options *dst,
+        char *err,
+        size_t errlen)
+{
+    if (!src || !dst) {
+        set_err(err, errlen, "distributed options are NULL");
+        return 1;
+    }
+    memset(dst, 0, sizeof(*dst));
+    switch (src->role) {
+    case DS4_BRIDGE_DISTRIBUTED_NONE:
+        dst->role = DS4_DISTRIBUTED_NONE;
+        break;
+    case DS4_BRIDGE_DISTRIBUTED_COORDINATOR:
+        dst->role = DS4_DISTRIBUTED_COORDINATOR;
+        break;
+    case DS4_BRIDGE_DISTRIBUTED_WORKER:
+        dst->role = DS4_DISTRIBUTED_WORKER;
+        break;
+    default:
+        set_err(err, errlen, "invalid distributed role");
+        return 1;
+    }
+    dst->layers.start = src->layer_start;
+    dst->layers.end = src->layer_end;
+    dst->layers.has_output = src->has_output != 0;
+    dst->layers.set = src->role != DS4_BRIDGE_DISTRIBUTED_NONE;
+    dst->listen_host = src->listen_host;
+    dst->listen_port = src->listen_port;
+    dst->coordinator_host = src->coordinator_host;
+    dst->coordinator_port = src->coordinator_port;
+    dst->prefill_chunk = src->prefill_chunk;
+    dst->prefill_window = src->prefill_window;
+    dst->activation_bits = src->activation_bits;
+    dst->replay_check = src->replay_check != 0;
+    dst->debug = src->debug != 0;
+    return 0;
+}
+
+static int model_open_impl(ds4_bridge_model **out,
+                           const ds4_bridge_model_open_options *opt,
+                           const ds4_bridge_distributed_options *distributed,
+                           char *err, size_t errlen)
 {
     ds4_engine_options eopt;
+    ds4_dist_options dist;
     ds4_engine *engine = NULL;
     ds4_bridge_model *m;
     int rc;
@@ -180,6 +226,12 @@ int ds4_bridge_model_open(ds4_bridge_model **out,
     eopt.mtp_path = opt->mtp_path;
     eopt.dspark_path = opt->dspark_path;
     if (map_backend(opt->backend, &eopt.backend, err, errlen) != 0) return 1;
+    if (distributed) {
+        if (map_distributed_options(distributed, &dist, err, errlen) != 0 ||
+            ds4_dist_prepare_engine_options(&dist, &eopt, err, errlen) != 0) {
+            return 1;
+        }
+    }
 
     if (opt->tensors) ds4_host_tensor_dir_install(opt->tensors);
     if (opt->shape) ds4_host_shape_install(opt->shape);
@@ -210,8 +262,56 @@ int ds4_bridge_model_open(ds4_bridge_model **out,
         return 1;
     }
     m->engine = engine;
+    if (distributed) {
+        m->distributed = dist;
+        m->distributed_set = 1;
+    }
     *out = m;
     return 0;
+}
+
+int ds4_bridge_model_open(ds4_bridge_model **out,
+                          const ds4_bridge_model_open_options *opt,
+                          char *err, size_t errlen)
+{
+    return model_open_impl(out, opt, NULL, err, errlen);
+}
+
+int ds4_bridge_model_open_distributed(
+        ds4_bridge_model **out,
+        const ds4_bridge_model_open_options *opt,
+        const ds4_bridge_distributed_options *distributed,
+        char *err, size_t errlen)
+{
+    return model_open_impl(out, opt, distributed, err, errlen);
+}
+
+int ds4_bridge_model_run_distributed_worker(ds4_bridge_model *m,
+                                            int32_t ctx_size,
+                                            char *err, size_t errlen)
+{
+    ds4_dist_generation_options gen;
+    int rc;
+    if (!m || !m->engine) {
+        set_err(err, errlen, "model is NULL");
+        return 1;
+    }
+    if (!m->distributed_set ||
+        m->distributed.role != DS4_DISTRIBUTED_WORKER) {
+        set_err(err, errlen, "model is not a distributed worker");
+        return 1;
+    }
+    if (ctx_size <= 0) {
+        set_err(err, errlen, "ctx_size must be positive");
+        return 1;
+    }
+    memset(&gen, 0, sizeof(gen));
+    gen.ctx_size = ctx_size;
+    rc = ds4_dist_run(m->engine, &m->distributed, &gen);
+    if (rc != 0) {
+        set_err(err, errlen, "distributed worker stopped with an error");
+    }
+    return rc;
 }
 
 void ds4_bridge_model_boot_prewarm(ds4_bridge_model *m)
@@ -411,6 +511,16 @@ int ds4_bridge_session_exaone_rewind_span(ds4_bridge_session *s)
 {
     if (!s || !s->session) return 0;
     return ds4_session_exaone_rewind_span(s->session);
+}
+
+int ds4_bridge_session_distributed_route_ready(ds4_bridge_session *s,
+                                               char *err, size_t errlen)
+{
+    if (!s || !s->session) {
+        set_err(err, errlen, "session is NULL");
+        return -1;
+    }
+    return ds4_session_distributed_route_ready(s->session, err, errlen);
 }
 
 int ds4_bridge_session_sample(ds4_bridge_session *s,
