@@ -16,7 +16,8 @@ use ds4_sys::{
     ds4_bridge_batch_ctx, ds4_bridge_batch_ctx_create_fit, ds4_bridge_batch_ctx_destroy,
     ds4_bridge_batch_ctx_bank_load_payload_range, ds4_bridge_batch_ctx_bank_save_payload,
     ds4_bridge_batch_ctx_bank_snapshot, ds4_bridge_batch_ctx_max_seq,
-    ds4_bridge_batch_ctx_seq_cap, ds4_bridge_cont_request, ds4_bridge_continuous_generate,
+    ds4_bridge_batch_ctx_seq_cap, ds4_bridge_cont_request, ds4_bridge_cont_stats,
+    ds4_bridge_continuous_generate,
 };
 
 use crate::{cstring_payload_path, fail, Error, Model, Result};
@@ -78,7 +79,15 @@ impl ContAdmit {
 pub trait ContDriver {
     fn admit(&mut self) -> Option<ContAdmit>;
     fn on_token(&mut self, user: usize, token: i32) -> bool;
-    fn on_done(&mut self, user: usize, tokens: &[i32], finish: i32);
+    fn on_done(
+        &mut self,
+        user: usize,
+        tokens: &[i32],
+        finish: i32,
+        decode_ms: f64,
+        decode_tokens: i32,
+        decode_steps: i32,
+    );
     fn sample_override(&mut self, _user: usize) -> i32 {
         CONT_SAMPLE_NONE
     }
@@ -137,6 +146,7 @@ unsafe extern "C" fn tramp_on_done(
     tokens: *const i32,
     n: i32,
     finish: i32,
+    stats: *const ds4_bridge_cont_stats,
 ) {
     let t = &mut *(ud as *mut TrampCtx);
     let user = user as usize;
@@ -145,7 +155,17 @@ unsafe extern "C" fn tramp_on_done(
     } else {
         std::slice::from_raw_parts(tokens, n as usize)
     };
-    let _ = catch_unwind(AssertUnwindSafe(|| t.driver.on_done(user, toks, finish)));
+    let stats = stats.as_ref().copied().unwrap_or_default();
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        t.driver.on_done(
+            user,
+            toks,
+            finish,
+            stats.decode_ms,
+            stats.decode_tokens as i32,
+            stats.decode_steps as i32,
+        )
+    }));
     t.tokens_live.remove(&user);
 }
 

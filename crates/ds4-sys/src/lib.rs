@@ -544,12 +544,27 @@ extern "C" {
         admit: Option<unsafe extern "C" fn(*mut c_void, *mut ds4_bridge_cont_request) -> c_int>,
         on_token: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, i32) -> c_int>,
         on_done: Option<
-            unsafe extern "C" fn(*mut c_void, *mut c_void, *const i32, i32, i32),
+            unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *const i32,
+                i32,
+                i32,
+                *const ds4_bridge_cont_stats,
+            ),
         >,
         ud: *mut c_void,
         err: *mut c_char,
         errlen: usize,
     ) -> c_int;
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ds4_bridge_cont_stats {
+    pub decode_ms: f64,
+    pub decode_tokens: u32,
+    pub decode_steps: u32,
 }
 
 #[repr(C)]

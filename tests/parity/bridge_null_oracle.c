@@ -29,6 +29,8 @@ extern int bridge_bank_save_result;
 extern unsigned bridge_bank_load_calls;
 extern int64_t bridge_bank_load_offset;
 extern uint64_t bridge_bank_load_bytes;
+extern int bridge_cont_run;
+extern ds4_cont_seq_stats bridge_cont_stats;
 
 struct ds4_bridge_model {
     ds4_engine *engine;
@@ -63,6 +65,23 @@ static void record_progress(void *ud, int32_t current, int32_t total) {
     progress_current[progress_n] = current;
     progress_total[progress_n] = total;
     progress_n++;
+}
+
+static int no_admit(void *ud, ds4_bridge_cont_request *req) {
+    (void)ud;
+    (void)req;
+    return 0;
+}
+
+static ds4_bridge_cont_stats done_stats;
+
+static void record_done(void *ud, void *user, const int32_t *tokens, int32_t n,
+                        int32_t finish, const ds4_bridge_cont_stats *stats) {
+    (void)ud;
+    if (user != (void *)42 || !tokens || n != 5 || finish != 1 || !stats) {
+        fail("cont done callback");
+    }
+    done_stats = *stats;
 }
 
 int main(void) {
@@ -358,6 +377,25 @@ int main(void) {
                                                    sizeof(err)) == 0)
                 fail("bank snapshot short buffer");
             if (n != 3) fail("bank snapshot required length");
+
+            bridge_cont_run = 1;
+            memset(&bridge_cont_stats, 0, sizeof(bridge_cont_stats));
+            bridge_cont_stats.first_token_sec = 10.0;
+            bridge_cont_stats.done_sec = 10.333;
+            /* The native decode includes EOS: five tokens over four steps. */
+            bridge_cont_stats.decode_tokens = 5;
+            bridge_cont_stats.decode_steps = 4;
+            memset(&done_stats, 0, sizeof(done_stats));
+            if (ds4_bridge_continuous_generate(
+                    &fake, no_admit, NULL, record_done, NULL,
+                    err, sizeof(err)) != 0) {
+                fail("cont stats generate");
+            }
+            if (done_stats.decode_tokens != 5 || done_stats.decode_steps != 4 ||
+                done_stats.decode_ms < 332.9 || done_stats.decode_ms > 333.1) {
+                fail("cont stats values");
+            }
+            bridge_cont_run = 0;
 
             int fd = mkstemp(path);
             if (fd < 0) fail("bank payload fixture");

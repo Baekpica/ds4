@@ -1093,11 +1093,12 @@ typedef struct {
     int (*admit)(void *ud, ds4_bridge_cont_request *req);
     int (*on_token)(void *ud, void *user, int32_t token);
     void (*on_done)(void *ud, void *user, const int32_t *tokens, int32_t n,
-                    int32_t finish);
+                    int32_t finish, const ds4_bridge_cont_stats *stats);
     int (*sample_override)(void *ud, void *user);
     int (*alive)(void *ud, void *user);
     int (*on_admitted)(void *ud, void *user, int n_cached, int n_computed,
                        int bank);
+    ds4_batch_ctx *ctx;
     void *ud;
 } cont_tramp;
 
@@ -1165,9 +1166,18 @@ static void cont_tramp_on_done(void *ud, void *user, const int *tokens,
                                int n, int finish)
 {
     cont_tramp *t = ud;
-    if (t->on_done)
+    ds4_bridge_cont_stats stats = {0};
+    ds4_cont_seq_stats native;
+
+    if (tokens && ds4_cont_last_done_stats(t->ctx, &native)) {
+        stats.decode_ms = (native.done_sec - native.first_token_sec) * 1e3;
+        stats.decode_tokens = native.decode_tokens;
+        stats.decode_steps = native.decode_steps;
+    }
+    if (t->on_done) {
         t->on_done(t->ud, user, (const int32_t *)tokens, (int32_t)n,
-                   (int32_t)finish);
+                   (int32_t)finish, &stats);
+    }
 }
 
 int ds4_bridge_continuous_generate(
@@ -1175,7 +1185,7 @@ int ds4_bridge_continuous_generate(
     int (*admit)(void *ud, ds4_bridge_cont_request *req),
     int (*on_token)(void *ud, void *user, int32_t token),
     void (*on_done)(void *ud, void *user, const int32_t *tokens, int32_t n,
-                    int32_t finish),
+                    int32_t finish, const ds4_bridge_cont_stats *stats),
     void *ud, char *err, size_t errlen)
 {
     cont_tramp t;
@@ -1192,6 +1202,7 @@ int ds4_bridge_continuous_generate(
     t.admit = admit;
     t.on_token = on_token;
     t.on_done = on_done;
+    t.ctx = c->ctx;
     t.ud = ud;
     return ds4_engine_continuous_generate(c->ctx, cont_tramp_admit,
                                           on_token ? cont_tramp_on_token : NULL,

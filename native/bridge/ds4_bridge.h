@@ -274,12 +274,18 @@ typedef struct {
     int32_t fork_bank;      /* source bank id + 1; 0 = no fork */
 } ds4_bridge_cont_request;
 
+typedef struct {
+    double decode_ms;
+    uint32_t decode_tokens;
+    uint32_t decode_steps;
+} ds4_bridge_cont_stats;
+
 int ds4_bridge_continuous_generate(
     ds4_bridge_batch_ctx *c,
     int (*admit)(void *ud, ds4_bridge_cont_request *req),
     int (*on_token)(void *ud, void *user, int32_t token),
     void (*on_done)(void *ud, void *user, const int32_t *tokens, int32_t n,
-                    int32_t finish),
+                    int32_t finish, const ds4_bridge_cont_stats *stats),
     void *ud, char *err, size_t errlen);
 
 #ifdef __cplusplus

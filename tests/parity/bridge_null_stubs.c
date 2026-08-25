@@ -33,6 +33,8 @@ int bridge_bank_save_result;
 unsigned bridge_bank_load_calls;
 int64_t bridge_bank_load_offset;
 uint64_t bridge_bank_load_bytes;
+int bridge_cont_run;
+ds4_cont_seq_stats bridge_cont_stats;
 
 static ds4_session_progress_fn bridge_progress;
 static void *bridge_progress_ud;
@@ -213,9 +215,24 @@ int ds4_engine_continuous_generate(ds4_batch_ctx *ctx,
                                    void (*on_done)(void *ud, void *user,
                                                    const int *tokens, int n, int finish),
                                    void *ud, char *err, size_t errlen) {
-    (void)ctx; (void)admit; (void)on_token; (void)on_done; (void)ud;
+    (void)ctx; (void)admit; (void)on_token;
     (void)err; (void)errlen;
+    if (bridge_cont_run) {
+        static const int tokens[] = {1, 2, 3, 4, 5};
+        on_done(ud, (void *)42, tokens, 5, 1);
+        return 0;
+    }
     STUB("ds4_engine_continuous_generate");
+}
+
+int ds4_cont_last_done_stats(const ds4_batch_ctx *ctx,
+                             ds4_cont_seq_stats *out) {
+    (void)ctx;
+    if (!bridge_cont_run || !out) {
+        return 0;
+    }
+    *out = bridge_cont_stats;
+    return 1;
 }
 
 int ds4_gpu_mem_census_read(int consumer_class, int domain, ds4_mem_cell *out) {

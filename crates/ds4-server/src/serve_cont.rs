@@ -549,6 +549,9 @@ mod native {
         t_admit: Option<Instant>,
         t_first: Option<Instant>,
         t_done: Option<Instant>,
+        decode_ms: f64,
+        decode_tokens: i32,
+        decode_steps: i32,
     }
 
     impl<W: Write> OneJob<'_, W> {
@@ -603,11 +606,22 @@ mod native {
             true
         }
 
-        fn on_done(&mut self, _user: usize, tokens: &[i32], finish: i32) {
+        fn on_done(
+            &mut self,
+            _user: usize,
+            tokens: &[i32],
+            finish: i32,
+            decode_ms: f64,
+            decode_tokens: i32,
+            decode_steps: i32,
+        ) {
             self.engine_eos = finish == 1;
             if self.capture_done {
                 self.done_tokens.extend_from_slice(tokens);
             }
+            self.decode_ms = decode_ms;
+            self.decode_tokens = decode_tokens;
+            self.decode_steps = decode_steps;
             self.t_done = Some(Instant::now());
         }
 
@@ -926,10 +940,12 @@ mod native {
                 t_admit: None,
                 t_first: None,
                 t_done: None,
+                decode_ms: 0.0,
+                decode_tokens: 0,
+                decode_steps: 0,
             };
             let native_result = self.batch.continuous_generate(&mut job);
             let timings = {
-                let done = job.t_done.unwrap_or_else(Instant::now);
                 let completion = job.stepper.completion();
                 match job.t_first {
                     Some(first) if completion > 0 => ReqTimings {
@@ -939,11 +955,11 @@ mod native {
                             .duration_since(job.t_admit.unwrap_or(job.t_arrive))
                             .as_secs_f64()
                             * 1e3,
-                        decode_ms: done.duration_since(first).as_secs_f64() * 1e3,
+                        decode_ms: job.decode_ms,
                         prefill_tokens: job.n_computed,
                         prefill_cached: job.n_cached,
-                        decode_tokens: completion,
-                        decode_steps: completion,
+                        decode_tokens: job.decode_tokens,
+                        decode_steps: job.decode_steps,
                     },
                     _ => ReqTimings::default(),
                 }
