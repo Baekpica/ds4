@@ -7,18 +7,21 @@ use std::net::TcpStream;
 use crate::activation::bits_or_default;
 use crate::codec::{
     decode_hello_payload, encode_hello_payload, u64_from_halves, CodecError, Hello, Work,
-    MSG_ERROR, MSG_HELLO, MSG_WORK, RESULT_ACK, RESULT_HIDDEN_STATE, RESULT_LOGITS,
-    ROUTE_F_OUTPUT_LOGITS, ROUTE_RETURN_UPSTREAM, WORK_FIXED_BYTES, WORK_F_ACK_ONLY,
-    WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS, WORK_F_RESET_SESSION, WORK_F_VALID_MASK,
+    MSG_ERROR, MSG_HELLO, MSG_SNAPSHOT_LOAD_BEGIN, MSG_SNAPSHOT_SAVE_REQ, MSG_WORK, RESULT_ACK,
+    RESULT_HIDDEN_STATE, RESULT_LOGITS, ROUTE_F_OUTPUT_LOGITS, ROUTE_RETURN_UPSTREAM,
+    WORK_FIXED_BYTES, WORK_F_ACK_ONLY, WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS, WORK_F_RESET_SESSION,
+    WORK_F_VALID_MASK,
 };
 use crate::exec::{SliceExec, WorkRequest};
 use crate::hash::{token_hash_update_span, TOKEN_HASH_INIT};
+use crate::native_snapshot::{dispatch_worker_snapshot, MemorySnapshotStore, SnapshotStore};
 use crate::route::{decode_route_blob, validate_route_blob};
 use crate::transport::{read_frame, write_frame};
 use crate::work::{
     decode_work_body, encode_logits_payload, encode_result_frame, encode_work_frame,
     error_result_frame, ok_result_hdr, ResultBody, WorkBody,
 };
+use crate::worker_snapshot::WorkerSnapshotIdentity;
 
 pub fn send_hello<W: Write>(w: &mut W, hello: &Hello, model_name: &str) -> std::io::Result<()> {
     let payload = encode_hello_payload(hello, model_name)
@@ -38,16 +41,41 @@ pub fn recv_hello<R: Read>(r: &mut R) -> std::io::Result<(Hello, String)> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
-pub struct Worker<E: SliceExec> {
+pub struct Worker<E: SliceExec, S: SnapshotStore = MemorySnapshotStore> {
     pub exec: E,
     sessions: HashMap<u64, u64>,
+    store: S,
 }
 
 impl<E: SliceExec> Worker<E> {
     pub fn new(exec: E) -> Self {
+        Self::with_store(exec, MemorySnapshotStore::new())
+    }
+}
+
+impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
+    pub fn with_store(exec: E, store: S) -> Self {
         Self {
             exec,
             sessions: HashMap::new(),
+            store,
+        }
+    }
+
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut S {
+        &mut self.store
+    }
+
+    fn snapshot_identity(&self) -> WorkerSnapshotIdentity {
+        WorkerSnapshotIdentity {
+            model_id: self.exec.model_id(),
+            layer_start: self.exec.layer_start(),
+            layer_end: self.exec.layer_end(),
+            ctx_size: self.exec.ctx_size(),
         }
     }
 
@@ -69,7 +97,7 @@ impl<E: SliceExec> Worker<E> {
         )
     }
 
-    pub fn serve<S: Read + Write>(&mut self, stream: &mut S) -> std::io::Result<()> {
+    pub fn serve<Stream: Read + Write>(&mut self, stream: &mut Stream) -> std::io::Result<()> {
         loop {
             let (typ, body) = match read_frame(stream) {
                 Ok(v) => v,
@@ -82,24 +110,44 @@ impl<E: SliceExec> Worker<E> {
                     format!("coordinator error: {}", String::from_utf8_lossy(&body)),
                 ));
             }
-            if typ != MSG_WORK {
-                write_frame(stream, MSG_ERROR, b"unsupported distributed worker frame")?;
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("rejected unsupported frame type {typ}"),
-                ));
-            }
-            let reply = self.process_work(&body, stream)?;
-            if let Some(frame) = reply {
-                stream.write_all(&frame)?;
+            match typ {
+                MSG_WORK => {
+                    let reply = self.process_work(&body, stream)?;
+                    if let Some(frame) = reply {
+                        stream.write_all(&frame)?;
+                    }
+                }
+                MSG_SNAPSHOT_SAVE_REQ | MSG_SNAPSHOT_LOAD_BEGIN => {
+                    match dispatch_worker_snapshot(
+                        stream,
+                        typ,
+                        &body,
+                        self.snapshot_identity(),
+                        self.exec.vocab(),
+                        &mut self.store,
+                    ) {
+                        Ok(Some((session_id, token_hash))) => {
+                            self.sessions.insert(session_id, token_hash);
+                        }
+                        Ok(None) => {}
+                        Err(_) => {}
+                    }
+                }
+                _ => {
+                    write_frame(stream, MSG_ERROR, b"unsupported distributed worker frame")?;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("rejected unsupported frame type {typ}"),
+                    ));
+                }
             }
         }
     }
 
-    fn process_work<S: Read + Write>(
+    fn process_work<Stream: Read + Write>(
         &mut self,
         payload: &[u8],
-        stream: &mut S,
+        stream: &mut Stream,
     ) -> std::io::Result<Option<Vec<u8>>> {
         if payload.len() < WORK_FIXED_BYTES {
             return Ok(Some(error_result_frame(
@@ -127,10 +175,10 @@ impl<E: SliceExec> Worker<E> {
         }
     }
 
-    fn handle_decoded<S: Read + Write>(
+    fn handle_decoded<Stream: Read + Write>(
         &mut self,
         body: WorkBody,
-        stream: &mut S,
+        stream: &mut Stream,
     ) -> Result<Option<Vec<u8>>, String> {
         let work = body.work;
         let request_id = u64_from_halves(work.request_hi, work.request_lo);

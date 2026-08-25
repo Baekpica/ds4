@@ -190,6 +190,35 @@ mod tests {
         }
     }
 
+    #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_session_save_layer_payload(
+        s: *mut ds4_bridge_session,
+        path: *const c_char,
+        _layer_start: u32,
+        _layer_end: u32,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        ds4_bridge_session_save_payload(s, path, _err, _errlen)
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_session_load_layer_payload(
+        s: *mut ds4_bridge_session,
+        path: *const c_char,
+        _payload_bytes: u64,
+        _tokens: *const i32,
+        _n_tokens: u32,
+        _layer_start: u32,
+        _layer_end: u32,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        assert!(!s.is_null());
+        assert!(!path.is_null());
+        0
+    }
+
     fn fake_session() -> std::mem::ManuallyDrop<Session<'static>> {
         std::mem::ManuallyDrop::new(Session {
             raw: NonNull::<ds4_bridge_session>::dangling(),

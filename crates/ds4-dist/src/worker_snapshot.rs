@@ -1,7 +1,4 @@
 //! Worker-side DS4D snapshot save/load frame handling.
-//!
-//! Session payload binding stays in a later slice. These functions speak the
-//! same codecs and chunk sizes as the coordinator transport.
 
 use std::io::{Read, Write};
 
@@ -96,17 +93,13 @@ fn write_chunks<S: Write, R: Read>(
     Ok(())
 }
 
-fn identity_matches(
-    identity: WorkerSnapshotIdentity,
-    model_id: u32,
-    start: u32,
-    end: u32,
-    tokens: u32,
-) -> bool {
-    model_id == identity.model_id
-        && start == identity.layer_start
-        && end == identity.layer_end
-        && tokens <= identity.ctx_size
+impl WorkerSnapshotIdentity {
+    pub fn accepts(self, model_id: u32, start: u32, end: u32, tokens: u32) -> bool {
+        model_id == self.model_id
+            && start == self.layer_start
+            && end == self.layer_end
+            && tokens <= self.ctx_size
+    }
 }
 
 /// Answer one SAVE_REQ body with BEGIN+CHUNK+DONE, or a C error BEGIN.
@@ -132,8 +125,7 @@ where
     let req = SnapshotReq::decode(req_body).map_err(|e| e.to_string())?;
     let request_id = u64_from_halves(req.request_hi, req.request_lo);
     let session_id = u64_from_halves(req.session_hi, req.session_lo);
-    if !identity_matches(
-        identity,
+    if !identity.accepts(
         req.model_id,
         req.layer_start,
         req.layer_end,
@@ -188,6 +180,25 @@ where
     S: Read + Write,
     W: Write,
 {
+    worker_handle_snapshot_load_restore(stream, identity, begin_body, vocab_size, payload, |_| {
+        Ok(())
+    })
+}
+
+/// Same as [`worker_handle_snapshot_load`], but runs `restore` before DONE.
+pub fn worker_handle_snapshot_load_restore<S, W, F>(
+    stream: &mut S,
+    identity: WorkerSnapshotIdentity,
+    begin_body: &[u8],
+    vocab_size: u32,
+    payload: &mut W,
+    restore: F,
+) -> Result<WorkerLoadOffer, String>
+where
+    S: Read + Write,
+    W: Write,
+    F: FnOnce(&WorkerLoadOffer) -> Result<(), String>,
+{
     if begin_body.len() < SNAPSHOT_BEGIN_FIXED_BYTES {
         return Err("invalid distributed snapshot load header".into());
     }
@@ -207,8 +218,7 @@ where
         "snapshot token id is outside the model vocabulary"
     } else if token_hash_prefix(&tokens) != token_hash {
         "snapshot load token hash mismatch"
-    } else if !identity_matches(
-        identity,
+    } else if !identity.accepts(
         begin.model_id,
         begin.layer_start,
         begin.layer_end,
@@ -248,18 +258,27 @@ where
         }
     }
 
-    let status = u32::from(!err.is_empty());
-    write_done(stream, request_id, status, &err)?;
-    if !err.is_empty() {
-        return Err(err);
+    if err.is_empty() && payload.flush().is_err() {
+        err = "failed to flush worker KV shard restore file".into();
     }
-    Ok(WorkerLoadOffer {
+    let offer = WorkerLoadOffer {
         session_id,
         request_id,
         token_hash,
         tokens,
         payload_bytes,
-    })
+    };
+    if err.is_empty() {
+        if let Err(message) = restore(&offer) {
+            err = message;
+        }
+    }
+    let status = u32::from(!err.is_empty());
+    write_done(stream, request_id, status, &err)?;
+    if !err.is_empty() {
+        return Err(err);
+    }
+    Ok(offer)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

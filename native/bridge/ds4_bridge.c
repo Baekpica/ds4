@@ -663,6 +663,71 @@ int ds4_bridge_session_load_payload_range(ds4_bridge_session *s, const char *pat
     return rc;
 }
 
+int ds4_bridge_session_save_layer_payload(ds4_bridge_session *s, const char *path,
+                                          uint32_t layer_start, uint32_t layer_end,
+                                          char *err, size_t errlen)
+{
+    FILE *fp;
+    int rc;
+
+    if (!s || !s->session) {
+        set_err(err, errlen, "session is NULL");
+        return 1;
+    }
+    if (!path || !path[0]) {
+        set_err(err, errlen, "payload path is required");
+        return 1;
+    }
+    fp = fopen(path, "wb");
+    if (!fp) {
+        set_err(err, errlen, "failed to open session payload for write");
+        return 1;
+    }
+    rc = ds4_session_save_layer_payload(s->session, fp, layer_start, layer_end,
+                                        err, errlen);
+    if (fclose(fp) != 0 && rc == 0) {
+        set_err(err, errlen, "failed to close session payload");
+        return 1;
+    }
+    return rc;
+}
+
+int ds4_bridge_session_load_layer_payload(ds4_bridge_session *s, const char *path,
+                                          uint64_t payload_bytes,
+                                          const int32_t *tokens, uint32_t n_tokens,
+                                          uint32_t layer_start, uint32_t layer_end,
+                                          char *err, size_t errlen)
+{
+    FILE *fp;
+    int rc;
+
+    if (!s || !s->session) {
+        set_err(err, errlen, "session is NULL");
+        return 1;
+    }
+    if (!path || !path[0]) {
+        set_err(err, errlen, "payload path is required");
+        return 1;
+    }
+    if (!tokens && n_tokens != 0) {
+        set_err(err, errlen, "tokens is NULL");
+        return 1;
+    }
+    fp = fopen(path, "rb");
+    if (!fp) {
+        set_err(err, errlen, "failed to open session payload for read");
+        return 1;
+    }
+    rc = ds4_session_load_layer_payload(s->session, fp, payload_bytes, tokens,
+                                        n_tokens, layer_start, layer_end,
+                                        err, errlen);
+    if (fclose(fp) != 0 && rc == 0) {
+        set_err(err, errlen, "failed to close session payload");
+        return 1;
+    }
+    return rc;
+}
+
 int ds4_bridge_snapshot_create(ds4_bridge_snapshot **out,
                                char *err, size_t errlen)
 {

@@ -454,6 +454,27 @@ extern "C" {
         errlen: usize,
     ) -> c_int;
 
+    pub fn ds4_bridge_session_save_layer_payload(
+        s: *mut ds4_bridge_session,
+        path: *const c_char,
+        layer_start: u32,
+        layer_end: u32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    pub fn ds4_bridge_session_load_layer_payload(
+        s: *mut ds4_bridge_session,
+        path: *const c_char,
+        payload_bytes: u64,
+        tokens: *const i32,
+        n_tokens: u32,
+        layer_start: u32,
+        layer_end: u32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
     pub fn ds4_bridge_snapshot_create(
         out: *mut *mut ds4_bridge_snapshot,
         err: *mut c_char,

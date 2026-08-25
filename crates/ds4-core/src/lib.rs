@@ -89,9 +89,10 @@ use ds4_sys::{
     ds4_bridge_session, ds4_bridge_session_argmax, ds4_bridge_session_argmax_excluding,
     ds4_bridge_session_create, ds4_bridge_session_ctx, ds4_bridge_session_distributed_route_ready,
     ds4_bridge_session_exaone_rewind_span, ds4_bridge_session_free, ds4_bridge_session_generation,
-    ds4_bridge_session_invalidate, ds4_bridge_session_load_payload,
-    ds4_bridge_session_load_payload_range, ds4_bridge_session_load_snapshot,
-    ds4_bridge_session_prefill_cap, ds4_bridge_session_rewind, ds4_bridge_session_sample,
+    ds4_bridge_session_invalidate, ds4_bridge_session_load_layer_payload,
+    ds4_bridge_session_load_payload, ds4_bridge_session_load_payload_range,
+    ds4_bridge_session_load_snapshot, ds4_bridge_session_prefill_cap, ds4_bridge_session_rewind,
+    ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
     ds4_bridge_session_save_payload, ds4_bridge_session_save_snapshot, ds4_bridge_session_sync,
     ds4_bridge_session_top_logprobs, ds4_bridge_shard, ds4_bridge_snapshot,
     ds4_bridge_snapshot_create, ds4_bridge_snapshot_free, ds4_bridge_snapshot_len,
@@ -1510,6 +1511,75 @@ impl Session<'_> {
         self.host.generation = self.native_generation();
         Ok(())
     }
+
+    /// Worker KV shard: native writes only the requested layer range.
+    pub fn save_layer_payload(
+        &self,
+        path: impl AsRef<Path>,
+        layer_start: u32,
+        layer_end: u32,
+    ) -> Result<()> {
+        let c_path = cstring_payload_path(path.as_ref())?;
+        let mut err = [0u8; 512];
+        // SAFETY: [Category 8 — FFI] `raw` is a live session from create; path
+        // is a NUL-terminated CString; err is a stack buffer whose length is
+        // passed to native. The bridge does not retain the pointers.
+        let rc = unsafe {
+            ds4_bridge_session_save_layer_payload(
+                self.raw.as_ptr(),
+                c_path.as_ptr(),
+                layer_start,
+                layer_end,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(fail(rc, &err));
+        }
+        Ok(())
+    }
+
+    /// Restore one worker KV shard and replace the host token timeline.
+    pub fn load_layer_payload(&mut self, req: LayerPayloadLoad<'_>) -> Result<()> {
+        let n_tokens = u32::try_from(req.tokens.len()).map_err(|_| Error {
+            code: 1,
+            message: "layer payload token count exceeds u32".into(),
+        })?;
+        let c_path = cstring_payload_path(req.path)?;
+        let mut err = [0u8; 512];
+        // SAFETY: [Category 8 — FFI] session/path/err as in save_layer_payload.
+        // `tokens` is borrowed for the call only; empty slices still yield a
+        // non-null aligned pointer, matching the C `tokens != NULL` contract
+        // when n_tokens == 0.
+        let rc = unsafe {
+            ds4_bridge_session_load_layer_payload(
+                self.raw.as_ptr(),
+                c_path.as_ptr(),
+                req.payload_bytes,
+                req.tokens.as_ptr(),
+                n_tokens,
+                req.layer_start,
+                req.layer_end,
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(fail(rc, &err));
+        }
+        self.host.replace_checkpoint(req.tokens);
+        Ok(())
+    }
+}
+
+/// Inputs for [`Session::load_layer_payload`].
+pub struct LayerPayloadLoad<'a> {
+    pub path: &'a Path,
+    pub payload_bytes: u64,
+    pub tokens: &'a [i32],
+    pub layer_start: u32,
+    pub layer_end: u32,
 }
 
 impl Drop for Session<'_> {
@@ -1581,6 +1651,36 @@ mod tests {
         });
 
         assert_eq!(session.ctx(), 4096);
+    }
+
+    #[test]
+    fn load_layer_payload_replaces_host_checkpoint() {
+        let mut session = std::mem::ManuallyDrop::new(Session {
+            raw: NonNull::<ds4_bridge_session>::dangling(),
+            host: SessionLedger::new(ModelFamily::DeepSeek4, SessionBackend::Cuda, 4096, 1),
+            _model: PhantomData,
+            _not_send: PhantomData,
+        });
+        let path = std::env::temp_dir().join(format!(
+            "ds4-layer-payload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, b"x").unwrap();
+        session
+            .load_layer_payload(LayerPayloadLoad {
+                path: &path,
+                payload_bytes: 1,
+                tokens: &[9, 8],
+                layer_start: 0,
+                layer_end: 1,
+            })
+            .unwrap();
+        assert_eq!(session.host().tokens(), &[9, 8]);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(unix)]

@@ -174,6 +174,14 @@ int ds4_bridge_session_load_payload(ds4_bridge_session *s, const char *path,
 int ds4_bridge_session_load_payload_range(ds4_bridge_session *s, const char *path,
                                           uint64_t offset, uint64_t length,
                                           char *err, size_t errlen);
+int ds4_bridge_session_save_layer_payload(ds4_bridge_session *s, const char *path,
+                                          uint32_t layer_start, uint32_t layer_end,
+                                          char *err, size_t errlen);
+int ds4_bridge_session_load_layer_payload(ds4_bridge_session *s, const char *path,
+                                          uint64_t payload_bytes,
+                                          const int32_t *tokens, uint32_t n_tokens,
+                                          uint32_t layer_start, uint32_t layer_end,
+                                          char *err, size_t errlen);
 
 int ds4_bridge_snapshot_create(ds4_bridge_snapshot **out,
                                char *err, size_t errlen);
