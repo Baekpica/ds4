@@ -1043,10 +1043,10 @@ fn run_engine<W: TerminalSink>(
     if dec.lane == LANE_CONTINUOUS {
         if let Some(exec) = cont.as_mut() {
             let store = engine.kv_store_mut();
-            let mut bank_protected = |bank, live| {
+            let mut bank_hold_retry = |bank, live| {
                 lock_inner(inner)
                     .creg
-                    .bank_protected(bank, live, monotonic_now())
+                    .bank_hold_retry(bank, live, monotonic_now())
             };
             let result = exec.generate(
                 &job.parsed,
@@ -1055,7 +1055,7 @@ fn run_engine<W: TerminalSink>(
                 cfg.cors,
                 cfg.default_tokens,
                 arrived_at,
-                &mut bank_protected,
+                &mut bank_hold_retry,
                 store,
                 out,
             );
@@ -1179,6 +1179,16 @@ fn settle_generation_result<W: Write>(
                 None,
             ));
             Settlement::FAILED
+        }
+        Err(GenerateError::ContinuationHold { retry_after }) => {
+            let _ = out.write_all(&wire_http_error_bytes(
+                job.surface,
+                503,
+                "batch capacity is reserved for live tool continuations; retry shortly",
+                cfg.cors,
+                Some(retry_after.max(1)),
+            ));
+            Settlement::shed(SHED_CONT_HOLD)
         }
         Err(GenerateError::Engine(msg)) => {
             let _ = out.write_all(&wire_http_error_bytes(
@@ -1570,6 +1580,7 @@ mod owner_tests {
         Accept,
         Reject,
         Fail,
+        Hold(i32),
         Shutdown(Arc<Mutex<Vec<&'static str>>>),
     }
 
@@ -1736,7 +1747,7 @@ mod owner_tests {
             cors: bool,
             _default_tokens: i32,
             _t_arrive: Instant,
-            _bank_protected: &mut dyn FnMut(i32, Option<(u64, i32)>) -> bool,
+            _bank_hold_retry: &mut dyn FnMut(i32, Option<(u64, i32)>) -> Option<i32>,
             _store: Option<&mut ds4_kv::Store>,
             out: &mut dyn Write,
         ) -> Result<GenerateOutcome, GenerateError> {
@@ -1759,6 +1770,9 @@ mod owner_tests {
                 }
                 Self::Reject => Err(GenerateError::Unsupported("serial fallback")),
                 Self::Fail => Err(GenerateError::Engine("native failure".into())),
+                Self::Hold(retry_after) => Err(GenerateError::ContinuationHold {
+                    retry_after: *retry_after,
+                }),
                 Self::Shutdown(_) => unreachable!("shutdown-only continuous lane generated"),
             }
         }
@@ -1994,6 +2008,52 @@ mod owner_tests {
         let g = lock_inner(&inner);
         assert_eq!(g.metrics.route_requests[0][1], 1);
         assert_eq!(g.metrics.shed[SHED_CONT_HOLD as usize], 0);
+        assert_eq!(g.runtime.requests_serial, 0);
+    }
+
+    #[test]
+    fn protected_bank_saturation_sheds_with_retry_without_serial_fallback() {
+        let cfg = test_cfg();
+        let inner = Mutex::new(ServerInner::from_cfg(&cfg));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let body =
+            r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#;
+        write!(
+            client,
+            "POST /v1/chat/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let mut engine = ScriptedDecode::from_pieces(&[b"serial fallback"]);
+        let mut cont = TestCont::Hold(7);
+
+        handle_client_inner(
+            &cfg,
+            &inner,
+            &mut server,
+            Some(&mut engine),
+            Some(&mut cont),
+        );
+        drop(server);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+        let response = String::from_utf8(response).unwrap();
+
+        assert!(
+            response.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "{response}"
+        );
+        assert!(response.contains("Retry-After: 7\r\n"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            body,
+            "{\"error\":{\"message\":\"batch capacity is reserved for live tool continuations; retry shortly\",\"type\":\"server_error\"}}\n"
+        );
+        let g = lock_inner(&inner);
+        assert_eq!(g.metrics.shed[SHED_CONT_HOLD as usize], 1);
         assert_eq!(g.runtime.requests_serial, 0);
     }
 

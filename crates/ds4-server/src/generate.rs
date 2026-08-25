@@ -46,6 +46,7 @@ use crate::tools::{assign_tool_ids, parse_generated_for_response, SemAccum};
 #[derive(Debug)]
 pub enum GenerateError {
     Unsupported(&'static str),
+    ContinuationHold { retry_after: i32 },
     Engine(String),
     Io,
 }
@@ -54,6 +55,9 @@ impl std::fmt::Display for GenerateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             GenerateError::Unsupported(s) => f.write_str(s),
+            GenerateError::ContinuationHold { .. } => {
+                f.write_str("batch capacity is reserved for live tool continuations")
+            }
             GenerateError::Engine(s) => write!(f, "{s}"),
             GenerateError::Io => f.write_str("client stream write failed"),
         }

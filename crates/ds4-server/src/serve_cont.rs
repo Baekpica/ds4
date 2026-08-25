@@ -750,7 +750,7 @@ pub trait ContExec {
     fn seq_cap(&self) -> i32;
     fn encode_chat(&self, rendered: &[u8]) -> Vec<i32>;
     fn encode_text(&self, text: &str) -> Vec<i32>;
-    /// `bank_protected` keeps registry locking outside the native owner; a
+    /// `bank_hold_retry` keeps registry locking outside the native owner; a
     /// missing live reference asks the registry to preserve C's fail-closed rule.
     fn generate(
         &mut self,
@@ -760,7 +760,7 @@ pub trait ContExec {
         cors: bool,
         default_tokens: i32,
         t_arrive: Instant,
-        bank_protected: &mut dyn FnMut(i32, Option<(u64, i32)>) -> bool,
+        bank_hold_retry: &mut dyn FnMut(i32, Option<(u64, i32)>) -> Option<i32>,
         store: Option<&mut KvStore>,
         out: &mut dyn Write,
     ) -> Result<GenerateOutcome, GenerateError>;
@@ -1000,19 +1000,22 @@ mod native {
 
         fn protected_banks(
             &self,
-            bank_protected: &mut dyn FnMut(i32, Option<(u64, i32)>) -> bool,
-        ) -> Vec<bool> {
-            self.warm
-                .iter()
-                .enumerate()
-                .map(|(bank, state)| {
-                    let live = state
-                        .record
-                        .as_ref()
-                        .map(|record| (record.generation, state.committed_tokens));
-                    bank_protected(i32::try_from(bank).unwrap_or(-1), live)
-                })
-                .collect()
+            bank_hold_retry: &mut dyn FnMut(i32, Option<(u64, i32)>) -> Option<i32>,
+        ) -> (Vec<bool>, Option<i32>) {
+            let mut protected = Vec::with_capacity(self.warm.len());
+            let mut retry_min = None;
+            for (bank, state) in self.warm.iter().enumerate() {
+                let live = state
+                    .record
+                    .as_ref()
+                    .map(|record| (record.generation, state.committed_tokens));
+                let retry = bank_hold_retry(i32::try_from(bank).unwrap_or(-1), live);
+                protected.push(retry.is_some());
+                if let Some(retry) = retry {
+                    retry_min = Some(retry_min.map_or(retry, |current: i32| current.min(retry)));
+                }
+            }
+            (protected, retry_min)
         }
 
         fn disk_victim(&self, protected: &[bool], disk_tokens: u32) -> Option<usize> {
@@ -1258,7 +1261,7 @@ mod native {
             cors: bool,
             default_tokens: i32,
             t_arrive: Instant,
-            bank_protected: &mut dyn FnMut(i32, Option<(u64, i32)>) -> bool,
+            bank_hold_retry: &mut dyn FnMut(i32, Option<(u64, i32)>) -> Option<i32>,
             mut store: Option<&mut KvStore>,
             out: &mut dyn Write,
         ) -> Result<GenerateOutcome, GenerateError> {
@@ -1284,7 +1287,7 @@ mod native {
             let (temperature, top_k, top_p, min_p) = stepper.sampling(parsed);
             let bank_enabled = bank_scope(parsed);
             let canonical_tokens = tokens;
-            let protected = self.protected_banks(bank_protected);
+            let (protected, hold_retry) = self.protected_banks(bank_hold_retry);
             let warm = if bank_enabled {
                 self.warm_plan(&stepper.prompt).or_else(|| {
                     store
@@ -1307,7 +1310,9 @@ mod native {
                 admit
             } else {
                 let target = self.place_cold(&protected, store.as_deref_mut()).ok_or(
-                    GenerateError::Unsupported("continuous banks are protected; serial fallback"),
+                    GenerateError::ContinuationHold {
+                        retry_after: hold_retry.unwrap_or(1),
+                    },
                 )?;
                 let mut admit = ContAdmit::cold(1, canonical_tokens, stepper.max_tokens.max(1));
                 admit.place_bank = i32::try_from(target + 1).unwrap_or(0);

@@ -73,6 +73,11 @@ fn bank_claim_matches_c() {
     assert_script("bank-claim");
 }
 
+#[test]
+fn bank_protection_retry_matches_c() {
+    assert_script("bank-protection");
+}
+
 fn http_post(addr: std::net::SocketAddr, path: &str, body: &str) -> String {
     let mut c = TcpStream::connect(addr).unwrap();
     let req = format!(

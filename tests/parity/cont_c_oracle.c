@@ -204,6 +204,51 @@ static void hold_print(int h, int retry)
     else printf("HOLD 0\n");
 }
 
+static int bank_ref_matches(const rec *x, uint64_t gen, int frontier)
+{
+    return x && x->state == LIVE && x->owner == OWNER_BANK && gen != 0 &&
+           frontier > 0 && x->gen == gen && x->frontier == frontier;
+}
+
+static int bank_protects(const reg *r, const rec *x, double now,
+                         int query_ok, uint64_t gen, int frontier)
+{
+    if (!x || x->state != LIVE || x->owner != OWNER_BANK) return 0;
+    if (query_ok && !bank_ref_matches(x, gen, frontier)) return 0;
+    int grace = r->grace > 0 && now - x->publish < r->grace;
+    int pinned = x->hard_refs > 0 && r->pin_dead > 0 && now < x->pin_expiry;
+    return grace || pinned;
+}
+
+static int bank_retry(const reg *r, int bank, double now, int query_ok,
+                      uint64_t gen, int frontier, int *retry)
+{
+    double left_min = -1;
+    for (int i = 0; i < r->n; i++) {
+        const rec *x = &r->v[i];
+        if (x->owner_id != bank ||
+            !bank_protects(r, x, now, query_ok, gen, frontier))
+            continue;
+        double grace_left = r->grace > 0 ? r->grace - (now - x->publish) : 0;
+        double pin_left = x->hard_refs > 0 && r->pin_dead > 0 && now < x->pin_expiry
+                              ? x->pin_expiry - now
+                              : 0;
+        double left = grace_left > pin_left ? grace_left : pin_left;
+        if (left > 0 && (left_min < 0 || left < left_min)) left_min = left;
+    }
+    if (left_min <= 0) return 0;
+    int ra = (int)(left_min + 0.999);
+    if (ra < 1) ra = 1;
+    if (retry) *retry = ra;
+    return 1;
+}
+
+static void bank_retry_print(const char *name, int protected, int retry)
+{
+    printf("%s=", name);
+    hold_print(protected, retry);
+}
+
 static void script_publish(void)
 {
     reg r;
@@ -352,6 +397,33 @@ static void script_bank(void)
            n_live(&r), known(&r, "toolu_bk2"));
 }
 
+static void script_bank_protection(void)
+{
+    reg r;
+    char id_text[] = "toolu_protected", *id[1] = {id_text};
+    int retry = 0, protected = 0;
+    double now = 1001;
+    r_init(&r);
+    r.pin_dead = 20;
+    publish(&r, API_ANTHROPIC, id, 1, OWNER_BANK, 5, 3, 200, 1000);
+    protected = bank_retry(&r, 5, now, 1, 3, 200, &retry);
+    bank_retry_print("current", protected, retry);
+    protected = bank_retry(&r, 5, now, 1, 4, 200, &retry);
+    bank_retry_print("stale", protected, retry);
+    protected = bank_retry(&r, 5, now, 0, 0, 0, &retry);
+    bank_retry_print("unknown", protected, retry);
+    r.v[0].publish -= 100;
+    protected = bank_retry(&r, 5, now, 1, 3, 200, &retry);
+    bank_retry_print("lapsed", protected, retry);
+    r.v[0].hard_refs++;
+    r.v[0].pin_expiry = now + r.pin_dead;
+    protected = bank_retry(&r, 5, now, 1, 3, 200, &retry);
+    bank_retry_print("pinned", protected, retry);
+    r.v[0].hard_refs--;
+    protected = bank_retry(&r, 5, now, 1, 3, 200, &retry);
+    bank_retry_print("unpinned", protected, retry);
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -363,6 +435,7 @@ int main(int argc, char **argv)
     else if (strcmp(argv[1], "grace-hold") == 0) script_hold();
     else if (strcmp(argv[1], "ttl") == 0) script_ttl();
     else if (strcmp(argv[1], "bank-claim") == 0) script_bank();
+    else if (strcmp(argv[1], "bank-protection") == 0) script_bank_protection();
     else {
         fprintf(stderr, "unknown script\n");
         return 2;

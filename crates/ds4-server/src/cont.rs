@@ -376,6 +376,37 @@ impl ContRegistry {
         })
     }
 
+    pub fn bank_hold_retry(&self, bank: i32, live: Option<(u64, i32)>, now: f64) -> Option<i32> {
+        if !self.bank_protected(bank, live, now) {
+            return None;
+        }
+        let record = self.records.iter().find(|record| {
+            record.state == ContState::LiveFrontier
+                && record.owner == ContOwner::BatchBank
+                && record.owner_id == bank
+                && live.is_none_or(|(generation, frontier)| {
+                    generation != 0
+                        && frontier > 0
+                        && record.owner_gen == generation
+                        && record.frontier == frontier
+                })
+        })?;
+        let grace_left = if self.grace_s > 0.0 {
+            self.grace_s - (now - record.publish_time)
+        } else {
+            0.0
+        };
+        let pin_left =
+            if record.hard_refs > 0 && self.pin_deadline_s > 0.0 && now < record.pin_expiry {
+                record.pin_expiry - now
+            } else {
+                0.0
+            };
+        let left = grace_left.max(pin_left);
+        let retry = (left + 0.999) as i32;
+        Some(retry.max(1))
+    }
+
     pub fn pin_live(&mut self, proto: Api, id: &str, now: f64) -> Option<ContPin> {
         self.expire(now);
         let i = self.find_idx(proto as u8, id)?;
@@ -783,6 +814,50 @@ pub fn dump_script(name: &str) -> String {
                 u32::from(r.live_has_id(Api::Anthropic, "toolu_bk2", now)),
                 r.n_live(),
                 u32::from(r.id_known("toolu_bk2"))
+            ));
+        }
+        "bank-protection" => {
+            let mut r = ContRegistry::default();
+            let now = 1001.0;
+            r.grace_s = 60.0;
+            r.ttl_s = 300.0;
+            r.pin_deadline_s = 20.0;
+            r.publish_bank(
+                Api::Anthropic,
+                &csv(&["toolu_protected"]),
+                5,
+                3,
+                200,
+                1000.0,
+            );
+            out.push_str(&format!(
+                "current={}\n",
+                hold_line(r.bank_hold_retry(5, Some((3, 200)), now))
+            ));
+            out.push_str(&format!(
+                "stale={}\n",
+                hold_line(r.bank_hold_retry(5, Some((4, 200)), now))
+            ));
+            out.push_str(&format!(
+                "unknown={}\n",
+                hold_line(r.bank_hold_retry(5, None, now))
+            ));
+            r.rewind_live_publish(100.0);
+            out.push_str(&format!(
+                "lapsed={}\n",
+                hold_line(r.bank_hold_retry(5, Some((3, 200)), now))
+            ));
+            let pin = r.pin_live(Api::Anthropic, "toolu_protected", now);
+            out.push_str(&format!(
+                "pinned={}\n",
+                hold_line(r.bank_hold_retry(5, Some((3, 200)), now))
+            ));
+            if let Some(pin) = pin {
+                r.unpin(pin);
+            }
+            out.push_str(&format!(
+                "unpinned={}\n",
+                hold_line(r.bank_hold_retry(5, Some((3, 200)), now))
             ));
         }
         _ => out.push_str("ERROR unknown-script\n"),
