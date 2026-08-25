@@ -1025,6 +1025,17 @@ impl Model {
         prompt: &str,
         think_mode: i32,
     ) -> Result<TokenBuffer> {
+        self.encode_chat_prompt_bytes(system.map(str::as_bytes), prompt.as_bytes(), think_mode)
+    }
+
+    /// Byte-input form for C callers that read prompt files before the first
+    /// NUL and do not require UTF-8.
+    pub fn encode_chat_prompt_bytes(
+        &self,
+        system: Option<&[u8]>,
+        prompt: &[u8],
+        think_mode: i32,
+    ) -> Result<TokenBuffer> {
         let c_system = match system {
             Some(s) => Some(CString::new(s).map_err(|_| Error {
                 code: 1,
@@ -1037,7 +1048,7 @@ impl Model {
             message: "prompt contains NUL".into(),
         })?;
         // BPE merges only shrink and specials add a bounded prefix.
-        let cap = prompt.len() + system.map_or(0, str::len) + 256;
+        let cap = prompt.len() + system.map_or(0, <[u8]>::len) + 256;
         let mut out = vec![0i32; cap];
         let mut n_out = 0i32;
         let mut err = [0u8; 256];

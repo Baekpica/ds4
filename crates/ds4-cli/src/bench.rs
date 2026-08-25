@@ -3,11 +3,15 @@ use std::io::{BufWriter, Write};
 use std::time::Instant;
 
 const CSV_HEADER: &str = "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_tps_ss,first_token_sec,kvcache_bytes";
+const THINK_NONE: i32 = 0;
+const PROMPT_SELECTION_ERR: &str = "specify exactly one of --prompt-file or --chat-prompt-file";
 
 #[derive(Debug)]
 pub struct BenchArgs {
     model: String,
     prompt_file: Option<String>,
+    chat_prompt_file: Option<String>,
+    system: Option<String>,
     backend: Backend,
     threads: i32,
     ctx_start: i32,
@@ -26,6 +30,8 @@ impl Default for BenchArgs {
         Self {
             model: "ds4flash.gguf".into(),
             prompt_file: None,
+            chat_prompt_file: None,
+            system: Some("You are a helpful assistant.".into()),
             backend: default_backend(),
             threads: 0,
             ctx_start: 2048,
@@ -81,6 +87,10 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, S
             }
             "-m" | "--model" => parsed.model = require_value(&arg, iter.next())?,
             "--prompt-file" => parsed.prompt_file = Some(require_value(&arg, iter.next())?),
+            "--chat-prompt-file" => {
+                parsed.chat_prompt_file = Some(require_value(&arg, iter.next())?);
+            }
+            "-sys" | "--system" => parsed.system = Some(require_value(&arg, iter.next())?),
             "--backend" => parsed.backend = parse_backend(&require_value(&arg, iter.next())?)?,
             "--cuda" => parsed.backend = Backend::Cuda,
             "--metal" => parsed.backend = Backend::Metal,
@@ -108,10 +118,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, S
                     parse_nonnegative_i32(&arg, &require_value(&arg, iter.next())?)?;
             }
             "--csv" => parsed.csv = Some(require_value(&arg, iter.next())?),
-            "--chat-prompt-file"
-            | "-sys"
-            | "--system"
-            | "--mtp"
+            "--mtp"
             | "--mtp-draft"
             | "--mtp-margin"
             | "--quality"
@@ -131,8 +138,8 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, S
         }
     }
 
-    if parsed.prompt_file.is_none() {
-        return Err("--prompt-file is required".into());
+    if parsed.prompt_file.is_some() == parsed.chat_prompt_file.is_some() {
+        return Err(PROMPT_SELECTION_ERR.into());
     }
     if parsed.ctx_start > parsed.ctx_max {
         return Err("--ctx-start must be <= --ctx-max".into());
@@ -161,6 +168,25 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, S
 
 fn uses_distributed_replay(args: &BenchArgs) -> bool {
     args.dist.role == ds4_dist::Role::Coordinator
+}
+
+fn prompt_source(args: &BenchArgs) -> Result<(&str, bool), String> {
+    match (
+        args.prompt_file.as_deref(),
+        args.chat_prompt_file.as_deref(),
+    ) {
+        (Some(path), None) => Ok((path, false)),
+        (None, Some(path)) => Ok((path, true)),
+        _ => Err(PROMPT_SELECTION_ERR.into()),
+    }
+}
+
+fn read_prompt(path: &str) -> Result<Vec<u8>, String> {
+    let mut bytes = std::fs::read(path).map_err(|e| format!("failed to read {path}: {e}"))?;
+    if let Some(nul) = bytes.iter().position(|byte| *byte == 0) {
+        bytes.truncate(nul);
+    }
+    Ok(bytes)
 }
 
 fn wait_distributed_route(session: &Session<'_>) -> Result<(), String> {
@@ -208,12 +234,8 @@ pub fn run(args: BenchArgs) -> Result<i32, String> {
         return Ok(0);
     }
 
-    let prompt_path = args
-        .prompt_file
-        .as_deref()
-        .ok_or_else(|| "--prompt-file is required".to_string())?;
-    let text = std::fs::read_to_string(prompt_path)
-        .map_err(|e| format!("failed to read {prompt_path}: {e}"))?;
+    let (prompt_path, chat_prompt) = prompt_source(&args)?;
+    let text = read_prompt(prompt_path)?;
     let native_dist = crate::distributed_config(&args.dist);
     let model = match native_dist.as_ref() {
         Some(config) => Model::open_distributed(
@@ -228,7 +250,13 @@ pub fn run(args: BenchArgs) -> Result<i32, String> {
         None => Model::open(&args.model, args.backend, args.threads, false),
     }
     .map_err(|e| e.to_string())?;
-    let prompt = model.tokenize_text(&text).map_err(|e| e.to_string())?;
+    let prompt = if chat_prompt {
+        model
+            .encode_chat_prompt_bytes(args.system.as_deref().map(str::as_bytes), &text, THINK_NONE)
+            .map_err(|e| e.to_string())?
+    } else {
+        TokenBuffer::from_tokens(model.vocab().encode_bytes(&text))
+    };
     if prompt.len() < args.ctx_max as usize {
         return Err(format!(
             "prompt has {} tokens, need at least {}",
@@ -467,14 +495,17 @@ fn default_backend() -> Backend {
 }
 
 fn help_text() -> &'static str {
-    "Usage: ds4-bench-rs --prompt-file FILE [options]\n\
+    "Usage: ds4-bench-rs (--prompt-file FILE | --chat-prompt-file FILE) [options]\n\
      \n\
-     Non-MTP throughput sweep over one fixed raw prompt.\n\
+     Non-MTP throughput sweep over one fixed prompt.\n\
      \n\
      -m, --model FILE       GGUF model path (default: ds4flash.gguf)\n\
      --cuda|--metal|--cpu   Select backend\n\
      -t, --threads N        CPU helper threads\n\
      --prompt-file FILE     Raw UTF-8 benchmark prompt\n\
+     --chat-prompt-file FILE\n\
+                             One no-thinking chat user message\n\
+     -sys, --system TEXT    System prompt used only with --chat-prompt-file\n\
      --ctx-start N          First frontier (default: 2048)\n\
      --ctx-max N            Last frontier (default: 32768)\n\
      --ctx-alloc N          Allocated context\n\
@@ -523,6 +554,60 @@ mod tests {
         assert_eq!(args.prompt_file.as_deref(), Some("prompt.txt"));
         assert_eq!(args.ctx_alloc, 16513);
         assert_eq!(args.csv.as_deref(), Some("out.csv"));
+    }
+
+    #[test]
+    fn selects_chat_prompt_and_system_aliases() {
+        let default = parse_args(argv(&["--chat-prompt-file", "chat.txt"])).unwrap();
+        assert_eq!(
+            default.system.as_deref(),
+            Some("You are a helpful assistant.")
+        );
+
+        let args = parse_args(argv(&[
+            "--chat-prompt-file",
+            "chat.txt",
+            "--system",
+            "first",
+            "-sys",
+            "second",
+        ]))
+        .unwrap();
+
+        assert_eq!(args.prompt_file, None);
+        assert_eq!(args.chat_prompt_file.as_deref(), Some("chat.txt"));
+        assert_eq!(args.system.as_deref(), Some("second"));
+        assert_eq!(prompt_source(&args).unwrap(), ("chat.txt", true));
+        assert!(help_text().contains("--chat-prompt-file FILE"));
+        assert!(help_text().contains("-sys, --system TEXT"));
+    }
+
+    #[test]
+    fn requires_exactly_one_prompt_file_and_ignores_raw_system() {
+        assert_eq!(parse_args(argv(&[])).unwrap_err(), PROMPT_SELECTION_ERR);
+        assert_eq!(
+            parse_args(argv(&[
+                "--prompt-file",
+                "raw.txt",
+                "--chat-prompt-file",
+                "chat.txt",
+            ]))
+            .unwrap_err(),
+            PROMPT_SELECTION_ERR
+        );
+
+        let raw = parse_args(argv(&["--prompt-file", "raw.txt", "--system", "ignored"])).unwrap();
+        assert_eq!(raw.system.as_deref(), Some("ignored"));
+        assert_eq!(prompt_source(&raw).unwrap(), ("raw.txt", false));
+    }
+
+    #[test]
+    fn prompt_files_preserve_bytes_and_stop_at_c_nul() {
+        let path =
+            std::env::temp_dir().join(format!("ds4-bench-rs-prompt-bytes-{}", std::process::id()));
+        std::fs::write(&path, [0xff, b'a', 0, b'b']).unwrap();
+        assert_eq!(read_prompt(path.to_str().unwrap()).unwrap(), [0xff, b'a']);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
