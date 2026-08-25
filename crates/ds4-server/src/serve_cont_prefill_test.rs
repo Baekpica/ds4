@@ -1,8 +1,9 @@
 use std::ffi::OsStr;
 
 use crate::serve_cont_prefill::{
-    tick_roll_prefill, PrefillChunkPolicy, RollPhase, TickOp, DEFAULT_PREFILL_CHUNK,
-    DEFAULT_PREFILL_CHUNK_LIVE, ENV_PREFILL_CHUNK, ENV_PREFILL_CHUNK_LIVE,
+    owner_tick_call_count, owner_tick_pair, reset_owner_tick_call_count, tick_roll_prefill,
+    PrefillChunkPolicy, RollPhase, TickOp, DEFAULT_PREFILL_CHUNK, DEFAULT_PREFILL_CHUNK_LIVE,
+    ENV_PREFILL_CHUNK, ENV_PREFILL_CHUNK_LIVE,
 };
 use crate::serve_cont_roll::ContRoll;
 
@@ -108,4 +109,24 @@ fn idle_prefill_keeps_boot_width_when_nobody_is_decoding() {
         }]
     );
     assert_eq!(jobs[0].1, RollPhase::Prefill { remaining: 904 });
+}
+
+#[test]
+fn owner_tick_pair_steps_live_decode_while_peer_prefills_live_chunk() {
+    reset_owner_tick_call_count();
+    let policy = PrefillChunkPolicy::from_raw(4096, 512, false);
+
+    let ops = owner_tick_pair(policy, 4, 3000);
+
+    assert_eq!(owner_tick_call_count(), 1);
+    assert_eq!(
+        ops,
+        vec![
+            TickOp::Prefill {
+                user: 2,
+                tokens: 512
+            },
+            TickOp::Decode { user: 1 },
+        ]
+    );
 }

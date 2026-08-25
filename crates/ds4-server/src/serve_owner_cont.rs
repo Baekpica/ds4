@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use super::*;
 use crate::route::{route_decide, RouteEnv, LANE_CONTINUOUS};
 use crate::serve_cont::{cont_prompt_tokens, ContExec, ContPair, ContWork};
+use crate::serve_cont_prefill::{owner_tick_pair, PrefillChunkPolicy};
 
 pub(super) fn run_owner_maybe_roll(
     cfg: &ServerConfig,
@@ -107,6 +108,17 @@ fn serve_pair(
     let store = engine.kv_store_mut();
     let arrived_a = first.prepared.arrived_at;
     let arrived_b = second.prepared.arrived_at;
+    let decode_remaining = u32::try_from(first.prepared.parsed.max_tokens.max(1)).unwrap_or(1);
+    let prefill_remaining = cont_prompt_tokens(exec, &second.prepared.parsed)
+        .ok()
+        .and_then(|(_, toks)| u32::try_from(toks.len()).ok())
+        .unwrap_or(1)
+        .max(1);
+    let _ops = owner_tick_pair(
+        PrefillChunkPolicy::from_env(),
+        decode_remaining,
+        prefill_remaining,
+    );
     let [result_a, result_b] = exec.generate_pair(
         ContPair {
             first: ContWork {
@@ -175,3 +187,7 @@ fn settle_roll_job(
         lease.settlement = lease.settlement.transport_gone();
     }
 }
+
+#[cfg(test)]
+#[path = "serve_owner_cont_test.rs"]
+mod tests;

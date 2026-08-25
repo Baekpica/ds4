@@ -1,6 +1,7 @@
 //! C continuous prefill-chunk interleave (R4 overlap-lite) on the rolling
 //! scheduler. Env names match C and must not change.
 
+use std::cell::Cell;
 use std::ffi::OsStr;
 
 /// C `DS4_CONT_PREFILL_CHUNK`. Do not rename.
@@ -141,6 +142,43 @@ pub(crate) fn tick_roll_prefill(
         ops.push(TickOp::Decode { user: *user });
     }
     ops
+}
+
+thread_local! {
+    static OWNER_TICK_CALLS: Cell<u32> = const { Cell::new(0) };
+}
+
+pub(crate) fn owner_tick_pair(
+    policy: PrefillChunkPolicy,
+    live_decode_remaining: u32,
+    prefill_remaining: u32,
+) -> Vec<TickOp> {
+    OWNER_TICK_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+    let mut jobs = [
+        (
+            1,
+            RollPhase::Decode {
+                remaining: live_decode_remaining,
+            },
+        ),
+        (
+            2,
+            RollPhase::Prefill {
+                remaining: prefill_remaining,
+            },
+        ),
+    ];
+    tick_roll_prefill(policy, &mut jobs)
+}
+
+#[cfg(test)]
+pub(crate) fn owner_tick_call_count() -> u32 {
+    OWNER_TICK_CALLS.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_owner_tick_call_count() {
+    OWNER_TICK_CALLS.with(|calls| calls.set(0));
 }
 
 fn parse_chunk(value: Option<&OsStr>, default: u32) -> i32 {
