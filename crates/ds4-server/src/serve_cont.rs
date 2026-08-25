@@ -18,8 +18,6 @@ use ds4_kv::Store as KvStore;
 use ds4_kv::{bank_persist_ext_flags, Reason as KvReason};
 
 use crate::dsml::{SampleOverride, SamplePolicy};
-#[cfg(any(feature = "native", test))]
-use crate::generate::ordinary_disk_cache_eligible;
 use crate::generate::{
     render_prompt, responses_ids, stream_req_from_parsed, GenerateError, GenerateOutcome,
 };
@@ -460,7 +458,11 @@ fn last_delta(raw: &[u8], emit_limit: usize, piece_len: usize) -> Option<&[u8]> 
 
 #[cfg(any(feature = "native", test))]
 fn bank_scope(parsed: &ParsedRequest) -> bool {
-    parsed.kind == ReqKind::Chat && ordinary_disk_cache_eligible(parsed)
+    parsed.kind == ReqKind::Chat
+        && !think_mode_enabled(parsed.think_mode)
+        && !parsed.has_tools
+        && !parsed.has_tool_results
+        && parsed.live_call_ids.is_empty()
 }
 
 #[cfg(any(feature = "native", test))]
@@ -1806,7 +1808,7 @@ mod bank_tests {
     }
 
     #[test]
-    fn bank_scope_is_openai_chat_without_thinking_or_tools() {
+    fn bank_scope_is_chat_without_thinking_or_tools() {
         let mut env = ParseEnv::default();
         env.default_effort = ThinkMode::None;
         let mut parsed = parse_chat_request(
@@ -1817,7 +1819,9 @@ mod bank_tests {
         assert!(bank_scope(&parsed));
 
         parsed.api = Api::Anthropic;
-        assert!(!bank_scope(&parsed));
+        assert!(bank_scope(&parsed));
+        parsed.api = Api::Responses;
+        assert!(bank_scope(&parsed));
         parsed.api = Api::Openai;
         parsed.kind = ReqKind::Completion;
         assert!(!bank_scope(&parsed));
