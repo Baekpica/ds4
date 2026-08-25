@@ -646,6 +646,74 @@ fn cont_stepper_streams_and_stops_on_budget() {
 }
 
 #[test]
+fn cont_stepper_streams_anthropic_events() {
+    let parsed = parse_request(
+        WireSurface::Anthropic,
+        &env(),
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":8,"stream":true}"#,
+    )
+    .unwrap();
+    let (mut stepper, head) = ContStepper::new(
+        &parsed,
+        0,
+        "msg-cont-anthropic",
+        CREATED_TEST,
+        false,
+        16,
+        b"prompt".to_vec(),
+        1,
+        8192,
+    );
+
+    let head = String::from_utf8(head).unwrap();
+    assert!(head.contains("event: message_start"), "{head}");
+    let mut deltas = Vec::new();
+    for piece in TAPE_PLAIN {
+        deltas.extend(stepper.feed(piece.as_bytes()).bytes);
+    }
+    let (tail, outcome) =
+        stepper.finalize(true, 0, 1, ReqTimings::default(), false);
+    let deltas = String::from_utf8(deltas).unwrap();
+    let tail = String::from_utf8(tail).unwrap();
+    assert!(deltas.contains("event: content_block_delta"), "{deltas}");
+    assert!(tail.contains("event: message_stop"), "{tail}");
+    assert_eq!(outcome.finish, "stop");
+}
+
+#[test]
+fn cont_stepper_buffers_anthropic_message() {
+    let parsed = parse_request(
+        WireSurface::Anthropic,
+        &env(),
+        r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#,
+    )
+    .unwrap();
+    let (mut stepper, head) = ContStepper::new(
+        &parsed,
+        0,
+        "msg-cont-anthropic-buffered",
+        CREATED_TEST,
+        false,
+        16,
+        b"prompt".to_vec(),
+        1,
+        8192,
+    );
+
+    assert!(head.is_empty());
+    for piece in TAPE_PLAIN {
+        assert!(stepper.feed(piece.as_bytes()).bytes.is_empty());
+    }
+    let (body, outcome) =
+        stepper.finalize(true, 0, 1, ReqTimings::default(), false);
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("\"type\":\"message\""), "{body}");
+    assert!(body.contains("\"text\":\"Hello world.\""), "{body}");
+    assert!(body.contains("\"stop_reason\":\"end_turn\""), "{body}");
+    assert_eq!(outcome.finish, "stop");
+}
+
+#[test]
 fn cont_stepper_stream_tool_id_matches_outcome() {
     let mut parsed = tools_req();
     parsed.stream = true;

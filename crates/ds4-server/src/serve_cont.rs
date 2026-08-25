@@ -27,8 +27,10 @@ use crate::render::syntax_for_model_id;
 use crate::retry::{terminal_finish, truncation_outcome, TruncationOutcome};
 use crate::route::{decode_budget, think_mode_enabled, Api, ReqKind};
 use crate::stream::{
-    final_response, openai_sse_finish_live, openai_sse_stream_update, openai_stream_start,
-    sse_chunk, sse_done, sse_headers, OpenaiStream, ReqTimings, StreamReq, Writer,
+    anthropic_final_response, anthropic_sse_finish_live, anthropic_sse_start_live,
+    anthropic_sse_stream_update, final_response, openai_sse_finish_live,
+    openai_sse_stream_update, openai_stream_start, sse_chunk, sse_done, sse_headers,
+    AnthropicStream, OpenaiStream, ReqTimings, StreamReq, Writer,
 };
 use crate::tools::{assign_tool_ids, parse_generated_for_response, SemAccum};
 
@@ -45,6 +47,7 @@ pub struct ContStepper {
     acc: SemAccum,
     w: Writer,
     oa: Option<OpenaiStream>,
+    anth: Option<AnthropicStream>,
     finish: &'static str,
     stops: Vec<String>,
     think_mode: crate::route::ThinkMode,
@@ -91,13 +94,22 @@ impl ContStepper {
         );
         let mut w = Writer::new(created);
         let mut oa = None;
+        let mut anth = None;
         if req.stream {
             w.out.extend_from_slice(&sse_headers(cors));
-            if req.api == Api::Openai && req.kind == ReqKind::Chat {
-                let mut st = openai_stream_start(&req);
-                st.tool.use_random_ids();
-                oa = Some(st);
-                sse_chunk(&mut w, &req, job_id, None, None);
+            match req.api {
+                Api::Openai if req.kind == ReqKind::Chat => {
+                    let mut st = openai_stream_start(&req);
+                    st.tool.use_random_ids();
+                    oa = Some(st);
+                    sse_chunk(&mut w, &req, job_id, None, None);
+                }
+                Api::Anthropic => {
+                    let mut st = anthropic_sse_start_live(&mut w, &req, job_id, prompt_n);
+                    st.tool.use_random_ids();
+                    anth = Some(st);
+                }
+                _ => {}
             }
         }
         let head = std::mem::take(&mut w.out);
@@ -112,6 +124,7 @@ impl ContStepper {
                 acc,
                 w,
                 oa,
+                anth,
                 finish: "length",
                 stops: parsed.stops.clone(),
                 think_mode: parsed.think_mode,
@@ -159,13 +172,13 @@ impl ContStepper {
         let feed = self.acc.feed(piece, &self.stops);
         if self.req.stream {
             let view = &self.acc.text[..feed.emit_limit.min(self.acc.text.len())];
-            match self.req.kind {
-                ReqKind::Completion => {
+            match (self.req.api, self.req.kind) {
+                (Api::Openai, ReqKind::Completion) => {
                     if let Some(delta) = last_delta(&self.acc.text, feed.emit_limit, piece.len()) {
                         sse_chunk(&mut self.w, &self.req, &self.job_id, Some(delta), None);
                     }
                 }
-                ReqKind::Chat => {
+                (Api::Openai, ReqKind::Chat) => {
                     if let Some(st) = self.oa.as_mut() {
                         openai_sse_stream_update(
                             &mut self.w,
@@ -177,6 +190,19 @@ impl ContStepper {
                         );
                     }
                 }
+                (Api::Anthropic, _) => {
+                    if let Some(st) = self.anth.as_mut() {
+                        anthropic_sse_stream_update(
+                            &mut self.w,
+                            &self.req,
+                            &self.job_id,
+                            st,
+                            view,
+                            false,
+                        );
+                    }
+                }
+                (Api::Responses, _) => {}
             }
         }
         let mut done = false;
@@ -257,6 +283,9 @@ impl ContStepper {
             if let Some(st) = self.oa.as_ref() {
                 st.tool.apply_ids(&mut parsed_gen.calls);
             }
+            if let Some(st) = self.anth.as_ref() {
+                st.tool.apply_ids(&mut parsed_gen.calls);
+            }
             assign_tool_ids(
                 &mut parsed_gen.calls,
                 if self.req.api == Api::Anthropic {
@@ -277,12 +306,12 @@ impl ContStepper {
         let _ = n_cached;
         self.req.timings = timings;
         if self.req.stream {
-            match self.req.kind {
-                ReqKind::Completion => {
+            match (self.req.api, self.req.kind) {
+                (Api::Openai, ReqKind::Completion) => {
                     sse_chunk(&mut self.w, &self.req, &self.job_id, None, Some(self.finish));
                     sse_done(&mut self.w, &self.req, &self.job_id, self.prompt_n, completion);
                 }
-                ReqKind::Chat => {
+                (Api::Openai, ReqKind::Chat) => {
                     if let Some(st) = self.oa.as_mut() {
                         openai_sse_finish_live(
                             &mut self.w,
@@ -297,20 +326,50 @@ impl ContStepper {
                         );
                     }
                 }
+                (Api::Anthropic, _) => {
+                    if let Some(st) = self.anth.as_mut() {
+                        anthropic_sse_finish_live(
+                            &mut self.w,
+                            &self.req,
+                            &self.job_id,
+                            st,
+                            &self.acc.text,
+                            self.finish,
+                            self.acc.matched_stop.as_deref(),
+                            completion,
+                            &parsed_gen.calls,
+                        );
+                    }
+                }
+                (Api::Responses, _) => {}
             }
         } else {
-            let bytes = final_response(
-                &self.req,
-                &self.job_id,
-                &parsed_gen.content,
-                Some(&parsed_gen.reasoning),
-                self.finish,
-                self.prompt_n,
-                completion,
-                self.w.created,
-                cors,
-                &parsed_gen.calls,
-            );
+            let bytes = match self.req.api {
+                Api::Anthropic => anthropic_final_response(
+                    &self.req,
+                    &self.job_id,
+                    &parsed_gen.content,
+                    Some(&parsed_gen.reasoning),
+                    self.finish,
+                    self.acc.matched_stop.as_deref(),
+                    self.prompt_n,
+                    completion,
+                    cors,
+                    &parsed_gen.calls,
+                ),
+                _ => final_response(
+                    &self.req,
+                    &self.job_id,
+                    &parsed_gen.content,
+                    Some(&parsed_gen.reasoning),
+                    self.finish,
+                    self.prompt_n,
+                    completion,
+                    self.w.created,
+                    cors,
+                    &parsed_gen.calls,
+                ),
+            };
             self.w.out.extend_from_slice(&bytes);
         }
         let outcome = GenerateOutcome {

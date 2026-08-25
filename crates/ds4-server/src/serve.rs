@@ -103,7 +103,7 @@ fn parse_f64_bound(value: Option<&OsStr>, default: f64) -> f64 {
     }
 }
 
-fn parse_disconnect_abort(value: Option<&OsStr>) -> bool {
+fn parse_default_on(value: Option<&OsStr>) -> bool {
     value.map(os_str_bytes) != Some(b"0")
 }
 
@@ -133,7 +133,7 @@ impl Default for ServerConfig {
                 "DS4_SERVER_OUT_AGG_EVICT_MIN",
                 JOB_SINK_AGG_EVICT_MIN_BYTES,
             ),
-            disconnect_abort: parse_disconnect_abort(
+            disconnect_abort: parse_default_on(
                 std::env::var_os("DS4_SERVER_DISCONNECT_ABORT").as_deref(),
             ),
             have_engine: false,
@@ -965,7 +965,9 @@ fn run_prepared<W: TerminalSink>(
     let route_env = RouteEnv {
         coalesce: cont_gate.is_some(),
         have_cont: cont_gate.is_some(),
-        cont_anthropic: false,
+        cont_anthropic: parse_default_on(
+            std::env::var_os("DS4_SERVER_CONT_ANTHROPIC").as_deref(),
+        ),
         cont_responses: false,
         cont_tools_anthropic: false,
         cont_tools_responses: false,
@@ -1781,17 +1783,17 @@ mod owner_tests {
             parse_f64_bound(Some(OsStr::from_bytes(b"2.5\xff")), 600.0),
             2.5
         );
-        assert!(!parse_disconnect_abort(Some(OsStr::from_bytes(b"0"))));
-        assert!(parse_disconnect_abort(Some(OsStr::from_bytes(b"0\xff"))));
+        assert!(!parse_default_on(Some(OsStr::from_bytes(b"0"))));
+        assert!(parse_default_on(Some(OsStr::from_bytes(b"0\xff"))));
     }
 
     #[test]
     fn c_disconnect_abort_environment_contract_is_preserved() {
-        assert!(parse_disconnect_abort(None));
-        assert!(!parse_disconnect_abort(Some(OsStr::new("0"))));
-        assert!(parse_disconnect_abort(Some(OsStr::new("00"))));
-        assert!(parse_disconnect_abort(Some(OsStr::new("1"))));
-        assert!(parse_disconnect_abort(Some(OsStr::new("bad"))));
+        assert!(parse_default_on(None));
+        assert!(!parse_default_on(Some(OsStr::new("0"))));
+        assert!(parse_default_on(Some(OsStr::new("00"))));
+        assert!(parse_default_on(Some(OsStr::new("1"))));
+        assert!(parse_default_on(Some(OsStr::new("bad"))));
     }
 
     #[test]
@@ -1938,6 +1940,41 @@ mod owner_tests {
         let g = lock_inner(&inner);
         assert_eq!(g.metrics.route_requests[0][1], 1);
         assert_eq!(g.metrics.shed[SHED_CONT_HOLD as usize], 0);
+        assert_eq!(g.runtime.requests_serial, 0);
+    }
+
+    #[test]
+    fn stateless_anthropic_uses_continuous_lane() {
+        let cfg = test_cfg();
+        let inner = Mutex::new(ServerInner::from_cfg(&cfg));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let body = r#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":8}"#;
+        write!(
+            client,
+            "POST /v1/messages HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let mut engine = ScriptedDecode::from_pieces(&[]);
+        let mut cont = TestCont::Accept;
+
+        handle_client_inner(
+            &cfg,
+            &inner,
+            &mut server,
+            Some(&mut engine),
+            Some(&mut cont),
+        );
+        drop(server);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+        let g = lock_inner(&inner);
+        assert_eq!(g.metrics.route_requests[WireSurface::Anthropic as usize][1], 1);
         assert_eq!(g.runtime.requests_serial, 0);
     }
 
