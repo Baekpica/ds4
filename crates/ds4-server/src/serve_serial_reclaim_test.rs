@@ -1,8 +1,14 @@
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::Mutex;
+
+use crate::generate::ScriptedDecode;
+use crate::serve::{handle_client_inner, ServerConfig, ServerInner};
 use crate::serve_cont_roll::RejectReason;
 use crate::serve_serial_reclaim::{
-    serial_capacity_refuse_msg, serial_reclaim_gate, serial_reclaim_rank, AvailBytes,
-    HeadroomBytes, MemFloor, NeedBytes, ReclaimBank, ReclaimableBytes, SerialReclaimAsk,
-    SerialReclaimOutcome,
+    serial_capacity_refuse_msg, serial_reclaim_gate, serial_reclaim_rank, unquoted_serial_fit,
+    AvailBytes, HeadroomBytes, MemFloor, NeedBytes, ReclaimBank, ReclaimableBytes, SerialFitQuote,
+    SerialReclaimAsk, SerialReclaimOutcome,
 };
 
 const GIB: u64 = 1 << 30;
@@ -110,6 +116,87 @@ fn already_fits_does_not_reclaim() {
 
     // Then: admit with no reclaim
     assert_eq!(out, SerialReclaimOutcome::Admit { reclaimed: 0 });
+}
+
+#[test]
+fn mem_floor_cli_wins_over_env() {
+    let floor = MemFloor::from_cli_or_env(Some(b"2"), Some(b"8"));
+    assert_eq!(floor, MemFloor::from_gb(2));
+}
+
+#[test]
+fn unquoted_live_fit_admits_without_harder_refuse() {
+    let out = serial_reclaim_gate(unquoted_serial_fit().ask(MemFloor::from_gb(4)));
+    assert_eq!(out, SerialReclaimOutcome::Admit { reclaimed: 0 });
+}
+
+fn drive_serial_completion(cfg: &ServerConfig) -> Vec<u8> {
+    let inner = Mutex::new(ServerInner::from_cfg(cfg));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let body = r#"{"prompt":"hello","max_tokens":0}"#;
+    write!(
+        client,
+        "POST /v1/completions HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+    let (mut server, _) = listener.accept().unwrap();
+    let mut engine = ScriptedDecode::from_pieces(&[]);
+    handle_client_inner(cfg, &inner, &mut server, Some(&mut engine), None);
+    drop(server);
+    let mut response = Vec::new();
+    client.read_to_end(&mut response).unwrap();
+    response
+}
+
+#[test]
+fn serial_path_refuses_with_c_body_when_gate_refuses() {
+    let mut cfg = ServerConfig {
+        have_engine: true,
+        mem_floor_gb: 4,
+        ..ServerConfig::default()
+    };
+    cfg.serial_fit = Some(SerialFitQuote {
+        avail: AvailBytes::from_raw(5 * GIB),
+        need: NeedBytes::from_raw(3 * GIB),
+        reclaimable: ReclaimableBytes::from_raw(GIB),
+        headroom: HeadroomBytes::from_raw(0),
+    });
+
+    let bytes = drive_serial_completion(&cfg);
+    let response = String::from_utf8_lossy(&bytes);
+
+    assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    assert!(
+        response.contains(&serial_capacity_refuse_msg(1)),
+        "{response}"
+    );
+}
+
+#[test]
+fn serial_path_admits_after_reclaim_covers_deficit() {
+    let mut cfg = ServerConfig {
+        have_engine: true,
+        mem_floor_gb: 4,
+        ..ServerConfig::default()
+    };
+    cfg.serial_fit = Some(SerialFitQuote {
+        avail: AvailBytes::from_raw(5 * GIB),
+        need: NeedBytes::from_raw(2 * GIB),
+        reclaimable: ReclaimableBytes::from_raw(3 * GIB),
+        headroom: HeadroomBytes::from_raw(0),
+    });
+
+    let bytes = drive_serial_completion(&cfg);
+    let response = String::from_utf8_lossy(&bytes);
+
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(
+        !response.contains("no session graph fits beside the batch banks"),
+        "{response}"
+    );
 }
 
 #[test]

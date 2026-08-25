@@ -35,6 +35,10 @@ use crate::route::{
     NEED_BANK_FRONTIER,
 };
 use crate::serve_cont::{cont_prompt_tokens, ContExec};
+use crate::serve_serial_reclaim::{
+    serial_capacity_refuse_msg, serial_reclaim_gate, unquoted_serial_fit, MemFloor, SerialFitQuote,
+    SerialReclaimOutcome,
+};
 use crate::serve_static::{
     run_static_routed, write_static_completion, DetachedStatic, StaticFinish, StaticJob, StaticRow,
     StaticSettle, STATIC_WIDTH_ERR,
@@ -65,6 +69,8 @@ pub struct ServerConfig {
     pub disconnect_abort: bool,
     pub have_engine: bool,
     pub stop_requested: Option<fn() -> bool>,
+    pub mem_floor_gb: u64,
+    pub(crate) serial_fit: Option<SerialFitQuote>,
 }
 
 pub(crate) fn env_i32_bound(name: &str, default: i32) -> i32 {
@@ -161,7 +167,20 @@ impl Default for ServerConfig {
             ),
             have_engine: false,
             stop_requested: None,
+            mem_floor_gb: mem_floor_gb_from_env(),
+            serial_fit: None,
         }
+    }
+}
+
+fn mem_floor_gb_from_env() -> u64 {
+    let env = std::env::var_os("DS4_MEM_FLOOR_GB");
+    MemFloor::from_env_gb(env.as_deref().map(os_str_bytes)).gb()
+}
+
+impl ServerConfig {
+    pub fn apply_mem_floor_gb(&mut self, raw: &str) {
+        self.mem_floor_gb = MemFloor::from_cli_or_env(Some(raw.as_bytes()), None).gb();
     }
 }
 
@@ -1345,6 +1364,33 @@ fn run_serial<W: TerminalSink>(
         };
     }
 
+    let quote = cfg.serial_fit.unwrap_or_else(unquoted_serial_fit);
+    match serial_reclaim_gate(quote.ask(MemFloor::from_gb(cfg.mem_floor_gb))) {
+        SerialReclaimOutcome::Admit { .. } => {}
+        SerialReclaimOutcome::Refuse { .. } => {
+            let prompt_n = match job.parsed.prompt_text.as_deref() {
+                Some(text) => engine.tokenize_text(text),
+                None => engine.tokenize_rendered_chat(&[]),
+            }
+            .map(|toks| i32::try_from(toks.len()).unwrap_or(i32::MAX))
+            .unwrap_or(0);
+            let ok = out
+                .write_all(&wire_http_error_bytes(
+                    job.surface,
+                    503,
+                    &serial_capacity_refuse_msg(prompt_n),
+                    cfg.cors,
+                    None,
+                ))
+                .is_ok();
+            return if ok {
+                Settlement::COMPLETED
+            } else {
+                Settlement::CANCELED
+            };
+        }
+    }
+
     lock_inner(inner).runtime.requests_serial += 1;
     let result = generate_terminal_at(
         engine,
@@ -2040,6 +2086,11 @@ mod owner_tests {
         assert_eq!(cfg.max_queue_age_s, 600.0);
         assert_eq!(cfg.out_agg_cap_bytes, 64 * 1024 * 1024);
         assert_eq!(cfg.out_agg_evict_min_bytes, 256 * 1024);
+        assert_eq!(
+            cfg.mem_floor_gb,
+            crate::serve_serial_reclaim::DEFAULT_MEM_FLOOR_GB
+        );
+        assert!(cfg.serial_fit.is_none());
     }
 
     #[test]

@@ -109,6 +109,10 @@ fn main() {
                     .unwrap_or_else(|| usage());
             }
             "--cors" => cfg.cors = true,
+            "--mem-floor-gb" => {
+                let raw = args.next().unwrap_or_else(|| usage());
+                cfg.apply_mem_floor_gb(&raw);
+            }
             "-h" | "--help" => usage(),
             other => {
                 eprintln!("ds4-server-rs: unknown argument {other}");
@@ -238,7 +242,7 @@ fn cli_error(message: &str) -> ! {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: ds4-server-rs [--host HOST] [--port PORT] [--listen HOST PORT] [--model-id ID] [-m GGUF] [--backend cuda|cpu|metal] [--tokens N] [-c N] [-t N] [--cont-width N] [--cors]\n\
+        "usage: ds4-server-rs [--host HOST] [--port PORT] [--listen HOST PORT] [--model-id ID] [-m GGUF] [--backend cuda|cpu|metal] [--tokens N] [-c N] [-t N] [--cont-width N] [--mem-floor-gb N] [--cors]\n\
          Disk KV: [--kv-disk-dir DIR] [--kv-disk-space-mb N] [--kv-cache-min-tokens N]\n\
          [--kv-cache-cold-max-tokens N] [--kv-cache-continued-interval-tokens N]\n\
          [--kv-cache-boundary-trim-tokens N]\n\

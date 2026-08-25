@@ -38,6 +38,10 @@ impl MemFloor {
         self.0
     }
 
+    pub(crate) const fn gb(self) -> u64 {
+        self.0 >> 30
+    }
+
     /// C `ds4_mem_floor_bytes`: default 4 GiB; `DS4_MEM_FLOOR_GB` via atol.
     pub(crate) fn from_env_gb(raw: Option<&[u8]>) -> Self {
         let Some(raw) = raw else {
@@ -51,6 +55,14 @@ impl MemFloor {
             Self::from_gb(DEFAULT_MEM_FLOOR_GB)
         } else {
             Self::from_gb(fv as u64)
+        }
+    }
+
+    /// CLI `--mem-floor-gb` wins over `DS4_MEM_FLOOR_GB`; both use C atol.
+    pub(crate) fn from_cli_or_env(cli: Option<&[u8]>, env: Option<&[u8]>) -> Self {
+        match cli {
+            Some(cli) => Self::from_env_gb(Some(cli)),
+            None => Self::from_env_gb(env),
         }
     }
 }
@@ -92,6 +104,39 @@ impl HeadroomBytes {
 
     pub(crate) const fn raw(self) -> u64 {
         self.0
+    }
+}
+
+/// Quoted avail/need for the live serial path.
+/// C `ds4_session_graph_fit_quote` fields we can host without native trim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SerialFitQuote {
+    pub avail: AvailBytes,
+    pub need: NeedBytes,
+    pub reclaimable: ReclaimableBytes,
+    pub headroom: HeadroomBytes,
+}
+
+impl SerialFitQuote {
+    pub(crate) const fn ask(self, floor: MemFloor) -> SerialReclaimAsk {
+        SerialReclaimAsk {
+            avail: self.avail,
+            need: self.need,
+            floor,
+            reclaimable: self.reclaimable,
+            headroom: self.headroom,
+        }
+    }
+}
+
+/// No native graph-fit quote yet. need=0 so the gate still runs and
+/// cannot invent a harder refuse than C (margin, not floor).
+pub(crate) const fn unquoted_serial_fit() -> SerialFitQuote {
+    SerialFitQuote {
+        avail: AvailBytes::from_raw(u64::MAX),
+        need: NeedBytes::from_raw(0),
+        reclaimable: ReclaimableBytes::from_raw(0),
+        headroom: HeadroomBytes::from_raw(0),
     }
 }
 
