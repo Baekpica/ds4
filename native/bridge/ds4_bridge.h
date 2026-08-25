@@ -91,6 +91,9 @@ typedef struct {
     int backend;              /* DS4_BRIDGE_BACKEND_* */
     int n_threads;
     int defer_boot_prewarm;   /* nonzero => skip boot prewarm inside open */
+    int32_t power_percent;    /* 1..100; native default is 100 */
+    int32_t warm_weights;
+    int32_t quality;
     const ds4_bridge_bind_plan *plan; /* optional; borrowed for the call */
     const ds4_host_tensor_dir *tensors; /* optional full inventory; borrowed */
     const ds4_host_shape *shape; /* optional; skip C validate when set */

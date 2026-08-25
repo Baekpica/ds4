@@ -108,6 +108,52 @@ pub enum Backend {
     Cpu,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelOpenOption {
+    Quality,
+    WarmWeights,
+    PowerPercent(u8),
+}
+
+#[derive(Clone, Copy)]
+struct OpenTuning {
+    quality: bool,
+    warm_weights: bool,
+    power_percent: i32,
+}
+
+impl Default for OpenTuning {
+    fn default() -> Self {
+        Self {
+            quality: false,
+            warm_weights: false,
+            power_percent: 100,
+        }
+    }
+}
+
+fn open_tuning(options: &[ModelOpenOption]) -> Result<OpenTuning> {
+    let mut tuning = OpenTuning::default();
+
+    for option in options {
+        match *option {
+            ModelOpenOption::Quality => tuning.quality = true,
+            ModelOpenOption::WarmWeights => tuning.warm_weights = true,
+            ModelOpenOption::PowerPercent(percent) if (1..=100).contains(&percent) => {
+                tuning.power_percent = i32::from(percent);
+            }
+            ModelOpenOption::PowerPercent(_) => {
+                return Err(Error {
+                    code: 1,
+                    message: "power percent must be between 1 and 100".into(),
+                });
+            }
+        }
+    }
+
+    Ok(tuning)
+}
+
 impl Backend {
     fn to_c(self) -> i32 {
         match self {
@@ -729,7 +775,27 @@ impl Model {
         n_threads: i32,
         defer_boot_prewarm: bool,
     ) -> Result<Self> {
-        Self::open_with_support(path, backend, n_threads, defer_boot_prewarm, None, None)
+        Self::open_configured(path, backend, n_threads, defer_boot_prewarm, None, &[])
+    }
+
+    pub fn open_configured(
+        path: &str,
+        backend: Backend,
+        n_threads: i32,
+        defer_boot_prewarm: bool,
+        distributed: Option<&DistributedConfig>,
+        options: &[ModelOpenOption],
+    ) -> Result<Self> {
+        Self::open_impl(
+            path,
+            backend,
+            n_threads,
+            defer_boot_prewarm,
+            None,
+            None,
+            distributed,
+            options,
+        )
     }
 
     /// `mtp_path` / `dspark_path` attach the DeepSeek-only sibling support
@@ -751,6 +817,7 @@ impl Model {
             mtp_path,
             dspark_path,
             None,
+            &[],
         )
     }
 
@@ -771,6 +838,7 @@ impl Model {
             mtp_path,
             dspark_path,
             Some(distributed),
+            &[],
         )
     }
 
@@ -782,7 +850,9 @@ impl Model {
         mtp_path: Option<&str>,
         dspark_path: Option<&str>,
         distributed: Option<&DistributedConfig>,
+        options: &[ModelOpenOption],
     ) -> Result<Self> {
+        let tuning = open_tuning(options)?;
         let identified = identify_gguf(std::path::Path::new(path)).map_err(|e| Error {
             code: 1,
             message: format!("identify failed: {}", e.token()),
@@ -877,6 +947,9 @@ impl Model {
             backend: backend.to_c(),
             n_threads,
             defer_boot_prewarm: i32::from(defer_boot_prewarm),
+            power_percent: tuning.power_percent,
+            warm_weights: i32::from(tuning.warm_weights),
+            quality: i32::from(tuning.quality),
             plan: ffi_plan.as_c(),
             tensors: ffi_dir.as_c(),
             shape: &ffi_shape,
@@ -1470,6 +1543,26 @@ mod tests {
         let err = cstring_path("a\0b").unwrap_err();
         assert_eq!(err.code, 1);
         assert!(err.message.contains("NUL"));
+    }
+
+    #[test]
+    fn model_open_tuning_matches_c_defaults_and_bounds() {
+        let defaults = open_tuning(&[]).unwrap();
+        assert!(!defaults.quality);
+        assert!(!defaults.warm_weights);
+        assert_eq!(defaults.power_percent, 100);
+
+        let configured = open_tuning(&[
+            ModelOpenOption::Quality,
+            ModelOpenOption::WarmWeights,
+            ModelOpenOption::PowerPercent(37),
+        ])
+        .unwrap();
+        assert!(configured.quality);
+        assert!(configured.warm_weights);
+        assert_eq!(configured.power_percent, 37);
+        assert!(open_tuning(&[ModelOpenOption::PowerPercent(0)]).is_err());
+        assert!(open_tuning(&[ModelOpenOption::PowerPercent(101)]).is_err());
     }
 
     #[no_mangle]

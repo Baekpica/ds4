@@ -223,6 +223,9 @@ static int model_open_impl(ds4_bridge_model **out,
     eopt.model_path = opt->model_path;
     eopt.n_threads = opt->n_threads;
     eopt.defer_boot_prewarm = opt->defer_boot_prewarm != 0;
+    eopt.power_percent = opt->power_percent;
+    eopt.warm_weights = opt->warm_weights != 0;
+    eopt.quality = opt->quality != 0;
     eopt.mtp_path = opt->mtp_path;
     eopt.dspark_path = opt->dspark_path;
     if (map_backend(opt->backend, &eopt.backend, err, errlen) != 0) return 1;

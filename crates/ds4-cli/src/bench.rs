@@ -1,4 +1,4 @@
-use ds4_core::{Backend, Model, Session, SessionSnapshot, TokenBuffer};
+use ds4_core::{Backend, Model, ModelOpenOption, Session, SessionSnapshot, TokenBuffer};
 use std::io::{BufWriter, Write};
 use std::time::Instant;
 
@@ -21,6 +21,9 @@ pub struct BenchArgs {
     gen_tokens: i32,
     step_mul: f64,
     csv: Option<String>,
+    quality: bool,
+    warm_weights: bool,
+    power_percent: i32,
     dist: ds4_dist::Options,
     help: bool,
 }
@@ -41,6 +44,9 @@ impl Default for BenchArgs {
             gen_tokens: 128,
             step_mul: 1.0,
             csv: None,
+            quality: false,
+            warm_weights: false,
+            power_percent: 100,
             dist: ds4_dist::Options::default(),
             help: false,
         }
@@ -118,12 +124,14 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, S
                     parse_nonnegative_i32(&arg, &require_value(&arg, iter.next())?)?;
             }
             "--csv" => parsed.csv = Some(require_value(&arg, iter.next())?),
+            "--quality" => parsed.quality = true,
+            "--warm-weights" => parsed.warm_weights = true,
+            "--power" => {
+                parsed.power_percent = parse_power(&require_value(&arg, iter.next())?)?;
+            }
             "--mtp"
             | "--mtp-draft"
             | "--mtp-margin"
-            | "--quality"
-            | "--warm-weights"
-            | "--power"
             | "--output-head-bench"
             | "--dump-frontier-logits-dir" => {
                 return Err(format!("{arg} is not implemented in ds4-bench-rs"));
@@ -237,18 +245,22 @@ pub fn run(args: BenchArgs) -> Result<i32, String> {
     let (prompt_path, chat_prompt) = prompt_source(&args)?;
     let text = read_prompt(prompt_path)?;
     let native_dist = crate::distributed_config(&args.dist);
-    let model = match native_dist.as_ref() {
-        Some(config) => Model::open_distributed(
-            &args.model,
-            args.backend,
-            args.threads,
-            false,
-            None,
-            None,
-            config,
-        ),
-        None => Model::open(&args.model, args.backend, args.threads, false),
+    let mut open_options = Vec::with_capacity(3);
+    if args.quality {
+        open_options.push(ModelOpenOption::Quality);
     }
+    if args.warm_weights {
+        open_options.push(ModelOpenOption::WarmWeights);
+    }
+    open_options.push(ModelOpenOption::PowerPercent(args.power_percent as u8));
+    let model = Model::open_configured(
+        &args.model,
+        args.backend,
+        args.threads,
+        false,
+        native_dist.as_ref(),
+        &open_options,
+    )
     .map_err(|e| e.to_string())?;
     let prompt = if chat_prompt {
         model
@@ -475,6 +487,14 @@ fn parse_f64(flag: &str, value: &str) -> Result<f64, String> {
     Ok(parsed)
 }
 
+fn parse_power(value: &str) -> Result<i32, String> {
+    let parsed = parse_positive_i32("--power", value)?;
+    if parsed > 100 {
+        return Err("--power must be between 1 and 100".into());
+    }
+    Ok(parsed)
+}
+
 fn parse_backend(value: &str) -> Result<Backend, String> {
     match value {
         "cuda" => Ok(Backend::Cuda),
@@ -502,6 +522,9 @@ fn help_text() -> &'static str {
      -m, --model FILE       GGUF model path (default: ds4flash.gguf)\n\
      --cuda|--metal|--cpu   Select backend\n\
      -t, --threads N        CPU helper threads\n\
+     --quality              Prefer exact kernels where applicable\n\
+     --warm-weights         Touch mapped tensor pages before benchmarking\n\
+     --power N              GPU duty cycle, 1..100 (default: 100)\n\
      --prompt-file FILE     Raw UTF-8 benchmark prompt\n\
      --chat-prompt-file FILE\n\
                              One no-thinking chat user message\n\
@@ -554,6 +577,50 @@ mod tests {
         assert_eq!(args.prompt_file.as_deref(), Some("prompt.txt"));
         assert_eq!(args.ctx_alloc, 16513);
         assert_eq!(args.csv.as_deref(), Some("out.csv"));
+        assert!(!args.quality);
+        assert!(!args.warm_weights);
+        assert_eq!(args.power_percent, 100);
+    }
+
+    #[test]
+    fn parses_engine_benchmark_options() {
+        let args = parse_args(argv(&[
+            "--prompt-file",
+            "prompt.txt",
+            "--quality",
+            "--warm-weights",
+            "--power",
+            "37",
+        ]))
+        .unwrap();
+
+        assert!(args.quality);
+        assert!(args.warm_weights);
+        assert_eq!(args.power_percent, 37);
+        assert!(help_text().contains("--quality"));
+        assert!(help_text().contains("--warm-weights"));
+        assert!(help_text().contains("--power N"));
+
+        for power in ["0", "-1"] {
+            assert_eq!(
+                parse_args(argv(&["--prompt-file", "prompt.txt", "--power", power,])).unwrap_err(),
+                format!("invalid value for --power: {power}")
+            );
+        }
+        assert_eq!(
+            parse_args(argv(&["--prompt-file", "prompt.txt", "--power", "101"])).unwrap_err(),
+            "--power must be between 1 and 100"
+        );
+        for power in ["wat", "999999999999999999999999999999999999"] {
+            assert_eq!(
+                parse_args(argv(&["--prompt-file", "prompt.txt", "--power", power,])).unwrap_err(),
+                format!("invalid value for --power: {power}")
+            );
+        }
+        assert_eq!(
+            parse_args(argv(&["--prompt-file", "prompt.txt", "--power"])).unwrap_err(),
+            "--power requires a value"
+        );
     }
 
     #[test]

@@ -166,6 +166,9 @@ int main(void) {
         memset(&dist, 0, sizeof(dist));
         open_opt.model_path = "fixture.gguf";
         open_opt.backend = DS4_BRIDGE_BACKEND_CPU;
+        open_opt.power_percent = 37;
+        open_opt.warm_weights = 1;
+        open_opt.quality = 1;
         dist.role = DS4_BRIDGE_DISTRIBUTED_WORKER;
         dist.layer_start = 21;
         dist.layer_end = UINT32_MAX;
@@ -193,6 +196,11 @@ int main(void) {
             !bridge_dist_engine_options.load_output ||
             bridge_dist_engine_options.distributed.role != DS4_DISTRIBUTED_WORKER) {
             fail("distributed engine option mapping");
+        }
+        if (bridge_dist_engine_options.power_percent != 37 ||
+            !bridge_dist_engine_options.warm_weights ||
+            !bridge_dist_engine_options.quality) {
+            fail("engine tuning option mapping");
         }
         if (ds4_bridge_model_run_distributed_worker(model, 4096,
                                                     err, sizeof(err)) != 0) {
