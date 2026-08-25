@@ -1,10 +1,10 @@
 //! Continuous-lane execution: a push-based per-token stepper (pure, tape
 //! testable) plus the native `ContLane` that drives the engine's rolling
-//! scheduler through `ds4-core::BatchCtx`. The accept loop admits one request
-//! at a time, while the persistent batch context owns every configured bank;
-//! the engine-side bank/admit machinery is the same one C's continuous lane uses.
-//! Corrective retry (`decode_again`) and continuation publish route serial
-//! by the needs word, so this path never re-decodes.
+//! scheduler through `ds4-core::BatchCtx`. The accept loop admits another
+//! request while one is generating; the persistent batch context owns every
+//! configured bank. The engine-side bank/admit machinery is the same one C's
+//! continuous lane uses. Corrective retry (`decode_again`) and continuation
+//! publish route serial by the needs word, so this path never re-decodes.
 
 use std::io::Write;
 #[cfg(any(feature = "native", test))]
@@ -743,6 +743,23 @@ fn save_bank_record(
     Ok(true)
 }
 
+/// One continuous work item for a rolling admit.
+pub struct ContWork<'a> {
+    pub parsed: &'a ParsedRequest,
+    pub job_id: &'a str,
+    pub created: i64,
+    pub cors: bool,
+    pub default_tokens: i32,
+    pub t_arrive: Instant,
+    pub out: &'a mut dyn Write,
+}
+
+/// Two continuous jobs driven in one rolling `admit` loop.
+pub struct ContPair<'a> {
+    pub first: ContWork<'a>,
+    pub second: ContWork<'a>,
+}
+
 /// Trait seam so `handle_client_inner` can drive a continuous lane without
 /// the native feature (tests supply a scripted implementation).
 pub trait ContExec {
@@ -764,6 +781,41 @@ pub trait ContExec {
         store: Option<&mut KvStore>,
         out: &mut dyn Write,
     ) -> Result<GenerateOutcome, GenerateError>;
+
+    /// Drive two continuous jobs in one rolling admit loop. Default runs
+    /// them sequentially (one-at-a-time fallback). Native `ContLane`
+    /// admits the second while the first is generating.
+    fn generate_pair(
+        &mut self,
+        pair: ContPair<'_>,
+        bank_hold_retry: &mut dyn FnMut(i32, Option<(u64, i32)>) -> Option<i32>,
+        mut store: Option<&mut KvStore>,
+    ) -> [Result<GenerateOutcome, GenerateError>; 2] {
+        let ContPair { first, second } = pair;
+        let a = self.generate(
+            first.parsed,
+            first.job_id,
+            first.created,
+            first.cors,
+            first.default_tokens,
+            first.t_arrive,
+            bank_hold_retry,
+            store.as_deref_mut(),
+            first.out,
+        );
+        let b = self.generate(
+            second.parsed,
+            second.job_id,
+            second.created,
+            second.cors,
+            second.default_tokens,
+            second.t_arrive,
+            bank_hold_retry,
+            store.as_deref_mut(),
+            second.out,
+        );
+        [a, b]
+    }
 
     fn shutdown(&mut self, _store: Option<&mut KvStore>) {}
 
@@ -799,7 +851,7 @@ mod native {
 
     use crate::serve_static::{BatchStatic, CoalesceLimits, StaticExec, StaticJob, StaticRow};
 
-    /// Native continuous lane: one Rust owner call at a time over every bank
+    /// Native continuous lane: a rolling `ContDriver` over every bank
     /// exposed by the persistent native batch context.
     pub struct ContLane<'m> {
         batch: BatchCtx<'m>,
@@ -823,15 +875,53 @@ mod native {
         cached: i32,
     }
 
-    struct OneJob<'a, W: Write> {
+    struct PreparedSlot {
+        admit: ContAdmit,
+        head: Vec<u8>,
+        stepper: ContStepper,
+        capture_done: bool,
+        t_arrive: Instant,
+    }
+
+    impl PreparedSlot {
+        fn into_slot(self, out: &mut dyn Write) -> JobSlot<'_> {
+            JobSlot {
+                admit: Some(self.admit),
+                head: if self.head.is_empty() {
+                    None
+                } else {
+                    Some(self.head)
+                },
+                stepper: self.stepper,
+                out,
+                admitted: false,
+                bank: None,
+                io_failed: false,
+                host_abort: false,
+                engine_eos: false,
+                capture_done: self.capture_done,
+                done_tokens: Vec::new(),
+                n_cached: 0,
+                n_computed: 0,
+                t_arrive: self.t_arrive,
+                t_admit: None,
+                t_first: None,
+                t_done: None,
+                decode_ms: 0.0,
+                decode_tokens: 0,
+                decode_steps: 0,
+            }
+        }
+    }
+
+    struct JobSlot<'a> {
         admit: Option<ContAdmit>,
         /* Client-visible transport is committed at on_admitted, the C
          * cont_stream_start point: a rejected request never sees bytes and
          * can fall back to the serial lane transport-clean. */
         head: Option<Vec<u8>>,
-        stepper: &'a mut ContStepper,
-        vocab: &'a Vocab,
-        out: &'a mut W,
+        stepper: ContStepper,
+        out: &'a mut dyn Write,
         admitted: bool,
         bank: Option<i32>,
         io_failed: bool,
@@ -850,7 +940,7 @@ mod native {
         decode_steps: i32,
     }
 
-    impl<W: Write> OneJob<'_, W> {
+    impl JobSlot<'_> {
         fn transport_alive(&mut self) -> bool {
             if !self.io_failed && self.out.flush().is_err() {
                 self.io_failed = true;
@@ -868,35 +958,67 @@ mod native {
         }
     }
 
-    impl<W: Write> ContDriver for OneJob<'_, W> {
-        fn admit(&mut self) -> Option<ContAdmit> {
-            self.admit.take()
+    struct RollDriver<'a> {
+        roll: crate::serve_cont_roll::ContRoll,
+        slots: std::collections::HashMap<usize, JobSlot<'a>>,
+        vocab: &'a Vocab,
+        next_user: usize,
+    }
+
+    impl<'a> RollDriver<'a> {
+        fn new(vocab: &'a Vocab) -> Self {
+            Self {
+                roll: crate::serve_cont_roll::ContRoll::new(),
+                slots: std::collections::HashMap::new(),
+                vocab,
+                next_user: 1,
+            }
         }
 
-        fn on_token(&mut self, _user: usize, token: i32) -> bool {
-            if !self.transport_alive() {
-                self.host_abort = true;
+        fn push(&mut self, mut slot: JobSlot<'a>) {
+            let user = self.next_user;
+            self.next_user += 1;
+            if let Some(admit) = slot.admit.as_mut() {
+                admit.user = user;
+            }
+            self.roll.enqueue(user);
+            self.slots.insert(user, slot);
+        }
+    }
+
+    impl ContDriver for RollDriver<'_> {
+        fn admit(&mut self) -> Option<ContAdmit> {
+            let user = self.roll.admit()?;
+            self.slots.get_mut(&user)?.admit.take()
+        }
+
+        fn on_token(&mut self, user: usize, token: i32) -> bool {
+            let Some(slot) = self.slots.get_mut(&user) else {
+                return false;
+            };
+            if !slot.transport_alive() {
+                slot.host_abort = true;
                 return false;
             }
-            if self.t_first.is_none() {
-                self.t_first = Some(Instant::now());
+            if slot.t_first.is_none() {
+                slot.t_first = Some(Instant::now());
             }
             /* Serial parity: the host stop set (family EOT / eos / role
              * starts) is checked before the token text is ever fed. */
             if self.vocab.is_stop(token) {
-                self.stepper.mark_stop();
-                self.host_abort = true;
+                slot.stepper.mark_stop();
+                slot.host_abort = true;
                 return false;
             }
             let piece = self.vocab.token_text(token);
-            let step = self.stepper.feed(&piece);
-            self.push(&step.bytes);
-            if self.io_failed {
-                self.host_abort = true;
+            let step = slot.stepper.feed(&piece);
+            slot.push(&step.bytes);
+            if slot.io_failed {
+                slot.host_abort = true;
                 return false;
             }
             if step.done {
-                self.host_abort = true;
+                slot.host_abort = true;
                 return false;
             }
             true
@@ -904,45 +1026,57 @@ mod native {
 
         fn on_done(
             &mut self,
-            _user: usize,
+            user: usize,
             tokens: &[i32],
             finish: i32,
             decode_ms: f64,
             decode_tokens: i32,
             decode_steps: i32,
         ) {
-            self.engine_eos = finish == 1;
-            if self.capture_done {
-                self.done_tokens.extend_from_slice(tokens);
+            let Some(slot) = self.slots.get_mut(&user) else {
+                return;
+            };
+            slot.engine_eos = finish == 1;
+            if slot.capture_done {
+                slot.done_tokens.extend_from_slice(tokens);
             }
-            self.decode_ms = decode_ms;
-            self.decode_tokens = decode_tokens;
-            self.decode_steps = decode_steps;
-            self.t_done = Some(Instant::now());
+            slot.decode_ms = decode_ms;
+            slot.decode_tokens = decode_tokens;
+            slot.decode_steps = decode_steps;
+            slot.t_done = Some(Instant::now());
+            self.roll.complete(user);
         }
 
-        fn sample_override(&mut self, _user: usize) -> i32 {
-            match self.stepper.sample_override() {
+        fn sample_override(&mut self, user: usize) -> i32 {
+            let Some(slot) = self.slots.get_mut(&user) else {
+                return CONT_SAMPLE_NONE;
+            };
+            match slot.stepper.sample_override() {
                 SampleOverride::None => CONT_SAMPLE_NONE,
                 SampleOverride::Greedy => CONT_SAMPLE_GREEDY,
                 SampleOverride::Token(t) => ds4_core::cont_sample_token(t),
             }
         }
 
-        fn alive(&mut self, _user: usize) -> bool {
-            self.transport_alive()
+        fn alive(&mut self, user: usize) -> bool {
+            self.slots
+                .get_mut(&user)
+                .is_none_or(|slot| slot.transport_alive())
         }
 
-        fn on_admitted(&mut self, _user: usize, n_cached: i32, n_computed: i32, bank: i32) -> bool {
-            self.n_cached = n_cached;
-            self.n_computed = n_computed;
-            self.bank = Some(bank);
-            self.t_admit = Some(Instant::now());
-            self.admitted = true;
-            if let Some(head) = self.head.take() {
-                self.push(&head);
+        fn on_admitted(&mut self, user: usize, n_cached: i32, n_computed: i32, bank: i32) -> bool {
+            let Some(slot) = self.slots.get_mut(&user) else {
+                return false;
+            };
+            slot.n_cached = n_cached;
+            slot.n_computed = n_computed;
+            slot.bank = Some(bank);
+            slot.t_admit = Some(Instant::now());
+            slot.admitted = true;
+            if let Some(head) = slot.head.take() {
+                slot.push(&head);
             }
-            !self.io_failed
+            !slot.io_failed
         }
     }
 
@@ -1241,6 +1375,156 @@ mod native {
                 self.persist_bank(store, bank, KvReason::BankShutdown, 1, false);
             }
         }
+
+        fn prepare_slot(
+            &mut self,
+            work: &ContWork<'_>,
+            bank_hold_retry: &mut dyn FnMut(i32, Option<(u64, i32)>) -> Option<i32>,
+            mut store: Option<&mut KvStore>,
+        ) -> Result<PreparedSlot, GenerateError> {
+            let parsed = work.parsed;
+            let prompt = render_prompt(parsed, self.model_id)?;
+            let tokens = match parsed.kind {
+                ReqKind::Completion => self
+                    .vocab
+                    .encode_text(std::str::from_utf8(&prompt).unwrap_or("")),
+                ReqKind::Chat => self.vocab.encode_rendered_bytes(&prompt),
+            };
+            let prompt_n = tokens.len() as i32;
+            let (stepper, head) = ContStepper::new(
+                parsed,
+                self.model_id,
+                work.job_id,
+                work.created,
+                work.cors,
+                work.default_tokens,
+                prompt,
+                prompt_n,
+                self.batch.seq_cap(),
+            );
+            let (temperature, top_k, top_p, min_p) = stepper.sampling(parsed);
+            let capture_done = bank_scope(parsed);
+            let (protected, hold_retry) = self.protected_banks(bank_hold_retry);
+            let warm = if capture_done {
+                self.warm_plan(&stepper.prompt).or_else(|| {
+                    store
+                        .as_deref_mut()
+                        .and_then(|store| self.disk_plan(store, &stepper.prompt, &protected))
+                })
+            } else {
+                None
+            };
+            let placement = warm
+                .as_ref()
+                .and_then(|plan| self.place_warm(plan, &protected, store.as_deref_mut()));
+            let mut admit = if let (Some(plan), Some(placement)) = (warm, placement) {
+                let mut admit = ContAdmit::cold(1, plan.tokens, stepper.max_tokens.max(1));
+                admit.place_bank = i32::try_from(placement.target + 1).unwrap_or(0);
+                admit.n_cached = plan.cached;
+                if placement.fork {
+                    admit.fork_bank = i32::try_from(placement.source + 1).unwrap_or(0);
+                }
+                admit
+            } else {
+                let target = self.place_cold(&protected, store.as_deref_mut()).ok_or(
+                    GenerateError::ContinuationHold {
+                        retry_after: hold_retry.unwrap_or(1),
+                    },
+                )?;
+                let mut admit = ContAdmit::cold(1, tokens, stepper.max_tokens.max(1));
+                admit.place_bank = i32::try_from(target + 1).unwrap_or(0);
+                admit
+            };
+            admit.eos = self.eos;
+            admit.temperature = temperature;
+            admit.top_k = top_k;
+            admit.top_p = top_p;
+            admit.min_p = min_p;
+            admit.seed = parsed.seed;
+            Ok(PreparedSlot {
+                admit,
+                head,
+                stepper,
+                capture_done,
+                t_arrive: work.t_arrive,
+            })
+        }
+
+        fn finish_driven(
+            &mut self,
+            mut job: JobSlot<'_>,
+            native_err: Option<String>,
+            store: Option<&mut KvStore>,
+            cors: bool,
+        ) -> Result<GenerateOutcome, GenerateError> {
+            let timings = {
+                let completion = job.stepper.completion();
+                match job.t_first {
+                    Some(first) if completion > 0 => ReqTimings {
+                        valid: true,
+                        ttft_ms: first.duration_since(job.t_arrive).as_secs_f64() * 1e3,
+                        prefill_ms: first
+                            .duration_since(job.t_admit.unwrap_or(job.t_arrive))
+                            .as_secs_f64()
+                            * 1e3,
+                        decode_ms: job.decode_ms,
+                        prefill_tokens: job.n_computed,
+                        prefill_cached: job.n_cached,
+                        decode_tokens: job.decode_tokens,
+                        decode_steps: job.decode_steps,
+                    },
+                    _ => ReqTimings::default(),
+                }
+            };
+            let engine_eos = job.engine_eos && !job.host_abort;
+            let n_cached = job.n_cached;
+            let n_computed = job.n_computed;
+            let io_ok = !job.io_failed;
+            let done_called = job.t_done.is_some();
+            let done_tokens = std::mem::take(&mut job.done_tokens);
+            let admitted = job.admitted;
+            let actual_bank = job.bank;
+            let capture_done = job.capture_done;
+            if let Some(bank) = retired_bank(
+                capture_done,
+                admitted,
+                done_called,
+                actual_bank,
+                self.batch.max_seq(),
+            ) {
+                self.retire(bank, &job.stepper.prompt, &done_tokens);
+                if self.warm_checkpoint {
+                    if let Some(store) = store {
+                        self.persist_bank(
+                            store,
+                            bank as usize,
+                            KvReason::BankCheckpoint,
+                            self.warm_pin_min,
+                            true,
+                        );
+                    }
+                }
+            }
+            if let Some(error) = native_err {
+                return Err(GenerateError::Engine(error));
+            }
+            if !admitted {
+                return Err(GenerateError::Unsupported(
+                    "continuous admission rejected; serial fallback",
+                ));
+            }
+            if !io_ok {
+                return Err(GenerateError::Io);
+            }
+            let (tail, outcome) = job
+                .stepper
+                .finalize(engine_eos, n_cached, n_computed, timings, cors);
+            if !tail.is_empty() {
+                job.out.write_all(&tail).map_err(|_| GenerateError::Io)?;
+                let _ = job.out.flush();
+            }
+            Ok(outcome)
+        }
     }
 
     impl StaticExec for ContLane<'_> {
@@ -1296,158 +1580,104 @@ mod native {
             mut store: Option<&mut KvStore>,
             out: &mut dyn Write,
         ) -> Result<GenerateOutcome, GenerateError> {
-            let prompt = render_prompt(parsed, self.model_id)?;
-            let tokens = match parsed.kind {
-                ReqKind::Completion => self
-                    .vocab
-                    .encode_text(std::str::from_utf8(&prompt).unwrap_or("")),
-                ReqKind::Chat => self.vocab.encode_rendered_bytes(&prompt),
-            };
-            let prompt_n = tokens.len() as i32;
-            let (mut stepper, head) = ContStepper::new(
+            let work = ContWork {
                 parsed,
-                self.model_id,
                 job_id,
                 created,
                 cors,
                 default_tokens,
-                prompt,
-                prompt_n,
-                self.batch.seq_cap(),
-            );
-            let (temperature, top_k, top_p, min_p) = stepper.sampling(parsed);
-            let bank_enabled = bank_scope(parsed);
-            let canonical_tokens = tokens;
-            let (protected, hold_retry) = self.protected_banks(bank_hold_retry);
-            let warm = if bank_enabled {
-                self.warm_plan(&stepper.prompt).or_else(|| {
-                    store
-                        .as_deref_mut()
-                        .and_then(|store| self.disk_plan(store, &stepper.prompt, &protected))
-                })
-            } else {
-                None
-            };
-            let placement = warm
-                .as_ref()
-                .and_then(|plan| self.place_warm(plan, &protected, store.as_deref_mut()));
-            let mut admit = if let (Some(plan), Some(placement)) = (warm, placement) {
-                let mut admit = ContAdmit::cold(1, plan.tokens, stepper.max_tokens.max(1));
-                admit.place_bank = i32::try_from(placement.target + 1).unwrap_or(0);
-                admit.n_cached = plan.cached;
-                if placement.fork {
-                    admit.fork_bank = i32::try_from(placement.source + 1).unwrap_or(0);
-                }
-                admit
-            } else {
-                let target = self.place_cold(&protected, store.as_deref_mut()).ok_or(
-                    GenerateError::ContinuationHold {
-                        retry_after: hold_retry.unwrap_or(1),
-                    },
-                )?;
-                let mut admit = ContAdmit::cold(1, canonical_tokens, stepper.max_tokens.max(1));
-                admit.place_bank = i32::try_from(target + 1).unwrap_or(0);
-                admit
-            };
-            admit.eos = self.eos;
-            admit.temperature = temperature;
-            admit.top_k = top_k;
-            admit.top_p = top_p;
-            admit.min_p = min_p;
-            admit.seed = parsed.seed;
-            let mut adapter = WriteAdapter(&mut *out);
-            let mut job = OneJob {
-                admit: Some(admit),
-                head: if head.is_empty() { None } else { Some(head) },
-                stepper: &mut stepper,
-                vocab: self.vocab,
-                out: &mut adapter,
-                admitted: false,
-                bank: None,
-                io_failed: false,
-                host_abort: false,
-                engine_eos: false,
-                capture_done: bank_enabled,
-                done_tokens: Vec::new(),
-                n_cached: 0,
-                n_computed: 0,
                 t_arrive,
-                t_admit: None,
-                t_first: None,
-                t_done: None,
-                decode_ms: 0.0,
-                decode_tokens: 0,
-                decode_steps: 0,
+                out,
             };
-            let native_result = self.batch.continuous_generate(&mut job);
-            let timings = {
-                let completion = job.stepper.completion();
-                match job.t_first {
-                    Some(first) if completion > 0 => ReqTimings {
-                        valid: true,
-                        ttft_ms: first.duration_since(job.t_arrive).as_secs_f64() * 1e3,
-                        prefill_ms: first
-                            .duration_since(job.t_admit.unwrap_or(job.t_arrive))
-                            .as_secs_f64()
-                            * 1e3,
-                        decode_ms: job.decode_ms,
-                        prefill_tokens: job.n_computed,
-                        prefill_cached: job.n_cached,
-                        decode_tokens: job.decode_tokens,
-                        decode_steps: job.decode_steps,
-                    },
-                    _ => ReqTimings::default(),
+            let prepared = self.prepare_slot(&work, bank_hold_retry, store.as_deref_mut())?;
+            let mut adapter = WriteAdapter(work.out);
+            let mut driver = RollDriver::new(self.vocab);
+            driver.push(prepared.into_slot(&mut adapter));
+            let native_err = self
+                .batch
+                .continuous_generate(&mut driver)
+                .err()
+                .map(|error| error.to_string());
+            let job = driver.slots.remove(&1).ok_or_else(|| {
+                GenerateError::Engine("continuous driver lost the admitted job".into())
+            })?;
+            self.finish_driven(job, native_err, store, cors)
+        }
+
+        fn generate_pair(
+            &mut self,
+            pair: ContPair<'_>,
+            bank_hold_retry: &mut dyn FnMut(i32, Option<(u64, i32)>) -> Option<i32>,
+            mut store: Option<&mut KvStore>,
+        ) -> [Result<GenerateOutcome, GenerateError>; 2] {
+            let ContPair { first, second } = pair;
+            let cors_a = first.cors;
+            let cors_b = second.cors;
+            let prepared_a = match self.prepare_slot(&first, bank_hold_retry, store.as_deref_mut())
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let b = self.generate(
+                        second.parsed,
+                        second.job_id,
+                        second.created,
+                        second.cors,
+                        second.default_tokens,
+                        second.t_arrive,
+                        bank_hold_retry,
+                        store,
+                        second.out,
+                    );
+                    return [Err(error), b];
                 }
             };
-            let engine_eos = job.engine_eos && !job.host_abort;
-            let n_cached = job.n_cached;
-            let n_computed = job.n_computed;
-            let io_ok = !job.io_failed;
-            let done_called = job.t_done.is_some();
-            let done_tokens = std::mem::take(&mut job.done_tokens);
-            let admitted = job.admitted;
-            let actual_bank = job.bank;
-            drop(job);
-            drop(adapter);
-            if let Some(bank) = retired_bank(
-                bank_enabled,
-                admitted,
-                done_called,
-                actual_bank,
-                self.batch.max_seq(),
-            ) {
-                self.retire(bank, &stepper.prompt, &done_tokens);
-                if self.warm_checkpoint {
-                    if let Some(store) = store.as_deref_mut() {
-                        self.persist_bank(
-                            store,
-                            bank as usize,
-                            KvReason::BankCheckpoint,
-                            self.warm_pin_min,
-                            true,
-                        );
-                    }
+            let prepared_b = match self.prepare_slot(&second, bank_hold_retry, store.as_deref_mut())
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let mut adapter = WriteAdapter(first.out);
+                    let mut driver = RollDriver::new(self.vocab);
+                    driver.push(prepared_a.into_slot(&mut adapter));
+                    let native_err = self
+                        .batch
+                        .continuous_generate(&mut driver)
+                        .err()
+                        .map(|e| e.to_string());
+                    let job = driver.slots.remove(&1).ok_or_else(|| {
+                        GenerateError::Engine("continuous driver lost the admitted job".into())
+                    });
+                    let a = match job {
+                        Ok(job) => self.finish_driven(job, native_err, store, cors_a),
+                        Err(error) => Err(error),
+                    };
+                    return [a, Err(error)];
                 }
-            }
-            if let Err(error) = native_result {
-                return Err(GenerateError::Engine(error.to_string()));
-            }
-            if !admitted {
-                /* Engine declined (oversized/budget): no bytes were sent,
-                 * the caller falls back to the serial lane. */
-                return Err(GenerateError::Unsupported(
-                    "continuous admission rejected; serial fallback",
-                ));
-            }
-            if !io_ok {
-                return Err(GenerateError::Io);
-            }
-            let (tail, outcome) = stepper.finalize(engine_eos, n_cached, n_computed, timings, cors);
-            if io_ok && !tail.is_empty() {
-                out.write_all(&tail).map_err(|_| GenerateError::Io)?;
-                let _ = out.flush();
-            }
-            Ok(outcome)
+            };
+            let mut adapter_a = WriteAdapter(first.out);
+            let mut adapter_b = WriteAdapter(second.out);
+            let mut driver = RollDriver::new(self.vocab);
+            driver.push(prepared_a.into_slot(&mut adapter_a));
+            driver.push(prepared_b.into_slot(&mut adapter_b));
+            let native_err = self
+                .batch
+                .continuous_generate(&mut driver)
+                .err()
+                .map(|error| error.to_string());
+            let a = match driver.slots.remove(&1) {
+                Some(job) => {
+                    self.finish_driven(job, native_err.clone(), store.as_deref_mut(), cors_a)
+                }
+                None => Err(GenerateError::Engine(
+                    "continuous driver lost the first job".into(),
+                )),
+            };
+            let b = match driver.slots.remove(&2) {
+                Some(job) => self.finish_driven(job, native_err, store, cors_b),
+                None => Err(GenerateError::Engine(
+                    "continuous driver lost the second job".into(),
+                )),
+            };
+            [a, b]
         }
 
         fn shutdown(&mut self, store: Option<&mut KvStore>) {

@@ -39,6 +39,8 @@ use crate::serve_static::{
     StaticSettle, STATIC_WIDTH_ERR,
 };
 
+#[path = "serve_owner_cont.rs"]
+mod owner_cont;
 #[path = "serve_owner_static.rs"]
 mod owner_static;
 use crate::stream::unix_now;
@@ -1656,7 +1658,8 @@ fn shutdown_owner(engine: &mut dyn DecodeIo, mut cont: Option<&mut dyn ContExec>
 }
 
 /// Client threads read and parse; this caller remains the sole non-`Send`
-/// inference owner and drains their FIFO one job at a time.
+/// inference owner. Continuous jobs roll: a second queued request can admit
+/// while the first is generating. Static jobs may coalesce. Serial stays FIFO.
 pub fn accept_loop_with_engine(
     listener: TcpListener,
     cfg: ServerConfig,

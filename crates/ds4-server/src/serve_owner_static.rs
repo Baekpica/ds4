@@ -33,8 +33,7 @@ pub(super) fn run_owner_maybe_coalesce(
     let env = static_route_env(exec, tokens.len() as i32);
     let dec = route_decide(job.prepared.parsed.needs, job.prepared.surface, &env);
     if dec.lane != LANE_STATIC {
-        run_owner_job(cfg, inner, engine, Some(exec), job);
-        return None;
+        return super::owner_cont::run_owner_maybe_roll(cfg, inner, engine, exec, job, jobs_rx);
     }
     let limits = exec
         .as_static()
