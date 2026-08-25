@@ -10,6 +10,8 @@ mod memory_snapshot;
 mod native_snapshot;
 mod options;
 mod plan;
+mod prefetch;
+mod reconnect;
 mod route;
 mod snapshot;
 mod snapshot_temp;
@@ -54,6 +56,17 @@ pub use options::{
     validate_layers_for_model, validate_options, CliResult, Layers, Options, Role, USAGE,
 };
 pub use plan::{build_route_plan, register_worker, CoordinatorView, RoutePlan, WorkerInfo};
+pub use prefetch::{
+    prefetch_depth, prefetch_depth_from, prefetch_disabled, prefetch_disabled_from,
+    prefetch_enabled_message, JobQueue, ERR_OOM_QUEUE, ERR_OOM_READ, PREFETCH_DEPTH_DEFAULT,
+    PREFETCH_DEPTH_MAX, PREFETCH_DEPTH_MIN,
+};
+pub use reconnect::{
+    cleared_sessions_message, connect_endpoint, connect_endpoint_once, connect_error,
+    connect_retryable, connected_message, disconnected_message, hello_failed_message, peer_name,
+    reconnect_with, retrying_message, sleep_reconnect, CONNECT_RETRY_ATTEMPTS, CONNECT_RETRY_DELAY,
+    RECONNECT_SLEEP,
+};
 pub use route::{
     decode_route_blob, encode_route_blob, validate_route_blob, ReturnTarget, RouteEntry,
 };

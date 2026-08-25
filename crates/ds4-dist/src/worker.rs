@@ -70,6 +70,39 @@ impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
         &mut self.store
     }
 
+    pub fn session_count(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn clear_sessions(&mut self) -> u32 {
+        let n = u32::try_from(self.sessions.len()).unwrap_or(u32::MAX);
+        self.sessions.clear();
+        n
+    }
+
+    pub(crate) fn apply_snapshot<Stream: Read + Write>(
+        &mut self,
+        stream: &mut Stream,
+        typ: u32,
+        body: &[u8],
+    ) -> std::io::Result<()> {
+        match dispatch_worker_snapshot(
+            stream,
+            typ,
+            body,
+            self.snapshot_identity(),
+            self.exec.vocab(),
+            &mut self.store,
+        ) {
+            Ok(Some((session_id, token_hash))) => {
+                self.sessions.insert(session_id, token_hash);
+            }
+            Ok(None) => {}
+            Err(_) => {}
+        }
+        Ok(())
+    }
+
     fn snapshot_identity(&self) -> WorkerSnapshotIdentity {
         WorkerSnapshotIdentity {
             model_id: self.exec.model_id(),
@@ -118,20 +151,7 @@ impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
                     }
                 }
                 MSG_SNAPSHOT_SAVE_REQ | MSG_SNAPSHOT_LOAD_BEGIN => {
-                    match dispatch_worker_snapshot(
-                        stream,
-                        typ,
-                        &body,
-                        self.snapshot_identity(),
-                        self.exec.vocab(),
-                        &mut self.store,
-                    ) {
-                        Ok(Some((session_id, token_hash))) => {
-                            self.sessions.insert(session_id, token_hash);
-                        }
-                        Ok(None) => {}
-                        Err(_) => {}
-                    }
+                    self.apply_snapshot(stream, typ, &body)?;
                 }
                 _ => {
                     write_frame(stream, MSG_ERROR, b"unsupported distributed worker frame")?;
@@ -144,10 +164,10 @@ impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
         }
     }
 
-    fn process_work<Stream: Read + Write>(
+    pub(crate) fn process_work<W: Write>(
         &mut self,
         payload: &[u8],
-        stream: &mut Stream,
+        stream: &mut W,
     ) -> std::io::Result<Option<Vec<u8>>> {
         if payload.len() < WORK_FIXED_BYTES {
             return Ok(Some(error_result_frame(
@@ -175,10 +195,10 @@ impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
         }
     }
 
-    fn handle_decoded<Stream: Read + Write>(
+    fn handle_decoded<W: Write>(
         &mut self,
         body: WorkBody,
-        stream: &mut Stream,
+        stream: &mut W,
     ) -> Result<Option<Vec<u8>>, String> {
         let work = body.work;
         let request_id = u64_from_halves(work.request_hi, work.request_lo);
