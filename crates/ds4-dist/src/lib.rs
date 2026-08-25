@@ -16,6 +16,7 @@ mod prefetch;
 mod reconnect;
 mod relay;
 mod route;
+mod serve_local;
 mod snapshot;
 mod snapshot_temp;
 mod transport;
@@ -76,8 +77,8 @@ pub use prefetch::{
 pub use reconnect::{
     cleared_sessions_message, connect_endpoint, connect_endpoint_once, connect_error,
     connect_retryable, connected_message, disconnected_message, hello_failed_message, peer_name,
-    reconnect_with, retrying_message, sleep_reconnect, CONNECT_RETRY_ATTEMPTS, CONNECT_RETRY_DELAY,
-    RECONNECT_SLEEP,
+    reconnect_local, reconnect_with, retrying_message, sleep_reconnect, LocalReconnect,
+    CONNECT_RETRY_ATTEMPTS, CONNECT_RETRY_DELAY, RECONNECT_SLEEP,
 };
 pub use relay::{
     forward_work_blocking, local_work_telemetry, now_sec, prepend_telemetry, usec_since, Forwarder,

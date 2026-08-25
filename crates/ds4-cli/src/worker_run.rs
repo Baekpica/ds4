@@ -72,6 +72,23 @@ mod tests {
     }
 
     #[test]
+    fn assemble_worker_compiles_against_reconnect_local() {
+        type SessionWorker<'m> = Worker<SessionSliceExec<'m>, SessionSnapshotStore<'m>>;
+        fn bind<'m, C, Sl, St>(
+            worker: &mut SessionWorker<'m>,
+            spec: ds4_dist::LocalReconnect<'_, C, Sl, St>,
+        ) -> std::io::Result<()>
+        where
+            C: FnMut() -> std::io::Result<std::net::TcpStream>,
+            Sl: FnMut(),
+            St: FnMut() -> bool,
+        {
+            ds4_dist::reconnect_local(worker, spec)
+        }
+        let _ = bind::<fn() -> std::io::Result<std::net::TcpStream>, fn(), fn() -> bool>;
+    }
+
+    #[test]
     fn worker_plan_matches_hello_and_layer_range() {
         let layers = Layers {
             start: 20,

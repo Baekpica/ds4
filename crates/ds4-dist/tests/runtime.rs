@@ -3,14 +3,15 @@
 use ds4_dist::{
     build_route_plan, decode_logits_payload, decode_result_body, dispatch_eval, encode_route_blob,
     encode_work_frame, format_telemetry_line, parse_cli, parse_layers, parse_role,
-    prepare_engine_options, read_frame, register_worker, resolved_layer_end, send_hello,
-    token_hash_update_span, token_span_hashes, validate_layers_for_model, validate_options,
-    work_with_ids, write_frame, Coordinator, CoordinatorView, EvalOutcome, ReturnTarget,
-    RouteEntry, SliceExec, Telemetry, Work, WorkBody, WorkOutput, WorkRequest, Worker, WorkerInfo,
-    MSG_ERROR, MSG_RESULT, RESULT_LOGITS, ROUTE_F_OUTPUT_LOGITS, ROUTE_RETURN_UPSTREAM,
-    TOKEN_HASH_INIT, WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS, WORK_F_RESET_SESSION,
+    prepare_engine_options, read_frame, reconnect_local, register_worker, resolved_layer_end,
+    send_hello, token_hash_update_span, token_span_hashes, validate_layers_for_model,
+    validate_options, work_with_ids, write_frame, Coordinator, CoordinatorView, EvalOutcome,
+    LocalReconnect, ReturnTarget, RouteEntry, SliceExec, Telemetry, Work, WorkBody, WorkOutput,
+    WorkRequest, Worker, WorkerInfo, MSG_ERROR, MSG_RESULT, RESULT_LOGITS, ROUTE_F_OUTPUT_LOGITS,
+    ROUTE_RETURN_UPSTREAM, TOKEN_HASH_INIT, WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS,
+    WORK_F_RESET_SESSION,
 };
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
@@ -787,4 +788,67 @@ fn accepted_hop_serve_once_unknown_frame_yields_error() {
     let (typ, body) = client.join().unwrap();
     assert_eq!(typ, MSG_ERROR);
     assert_eq!(body, b"unsupported distributed worker frame");
+}
+
+#[test]
+fn reconnect_local_keeps_coordinator_open_while_hop_work_completes() {
+    // Given: a coordinator TCP and a worker data listener
+    let coord_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let coord_addr = coord_listener.local_addr().unwrap();
+    let (data_listener, data_port) = ds4_dist::open_data_listener(Some("127.0.0.1"), 0).unwrap();
+    let frame = hop_work_frame(data_port);
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let (exec, logits) = hop_logits_exec();
+
+    let worker_thread = thread::spawn(move || {
+        let mut worker = Worker::new(exec);
+        let (hello, name) = worker.hello(u32::from(data_port), 128, "mock");
+        reconnect_local(
+            &mut worker,
+            LocalReconnect {
+                connect: || {
+                    let stream = TcpStream::connect(coord_addr)?;
+                    tune(&stream);
+                    Ok(stream)
+                },
+                hello: &hello,
+                model_name: &name,
+                sleep: || {},
+                should_stop: || stop_rx.try_recv().is_ok(),
+                listener: Some(&data_listener),
+            },
+        )
+    });
+
+    // When: HELLO stays on the coordinator while a hop WORK is served
+    let (mut coord, _) = coord_listener.accept().unwrap();
+    tune(&coord);
+    let _ = ds4_dist::recv_hello(&mut coord).unwrap();
+
+    let mut hop = TcpStream::connect(("127.0.0.1", data_port)).unwrap();
+    tune(&hop);
+    hop.write_all(&frame).unwrap();
+    let (typ, reply) = read_frame(&mut hop).unwrap();
+
+    // Then: hop RESULT arrives and the coordinator TCP is still open
+    assert_eq!(typ, MSG_RESULT);
+    let result = decode_result_body(&reply).unwrap();
+    assert_eq!(result.hdr.status, 0);
+    assert_eq!(result.hdr.result_kind, RESULT_LOGITS);
+    assert_eq!(decode_logits_payload(&result.payload).unwrap(), logits);
+    assert!(coord.peer_addr().is_ok());
+    coord
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let mut probe = [0u8; 1];
+    let idle = coord.read(&mut probe);
+    assert!(
+        matches!(&idle, Err(e) if e.kind() == std::io::ErrorKind::TimedOut
+            || e.kind() == std::io::ErrorKind::WouldBlock),
+        "coordinator must stay open (got {idle:?})"
+    );
+
+    stop_tx.send(()).unwrap();
+    drop(coord);
+    worker_thread.join().unwrap().unwrap();
 }
