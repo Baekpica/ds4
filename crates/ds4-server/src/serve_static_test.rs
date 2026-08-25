@@ -1,8 +1,11 @@
 use super::harness::{drive_static_chat, drive_static_chat_with, pair_jobs, SpyStatic};
 use super::*;
 use crate::generate::GenerateError;
-use crate::route::LANE_STATIC;
-use crate::WireSurface;
+use crate::route::{WireSurface, LANE_STATIC, NEED_STREAMING};
+
+fn peer(footprint: i64, peer_ok: bool) -> CoalescePeer {
+    CoalescePeer { footprint, peer_ok }
+}
 
 #[test]
 fn static_width_error_matches_c_bridge_string_when_n_lt_2() {
@@ -182,4 +185,120 @@ fn static_routed_request_settles_c_chat_terminal_when_n_eq_2() {
         "serial decode must not run: {text}"
     );
     assert_eq!(inner.runtime.requests_serial, 0);
+}
+
+#[test]
+fn coalesce_take_joins_two_queued_static_jobs_when_c_would() {
+    // Given: C coalesce_gather head + one static-peer-ok queued job under cap/budget
+    let queued = [peer(8, true)];
+    let limits = CoalesceLimits {
+        cap: 8,
+        max_tok_total: 4096,
+    };
+
+    // When
+    let take = coalesce_take(8, &queued, limits);
+
+    // Then: n=2 group (head kept, one extra taken)
+    assert_eq!(take, 1);
+}
+
+#[test]
+fn coalesce_take_stops_at_non_peer_to_preserve_fifo() {
+    // Given: next queued job is not static-peer-ok, a later one is
+    let queued = [peer(8, false), peer(8, true)];
+
+    // When
+    let take = coalesce_take(8, &queued, CoalesceLimits::UNBOUNDED);
+
+    // Then: C breaks on the non-batchable head; later peer stays queued
+    assert_eq!(take, 0);
+}
+
+#[test]
+fn coalesce_take_leaves_token_overflow_peer_queued() {
+    // Given: adding the next footprint would exceed max_tok_total
+    let queued = [peer(100, true)];
+    let limits = CoalesceLimits {
+        cap: 8,
+        max_tok_total: 150,
+    };
+
+    // When
+    let take = coalesce_take(100, &queued, limits);
+
+    // Then: C splits into another batch; head stays alone
+    assert_eq!(take, 0);
+}
+
+#[test]
+fn run_static_uses_c_fallback_when_ctx_overflows() {
+    // Given: n=2 fits gather but not StaticBatchContext width
+    let first = [10, 20];
+    let second = [30];
+    let jobs = pair_jobs(&first, &second);
+    let mut spy = SpyStatic {
+        ctx_max_seq: 1,
+        ..Default::default()
+    };
+
+    // When
+    let err = run_static(&mut spy, &jobs).unwrap_err();
+
+    // Then: C fallback text, generate_static skipped, never serial
+    assert_eq!(spy.calls, 0);
+    assert_eq!(spy.fallbacks, 1);
+    match err {
+        GenerateError::Engine(msg) => assert_eq!(msg, STATIC_FALLBACK_ERR),
+        other => panic!("expected Engine, got {other:?}"),
+    }
+}
+
+#[test]
+fn run_static_routed_coalesces_queued_sibling_when_c_would() {
+    // Given: one queued sibling C would join (peer-ok, under budget)
+    let current_tokens = [10, 20];
+    let current = StaticJob {
+        tokens: &current_tokens,
+        max_new_tokens: 8,
+        eos: -1,
+    };
+    let mut spy = SpyStatic {
+        siblings: vec![OwnedStaticJob {
+            tokens: vec![30],
+            max_new_tokens: 1,
+            eos: -1,
+        }],
+        ..Default::default()
+    };
+
+    // When
+    let rows = run_static_routed(&mut spy, current).unwrap();
+
+    // Then: one generate_static call at n=2
+    assert_eq!(spy.calls, 1);
+    assert_eq!(spy.ns, vec![2]);
+    assert_eq!(spy.fallbacks, 0);
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn static_peer_ok_matches_c_needs_free_openai() {
+    // Given: C job_static_peer_ok / needs==0 on OpenAI chat
+    let ok = StaticPeerSpec {
+        needs: 0,
+        surface: WireSurface::OpenaiChat,
+        cont_anthropic: false,
+        cont_responses: false,
+    };
+    let streaming = StaticPeerSpec {
+        needs: NEED_STREAMING,
+        surface: WireSurface::OpenaiChat,
+        cont_anthropic: false,
+        cont_responses: false,
+    };
+
+    // When / Then
+    assert!(static_peer_ok(ok));
+    assert!(!static_peer_ok(streaming));
 }

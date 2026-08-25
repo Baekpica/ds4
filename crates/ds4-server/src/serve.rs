@@ -38,6 +38,9 @@ use crate::serve_static::{
     run_static_routed, write_static_completion, DetachedStatic, StaticFinish, StaticJob, StaticRow,
     StaticSettle, STATIC_WIDTH_ERR,
 };
+
+#[path = "serve_owner_static.rs"]
+mod owner_static;
 use crate::stream::unix_now;
 
 #[derive(Debug, Clone)]
@@ -1616,11 +1619,29 @@ fn owner_loop(
         return;
     }
 
-    for job in jobs_rx {
-        match cont.as_mut() {
-            Some(exec) => run_owner_job(&cfg, &inner, engine, Some(&mut **exec), job),
-            None => run_owner_job(&cfg, &inner, engine, None, job),
-        }
+    let mut lookahead = None;
+    loop {
+        let job = match lookahead.take() {
+            Some(job) => job,
+            None => match jobs_rx.recv() {
+                Ok(job) => job,
+                Err(_) => break,
+            },
+        };
+        lookahead = match cont.as_mut() {
+            Some(exec) => owner_static::run_owner_maybe_coalesce(
+                &cfg,
+                &inner,
+                engine,
+                &mut **exec,
+                job,
+                &jobs_rx,
+            ),
+            None => {
+                run_owner_job(&cfg, &inner, engine, None, job);
+                None
+            }
+        };
     }
     shutdown_owner(engine, cont);
 }

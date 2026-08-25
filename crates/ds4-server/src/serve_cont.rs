@@ -797,7 +797,7 @@ mod native {
 
     use ds4_core::{BatchCtx, ContAdmit, ContDriver, Vocab, CONT_SAMPLE_GREEDY, CONT_SAMPLE_NONE};
 
-    use crate::serve_static::{BatchStatic, StaticExec, StaticJob, StaticRow};
+    use crate::serve_static::{BatchStatic, CoalesceLimits, StaticExec, StaticJob, StaticRow};
 
     /// Native continuous lane: one Rust owner call at a time over every bank
     /// exposed by the persistent native batch context.
@@ -1249,6 +1249,17 @@ mod native {
             jobs: &[StaticJob<'_>],
         ) -> Result<Vec<StaticRow>, GenerateError> {
             BatchStatic::new(&mut self.batch).generate_static(jobs)
+        }
+
+        fn ctx_max_seq(&self) -> i32 {
+            self.batch.max_seq()
+        }
+
+        fn coalesce_limits(&self) -> CoalesceLimits {
+            CoalesceLimits {
+                cap: self.batch.max_seq().max(1) as usize,
+                max_tok_total: 0,
+            }
         }
     }
 

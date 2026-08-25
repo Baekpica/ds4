@@ -2,6 +2,13 @@
 
 use crate::generate::GenerateError;
 
+#[path = "serve_static_coalesce.rs"]
+mod coalesce;
+pub use coalesce::{
+    coalesce_take, job_tok_footprint, static_ctx_overflow, static_peer_ok, CoalesceLimits,
+    CoalescePeer, StaticPeerSpec, COALESCE_HARD_MAX,
+};
+
 /// C `ds4_bridge_batch_ctx_generate_static` when `n` is not a legal width.
 pub const STATIC_WIDTH_ERR: &str = "static batch request count is out of range";
 
@@ -72,6 +79,18 @@ pub trait StaticExec {
         &[]
     }
 
+    fn coalesce_limits(&self) -> CoalesceLimits {
+        CoalesceLimits::UNBOUNDED
+    }
+
+    fn ctx_max_seq(&self) -> i32 {
+        i32::MAX
+    }
+
+    fn ctx_max_tokens(&self) -> i32 {
+        i32::MAX
+    }
+
     /// C per-call fallback after `generate_static` fails. Default: C err text.
     fn fallback_static(&mut self, err: GenerateError) -> Result<Vec<StaticRow>, GenerateError> {
         Err(static_fallback_error(err))
@@ -130,6 +149,17 @@ impl StaticExec for BatchStatic<'_, '_> {
             })
             .map_err(|err| GenerateError::Engine(err.message))
     }
+
+    fn ctx_max_seq(&self) -> i32 {
+        self.ctx.max_seq()
+    }
+
+    fn coalesce_limits(&self) -> CoalesceLimits {
+        CoalesceLimits {
+            cap: self.ctx.max_seq().max(1) as usize,
+            max_tok_total: 0,
+        }
+    }
 }
 
 /// Used when the route is static but no owner is attached (n<2 still refuses).
@@ -162,20 +192,42 @@ pub fn run_static(
     if let Some(msg) = static_width_error(jobs.len()) {
         return Err(GenerateError::Engine(msg.to_string()));
     }
+    let packed: i64 = jobs.iter().map(|job| job.tokens.len() as i64).sum();
+    if static_ctx_overflow(
+        jobs.len(),
+        packed,
+        exec.ctx_max_seq(),
+        exec.ctx_max_tokens(),
+    ) {
+        return exec.fallback_static(GenerateError::Engine(STATIC_FALLBACK_ERR.to_string()));
+    }
     match exec.generate_static(jobs) {
         Ok(rows) => Ok(rows),
         Err(err) => exec.fallback_static(err),
     }
 }
 
-/// Routed owner: current request plus any [`StaticExec::pending_siblings`].
+/// Routed owner: current request plus C-gathered [`StaticExec::pending_siblings`].
 pub fn run_static_routed(
     exec: &mut dyn StaticExec,
     current: StaticJob<'_>,
 ) -> Result<Vec<StaticRow>, GenerateError> {
     let siblings = exec.pending_siblings().to_vec();
-    let mut jobs = Vec::with_capacity(siblings.len() + 1);
-    for sibling in &siblings {
+    let limits = exec.coalesce_limits();
+    let peers: Vec<CoalescePeer> = siblings
+        .iter()
+        .map(|sibling| CoalescePeer {
+            footprint: job_tok_footprint(sibling.tokens.len(), sibling.max_new_tokens),
+            peer_ok: true,
+        })
+        .collect();
+    let take = coalesce_take(
+        job_tok_footprint(current.tokens.len(), current.max_new_tokens),
+        &peers,
+        limits,
+    );
+    let mut jobs = Vec::with_capacity(take + 1);
+    for sibling in siblings.iter().take(take) {
         jobs.push(StaticJob {
             tokens: &sibling.tokens,
             max_new_tokens: sibling.max_new_tokens,

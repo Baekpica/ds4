@@ -7,7 +7,8 @@ use crate::parse::ParsedRequest;
 use crate::serve::{handle_client_inner, ServerConfig, ServerInner};
 use crate::serve_cont::ContExec;
 use crate::serve_static::{
-    static_fallback_error, OwnedStaticJob, StaticExec, StaticFinish, StaticJob, StaticRow,
+    static_fallback_error, CoalesceLimits, OwnedStaticJob, StaticExec, StaticFinish, StaticJob,
+    StaticRow,
 };
 
 #[derive(Clone, Copy)]
@@ -16,17 +17,36 @@ pub(super) enum FailKind {
     Unsupported(&'static str),
 }
 
-#[derive(Default)]
 pub(super) struct SpyStatic {
     pub calls: usize,
     pub fallbacks: usize,
+    pub ns: Vec<usize>,
     pub siblings: Vec<OwnedStaticJob>,
     pub fail: Option<FailKind>,
+    pub ctx_max_seq: i32,
+    pub ctx_max_tokens: i32,
+    pub limits: CoalesceLimits,
+}
+
+impl Default for SpyStatic {
+    fn default() -> Self {
+        Self {
+            calls: 0,
+            fallbacks: 0,
+            ns: Vec::new(),
+            siblings: Vec::new(),
+            fail: None,
+            ctx_max_seq: i32::MAX,
+            ctx_max_tokens: i32::MAX,
+            limits: CoalesceLimits::UNBOUNDED,
+        }
+    }
 }
 
 impl StaticExec for SpyStatic {
     fn generate_static(&mut self, jobs: &[StaticJob<'_>]) -> Result<Vec<StaticRow>, GenerateError> {
         self.calls += 1;
+        self.ns.push(jobs.len());
         match self.fail {
             Some(FailKind::Engine(msg)) => Err(GenerateError::Engine(msg.to_string())),
             Some(FailKind::Unsupported(msg)) => Err(GenerateError::Unsupported(msg)),
@@ -47,6 +67,18 @@ impl StaticExec for SpyStatic {
 
     fn pending_siblings(&self) -> &[OwnedStaticJob] {
         &self.siblings
+    }
+
+    fn coalesce_limits(&self) -> CoalesceLimits {
+        self.limits
+    }
+
+    fn ctx_max_seq(&self) -> i32 {
+        self.ctx_max_seq
+    }
+
+    fn ctx_max_tokens(&self) -> i32 {
+        self.ctx_max_tokens
     }
 }
 
