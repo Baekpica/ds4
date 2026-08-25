@@ -1,4 +1,4 @@
-mod scan;
+pub(super) mod scan;
 
 use super::web_tools::parse_bool;
 use scan::{

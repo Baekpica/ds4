@@ -6,11 +6,14 @@ const THINK_CLOSE: &[u8] = b"</think>";
 const TOOL_UNSUPPORTED_ERROR: &str =
     "tool execution is not implemented in ds4-agent-rs; use ./ds4-agent";
 
+mod bash;
 mod edit;
 mod search;
 mod web_tools;
 mod write;
 
+#[cfg(test)]
+mod bash_parity;
 #[cfg(test)]
 mod edit_parity;
 #[cfg(test)]
@@ -331,6 +334,7 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
     };
     let mut web = web_tools::non_interactive_web();
     let mut read_cursor = web_tools::ReadCursor::default();
+    let mut bash_jobs = bash::BashTable::default();
     let mut output = Vec::new();
     loop {
         let room = session
@@ -358,8 +362,13 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
         transcript.push(model.token_eos());
 
         if web_tools::has_block(&raw) {
-            let round = web_tools::handle_round_with_cursor(&raw, &mut web, &mut read_cursor)
-                .map_err(|_| TOOL_UNSUPPORTED_ERROR.to_string())?;
+            let round = web_tools::handle_round_with_tools(
+                &raw,
+                &mut web,
+                &mut read_cursor,
+                &mut bash_jobs,
+            )
+            .map_err(|_| TOOL_UNSUPPORTED_ERROR.to_string())?;
             output.extend_from_slice(&project_output(&[&round.visible])?);
             model
                 .vocab()
@@ -391,7 +400,7 @@ fn help_text(name: &str) -> String {
     format!(
         "Usage: {name} --non-interactive -p TEXT [options]\n\
          \n\
-         One-turn ds4-agent shadow. Supports google_search, visit_page, read, more, list, search, write, and edit. \
+         One-turn ds4-agent shadow. Supports google_search, visit_page, read, more, list, search, write, edit, bash, bash_status, and bash_stop. \
          Use ./ds4-agent for other tools, interactive, KV, MTP, or distributed execution.\n\
          \n\
          Options:\n\
@@ -667,7 +676,7 @@ mod tests {
     fn help_names_the_supported_tool_subset() {
         let help = help_text("ds4-agent-rs");
         assert!(
-            help.contains("google_search, visit_page, read, more, list, search, write, and edit")
+            help.contains("google_search, visit_page, read, more, list, search, write, edit, bash, bash_status, and bash_stop")
         );
         assert!(!help.contains("Tool calls are rejected"));
     }

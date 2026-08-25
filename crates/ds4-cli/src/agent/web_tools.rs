@@ -645,10 +645,20 @@ fn handle_round<B: Browser>(raw: &[u8], web: &mut B) -> Result<ToolRound, String
     handle_round_with_cursor(raw, web, &mut ReadCursor::default())
 }
 
+#[cfg(test)]
 pub(super) fn handle_round_with_cursor<B: Browser>(
     raw: &[u8],
     web: &mut B,
     cursor: &mut ReadCursor,
+) -> Result<ToolRound, String> {
+    handle_round_with_tools(raw, web, cursor, &mut super::bash::BashTable::default())
+}
+
+pub(super) fn handle_round_with_tools<B: Browser>(
+    raw: &[u8],
+    web: &mut B,
+    cursor: &mut ReadCursor,
+    jobs: &mut super::bash::BashTable,
 ) -> Result<ToolRound, String> {
     let (open_at, open_len) = start(raw).ok_or_else(|| "missing DSML tool call".to_string())?;
     let calls = parse_calls(raw, open_at, open_len)?;
@@ -678,6 +688,19 @@ pub(super) fn handle_round_with_cursor<B: Browser>(
             }
             super::edit::EDIT => {
                 super::edit::edit_result(call.arg(PATH_ARG), call.arg("old"), call.arg("new"))
+            }
+            super::bash::BASH | super::bash::BASH_STATUS | super::bash::BASH_STOP => {
+                super::bash::bash_result(
+                    jobs,
+                    &call.name,
+                    &super::bash::BashArgs {
+                        command: call.arg("command"),
+                        timeout_sec: call.arg("timeout_sec"),
+                        refresh_sec: call.arg("refresh_sec"),
+                        job: call.arg("job"),
+                        pid: call.arg("pid"),
+                    },
+                )
             }
             super::search::SEARCH => match super::search::search_result(super::search::SearchArgs {
                 query: call.arg(QUERY_ARG),
@@ -817,7 +840,7 @@ mod tests {
             .position(|window| window == b"google_search")
             .map(|at| {
                 let mut raw = call("rust host");
-                raw.splice(at..at + "google_search".len(), b"bash".iter().copied());
+                raw.splice(at..at + "google_search".len(), b"xxxx".iter().copied());
                 raw
             })
             .expect("tool name");

@@ -21,7 +21,10 @@ static void oracle_usage(void)
             "read2 PATH | more PATH READ_COUNT RAW [COUNT...] | "
             "more-none [COUNT] | more-error PATH | list [PATH] | "
             "search [QUERY [PATH [MODE [GLOB [CASE [CONTEXT [MAX]]]]]]] | "
-            "write [PATH [CONTENT]] | edit [PATH [OLD [NEW]]]\n");
+            "write [PATH [CONTENT]] | edit [PATH [OLD [NEW]]] | "
+            "bash [COMMAND [TIMEOUT [REFRESH]]] | "
+            "bash-status [JOB [PID [REFRESH]]] | "
+            "bash-stop [JOB [PID [REFRESH]]]\n");
     exit(2);
 }
 
@@ -211,6 +214,82 @@ int main(int argc, char **argv)
         print_hex(result, strlen(result));
         free(result);
         agent_tool_call_free(&call);
+        return 0;
+    }
+
+    if (argc >= 2 && argc <= 5 && strcmp(argv[1], "bash") == 0) {
+        agent_worker worker = {0};
+        agent_tool_call call = {.name = xstrdup("bash")};
+        if (argc >= 3 && strcmp(argv[2], "-") != 0) {
+            agent_tool_call_add_arg(&call, "command", argv[2], strlen(argv[2]),
+                                    true);
+        }
+        if (argc >= 4 && strcmp(argv[3], "-") != 0) {
+            agent_tool_call_add_arg(&call, "timeout_sec", argv[3],
+                                    strlen(argv[3]), false);
+        }
+        if (argc >= 5 && strcmp(argv[4], "-") != 0) {
+            agent_tool_call_add_arg(&call, "refresh_sec", argv[4],
+                                    strlen(argv[4]), false);
+        }
+        const char *cmd = agent_tool_arg_value(&call, "command");
+        char *result;
+        if (!cmd || !cmd[0]) {
+            result = xstrdup("Tool error: bash requires command\n");
+        } else {
+            int timeout = agent_parse_timeout(agent_tool_arg_value(&call, "timeout_sec"));
+            int refresh = agent_parse_int_default(
+                agent_tool_arg_value(&call, "refresh_sec"), 60, 1, 3600);
+            char err[160] = {0};
+            agent_bash_job *job = agent_bash_start(&worker, cmd, timeout, err,
+                                                   sizeof(err));
+            if (!job) {
+                agent_buf b = {0};
+                agent_buf_puts(&b, "Tool error: bash failed to start: ");
+                agent_buf_puts(&b, err[0] ? err : "unknown error");
+                agent_buf_puts(&b, "\n");
+                result = agent_buf_take(&b);
+            } else {
+                result = agent_bash_job_tool_result(&worker, job, true, refresh,
+                                                    false, true);
+            }
+        }
+        print_hex(result, strlen(result));
+        free(result);
+        agent_tool_call_free(&call);
+        agent_bash_jobs_free(&worker);
+        return 0;
+    }
+
+    if (argc >= 2 && argc <= 5 &&
+        (strcmp(argv[1], "bash-status") == 0 ||
+         strcmp(argv[1], "bash-stop") == 0)) {
+        agent_worker worker = {0};
+        bool stop = strcmp(argv[1], "bash-stop") == 0;
+        int job_id = 0;
+        pid_t pid = 0;
+        int refresh = 60;
+        if (argc >= 3 && strcmp(argv[2], "-") != 0)
+            job_id = agent_parse_int_default(argv[2], 0, 0, INT_MAX);
+        if (argc >= 4 && strcmp(argv[3], "-") != 0)
+            pid = (pid_t)agent_parse_int_default(argv[3], 0, 0, INT_MAX);
+        if (argc >= 5 && strcmp(argv[4], "-") != 0)
+            refresh = agent_parse_int_default(argv[4], 60, 1, 3600);
+        agent_bash_job *job = agent_bash_find_job(&worker, job_id, pid);
+        char *result;
+        if (!job) {
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "Tool error: bash job not found: job=%d pid=%ld\n",
+                     job_id, (long)pid);
+            result = xstrdup(msg);
+        } else {
+            result = agent_bash_job_tool_result(&worker, job, stop, refresh,
+                                                stop, true);
+        }
+        print_hex(result, strlen(result));
+        free(result);
+        agent_bash_jobs_free(&worker);
         return 0;
     }
 

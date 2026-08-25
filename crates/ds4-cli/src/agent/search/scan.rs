@@ -105,7 +105,7 @@ fn glob_at(pattern: &[u8], pi: usize, name: &[u8], ni: usize) -> bool {
     }
 }
 
-pub(super) fn parse_int_default(value: Option<&str>, default: i32, min: i32, max: i32) -> i32 {
+pub(crate) fn parse_int_default(value: Option<&str>, default: i32, min: i32, max: i32) -> i32 {
     let Some(value) = value.filter(|value| !value.is_empty()) else {
         return default;
     };
