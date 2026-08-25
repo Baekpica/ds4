@@ -64,6 +64,80 @@ pub fn interrupt_end(interrupted: bool, generated: i32) -> InterruptEnd {
     }
 }
 
+pub const HISTORY_MAX_LEN: usize = 512;
+
+pub fn history_file_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    std::path::PathBuf::from(home.unwrap_or_else(|| ".".into())).join(".ds4_history")
+}
+
+pub struct History {
+    path: std::path::PathBuf,
+    lines: Vec<String>,
+}
+
+impl History {
+    pub fn load(path: std::path::PathBuf) -> Self {
+        let mut hist = Self {
+            path,
+            lines: Vec::new(),
+        };
+        let Ok(bytes) = std::fs::read(&hist.path) else {
+            return hist;
+        };
+        for raw in bytes.split(|byte| *byte == b'\n') {
+            if raw.is_empty() {
+                continue;
+            }
+            let mut entry = raw.to_vec();
+            for byte in &mut entry {
+                if *byte == b'\r' {
+                    *byte = b'\n';
+                }
+            }
+            hist.add(String::from_utf8_lossy(&entry).into_owned());
+        }
+        hist
+    }
+
+    pub fn add(&mut self, line: String) -> bool {
+        if line.is_empty() {
+            return false;
+        }
+        if self.lines.last().is_some_and(|last| last == &line) {
+            return false;
+        }
+        if self.lines.len() == HISTORY_MAX_LEN {
+            self.lines.remove(0);
+        }
+        self.lines.push(line);
+        true
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&self.path)?;
+        for line in &self.lines {
+            for &byte in line.as_bytes() {
+                file.write_all(&[if byte == b'\n' { b'\r' } else { byte }])?;
+            }
+            file.write_all(b"\n")?;
+        }
+        file.flush()
+    }
+
+    pub fn lines(&self) -> &[String] {
+        &self.lines
+    }
+}
+
 pub const REPL_HELP: &str = "\
 Commands:
   /help          Show this help.
@@ -368,5 +442,43 @@ mod tests {
         assert_eq!(interrupt_end(true, 1), InterruptEnd::KeepEos);
         assert_eq!(interrupt_end(false, 0), InterruptEnd::KeepEos);
         assert_eq!(interrupt_end(false, 4), InterruptEnd::KeepEos);
+    }
+
+    #[test]
+    fn history_path_add_and_cr_roundtrip_match_c() {
+        let old = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/tmp/ds4-home");
+        assert_eq!(
+            history_file_path(),
+            std::path::PathBuf::from("/tmp/ds4-home/.ds4_history")
+        );
+        std::env::set_var("HOME", "");
+        assert_eq!(
+            history_file_path(),
+            std::path::PathBuf::from("./.ds4_history")
+        );
+        match old {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "ds4-history-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let mut hist = History::load(path.clone());
+        assert!(hist.add("hello".into()));
+        assert!(!hist.add("hello".into()));
+        assert!(hist.add("a\nb".into()));
+        hist.save().unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(raw, b"hello\na\rb\n");
+        let loaded = History::load(path.clone());
+        assert_eq!(loaded.lines(), &["hello".to_string(), "a\nb".to_string()]);
+        let _ = std::fs::remove_file(path);
     }
 }

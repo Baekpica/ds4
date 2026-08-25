@@ -1062,6 +1062,7 @@ fn run_repl(model: &ds4_core::Model, mut args: ShadowArgs) -> Result<i32, String
     }
     let mut session = session_ready(model, &args, chat.ctx)?;
     let _sigint = repl::InterruptGuard::install();
+    let mut history = repl::History::load(repl::history_file_path());
 
     print!("{}", repl::REPL_HELP);
     let stdin = io::stdin();
@@ -1084,6 +1085,10 @@ fn run_repl(model: &ds4_core::Model, mut args: ShadowArgs) -> Result<i32, String
                 continue;
             }
             Err(error) => return Err(error.to_string()),
+        }
+        let cmd = repl::trim_inplace(&line);
+        if !cmd.is_empty() && history.add(cmd.to_string()) {
+            let _ = history.save();
         }
         match repl::parse_repl_line(&line) {
             Ok(repl::ReplLine::Empty) => {}
