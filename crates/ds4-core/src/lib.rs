@@ -89,12 +89,13 @@ use ds4_sys::{
     ds4_bridge_model_routed_quant_bits, ds4_bridge_model_run_distributed_worker,
     ds4_bridge_session, ds4_bridge_session_argmax, ds4_bridge_session_argmax_excluding,
     ds4_bridge_session_copy_logits, ds4_bridge_session_create, ds4_bridge_session_ctx,
-    ds4_bridge_session_distributed_route_ready, ds4_bridge_session_exaone_rewind_span,
-    ds4_bridge_session_free, ds4_bridge_session_generation, ds4_bridge_session_invalidate,
-    ds4_bridge_session_load_layer_payload, ds4_bridge_session_load_payload,
-    ds4_bridge_session_load_payload_range, ds4_bridge_session_load_snapshot,
-    ds4_bridge_session_output_head_bench, ds4_bridge_session_power, ds4_bridge_session_prefill_cap,
-    ds4_bridge_session_rewind, ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
+    ds4_bridge_session_distributed_route_ready, ds4_bridge_session_eval_layer_slice,
+    ds4_bridge_session_exaone_rewind_span, ds4_bridge_session_free, ds4_bridge_session_generation,
+    ds4_bridge_session_invalidate, ds4_bridge_session_load_layer_payload,
+    ds4_bridge_session_load_payload, ds4_bridge_session_load_payload_range,
+    ds4_bridge_session_load_snapshot, ds4_bridge_session_output_head_bench,
+    ds4_bridge_session_power, ds4_bridge_session_prefill_cap, ds4_bridge_session_rewind,
+    ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
     ds4_bridge_session_save_payload, ds4_bridge_session_save_snapshot,
     ds4_bridge_session_set_power, ds4_bridge_session_sync, ds4_bridge_session_top_logprobs,
     ds4_bridge_shard, ds4_bridge_snapshot, ds4_bridge_snapshot_create, ds4_bridge_snapshot_free,
@@ -1388,6 +1389,45 @@ impl Session<'_> {
         })
     }
 
+    /// Worker slice eval: native `ds4_session_eval_layer_slice`.
+    pub fn eval_layer_slice(&mut self, req: LayerSliceEval<'_>) -> Result<()> {
+        let n_tokens = u32::try_from(req.tokens.len()).map_err(|_| Error {
+            code: 1,
+            message: "layer slice token count exceeds u32".into(),
+        })?;
+        let mut err = [0u8; 512];
+        // SAFETY: [Category 8 — FFI] `raw` is a live session from create. Token
+        // and activation pointers are borrowed for the call only; empty slices
+        // still yield a non-null aligned pointer. Optional buffers pass NULL.
+        // The bridge does not retain the pointers.
+        let rc = unsafe {
+            ds4_bridge_session_eval_layer_slice(
+                self.raw.as_ptr(),
+                req.tokens.as_ptr(),
+                n_tokens,
+                req.pos0,
+                req.layer_start,
+                req.layer_end,
+                req.input_hc.map_or(ptr::null(), |values| values.as_ptr()),
+                req.output_hc
+                    .map_or(ptr::null_mut(), |values| values.as_mut_ptr()),
+                i32::from(req.logits.is_some()),
+                req.logits
+                    .map_or(ptr::null_mut(), |values| values.as_mut_ptr()),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(fail(rc, &err));
+        }
+        let prefix_len = (req.pos0 as usize).min(self.host.tokens().len());
+        let mut timeline = self.host.tokens()[..prefix_len].to_vec();
+        timeline.extend_from_slice(req.tokens);
+        self.host.replace_checkpoint(&timeline);
+        Ok(())
+    }
+
     pub fn eval_speculative_argmax(
         &mut self,
         first: i32,
@@ -1805,6 +1845,17 @@ impl Session<'_> {
     }
 }
 
+/// Inputs for [`Session::eval_layer_slice`].
+pub struct LayerSliceEval<'a> {
+    pub tokens: &'a [i32],
+    pub pos0: u32,
+    pub layer_start: u32,
+    pub layer_end: u32,
+    pub input_hc: Option<&'a [f32]>,
+    pub output_hc: Option<&'a mut [f32]>,
+    pub logits: Option<&'a mut [f32]>,
+}
+
 /// Inputs for [`Session::load_layer_payload`].
 pub struct LayerPayloadLoad<'a> {
     pub path: &'a Path,
@@ -1925,6 +1976,47 @@ mod tests {
         });
 
         assert_eq!(session.ctx(), 4096);
+    }
+
+    #[no_mangle]
+    extern "C" fn ds4_bridge_session_eval_layer_slice(
+        s: *mut ds4_bridge_session,
+        _tokens: *const i32,
+        _n_tokens: u32,
+        _pos0: u32,
+        _layer_start: u32,
+        _layer_end: u32,
+        _input_hc: *const f32,
+        _output_hc: *mut f32,
+        _output_logits: i32,
+        _logits: *mut f32,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        i32::from(s.is_null())
+    }
+
+    #[test]
+    fn eval_layer_slice_extends_host_timeline_from_pos0() {
+        let mut session = std::mem::ManuallyDrop::new(Session {
+            raw: NonNull::<ds4_bridge_session>::dangling(),
+            host: SessionLedger::new(ModelFamily::DeepSeek4, SessionBackend::Cuda, 4096, 1),
+            _model: PhantomData,
+            _not_send: PhantomData,
+        });
+        session.host.replace_checkpoint(&[1, 2, 3]);
+        session
+            .eval_layer_slice(LayerSliceEval {
+                tokens: &[4, 5],
+                pos0: 2,
+                layer_start: 20,
+                layer_end: 42,
+                input_hc: None,
+                output_hc: None,
+                logits: None,
+            })
+            .unwrap();
+        assert_eq!(session.host().tokens(), &[1, 2, 4, 5]);
     }
 
     #[test]

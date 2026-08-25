@@ -163,6 +163,17 @@ int ds4_bridge_eval_speculative_argmax(ds4_bridge_session *s,
                                        int32_t *accepted,
                                        int32_t accepted_cap,
                                        char *err, size_t errlen);
+int ds4_bridge_session_eval_layer_slice(ds4_bridge_session *s,
+                                        const int32_t *tokens,
+                                        uint32_t n_tokens,
+                                        uint32_t pos0,
+                                        uint32_t layer_start,
+                                        uint32_t layer_end,
+                                        const float *input_hc,
+                                        float *output_hc,
+                                        int32_t output_logits,
+                                        float *logits,
+                                        char *err, size_t errlen);
 int ds4_bridge_session_argmax(ds4_bridge_session *s);
 int ds4_bridge_session_argmax_excluding(ds4_bridge_session *s,
                                         int32_t excluded_id);

@@ -466,6 +466,40 @@ int ds4_bridge_eval(ds4_bridge_session *s, int32_t token,
     return ds4_session_eval(s->session, (int)token, err, errlen);
 }
 
+int ds4_bridge_session_eval_layer_slice(ds4_bridge_session *s,
+                                        const int32_t *tokens,
+                                        uint32_t n_tokens,
+                                        uint32_t pos0,
+                                        uint32_t layer_start,
+                                        uint32_t layer_end,
+                                        const float *input_hc,
+                                        float *output_hc,
+                                        int32_t output_logits,
+                                        float *logits,
+                                        char *err, size_t errlen)
+{
+    if (!s || !s->session) {
+        set_err(err, errlen, "session is NULL");
+        return 1;
+    }
+    if (!tokens && n_tokens != 0) {
+        set_err(err, errlen, "tokens is NULL");
+        return 1;
+    }
+    return ds4_session_eval_layer_slice(s->session,
+                                        tokens,
+                                        n_tokens,
+                                        pos0,
+                                        layer_start,
+                                        layer_end,
+                                        input_hc,
+                                        output_hc,
+                                        output_logits != 0,
+                                        logits,
+                                        err,
+                                        errlen);
+}
+
 int ds4_bridge_eval_speculative_argmax(ds4_bridge_session *s,
                                        int32_t first_token,
                                        int32_t max_tokens,

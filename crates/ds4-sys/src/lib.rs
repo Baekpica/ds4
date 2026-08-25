@@ -411,6 +411,21 @@ extern "C" {
         errlen: usize,
     ) -> c_int;
 
+    pub fn ds4_bridge_session_eval_layer_slice(
+        s: *mut ds4_bridge_session,
+        tokens: *const i32,
+        n_tokens: u32,
+        pos0: u32,
+        layer_start: u32,
+        layer_end: u32,
+        input_hc: *const f32,
+        output_hc: *mut f32,
+        output_logits: i32,
+        logits: *mut f32,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
     pub fn ds4_bridge_session_argmax(s: *mut ds4_bridge_session) -> c_int;
 
     pub fn ds4_bridge_session_argmax_excluding(
