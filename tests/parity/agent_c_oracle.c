@@ -18,8 +18,22 @@ static void oracle_usage(void)
     fprintf(stderr,
             "usage: agent_c_oracle prompt | datetime WHEN | dsml TEXT | "
             "project THINK CHUNK... | read PATH START MAX WHOLE RAW | "
-            "read2 PATH\n");
+            "read2 PATH | more PATH READ_COUNT RAW [COUNT...] | "
+            "more-none [COUNT] | more-error PATH\n");
     exit(2);
+}
+
+static void append_tool_result(agent_buf *all, int index, const char *name,
+                               char *result)
+{
+    char header[128];
+    snprintf(header, sizeof(header), "Tool result %d (%s):\n", index, name);
+    agent_buf_puts(all, header);
+    agent_buf_puts(all, result);
+    if (result[0] && result[strlen(result) - 1] != '\n') {
+        agent_buf_puts(all, "\n");
+    }
+    free(result);
 }
 
 int main(int argc, char **argv)
@@ -108,14 +122,71 @@ int main(int argc, char **argv)
         for (int i = 0; i < 2; i++) {
             agent_tool_call call = {.name = xstrdup("read")};
             agent_tool_call_add_arg(&call, "path", argv[2], strlen(argv[2]), true);
-            char *result = agent_tool_read(&worker, &call);
-            char header[128];
-            snprintf(header, sizeof(header), "Tool result %d (read):\n", i + 1);
-            agent_buf_puts(&all, header);
-            agent_buf_puts(&all, result);
-            if (result[0] && result[strlen(result) - 1] != '\n')
-                agent_buf_puts(&all, "\n");
-            free(result);
+            append_tool_result(&all, i + 1, "read",
+                               agent_tool_read(&worker, &call));
+            agent_tool_call_free(&call);
+        }
+        char *result = agent_buf_take(&all);
+        print_hex(result, strlen(result));
+        free(result);
+        return 0;
+    }
+
+    if (argc >= 5 && strcmp(argv[1], "more") == 0) {
+        agent_worker worker = {0};
+        agent_buf all = {0};
+        agent_tool_call read_call = {.name = xstrdup("read")};
+        agent_tool_call_add_arg(&read_call, "path", argv[2], strlen(argv[2]), true);
+        if (strcmp(argv[3], "-") != 0) {
+            agent_tool_call_add_arg(&read_call, "max_lines", argv[3],
+                                    strlen(argv[3]), false);
+        }
+        if (strcmp(argv[4], "-") != 0) {
+            agent_tool_call_add_arg(&read_call, "raw", argv[4],
+                                    strlen(argv[4]), false);
+        }
+        append_tool_result(&all, 1, "read",
+                           agent_tool_read(&worker, &read_call));
+        agent_tool_call_free(&read_call);
+
+        for (int i = 5; i < argc; i++) {
+            agent_tool_call more_call = {.name = xstrdup("more")};
+            if (strcmp(argv[i], "-") != 0) {
+                agent_tool_call_add_arg(&more_call, "count", argv[i],
+                                        strlen(argv[i]), false);
+            }
+            append_tool_result(&all, i - 3, "more",
+                               agent_tool_more(&worker, &more_call));
+            agent_tool_call_free(&more_call);
+        }
+        char *result = agent_buf_take(&all);
+        print_hex(result, strlen(result));
+        free(result);
+        return 0;
+    }
+
+    if ((argc == 2 || argc == 3) && strcmp(argv[1], "more-none") == 0) {
+        agent_worker worker = {0};
+        agent_tool_call call = {.name = xstrdup("more")};
+        if (argc == 3 && strcmp(argv[2], "-") != 0) {
+            agent_tool_call_add_arg(&call, "count", argv[2], strlen(argv[2]),
+                                    false);
+        }
+        char *result = agent_tool_more(&worker, &call);
+        print_hex(result, strlen(result));
+        free(result);
+        agent_tool_call_free(&call);
+        return 0;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "more-error") == 0) {
+        agent_worker worker = {0};
+        agent_buf all = {0};
+        agent_worker_set_more(&worker, argv[2], 1, false);
+        for (int i = 0; i < 2; i++) {
+            agent_tool_call call = {.name = xstrdup("more")};
+            append_tool_result(&all, 1, "more",
+                               agent_tool_more(&worker, &call));
             agent_tool_call_free(&call);
         }
         char *result = agent_buf_take(&all);

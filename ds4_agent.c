@@ -5439,6 +5439,15 @@ static bool agent_tool_result_fits_context(agent_worker *w, const char *result,
 static char *agent_read_range(agent_worker *w, const char *path, int start_line,
                               int max_lines, bool whole_file, bool bare,
                               bool set_more) {
+    char continued_path[PATH_MAX];
+    if (set_more) {
+        if (path == w->more_path) {
+            snprintf(continued_path, sizeof(continued_path), "%s", path);
+            path = continued_path;
+        }
+        agent_worker_set_more(w, NULL, 0, false);
+    }
+
     char err[256];
     char *data = NULL;
     size_t len = 0;
@@ -5461,8 +5470,10 @@ static char *agent_read_range(agent_worker *w, const char *path, int start_line,
     } else {
         if (max_lines <= 0) max_lines = AGENT_READ_DEFAULT_LINES;
     }
-    int end_idx = start_idx + max_lines;
-    if (end_idx > spans.len) end_idx = spans.len;
+    int end_idx = spans.len;
+    if (max_lines < spans.len - start_idx) {
+        end_idx = start_idx + max_lines;
+    }
 
     agent_buf out = {0};
     if (bare) {
