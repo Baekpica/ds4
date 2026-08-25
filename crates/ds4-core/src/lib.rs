@@ -864,7 +864,7 @@ fn pack_support(
 // Phase 8.6 model-bridge inventory (todo 45). No CUDA/mmap move this slice.
 // KEEP native (mmap GGUF + CUDA/VMM alloc + engine teardown):
 //   ds4_bridge_model_open / open_distributed (open_impl)
-//   ds4_bridge_model_free (Drop; todo 46 orders only)
+//   ds4_bridge_model_free (Drop: session before model, siblings before base)
 //   ds4_bridge_model_boot_prewarm (device graph/weight warm)
 // MOVE later (host already has the data, or production already left):
 //   ds4_bridge_model_id -> Shape::model_id from identify_gguf
@@ -1317,10 +1317,18 @@ impl Model {
     }
 }
 
+fn drop_model_native(raw: NonNull<ds4_bridge_model>) {
+    // SAFETY: [Category 8 — FFI boundary]
+    // `raw` is the unique owner from open, or a test dangling pointer
+    // whose free is stubbed. Drop runs this once. C `ds4_engine_close`
+    // closes MTP then DSpark siblings before the base GGUF; mmap and
+    // CUDA teardown stay in that C path (todo 45 KEEP).
+    unsafe { ds4_bridge_model_free(raw.as_ptr()) }
+}
+
 impl Drop for Model {
     fn drop(&mut self) {
-        // KEEP native: ds4_engine_close (mmap + CUDA). Todo 46: Drop order only.
-        unsafe { ds4_bridge_model_free(self.raw.as_ptr()) }
+        drop_model_native(self.raw);
     }
 }
 
@@ -1896,6 +1904,11 @@ pub struct LayerPayloadLoad<'a> {
 
 impl Drop for Session<'_> {
     fn drop(&mut self) {
+        // SAFETY: [Category 8 — FFI boundary]
+        // `self.raw` is the unique owner from `ds4_bridge_session_create`,
+        // or a test dangling pointer whose free is stubbed. Drop runs
+        // once. C `ds4_session_free` is NULL-safe. `'m` forbids Model
+        // Drop while this Session is live (session before model).
         unsafe { ds4_bridge_session_free(self.raw.as_ptr()) }
     }
 }
@@ -1903,6 +1916,7 @@ impl Drop for Session<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
 
     #[test]
     fn backend_codes_match_bridge_header() {
@@ -2125,5 +2139,109 @@ mod tests {
         let err = cstring_payload_path(&path).unwrap_err();
         assert_eq!(err.code, 1);
         assert_eq!(err.message, "payload path contains NUL");
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum DestroyKind {
+        Session,
+        SiblingMtp,
+        SiblingDspark,
+        Base,
+    }
+
+    fn c_destroy_order(
+        has_session: bool,
+        mtp_ready: bool,
+        dspark_ready: bool,
+    ) -> [Option<DestroyKind>; 4] {
+        let mut steps = [None; 4];
+        let mut i = 0usize;
+        if has_session {
+            steps[i] = Some(DestroyKind::Session);
+            i += 1;
+        }
+        if mtp_ready {
+            steps[i] = Some(DestroyKind::SiblingMtp);
+            i += 1;
+        }
+        if dspark_ready {
+            steps[i] = Some(DestroyKind::SiblingDspark);
+            i += 1;
+        }
+        steps[i] = Some(DestroyKind::Base);
+        steps
+    }
+
+    thread_local! {
+        static SESSION_FREE: Cell<u32> = const { Cell::new(0) };
+        static MODEL_FREE: Cell<u32> = const { Cell::new(0) };
+        static DESTROY_LOG: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    }
+
+    #[no_mangle]
+    extern "C" fn ds4_bridge_session_free(_s: *mut ds4_bridge_session) {
+        SESSION_FREE.with(|c| c.set(c.get() + 1));
+        DESTROY_LOG.with(|log| log.borrow_mut().push("session"));
+    }
+
+    #[no_mangle]
+    extern "C" fn ds4_bridge_model_free(_m: *mut ds4_bridge_model) {
+        MODEL_FREE.with(|c| c.set(c.get() + 1));
+        DESTROY_LOG.with(|log| log.borrow_mut().push("model"));
+    }
+
+    fn reset_destroy_stubs() {
+        SESSION_FREE.with(|c| c.set(0));
+        MODEL_FREE.with(|c| c.set(0));
+        DESTROY_LOG.with(|log| log.borrow_mut().clear());
+    }
+
+    #[test]
+    fn c_destroy_order_session_before_model_siblings_before_base() {
+        assert_eq!(
+            c_destroy_order(true, true, true),
+            [
+                Some(DestroyKind::Session),
+                Some(DestroyKind::SiblingMtp),
+                Some(DestroyKind::SiblingDspark),
+                Some(DestroyKind::Base),
+            ]
+        );
+        assert_eq!(
+            c_destroy_order(true, false, false),
+            [
+                Some(DestroyKind::Session),
+                Some(DestroyKind::Base),
+                None,
+                None,
+            ]
+        );
+        assert_eq!(
+            c_destroy_order(false, true, false),
+            [
+                Some(DestroyKind::SiblingMtp),
+                Some(DestroyKind::Base),
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn drop_order_session_before_model_via_stub_counters() {
+        reset_destroy_stubs();
+        let session = Session {
+            raw: NonNull::<ds4_bridge_session>::dangling(),
+            host: SessionLedger::new(ModelFamily::DeepSeek4, SessionBackend::Cuda, 4096, 1),
+            _model: PhantomData,
+            _not_send: PhantomData,
+        };
+        drop(session);
+        drop_model_native(NonNull::<ds4_bridge_model>::dangling());
+        assert_eq!(SESSION_FREE.with(Cell::get), 1);
+        assert_eq!(MODEL_FREE.with(Cell::get), 1);
+        DESTROY_LOG.with(|log| {
+            assert_eq!(*log.borrow(), ["session", "model"]);
+        });
     }
 }
