@@ -52,6 +52,7 @@ pub struct ShadowArgs {
     pub prompt: Option<String>,
     pub prompt_file: Option<String>,
     pub dump_logprobs: Option<String>,
+    pub dump_logits: Option<String>,
     pub logprobs_top_k: i32,
     pub temp: f32,
     pub top_p: f32,
@@ -100,6 +101,7 @@ impl Default for ShadowArgs {
             prompt: None,
             prompt_file: None,
             dump_logprobs: None,
+            dump_logits: None,
             logprobs_top_k: 20,
             temp: 1.0,
             top_p: 1.0,
@@ -207,6 +209,12 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
                     return Err("specify only one prompt source".into());
                 }
                 parsed.prompt_file = Some(require_value(&arg, iter.next())?);
+            }
+            "--dump-logits" => {
+                parsed.dump_logits = Some(
+                    iter.next()
+                        .ok_or_else(|| "ds4: missing value for --dump-logits".to_string())?,
+                );
             }
             "--dump-logprobs" => {
                 parsed.dump_logprobs = Some(require_value(&arg, iter.next())?);
@@ -785,6 +793,133 @@ fn json_token(model: &ds4_core::Model, token: i32) -> String {
     s
 }
 
+struct LogitsDumpJson<'a> {
+    model: &'a str,
+    backend: &'a str,
+    quant_bits: i32,
+    prompt_tokens: i32,
+    ctx: i32,
+    argmax_token_json: &'a str,
+    argmax_logit: f32,
+    logits: &'a [f32],
+}
+
+fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Cuda => "cuda",
+        Backend::Metal => "metal",
+        Backend::Cpu => "cpu",
+    }
+}
+
+fn json_escape_str(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_logit(v: f32) -> String {
+    if v.is_finite() {
+        format!("{v}")
+    } else {
+        "null".into()
+    }
+}
+
+fn format_logits_json(dump: &LogitsDumpJson<'_>) -> String {
+    let mut body = String::from("{\n  \"source\":\"ds4\",\n  \"model\":");
+    body.push_str(&json_escape_str(dump.model));
+    body.push_str(&format!(
+        ",\n  \"backend\":\"{}\",\n  \"quant_bits\":{},\n  \"prompt_tokens\":{},\n  \"ctx\":{},\n  \"vocab\":{},\n  \"argmax_token\":{},\n  \"argmax_logit\":{},\n  \"logits\":[",
+        dump.backend,
+        dump.quant_bits,
+        dump.prompt_tokens,
+        dump.ctx,
+        dump.logits.len(),
+        dump.argmax_token_json,
+        json_logit(dump.argmax_logit),
+    ));
+    for (i, logit) in dump.logits.iter().enumerate() {
+        if i > 0 {
+            body.push(',');
+        }
+        if i % 8 == 0 {
+            body.push_str("\n    ");
+        }
+        body.push_str(&json_logit(*logit));
+    }
+    body.push_str("\n  ]\n}\n");
+    body
+}
+
+fn write_logits_file(path: &str, body: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut fp = std::fs::File::create(path)
+        .map_err(|_| format!("ds4: failed to open --dump-logits file: {path}"))?;
+    fp.write_all(body.as_bytes()).map_err(|e| e.to_string())?;
+    fp.flush()
+        .map_err(|_| format!("ds4: failed to close --dump-logits file: {path}"))?;
+    Ok(())
+}
+
+fn run_logits_dump(
+    model: &ds4_core::Model,
+    args: &ShadowArgs,
+    prompt_text: &str,
+) -> Result<i32, String> {
+    const THINK_NONE: i32 = 0;
+    const THINK_LOW: i32 = 1;
+
+    let think = if args.nothink { THINK_NONE } else { THINK_LOW };
+    let prompt = if is_rendered_chat_prompt(prompt_text) {
+        model.tokenize_rendered_chat(prompt_text)
+    } else {
+        model.encode_chat_prompt(Some(args.system.as_str()), prompt_text, think)
+    }
+    .map_err(|e| e.to_string())?;
+    let n_prompt = prompt.len() as i32;
+    let ctx = args.ctx;
+    let mut session = session_ready(model, args, ctx)?;
+    session.sync(&prompt).map_err(|e| e.to_string())?;
+
+    let vocab = model.vocab().n_vocab() as usize;
+    let logits = session.copy_logits(vocab).map_err(|e| e.to_string())?;
+    let argmax = session.argmax();
+    let argmax_logit = if argmax >= 0 {
+        logits.get(argmax as usize).copied().unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let argmax_token_json = json_token(model, argmax);
+    let path = args
+        .dump_logits
+        .as_deref()
+        .ok_or_else(|| "ds4: missing value for --dump-logits".to_string())?;
+    let body = format_logits_json(&LogitsDumpJson {
+        model: args.model.as_deref().unwrap_or("ds4flash.gguf"),
+        backend: backend_name(args.backend),
+        quant_bits: model.routed_quant_bits(),
+        prompt_tokens: n_prompt,
+        ctx,
+        argmax_token_json: &argmax_token_json,
+        argmax_logit,
+        logits: &logits,
+    });
+    write_logits_file(path, &body)?;
+    Ok(0)
+}
+
 pub fn help_text(name: &str) -> String {
     format!(
         "\
@@ -808,6 +943,8 @@ Usage:
   {name} -m MODEL [--mtp GGUF] [--dspark GGUF] ...
   {name} --cuda -m MODEL --temp 0 -n N [--nothink] --dump-logprobs F \\
       --logprobs-top-k K (-p PROMPT | --prompt-file FILE)
+  {name} --cuda -m MODEL [--nothink] --dump-logits F \\
+      (-p PROMPT | --prompt-file FILE)
 
 --mtp/--dspark attach the DeepSeek-only sibling support models; the host
 resolves each sibling bind catalog + expected layouts, native skips that
@@ -815,6 +952,7 @@ sibling's name walk and layout check.
 --dump-logprobs mirrors the C CLI proof loop (chat-template encode via
 the engine, argmax decode, host stop set); ctx grows to fit prompt+n
 unless -c is explicit.
+--dump-logits writes full next-token logits as JSON after prompt prefill.
 One-shot sampling uses the native C sampler; an explicit --seed is
 reproducible across the C and Rust hosts.
 Thinking tags follow the C non-TTY byte contract; ANSI coloring is omitted.
@@ -964,15 +1102,20 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
         && args.prompt.is_none()
         && args.prompt_file.is_none()
         && args.dump_logprobs.is_none()
+        && args.dump_logits.is_none()
         && !args.lifecycle_only
         && !raw_token_diagnostic;
     if !want_repl
         && !worker
         && args.dump_logprobs.is_none()
+        && args.dump_logits.is_none()
         && !args.lifecycle_only
         && !raw_token_diagnostic
     {
         validate_one_shot_args(&args)?;
+    }
+    if !worker && args.dump_logits.is_some() && generation_text.is_none() {
+        return Err("--dump-logits requires -p or --prompt-file".into());
     }
     if !worker && args.dump_logprobs.is_some() && generation_text.is_none() {
         return Err("--dump-logprobs requires -p or --prompt-file".into());
@@ -1008,6 +1151,16 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
         return model
             .run_distributed_worker(args.ctx)
             .map_err(|e| e.to_string());
+    }
+
+    if args.dump_logits.is_some() {
+        return run_logits_dump(
+            &model,
+            &args,
+            generation_text
+                .as_deref()
+                .ok_or_else(|| "--dump-logits requires -p or --prompt-file".to_string())?,
+        );
     }
 
     if args.dump_logprobs.is_some() {
@@ -1664,5 +1817,55 @@ mod tests {
         let parsed = parse_args(args(&["--layout", "flash"])).unwrap();
         assert!(parsed.layout);
         assert_eq!(parsed.layout_variant.as_deref(), Some("flash"));
+    }
+
+    #[test]
+    fn parses_dump_logits() {
+        let parsed = parse_args(args(&["--dump-logits", "/tmp/logits.json"])).unwrap();
+        assert_eq!(parsed.dump_logits.as_deref(), Some("/tmp/logits.json"));
+        assert!(parsed.dump_logprobs.is_none());
+    }
+
+    #[test]
+    fn help_contains_dump_logits() {
+        assert!(help_text("ds4-rs").contains("--dump-logits"));
+    }
+
+    #[test]
+    fn dump_logits_missing_value_errors_like_c() {
+        assert_eq!(
+            parse_args(args(&["--dump-logits"])).unwrap_err(),
+            "ds4: missing value for --dump-logits"
+        );
+    }
+
+    #[test]
+    fn dump_logits_missing_file_errors_like_c() {
+        let dir = std::env::temp_dir().join("ds4-dump-logits-not-a-file");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_str().unwrap();
+        let err = write_logits_file(path, "{}").unwrap_err();
+        assert_eq!(
+            err,
+            format!("ds4: failed to open --dump-logits file: {path}")
+        );
+    }
+
+    #[test]
+    fn dump_logits_json_matches_c_shape() {
+        let body = format_logits_json(&LogitsDumpJson {
+            model: "m.gguf",
+            backend: "cuda",
+            quant_bits: 2,
+            prompt_tokens: 3,
+            ctx: 128,
+            argmax_token_json: "{\"id\":1,\"text\":\"a\",\"bytes\":[97]}",
+            argmax_logit: 1.5,
+            logits: &[1.0, 1.5, f32::INFINITY],
+        });
+        assert_eq!(
+            body,
+            "{\n  \"source\":\"ds4\",\n  \"model\":\"m.gguf\",\n  \"backend\":\"cuda\",\n  \"quant_bits\":2,\n  \"prompt_tokens\":3,\n  \"ctx\":128,\n  \"vocab\":3,\n  \"argmax_token\":{\"id\":1,\"text\":\"a\",\"bytes\":[97]},\n  \"argmax_logit\":1.5,\n  \"logits\":[\n    1,1.5,null\n  ]\n}\n"
+        );
     }
 }
