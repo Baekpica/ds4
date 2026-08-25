@@ -267,15 +267,90 @@ Rust binary SHA-256 was
 `3fd0e40320d06eae6891c5399fe622df16b9dfdfa081d92dd1df1519ff003736`.
 Every resident exited before `clear_cache`; final inspection found no GPU
 compute application or listener and 117 GiB available. This is a correctness
-and cross-read gate, not an ABBA performance claim, and it does not cover
-Motif/Solar callback semantics or continuous-bank ownership.
+and cross-read gate, not an ABBA performance claim, and it does not itself
+cover Motif/Solar callback semantics or the separately green width-1 bank lane.
 
-This is still not the whole Phase 4 gate. Continuous-bank checkpoints, the
-default configured 10,000-token/effective aligned 10,240-token interval, and
-full default-policy ABBA remain pending. Intermediate-prefill is green only for
-the scoped DeepSeek CUDA, OpenAI Chat, no-think/no-tools, ordinary-serial lane
-above; other families and surfaces remain pending. Tool-map replay retains its
-separately scoped limitations above.
+#### Width-1 continuous-bank shutdown checkpoint
+
+The scoped Motif-3 OpenAI Chat, no-think/no-tools bank lane is live-green under
+`scratch/rust-host-live/bank-fourway-20260825-093322/`. `e9dfd77` exposes
+opaque native bank snapshots and bounded payload save/load, `0e4a178` adds the
+strict-suffix bank candidate, and `15b016c` owns width-1 host metadata/policy,
+warm/disk admit, retirement, checkpoint/evict/shutdown persistence, and
+graceful shutdown ordering. CPU/oracle/link gates at that commit were
+`make test-kv-parity` (38 unit + 11 cross-language),
+`make test-server-parity` (88 unit + all integration matrices), and
+`make ds4-server-rs`. The native rolling scheduler and opaque bank payload
+remain C.
+
+The live fixture used the 94,162,541,472-byte
+`Motif-3-MQ87-88-FIT.gguf`, ctx 8,192, max output 128, temperature 0,
+thinking disabled, no tools, disk budget 2,048 MiB, minimum checkpoint 512,
+`cold=0`, `continued=0`, and `DS4_SERVER_BANK_CHECKPOINT=0`. The C oracle
+allocated two banks while Rust used `--cont-width 1`; every cell admitted one
+request into bank 0, so this is not multi-bank evidence. Producer and loader
+request SHA-256 values were `a765063d...` and `14042672...`.
+
+C and Rust graceful-shutdown producers wrote the same
+`3faf064c1bf3e92ef70f356f5c1c7baeb0dd62bc.kv`:
+
+```text
+size:          301,972,407 bytes
+reason/ext:    8 / 16 (bank-shutdown / EXT_BANK_REPLAY_V1)
+quant/model:   2 / 3
+tokens/ctx:    6,896 / 8,192
+text/payload:  24,591 / 301,947,764 bytes
+trailer:       0 bytes
+text SHA-256:  bb9a55e900337c73272f430fc3b66efa01966e6ba70fe31ec01a4e60aea9856c
+payload SHA:   df417b44399e62795a644431dafa537c5780a5753ab4d193d73f4c43208044c2
+```
+
+Each loader was a fresh process with an isolated copy of the selected record:
+
+```text
+C save    → Rust load   PASS  cached=6896 computed=15 output=4
+Rust save → C load      PASS  cached=6896 computed=15 output=4
+Rust save → Rust load   PASS  cached=6896 computed=15 output=4
+C save    → C load      PASS  cached=6896 computed=15 output=4
+```
+
+All four returned `RESTORED_OK`, finish `stop`, prompt tokens 6,911, and the
+continuous OpenAI Chat route. The C binary SHA-256 was `04f25a86...`; the Rust
+four-way/ABBA binary was `287c821a...` at `15b016c`.
+
+The same C-produced bank record then drove a 114-token C→Rust→Rust→C restore
+ABBA. The request SHA-256 was `d68b6990...`, and all completion text was exact
+(`faf7c021...`):
+
+| Cell | Prefill tok/s | Decode tok/s | TTFT ms | Device census GiB |
+|---|---:|---:|---:|---:|
+| C #1 | 76.0 | 14.9 | 375.0 | 99.15 |
+| Rust #1 | 76.4 | 14.8 | 388.4 | 98.82 |
+| Rust #2 | 76.1 | 14.7 | 387.4 | 98.82 |
+| C #2 | 76.1 | 14.9 | 398.7 | 99.15 |
+
+C/Rust means were 76.05/76.25 tok/s prefill, 14.90/14.75 tok/s decode
+(-1.01%), and 386.85/387.90 ms TTFT (+0.27%), inside the provisional gate.
+Peak host RSS was not captured, so this is not full memory-performance
+closure.
+
+Commit `98d81b9` then passed native continuous decode duration/token/step
+through the opaque callback; CUDA execution and bank behavior did not change.
+Its bridge/core/server/KV/link gates are green. A post-fix C→Rust short loader
+cell used Rust binary `6c25d952...` and returned `RESTORED_OK` with
+cached/computed/output 6,896/15/4, 12.3 decode tok/s, and 1.25 tok/step. That
+matches the C loader cells' 12.0--12.1 tok/s and 1.25 tok/step and closes the
+short-response timing-porcelain discrepancy. The 114-token ABBA was not
+repeated after this timing-only commit; its `15b016c` binary provenance remains
+explicit above.
+
+This is still not the whole Phase 4 gate. Live default configured
+10,000-token/effective aligned 10,240-token reason-bank-checkpoint, live
+reason-bank-evict, full default-policy ABBA, multi-bank fork/partial and
+pin/claim behavior, bank tool/thinking/extension integration, other families
+and surfaces, and peak host-RSS/soak evidence remain pending.
+Intermediate-prefill and tool-map replay retain their separately scoped
+limitations above.
 
 ### Phase 5 — web utility
 
@@ -325,12 +400,13 @@ Live Motif generate: content/finish/usage-count/`cache_write_tokens`
 match. Live CUDA census: `census_supported=1` epoch=1636
 weight_artifact 86.07 GiB (`scratch/rust-host-live/`).
 Serial buffered responses emit a C-shaped `timings` object.
-Live Motif width-1 continuous and the Rust smoke/long/OPP-C proof
-harness are green. Remaining: static lane, live multi-client rolling
-width, Anthropic/Responses continuous, and the full live API fixture
-inventory. `DS4_SERVER_CLIENT_SNDBUF` is also not applied by the safe
-stdlib socket path, so the pinned-buffer live slow-reader leg remains
-pending.
+Live Motif width-1 continuous, scoped no-think/no-tools bank shutdown/replay,
+and the Rust smoke/long/OPP-C proof harness are green. Remaining: static lane,
+live multi-client rolling width and multi-bank fork/partial semantics,
+bank tool/thinking/extension integration, Anthropic/Responses continuous, and
+the full live API fixture inventory. `DS4_SERVER_CLIENT_SNDBUF` is also not
+applied by the safe stdlib socket path, so the pinned-buffer live slow-reader
+leg remains pending.
 Do not improve the table.
 
 All four surfaces:
