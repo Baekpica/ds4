@@ -381,7 +381,7 @@ fn help_text(name: &str) -> String {
     format!(
         "Usage: {name} --non-interactive -p TEXT [options]\n\
          \n\
-         One-turn ds4-agent shadow. Supports google_search, visit_page, read, and more. \
+         One-turn ds4-agent shadow. Supports google_search, visit_page, read, more, and list. \
          Use ./ds4-agent for other tools, interactive, KV, MTP, or distributed execution.\n\
          \n\
          Options:\n\
@@ -656,7 +656,7 @@ mod tests {
     #[test]
     fn help_names_the_supported_tool_subset() {
         let help = help_text("ds4-agent-rs");
-        assert!(help.contains("google_search, visit_page, read, and more"));
+        assert!(help.contains("google_search, visit_page, read, more, and list"));
         assert!(!help.contains("Tool calls are rejected"));
     }
 }

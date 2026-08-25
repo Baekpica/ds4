@@ -1,6 +1,7 @@
 use super::TOOL_UNSUPPORTED_ERROR;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +16,7 @@ const VISIT_PAGE: &str = "visit_page";
 const URL_ARG: &str = "url";
 const READ_FILE: &str = "read";
 const MORE_FILE: &str = "more";
+const LIST_DIR: &str = "list";
 const PATH_ARG: &str = "path";
 const COUNT_ARG: &str = "count";
 const START_LINE_ARG: &str = "start_line";
@@ -25,6 +27,7 @@ const FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
 const RESULT_MAX_BYTES: usize = 128 * 1024;
 const READ_ERROR_MAX_BYTES: usize = 255;
 const READ_DEFAULT_LINES: usize = 500;
+const LIST_MAX_ENTRIES: usize = 300;
 const WEB_HEAD_BYTES: usize = 8 * 1024;
 const WEB_HEAD_LINES: usize = 100;
 const TEMP_ATTEMPTS: u64 = 1024;
@@ -463,6 +466,62 @@ fn more_result(call: &ToolCall, cursor: &mut ReadCursor) -> Vec<u8> {
     read_range(&path, next_line, Some(count), mode, cursor)
 }
 
+fn list_entry_type(file_type: std::fs::FileType) -> u8 {
+    if file_type.is_dir() {
+        b'd'
+    } else if file_type.is_symlink() {
+        b'l'
+    } else if file_type.is_file() {
+        b'-'
+    } else {
+        b'?'
+    }
+}
+
+fn list_result(call: &ToolCall) -> Vec<u8> {
+    let path = call
+        .arg(PATH_ARG)
+        .filter(|path| !path.is_empty())
+        .unwrap_or(".");
+    let dir = match std::fs::read_dir(path) {
+        Ok(dir) => dir,
+        Err(error) => {
+            return format!("Tool error: opendir failed: {}\n", io_detail(&error)).into_bytes();
+        }
+    };
+
+    let mut out = ResultBuf::default();
+    out.append(format!("{path}:\n").as_bytes());
+    let mut shown = 0usize;
+    let mut omitted = false;
+    for entry in dir {
+        let Ok(entry) = entry else {
+            break;
+        };
+        if shown >= LIST_MAX_ENTRIES {
+            omitted = true;
+            break;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let file_type = meta.file_type();
+        let mut line =
+            format!("{} {:10} ", list_entry_type(file_type) as char, meta.len()).into_bytes();
+        line.extend_from_slice(entry.file_name().as_bytes());
+        if file_type.is_dir() {
+            line.push(b'/');
+        }
+        line.push(b'\n');
+        out.append(&line);
+        shown += 1;
+    }
+    if omitted {
+        out.append(b"... more entries omitted ...\n");
+    }
+    out.into_vec()
+}
+
 fn count_lines(text: &str) -> usize {
     if text.is_empty() {
         return 0;
@@ -613,6 +672,7 @@ pub(super) fn handle_round_with_cursor<B: Browser>(
             VISIT_PAGE => visit_result(web, call.arg(URL_ARG)).into_bytes(),
             READ_FILE => read_result(call, cursor),
             MORE_FILE => more_result(call, cursor),
+            LIST_DIR => list_result(call),
             _ => return Err(TOOL_UNSUPPORTED_ERROR.into()),
         };
         observation.append(format!("Tool result {} ({}):\n", index + 1, call.name).as_bytes());
@@ -1302,5 +1362,125 @@ mod tests {
         sequence.extend_from_slice(&empty.observation);
         assert_eq!(sequence, c_more_error(relative_text));
         std::fs::remove_file(target).unwrap();
+    }
+
+    fn list_call(path: Option<&str>) -> Vec<u8> {
+        let arg = path
+            .map(|path| {
+                format!(
+                    "<｜DSML｜parameter name=\"path\" string=\"true\">{path}</｜DSML｜parameter>\n"
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "<｜DSML｜tool_calls>\n\
+             <｜DSML｜invoke name=\"list\">\n\
+             {arg}\
+             </｜DSML｜invoke>\n\
+             </｜DSML｜tool_calls>"
+        )
+        .into_bytes()
+    }
+
+    fn list_root() -> PathBuf {
+        let path = PathBuf::from(format!(
+            "/tmp/ds4_agent_list_{}_{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn c_list_bytes(path: Option<&str>) -> Vec<u8> {
+        let oracle = oracle();
+        assert!(oracle.exists(), "build C oracle: make test-agent-parity");
+        let mut command = std::process::Command::new(oracle);
+        command.arg("list");
+        match path {
+            Some(path) => {
+                command.arg(path);
+            }
+            None => {}
+        }
+        c_hex(&mut command)
+    }
+
+    fn c_list_observation(path: Option<&str>) -> Vec<u8> {
+        let result = c_list_bytes(path);
+        let mut observation = ResultBuf::default();
+        observation.append(b"Tool result 1 (list):\n");
+        observation.append(&result);
+        if !result.is_empty() && !result.ends_with(b"\n") {
+            observation.push(b'\n');
+        }
+        observation.into_vec()
+    }
+
+    #[test]
+    fn list_path_hidden_symlink_and_errors_match_c_oracle() {
+        let root = list_root();
+        let root_text = root.to_str().expect("UTF-8 list fixture");
+        std::fs::write(root.join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir(root.join("subdir")).unwrap();
+        std::fs::write(root.join(".hidden"), b"x").unwrap();
+        std::os::unix::fs::symlink("a.txt", root.join("link")).unwrap();
+        let file_path = root.join("a.txt");
+        let file_text = file_path.to_str().expect("UTF-8 file path");
+        let missing = root.join("missing");
+        let missing_text = missing.to_str().expect("UTF-8 missing path");
+        let mut web = FakeWeb {
+            result: Ok(String::new()),
+        };
+
+        let listed = handle_round(&list_call(Some(root_text)), &mut web).expect("list tool");
+        assert_eq!(listed.observation, c_list_observation(Some(root_text)));
+        let observation = std::str::from_utf8(&listed.observation).unwrap();
+        assert!(observation.starts_with(&format!("Tool result 1 (list):\n{root_text}:\n")));
+        assert!(observation.contains(".hidden"));
+        assert!(observation.contains("link"));
+        assert!(observation.contains("subdir/"));
+
+        let missing_path =
+            handle_round(&list_call(Some(missing_text)), &mut web).expect("missing list path");
+        assert_eq!(
+            missing_path.observation,
+            c_list_observation(Some(missing_text))
+        );
+        assert!(missing_path
+            .observation
+            .starts_with(b"Tool result 1 (list):\nTool error: opendir failed: "));
+
+        let not_dir = handle_round(&list_call(Some(file_text)), &mut web).expect("file list path");
+        assert_eq!(not_dir.observation, c_list_observation(Some(file_text)));
+
+        let empty = handle_round(&list_call(Some("")), &mut web).expect("empty list path");
+        let omitted = handle_round(&list_call(None), &mut web).expect("default list path");
+        assert_eq!(empty.observation, omitted.observation);
+        assert!(empty
+            .observation
+            .starts_with(b"Tool result 1 (list):\n.:\n"));
+        assert_eq!(c_list_bytes(Some("-")), c_list_bytes(None));
+        assert!(c_list_bytes(None).starts_with(b".:\n"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn list_entry_cap_matches_c_omit_marker() {
+        let root = list_root();
+        let root_text = root.to_str().expect("UTF-8 list fixture");
+        for index in 0..LIST_MAX_ENTRIES + 1 {
+            std::fs::write(root.join(format!("f{index:03}")), []).unwrap();
+        }
+        let mut web = FakeWeb {
+            result: Ok(String::new()),
+        };
+        let listed = handle_round(&list_call(Some(root_text)), &mut web).expect("capped list");
+        assert_eq!(listed.observation, c_list_observation(Some(root_text)));
+        assert!(listed
+            .observation
+            .windows(b"... more entries omitted ...\n".len())
+            .any(|window| window == b"... more entries omitted ...\n"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -19,7 +19,7 @@ static void oracle_usage(void)
             "usage: agent_c_oracle prompt | datetime WHEN | dsml TEXT | "
             "project THINK CHUNK... | read PATH START MAX WHOLE RAW | "
             "read2 PATH | more PATH READ_COUNT RAW [COUNT...] | "
-            "more-none [COUNT] | more-error PATH\n");
+            "more-none [COUNT] | more-error PATH | list [PATH]\n");
     exit(2);
 }
 
@@ -173,6 +173,19 @@ int main(int argc, char **argv)
                                     false);
         }
         char *result = agent_tool_more(&worker, &call);
+        print_hex(result, strlen(result));
+        free(result);
+        agent_tool_call_free(&call);
+        return 0;
+    }
+
+    if ((argc == 2 || argc == 3) && strcmp(argv[1], "list") == 0) {
+        agent_tool_call call = {.name = xstrdup("list")};
+        if (argc == 3 && strcmp(argv[2], "-") != 0) {
+            agent_tool_call_add_arg(&call, "path", argv[2], strlen(argv[2]),
+                                    true);
+        }
+        char *result = agent_tool_list(&call);
         print_hex(result, strlen(result));
         free(result);
         agent_tool_call_free(&call);
