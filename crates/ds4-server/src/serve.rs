@@ -34,7 +34,7 @@ use crate::route::{
     route_decide, Api, RouteEnv, ThinkMode, WireSurface, LANE_CONTINUOUS, LANE_STATIC,
 };
 use crate::serve_cont::{cont_prompt_tokens, ContExec};
-use crate::serve_static::{static_width_error, STATIC_WIDTH_ERR};
+use crate::serve_static::{run_static_routed, DetachedStatic, StaticJob, STATIC_WIDTH_ERR};
 use crate::stream::unix_now;
 
 #[derive(Debug, Clone)]
@@ -1071,7 +1071,26 @@ fn run_engine<W: TerminalSink>(
         }
     }
     if dec.lane == LANE_STATIC {
-        return (LANE_STATIC, refuse_static_singleton(cfg, job, out));
+        let tokens = match cont.as_deref() {
+            Some(exec) => cont_prompt_tokens(exec, &job.parsed)
+                .map(|(_, toks)| toks)
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let current = StaticJob {
+            tokens: &tokens,
+            max_new_tokens: job.parsed.max_tokens,
+            eos: -1,
+        };
+        let mut detached = DetachedStatic;
+        let result = match cont.as_mut() {
+            Some(exec) => match exec.as_static() {
+                Some(owner) => run_static_routed(owner, current),
+                None => run_static_routed(&mut detached, current),
+            },
+            None => run_static_routed(&mut detached, current),
+        };
+        return (LANE_STATIC, settle_static_lane(cfg, job, result, out));
     }
     (
         crate::route::LANE_SERIAL,
@@ -1079,12 +1098,42 @@ fn run_engine<W: TerminalSink>(
     )
 }
 
-fn refuse_static_singleton<W: Write>(
+fn settle_static_lane<W: Write>(
     cfg: &ServerConfig,
     job: &PreparedJob,
+    result: Result<Vec<crate::serve_static::StaticRow>, GenerateError>,
     out: &mut W,
 ) -> Settlement {
-    let msg = static_width_error(1).unwrap_or(STATIC_WIDTH_ERR);
+    match result {
+        Ok(_) => {
+            let ok = out
+                .write_all(&http_response_bytes(
+                    200,
+                    Some("application/json"),
+                    None,
+                    cfg.cors,
+                    "{}",
+                ))
+                .is_ok();
+            if ok {
+                Settlement::COMPLETED
+            } else {
+                Settlement::CANCELED
+            }
+        }
+        Err(GenerateError::Engine(msg)) if msg == STATIC_WIDTH_ERR => {
+            refuse_static_width(cfg, job, &msg, out)
+        }
+        Err(error) => settle_generation_result(cfg, job, Err(error), out),
+    }
+}
+
+fn refuse_static_width<W: Write>(
+    cfg: &ServerConfig,
+    job: &PreparedJob,
+    msg: &str,
+    out: &mut W,
+) -> Settlement {
     let ok = out
         .write_all(&wire_http_error_bytes(
             job.surface,

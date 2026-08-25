@@ -766,6 +766,11 @@ pub trait ContExec {
     ) -> Result<GenerateOutcome, GenerateError>;
 
     fn shutdown(&mut self, _store: Option<&mut KvStore>) {}
+
+    /// Static owner when this lane also holds a `BatchCtx`.
+    fn as_static(&mut self) -> Option<&mut dyn crate::serve_static::StaticExec> {
+        None
+    }
 }
 
 /// Render + tokenize a request for routing (`prompt_len` feeds
@@ -791,6 +796,8 @@ mod native {
     use super::*;
 
     use ds4_core::{BatchCtx, ContAdmit, ContDriver, Vocab, CONT_SAMPLE_GREEDY, CONT_SAMPLE_NONE};
+
+    use crate::serve_static::{BatchStatic, StaticExec, StaticJob, StaticRow};
 
     /// Native continuous lane: one Rust owner call at a time over every bank
     /// exposed by the persistent native batch context.
@@ -1236,9 +1243,22 @@ mod native {
         }
     }
 
+    impl StaticExec for ContLane<'_> {
+        fn generate_static(
+            &mut self,
+            jobs: &[StaticJob<'_>],
+        ) -> Result<Vec<StaticRow>, GenerateError> {
+            BatchStatic::new(&mut self.batch).generate_static(jobs)
+        }
+    }
+
     impl ContExec for ContLane<'_> {
         fn model_id(&self) -> i32 {
             self.model_id
+        }
+
+        fn as_static(&mut self) -> Option<&mut dyn StaticExec> {
+            Some(self)
         }
 
         fn seq_cap(&self) -> i32 {
