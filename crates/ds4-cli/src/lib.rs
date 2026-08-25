@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod bench;
+pub mod repl;
 
 use ds4_core::Backend;
 
@@ -287,17 +288,13 @@ fn prompt_text(args: &ShadowArgs) -> Result<String, String> {
             std::fs::read_to_string(path).map_err(|e| format!("prompt-file: {e}"))
         }
         (Some(_), Some(_)) => Err("specify only one prompt source".into()),
-        (None, None) => {
-            Err("one-shot generation requires -p or --prompt-file; REPL is not implemented".into())
-        }
+        (None, None) => Err("one-shot generation requires -p or --prompt-file".into()),
     }
 }
 
 fn validate_one_shot_args(args: &ShadowArgs) -> Result<(), String> {
     if args.prompt.is_none() && args.prompt_file.is_none() {
-        return Err(
-            "one-shot generation requires -p or --prompt-file; REPL is not implemented".into(),
-        );
+        return Err("one-shot generation requires -p or --prompt-file".into());
     }
     if args.mtp.is_some() || args.dspark.is_some() {
         return Err("one-shot generation with --mtp/--dspark is not implemented in ds4-rs".into());
@@ -787,7 +784,18 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
     } else {
         None
     };
-    if !worker && args.dump_logprobs.is_none() && !args.lifecycle_only && !raw_token_diagnostic {
+    let want_repl = !worker
+        && args.prompt.is_none()
+        && args.prompt_file.is_none()
+        && args.dump_logprobs.is_none()
+        && !args.lifecycle_only
+        && !raw_token_diagnostic;
+    if !want_repl
+        && !worker
+        && args.dump_logprobs.is_none()
+        && !args.lifecycle_only
+        && !raw_token_diagnostic
+    {
         validate_one_shot_args(&args)?;
     }
     if !worker && args.dump_logprobs.is_some() && generation_text.is_none() {
@@ -857,7 +865,73 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
         let _session = model.session(args.ctx).map_err(|e| e.to_string())?;
         return Ok(0);
     }
+    if want_repl {
+        return run_repl(&model, args);
+    }
     run_one_shot(&model, &args, generation_text.as_deref().unwrap())
+}
+
+fn run_repl(model: &ds4_core::Model, mut args: ShadowArgs) -> Result<i32, String> {
+    use std::io::{self, BufRead, Write};
+
+    print!("{}", repl::REPL_HELP);
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    loop {
+        write!(stdout, "ds4> ").map_err(|e| e.to_string())?;
+        stdout.flush().map_err(|e| e.to_string())?;
+        let mut line = String::new();
+        if stdin
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| e.to_string())?
+            == 0
+        {
+            break;
+        }
+        match repl::parse_repl_line(&line) {
+            Ok(repl::ReplLine::Empty) => {}
+            Ok(repl::ReplLine::Help) => print!("{}", repl::REPL_HELP),
+            Ok(repl::ReplLine::Quit) => break,
+            Ok(repl::ReplLine::Think) => {
+                args.nothink = false;
+                println!("{}", repl::think_mode_message(repl::ThinkRepl::High));
+            }
+            Ok(repl::ReplLine::ThinkMax) => {
+                args.nothink = false;
+                let mode = if repl::think_max_active(args.ctx) {
+                    repl::ThinkRepl::Max
+                } else {
+                    repl::ThinkRepl::HighBelowCtx
+                };
+                println!("{}", repl::think_mode_message(mode));
+            }
+            Ok(repl::ReplLine::NoThink) => {
+                args.nothink = true;
+                println!("{}", repl::think_mode_message(repl::ThinkRepl::None));
+            }
+            Ok(repl::ReplLine::Ctx(n)) => {
+                args.ctx = n;
+                args.ctx_set = true;
+            }
+            Ok(repl::ReplLine::Power(None)) => {
+                println!("Power: 100%.");
+            }
+            Ok(repl::ReplLine::Power(Some(n))) => {
+                println!("Power: {n}%.");
+            }
+            Ok(repl::ReplLine::Read(path)) => {
+                let text = std::fs::read_to_string(&path)
+                    .map_err(|e| format!("ds4: failed to read {path}: {e}"))?;
+                run_one_shot(model, &args, &text)?;
+            }
+            Ok(repl::ReplLine::Prompt(text)) => {
+                run_one_shot(model, &args, &text)?;
+            }
+            Err(err) => eprint!("{}", err.message()),
+        }
+    }
+    Ok(0)
 }
 
 fn require_value(flag: &str, value: Option<String>) -> Result<String, String> {
@@ -1192,12 +1266,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_the_unimplemented_repl_route() {
+    fn missing_prompt_is_repl_not_one_shot() {
         let parsed = parse_args(args(&[])).unwrap();
-
+        assert!(parsed.prompt.is_none());
+        assert!(parsed.prompt_file.is_none());
         assert!(validate_one_shot_args(&parsed)
             .unwrap_err()
-            .contains("REPL is not implemented"));
+            .contains("one-shot generation requires -p or --prompt-file"));
     }
 
     #[test]
