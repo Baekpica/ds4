@@ -45,8 +45,9 @@ pub use codec::{
     WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS, WORK_F_RESET_SESSION, WORK_F_VALID_MASK,
 };
 pub use coordinator::{
-    accept_loop, dispatch_eval, format_telemetry_line, listen, recv_hello_only, token_span_hashes,
-    Coordinator, EvalOutcome, RegisteredWorker, SharedCoordinator,
+    accept_loop, dispatch_eval, format_telemetry_line, listen, open_data_listener, recv_hello_only,
+    token_span_hashes, Coordinator, EvalOutcome, RegisteredWorker, SharedCoordinator,
+    ERR_DATA_LISTEN_PORT,
 };
 pub use exec::{SliceExec, WorkOutput, WorkRequest};
 pub use forward::{

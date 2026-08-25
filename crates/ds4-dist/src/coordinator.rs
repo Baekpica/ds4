@@ -94,6 +94,21 @@ pub fn listen(host: &str, port: u16) -> std::io::Result<TcpListener> {
     TcpListener::bind((host, port))
 }
 
+pub const ERR_DATA_LISTEN_PORT: &str = "could not determine data listener port";
+
+pub fn open_data_listener(host: Option<&str>, port: u16) -> std::io::Result<(TcpListener, u16)> {
+    let host = host.unwrap_or("0.0.0.0");
+    let listener = listen(host, port)?;
+    let bound = listener.local_addr()?.port();
+    if bound == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            ERR_DATA_LISTEN_PORT,
+        ));
+    }
+    Ok((listener, bound))
+}
+
 /// Dispatch one remote eval on an already-connected first-hop stream.
 ///
 /// `prefix_hash` is the committed token-hash *before* this span (C session

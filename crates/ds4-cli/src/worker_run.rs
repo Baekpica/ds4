@@ -57,6 +57,21 @@ mod tests {
     use ds4_dist::Layers;
 
     #[test]
+    fn worker_plan_uses_bound_data_listen_port() {
+        let layers = Layers {
+            start: 20,
+            end: 20,
+            has_output: true,
+            set: true,
+        };
+        let meta = slice_meta(7, &SHAPE_FLASH, 4096, &layers);
+        let (_listener, port) = ds4_dist::open_data_listener(Some("127.0.0.1"), 0).unwrap();
+        let plan = worker_plan(&meta, 2, u32::from(port), SHAPE_FLASH.name);
+        assert_eq!(plan.hello.listen_port, u32::from(port));
+        assert_ne!(plan.hello.listen_port, 0);
+    }
+
+    #[test]
     fn worker_plan_matches_hello_and_layer_range() {
         let layers = Layers {
             start: 20,

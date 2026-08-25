@@ -632,3 +632,11 @@ fn usage_text_mentions_roles() {
     assert!(ds4_dist::USAGE.contains("--role ROLE"));
     assert!(ds4_dist::USAGE.contains("21:output"));
 }
+
+#[test]
+fn open_data_listener_assigns_ephemeral_port() {
+    let (listener, port) = ds4_dist::open_data_listener(Some("127.0.0.1"), 0).unwrap();
+    assert_ne!(port, 0);
+    assert_eq!(listener.local_addr().unwrap().port(), port);
+    let _stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+}
