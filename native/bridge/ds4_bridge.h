@@ -12,7 +12,11 @@ extern "C" {
 
 /* Narrow Rust ↔ native ABI.  Do not include ds4.h from Rust.  Handles are
  * opaque; the C structs below may contain ds4_engine / ds4_session pointers
- * but those layouts are not part of this contract. */
+ * but those layouts are not part of this contract.
+ *
+ * Freeze: do not add new ds4_bridge_* except create / load / session /
+ * prefill / decode / KV / destroy.  Existing extras stay; do not mass-delete.
+ * Policy: docs/rust-migration/FFI_CONTRACT.md */
 
 typedef struct ds4_bridge_model ds4_bridge_model;
 typedef struct ds4_bridge_session ds4_bridge_session;

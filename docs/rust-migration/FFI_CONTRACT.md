@@ -237,3 +237,33 @@ backend_destroy
 Until then, `ds4_bridge_*` wrapping the current `ds4_engine` /
 `ds4_session` API is the correct strangler seam: same CUDA path,
 no kernel rewrite.
+
+## Freeze: no unplanned `ds4_bridge_*` growth
+
+`native/bridge/ds4_bridge.h` is frozen against **new** symbols except
+those that map to create / load / session / prefill / decode / KV /
+destroy. This wave does **not** mass-delete extras. Header and `.c`
+currently declare the same 62 functions.
+
+Allowed existing (21): `model_open`, `model_open_distributed`,
+`model_free`, `session_create`, `session_free`, `session_sync`,
+`session_sync_cb`, `eval`, `session_save_payload`,
+`session_load_payload`, `session_load_payload_range`,
+`session_save_layer_payload`, `session_load_layer_payload`,
+`snapshot_create`, `snapshot_free`, `session_save_snapshot`,
+`session_load_snapshot`, `batch_ctx_create_fit`, `batch_ctx_destroy`,
+`batch_ctx_bank_save_payload`, `batch_ctx_bank_load_payload_range`.
+
+Frozen extras (41; keep until a dedicated shrink):
+
+| Group | Symbols |
+|---|---|
+| Host bind inventory | `bind_plan_check`, `bind_plan_match` |
+| Dist / worker oracle | `model_run_distributed_worker`, `session_eval_layer_slice`, `session_layer_slice_reset`, `session_distributed_route_ready` |
+| Device warm | `model_boot_prewarm` |
+| Decode / sample extras | `eval_speculative_argmax`, `session_argmax`, `session_argmax_excluding`, `session_sample` |
+| Session queries / control | `session_pos`, `session_ctx`, `session_power`, `session_set_power`, `session_rewind`, `session_invalidate`, `session_generation`, `session_prefill_cap`, `session_exaone_rewind_span` |
+| Tokenizer / identity | `tokenize_text`, `tokenize_rendered_chat`, `token_text`, `token_eos`, `token_is_stop`, `encode_chat_prompt`, `model_id`, `model_routed_quant_bits` |
+| Proof / debug | `session_top_logprobs`, `session_copy_logits`, `session_output_head_bench`, `snapshot_len` |
+| Memgov snaps | `mem_census_snap`, `mem_observe_snap`, `mem_substrate_outstanding` |
+| Batch / continuous | `batch_ctx_max_seq`, `batch_ctx_raw_cap`, `batch_ctx_seq_cap`, `batch_ctx_generate_static`, `batch_ctx_bank_snapshot`, `continuous_generate` |
