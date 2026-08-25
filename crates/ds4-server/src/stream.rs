@@ -1301,6 +1301,7 @@ fn find_type_close(body: &[u8]) -> Option<usize> {
 }
 
 pub fn responses_sse_created(w: &mut Writer, r: &StreamReq, st: &mut ResponsesStream, created_at: i64) {
+    st.active = true;
     let mut b = format!(
         "{{\"type\":\"response.created\",\"response\":{{\"id\":\"{}\",\"object\":\"response\",\"created_at\":{created_at},\"status\":\"in_progress\",\"model\":",
         st.response_id

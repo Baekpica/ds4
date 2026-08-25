@@ -968,7 +968,9 @@ fn run_prepared<W: TerminalSink>(
         cont_anthropic: parse_default_on(
             std::env::var_os("DS4_SERVER_CONT_ANTHROPIC").as_deref(),
         ),
-        cont_responses: false,
+        cont_responses: parse_default_on(
+            std::env::var_os("DS4_SERVER_CONT_RESPONSES").as_deref(),
+        ),
         cont_tools_anthropic: false,
         cont_tools_responses: false,
         seq_cap: cont_gate.map_or(cfg.ctx, |(_, cap)| cap),
@@ -1975,6 +1977,41 @@ mod owner_tests {
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
         let g = lock_inner(&inner);
         assert_eq!(g.metrics.route_requests[WireSurface::Anthropic as usize][1], 1);
+        assert_eq!(g.runtime.requests_serial, 0);
+    }
+
+    #[test]
+    fn stateless_responses_uses_continuous_lane() {
+        let cfg = test_cfg();
+        let inner = Mutex::new(ServerInner::from_cfg(&cfg));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let body = r#"{"input":"hi","max_output_tokens":8}"#;
+        write!(
+            client,
+            "POST /v1/responses HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let mut engine = ScriptedDecode::from_pieces(&[]);
+        let mut cont = TestCont::Accept;
+
+        handle_client_inner(
+            &cfg,
+            &inner,
+            &mut server,
+            Some(&mut engine),
+            Some(&mut cont),
+        );
+        drop(server);
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).unwrap();
+
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+        let g = lock_inner(&inner);
+        assert_eq!(g.metrics.route_requests[WireSurface::Responses as usize][1], 1);
         assert_eq!(g.runtime.requests_serial, 0);
     }
 

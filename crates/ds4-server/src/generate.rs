@@ -929,7 +929,7 @@ fn split_think(raw: &[u8], think: bool, fmt: ChatFormat) -> (Vec<u8>, Vec<u8>) {
     }
 }
 
-fn responses_ids(job_id: &str) -> (String, String, String) {
+pub(crate) fn responses_ids(job_id: &str) -> (String, String, String) {
     let mut h = 2_166_136_261u32;
     for b in job_id.as_bytes() {
         h ^= u32::from(*b);

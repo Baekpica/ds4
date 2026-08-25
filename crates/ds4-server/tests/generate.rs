@@ -312,6 +312,42 @@ fn scripted_buffered_openai_has_text_and_stop() {
 }
 
 #[test]
+fn scripted_responses_stream_activates_after_created() {
+    let parsed = parse_request(
+        WireSurface::Responses,
+        &env(),
+        r#"{"input":"hi","max_output_tokens":8,"stream":true}"#,
+    )
+    .unwrap();
+    let mut engine = ScriptedDecode::from_pieces(
+        &TAPE_PLAIN
+            .iter()
+            .map(|piece| piece.as_bytes())
+            .collect::<Vec<_>>(),
+    );
+    let mut out = Vec::new();
+
+    generate_and_write(
+        &mut engine,
+        &parsed,
+        "resp-serial-stream",
+        CREATED_TEST,
+        false,
+        16,
+        &mut out,
+    )
+    .unwrap();
+
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("\"type\":\"response.created\""), "{out}");
+    assert!(
+        out.contains("\"type\":\"response.output_text.delta\""),
+        "{out}"
+    );
+    assert!(out.contains("\"type\":\"response.completed\""), "{out}");
+}
+
+#[test]
 fn prompt_sync_reports_buffered_cache_usage_from_effective_pos() {
     let parsed = user_req();
     let inner = ScriptedDecode::from_pieces(
@@ -710,6 +746,77 @@ fn cont_stepper_buffers_anthropic_message() {
     assert!(body.contains("\"type\":\"message\""), "{body}");
     assert!(body.contains("\"text\":\"Hello world.\""), "{body}");
     assert!(body.contains("\"stop_reason\":\"end_turn\""), "{body}");
+    assert_eq!(outcome.finish, "stop");
+}
+
+#[test]
+fn cont_stepper_streams_responses_events() {
+    let parsed = parse_request(
+        WireSurface::Responses,
+        &env(),
+        r#"{"input":"hi","max_output_tokens":8,"stream":true}"#,
+    )
+    .unwrap();
+    let (mut stepper, head) = ContStepper::new(
+        &parsed,
+        0,
+        "resp-cont-stream",
+        CREATED_TEST,
+        false,
+        16,
+        b"prompt".to_vec(),
+        1,
+        8192,
+    );
+
+    let head = String::from_utf8(head).unwrap();
+    assert!(head.contains("\"type\":\"response.created\""), "{head}");
+    let mut deltas = Vec::new();
+    for piece in TAPE_PLAIN {
+        deltas.extend(stepper.feed(piece.as_bytes()).bytes);
+    }
+    let (tail, outcome) = stepper.finalize(true, 0, 1, ReqTimings::default(), false);
+    let deltas = String::from_utf8(deltas).unwrap();
+    let tail = String::from_utf8(tail).unwrap();
+    assert!(
+        deltas.contains("\"type\":\"response.output_text.delta\""),
+        "{deltas}"
+    );
+    assert!(tail.contains("\"type\":\"response.completed\""), "{tail}");
+    assert!(tail.contains("resp_"), "{tail}");
+    assert_eq!(outcome.finish, "stop");
+}
+
+#[test]
+fn cont_stepper_buffers_responses_object() {
+    let parsed = parse_request(
+        WireSurface::Responses,
+        &env(),
+        r#"{"input":"hi","max_output_tokens":8}"#,
+    )
+    .unwrap();
+    let (mut stepper, head) = ContStepper::new(
+        &parsed,
+        0,
+        "resp-cont-buffered",
+        CREATED_TEST,
+        false,
+        16,
+        b"prompt".to_vec(),
+        1,
+        8192,
+    );
+
+    assert!(head.is_empty());
+    for piece in TAPE_PLAIN {
+        assert!(stepper.feed(piece.as_bytes()).bytes.is_empty());
+    }
+    let (body, outcome) = stepper.finalize(true, 0, 1, ReqTimings::default(), false);
+    let body = String::from_utf8(body).unwrap();
+    assert!(body.contains("\"object\":\"response\""), "{body}");
+    assert!(body.contains("\"type\":\"output_text\""), "{body}");
+    assert!(body.contains("Hello world."), "{body}");
+    assert!(body.contains("resp_"), "{body}");
     assert_eq!(outcome.finish, "stop");
 }
 

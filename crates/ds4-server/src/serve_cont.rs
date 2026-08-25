@@ -20,7 +20,9 @@ use ds4_kv::bank_checkpoint_due;
 use crate::dsml::{SamplePolicy, SampleOverride};
 #[cfg(any(feature = "native", test))]
 use crate::generate::ordinary_disk_cache_eligible;
-use crate::generate::{render_prompt, stream_req_from_parsed, GenerateError, GenerateOutcome};
+use crate::generate::{
+    render_prompt, responses_ids, stream_req_from_parsed, GenerateError, GenerateOutcome,
+};
 use crate::parse::{ParsedRequest, ToolChoice};
 use crate::parse::{DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_TOP_P};
 use crate::render::syntax_for_model_id;
@@ -29,14 +31,17 @@ use crate::route::{decode_budget, think_mode_enabled, Api, ReqKind};
 use crate::stream::{
     anthropic_final_response, anthropic_sse_finish_live, anthropic_sse_start_live,
     anthropic_sse_stream_update, final_response, openai_sse_finish_live,
-    openai_sse_stream_update, openai_stream_start, sse_chunk, sse_done, sse_headers,
-    AnthropicStream, OpenaiStream, ReqTimings, StreamReq, Writer,
+    openai_sse_stream_update, openai_stream_start, responses_final_response,
+    responses_sse_created, responses_sse_finish_live, responses_sse_stream_update,
+    responses_stream_init, sse_chunk, sse_done, sse_headers, AnthropicStream, OpenaiStream,
+    ReqTimings, ResponsesStream, StreamReq, Writer,
 };
 use crate::tools::{assign_tool_ids, parse_generated_for_response, SemAccum};
 
 /// Pure continuous-request stepper. The caller feeds decoded pieces and
 /// receives wire bytes; the engine (or a tape) owns token production.
-/// OpenAI chat/completions only — every other surface routes serial.
+/// The four frozen wire surfaces share this stepper; route eligibility still
+/// decides which request shapes may enter the continuous lane.
 pub struct ContStepper {
     pub req: StreamReq,
     pub job_id: String,
@@ -48,6 +53,7 @@ pub struct ContStepper {
     w: Writer,
     oa: Option<OpenaiStream>,
     anth: Option<AnthropicStream>,
+    resp: Option<ResponsesStream>,
     finish: &'static str,
     stops: Vec<String>,
     think_mode: crate::route::ThinkMode,
@@ -95,6 +101,7 @@ impl ContStepper {
         let mut w = Writer::new(created);
         let mut oa = None;
         let mut anth = None;
+        let mut resp = None;
         if req.stream {
             w.out.extend_from_slice(&sse_headers(cors));
             match req.api {
@@ -109,7 +116,18 @@ impl ContStepper {
                     st.tool.use_random_ids();
                     anth = Some(st);
                 }
-                _ => {}
+                Api::Responses => {
+                    let (response_id, reasoning_id, message_id) = responses_ids(job_id);
+                    let mut st = responses_stream_init(
+                        &req,
+                        &response_id,
+                        &reasoning_id,
+                        &message_id,
+                    );
+                    responses_sse_created(&mut w, &req, &mut st, created);
+                    resp = Some(st);
+                }
+                Api::Openai => {}
             }
         }
         let head = std::mem::take(&mut w.out);
@@ -125,6 +143,7 @@ impl ContStepper {
                 w,
                 oa,
                 anth,
+                resp,
                 finish: "length",
                 stops: parsed.stops.clone(),
                 think_mode: parsed.think_mode,
@@ -202,7 +221,11 @@ impl ContStepper {
                         );
                     }
                 }
-                (Api::Responses, _) => {}
+                (Api::Responses, _) => {
+                    if let Some(st) = self.resp.as_mut() {
+                        responses_sse_stream_update(&mut self.w, &self.req, st, view, false);
+                    }
+                }
             }
         }
         let mut done = false;
@@ -341,7 +364,23 @@ impl ContStepper {
                         );
                     }
                 }
-                (Api::Responses, _) => {}
+                (Api::Responses, _) => {
+                    if let Some(st) = self.resp.as_mut() {
+                        let created = self.w.created;
+                        responses_sse_finish_live(
+                            &mut self.w,
+                            &self.req,
+                            st,
+                            &self.acc.text,
+                            self.finish,
+                            self.prompt_n,
+                            completion,
+                            0,
+                            created,
+                            &parsed_gen.calls,
+                        );
+                    }
+                }
             }
         } else {
             let bytes = match self.req.api {
@@ -357,7 +396,25 @@ impl ContStepper {
                     cors,
                     &parsed_gen.calls,
                 ),
-                _ => final_response(
+                Api::Responses => {
+                    let (response_id, reasoning_id, message_id) = responses_ids(&self.job_id);
+                    responses_final_response(
+                        &self.req,
+                        &parsed_gen.content,
+                        Some(&parsed_gen.reasoning),
+                        self.finish,
+                        self.prompt_n,
+                        completion,
+                        0,
+                        self.w.created,
+                        cors,
+                        &response_id,
+                        &reasoning_id,
+                        &message_id,
+                        &parsed_gen.calls,
+                    )
+                }
+                Api::Openai => final_response(
                     &self.req,
                     &self.job_id,
                     &parsed_gen.content,
