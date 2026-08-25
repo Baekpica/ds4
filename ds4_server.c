@@ -8706,6 +8706,14 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    /* issue #18 forensics: --trace covers only the serial lane, so a
+     * cont-served tools-armed turn that settles without tool calls (the
+     * field failure shape) was never captured byte-level -- agent harnesses
+     * discard the rejected response.  When armed, both lanes dump one JSON
+     * file per such turn: raw request body + generated text + parse verdict. */
+    const char *tool_slip_dir;
+    pthread_mutex_t tool_slip_mu;
+    uint64_t tool_slip_seq;
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -11787,6 +11795,61 @@ static bool should_remember_thinking_checkpoint(const request *r,
     return true;
 }
 
+/* issue #18 forensics: one self-contained JSON file per tools-armed chat
+ * completion that settles WITHOUT tool calls.  saw_tool_start distinguishes
+ * the two field failure shapes (false = pure prose, true = tool markup the
+ * parser rejected); the raw request body makes the file a byte-exact replay
+ * fixture.  Legitimate prose answers on tool_choice=auto requests dump too --
+ * the knob is an opt-in debug instrument, the reader filters. */
+static void tool_slip_dump(server *s, const request *req, const char *lane,
+                           const char *finish, int completion_tokens,
+                           bool saw_tool_start, bool saw_tool_end,
+                           const char *gen_text, size_t gen_len) {
+    if (!s->tool_slip_dir || !req->has_tools || req->kind != REQ_CHAT) return;
+    pthread_mutex_lock(&s->tool_slip_mu);
+    const uint64_t id = ++s->tool_slip_seq;
+    pthread_mutex_unlock(&s->tool_slip_mu);
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/slip-%lld-%llu.json",
+             s->tool_slip_dir, (long long)time(NULL), (unsigned long long)id);
+    buf b = {0};
+    char meta[256];
+    buf_puts(&b, "{\"lane\":");
+    json_escape(&b, lane);
+    buf_puts(&b, ",\"finish\":");
+    json_escape(&b, finish ? finish : "");
+    snprintf(meta, sizeof(meta),
+             ",\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+             "\"saw_tool_start\":%s,\"saw_tool_end\":%s,"
+             "\"think\":\"%s\",\"stream\":%s,",
+             req->prompt.len, completion_tokens,
+             saw_tool_start ? "true" : "false",
+             saw_tool_end ? "true" : "false",
+             ds4_think_mode_name(req->think_mode),
+             req->stream ? "true" : "false");
+    buf_puts(&b, meta);
+    buf_puts(&b, "\"generated_text\":");
+    json_escape_n(&b, gen_text ? gen_text : "", gen_len);
+    buf_puts(&b, ",\"request_body\":");
+    if (req->raw_body) json_escape(&b, req->raw_body);
+    else buf_puts(&b, "null");
+    buf_puts(&b, "}\n");
+    FILE *fp = fopen(path, "w");
+    if (fp) {
+        fwrite(b.ptr, 1, b.len, fp);
+        fclose(fp);
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: %s chat tools-armed turn settled with no tool calls; dumped %s (finish=%s gen=%d saw_start=%d)",
+                   lane, path, finish ? finish : "?", completion_tokens,
+                   saw_tool_start);
+    } else {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: tool-slip dump open failed: %s: %s",
+                   path, strerror(errno));
+    }
+    buf_free(&b);
+}
+
 static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
                                    bool responses_protocol) {
     if (!calls || calls->len == 0) return;
@@ -13066,6 +13129,10 @@ decode_again:
         } else if (j->req.api == API_RESPONSES) {
             responses_live_clear(s);
         }
+        if (!parsed_calls.len)
+            tool_slip_dump(s, &j->req, "serial", final_finish, acc.completion,
+                           acc.saw_tool_start, acc.saw_tool_end,
+                           acc.text.ptr, acc.text.len);
     }
     log_tool_calls_summary(ctx_span, &parsed_calls,
                            responses_protocol);
@@ -15957,6 +16024,10 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
                 ds4_batch_ctx_bank_committed(s->batch_ctx, j->cont_bank, NULL));
         }
         *fin_io = "tool_calls";
+    } else {
+        tool_slip_dump(s, &j->req, "cont", *fin_io, st->acc.completion,
+                       st->acc.saw_tool_start, st->acc.saw_tool_end,
+                       st->acc.text.ptr, st->acc.text.len);
     }
 }
 
@@ -18618,6 +18689,7 @@ typedef struct {
     int default_tokens;
     const char *chdir_path;
     const char *trace_path;
+    const char *tool_slip_dump_dir;
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
@@ -18762,6 +18834,11 @@ static void usage(FILE *fp) {
         "      Add Access-Control-Allow-* headers for browser JS clients. Does not change --host.\n"
         "  --trace FILE\n"
         "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
+        "      Serial lane only: continuously-batched rows do not trace yet.\n"
+        "  --tool-slip-dump DIR\n"
+        "      Dump one JSON file per tools-armed chat completion that settles without\n"
+        "      tool calls (raw request body + generated text + parse verdict), both\n"
+        "      lanes -- the issue #18 forensic instrument. Env twin: DS4_TOOL_SLIP_DUMP_DIR.\n"
         "  --reasoning-effort LEVEL\n"
         "      Default reasoning effort for requests that do not send one: low (default),\n"
         "      high, max, or off. Explicit request values always win.\n"
@@ -19330,6 +19407,8 @@ static server_config parse_options(int argc, char **argv) {
             c.no_serial = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--tool-slip-dump")) {
+            c.tool_slip_dump_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--reasoning-effort-native")) {
             g_native_reasoning_effort = true;
         } else if (!strcmp(arg, "--reasoning-effort")) {
@@ -19707,6 +19786,24 @@ int main(int argc, char **argv) {
         }
         setvbuf(s.trace, NULL, _IONBF, 0);
         server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
+    }
+    pthread_mutex_init(&s.tool_slip_mu, NULL);
+    if (!cfg.tool_slip_dump_dir) {   /* env twin of --tool-slip-dump */
+        const char *env = getenv("DS4_TOOL_SLIP_DUMP_DIR");
+        if (env && env[0]) cfg.tool_slip_dump_dir = env;
+    }
+    if (cfg.tool_slip_dump_dir) {
+        if (mkdir(cfg.tool_slip_dump_dir, 0755) != 0 && errno != EEXIST) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to create tool-slip dump dir %s: %s",
+                       cfg.tool_slip_dump_dir, strerror(errno));
+            server_close_resources(&s);
+            return 1;
+        }
+        s.tool_slip_dir = cfg.tool_slip_dump_dir;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: dumping tools-armed no-tool-call turns to %s",
+                   s.tool_slip_dir);
     }
 
     /* W4: build the persistent batched-generation context, sized to the same
@@ -21486,6 +21583,92 @@ static void test_client_reasoning_effort_compat(void) {
      * clamped: setting --reasoning-effort IS the opt-in for that level. */
     ds4_think_mode op = DS4_THINK_NONE;
     TEST_ASSERT(parse_reasoning_effort_name("high", &op) && op == DS4_THINK_HIGH);
+}
+
+static void test_tool_slip_dump(void) {
+    /* issue #18 forensics: a tools-armed chat turn with no parsed calls
+     * writes one JSON file carrying the raw request and the generated text;
+     * disarmed / no-tools / non-chat turns write nothing. */
+    char tmpl[] = "/tmp/ds4-tool-slip-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.tool_slip_mu, NULL);
+    s.tool_slip_dir = dir;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.has_tools = true;
+    r.think_mode = DS4_THINK_LOW;
+    r.prompt.len = 42;
+    r.raw_body = xstrdup("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+    const char *gen = "<think>done</think>All tests pass.\nWhat \"next\"?";
+
+    tool_slip_dump(&s, &r, "cont", "stop", 7, false, false, gen, strlen(gen));
+
+    char slip_path[4096] = {0};
+    int n_files = 0;
+    DIR *dp = opendir(dir);
+    TEST_ASSERT(dp != NULL);
+    if (dp) {
+        struct dirent *de;
+        while ((de = readdir(dp)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            n_files++;
+            snprintf(slip_path, sizeof(slip_path), "%s/%s", dir, de->d_name);
+            TEST_ASSERT(strncmp(de->d_name, "slip-", 5) == 0);
+        }
+        closedir(dp);
+    }
+    TEST_ASSERT(n_files == 1);
+
+    FILE *fp = fopen(slip_path, "r");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        char body[8192] = {0};
+        size_t got = fread(body, 1, sizeof(body) - 1, fp);
+        fclose(fp);
+        TEST_ASSERT(got > 0);
+        TEST_ASSERT(strstr(body, "\"lane\":\"cont\"") != NULL);
+        TEST_ASSERT(strstr(body, "\"finish\":\"stop\"") != NULL);
+        TEST_ASSERT(strstr(body, "\"prompt_tokens\":42") != NULL);
+        TEST_ASSERT(strstr(body, "\"completion_tokens\":7") != NULL);
+        TEST_ASSERT(strstr(body, "\"saw_tool_start\":false") != NULL);
+        TEST_ASSERT(strstr(body, "\"think\":\"low\"") != NULL);
+        /* Generated text and raw body survive JSON-escaped byte-exact. */
+        TEST_ASSERT(strstr(body, "All tests pass.\\nWhat \\\"next\\\"?") != NULL);
+        TEST_ASSERT(strstr(body, "\"request_body\":\"{\\\"messages\\\"") != NULL);
+    }
+
+    /* Disarmed and non-qualifying turns write nothing new. */
+    const char *keep = s.tool_slip_dir;
+    s.tool_slip_dir = NULL;
+    tool_slip_dump(&s, &r, "cont", "stop", 7, false, false, gen, strlen(gen));
+    s.tool_slip_dir = keep;
+    r.has_tools = false;
+    tool_slip_dump(&s, &r, "serial", "stop", 7, false, false, gen, strlen(gen));
+    r.has_tools = true;
+    r.kind = REQ_COMPLETION;
+    tool_slip_dump(&s, &r, "serial", "stop", 7, false, false, gen, strlen(gen));
+    n_files = 0;
+    dp = opendir(dir);
+    if (dp) {
+        struct dirent *de;
+        while ((de = readdir(dp)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            n_files++;
+        }
+        closedir(dp);
+    }
+    TEST_ASSERT(n_files == 1);
+
+    unlink(slip_path);
+    rmdir(dir);
+    request_free(&r);
+    pthread_mutex_destroy(&s.tool_slip_mu);
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -29424,6 +29607,7 @@ static void ds4_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
     test_client_reasoning_effort_compat();
+    test_tool_slip_dump();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_think_effort_prefix_tiers();
