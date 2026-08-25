@@ -232,9 +232,6 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AgentArgs, S
     if parsed.steering_file.is_some() && !steering_scale_set {
         parsed.steering_ffn = 1.0;
     }
-    if !parsed.non_interactive {
-        return Err("this shadow requires --non-interactive".into());
-    }
     ds4_dist::prepare_engine_options(&parsed.dist)?;
     if parsed.dist.role == ds4_dist::Role::Worker {
         return Err("--role worker is a serving mode; start workers with ./ds4".into());
@@ -1104,10 +1101,17 @@ mod tests {
     }
 
     #[test]
-    fn narrow_cli_requires_one_shot_shape_and_rejects_deferred_flags() {
-        assert!(parse_args(argv(&["-p", "hello"]))
-            .unwrap_err()
-            .contains("--non-interactive"));
+    fn parse_args_allows_interactive_when_tui_path_exists() {
+        // Given: TUI/KV/approval landed (todos 32-34)
+        // When: parse without --non-interactive
+        let parsed = parse_args(argv(&["-p", "hello"])).expect("interactive allowed");
+        // Then: Ok, flag stays off
+        assert!(!parsed.non_interactive);
+        assert_eq!(parsed.prompt.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn parse_args_keeps_non_interactive_and_rejects_unknown_flags() {
         let stdin_repeat = parse_args(argv(&["--non-interactive"])).unwrap();
         assert!(stdin_repeat.non_interactive);
         assert!(stdin_repeat.prompt.is_none());
@@ -1119,6 +1123,9 @@ mod tests {
         ]))
         .unwrap_err()
         .contains("unknown option"));
+        assert!(parse_args(argv(&["-p", "hello", "--no-such-flag"]))
+            .unwrap_err()
+            .contains("unknown option"));
     }
 
     #[test]
