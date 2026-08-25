@@ -15,7 +15,7 @@ use std::time::Instant;
 use ds4_kv::bank_checkpoint_due;
 use ds4_kv::Store as KvStore;
 #[cfg(any(feature = "native", test))]
-use ds4_kv::{Reason as KvReason, EXT_BANK_REPLAY_V1};
+use ds4_kv::{bank_persist_ext_flags, Reason as KvReason};
 
 use crate::dsml::{SampleOverride, SamplePolicy};
 #[cfg(any(feature = "native", test))]
@@ -465,20 +465,21 @@ fn bank_scope(parsed: &ParsedRequest) -> bool {
 
 #[cfg(any(feature = "native", test))]
 #[derive(Debug, Default)]
-struct WarmBank {
-    record: Option<WarmRecord>,
+pub(crate) struct WarmBank {
+    pub(crate) record: Option<WarmRecord>,
     /// Exact native committed frontier recorded at retire/restore. Banks are
     /// idle between owner calls, so this is also the C victim-picker depth.
-    committed_tokens: i32,
-    stored_tokens: i32,
-    last_use: u64,
+    pub(crate) committed_tokens: i32,
+    pub(crate) stored_tokens: i32,
+    pub(crate) last_use: u64,
 }
 
 #[cfg(any(feature = "native", test))]
 #[derive(Debug)]
-struct WarmRecord {
-    text: Vec<u8>,
-    generation: u64,
+pub(crate) struct WarmRecord {
+    pub(crate) text: Vec<u8>,
+    pub(crate) generation: u64,
+    pub(crate) ext_flags: u8,
 }
 
 #[cfg(any(feature = "native", test))]
@@ -704,7 +705,7 @@ fn retired_bank(
 }
 
 #[cfg(any(feature = "native", test))]
-fn save_bank_record(
+pub(crate) fn save_bank_record(
     store: &mut KvStore,
     warm: &mut WarmBank,
     identity: (u8, u8, u32),
@@ -728,10 +729,15 @@ fn save_bank_record(
     };
     let tokens = u32::try_from(committed)
         .map_err(|_| GenerateError::Engine("bank token count exceeds u32".into()))?;
+    let keep_ext = warm
+        .record
+        .as_ref()
+        .map(|record| record.ext_flags)
+        .unwrap_or(0);
     let (model_id, quant_bits, ctx) = identity;
     let mut header = crate::generate::kv_header(model_id, quant_bits, ctx, tokens);
     header.reason = reason;
-    header.ext_flags = EXT_BANK_REPLAY_V1;
+    header.ext_flags = bank_persist_ext_flags(keep_ext, false, false);
     let payload = store
         .payload_temp()
         .map_err(|error| GenerateError::Engine(error.to_string()))?;
@@ -1223,6 +1229,7 @@ mod native {
             self.warm[target].record = Some(WarmRecord {
                 text: envelope.text,
                 generation: snapshot.generation,
+                ext_flags: envelope.header.ext_flags,
             });
             self.warm[target].committed_tokens = committed;
             self.warm[target].stored_tokens = committed;
@@ -1277,6 +1284,7 @@ mod native {
             self.warm[bank].record = (!key.is_empty()).then_some(WarmRecord {
                 text: key,
                 generation: snapshot.generation,
+                ext_flags: 0,
             });
         }
 
@@ -1351,6 +1359,9 @@ mod native {
                 self.warm_pin_min,
                 self.warm_fork,
             )?;
+            if placement.fork && protected.get(placement.target).copied().unwrap_or(false) {
+                return None;
+            }
             self.note_use(placement.source);
             if placement.fork {
                 if let Some(store) = store {
@@ -1373,6 +1384,9 @@ mod native {
 
         fn place_cold(&mut self, protected: &[bool], store: Option<&mut KvStore>) -> Option<usize> {
             let target = warm_victim_pick(&self.warm, protected, None, self.warm_pin_min, true)?;
+            if protected.get(target).copied().unwrap_or(false) {
+                return None;
+            }
             if let Some(store) = store {
                 self.persist_bank(store, target, KvReason::BankEvict, self.warm_pin_min, false);
             }
@@ -1783,6 +1797,7 @@ mod bank_tests {
             record: Some(WarmRecord {
                 text: text.as_bytes().to_vec(),
                 generation: 1,
+                ext_flags: 0,
             }),
             committed_tokens: 10,
             stored_tokens: 0,
@@ -1838,6 +1853,7 @@ mod bank_tests {
             record: Some(WarmRecord {
                 text: b"shared".to_vec(),
                 generation: 7,
+                ext_flags: 0,
             }),
             committed_tokens: 2,
             stored_tokens: 0,
@@ -2046,6 +2062,7 @@ mod bank_tests {
             record: Some(WarmRecord {
                 text: b"live".to_vec(),
                 generation: 7,
+                ext_flags: 0,
             }),
             committed_tokens: 70_000,
             stored_tokens: 0,
@@ -2103,6 +2120,7 @@ mod bank_tests {
             record: Some(WarmRecord {
                 text: b"shared prefix".to_vec(),
                 generation: 7,
+                ext_flags: 0,
             }),
             committed_tokens: 3,
             stored_tokens: 1,

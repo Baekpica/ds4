@@ -18,10 +18,15 @@ pub mod retry;
 pub mod route;
 pub mod serve;
 pub mod serve_cont;
+#[cfg(any(feature = "native", test))]
+mod serve_cont_evict;
 mod serve_cont_prefill;
 #[cfg(test)]
 mod serve_cont_prefill_test;
 mod serve_cont_roll;
+mod serve_serial_reclaim;
+#[cfg(test)]
+mod serve_serial_reclaim_test;
 pub mod serve_static;
 pub mod stream;
 #[cfg(any(feature = "native", test))]

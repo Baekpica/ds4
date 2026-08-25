@@ -4,7 +4,10 @@
 //! The only appended trailer magic is C's `KTM\x01`. A missing or invalid
 //! section is ignored the way `kv_tool_map_load_from_pos` returns 0.
 
-use crate::format::{Record, EXT_BANK_REPLAY_V1, EXT_THINKING_VISIBLE, EXT_TOOL_MAP};
+use crate::format::{
+    Record, EXT_BANK_REPLAY_V1, EXT_RESPONSES_VISIBLE, EXT_SESSION_TITLE, EXT_THINKING_VISIBLE,
+    EXT_TOOL_MAP,
+};
 
 pub const KTM_MAGIC: [u8; 3] = [b'K', b'T', b'M'];
 pub const KTM_VERSION: u8 = 1;
@@ -27,23 +30,19 @@ pub struct BankThinkingExtensions {
 
 impl BankThinkingExtensions {
     pub fn ext_flags(&self) -> u8 {
-        self.wire().0
+        self.wire(0).0
     }
 
     pub fn encode_trailer(&self) -> Vec<u8> {
-        self.wire().1
+        self.wire(0).1
     }
 
-    fn wire(&self) -> (u8, Vec<u8>) {
+    fn wire(&self, keep: u8) -> (u8, Vec<u8>) {
         let trailer = encode_ktm(&self.records);
-        let mut flags = EXT_BANK_REPLAY_V1;
-        if self.thinking_visible {
-            flags |= EXT_THINKING_VISIBLE;
-        }
-        if !trailer.is_empty() {
-            flags |= EXT_TOOL_MAP;
-        }
-        (flags, trailer)
+        (
+            bank_persist_ext_flags(keep, self.thinking_visible, !trailer.is_empty()),
+            trailer,
+        )
     }
 
     pub fn restore(ext_flags: u8, trailer: &[u8]) -> Self {
@@ -56,12 +55,25 @@ impl BankThinkingExtensions {
 
 impl Record {
     pub fn persist_bank_extensions(&mut self, ext: &BankThinkingExtensions) {
-        let (flags, trailer) = ext.wire();
+        let (flags, trailer) = ext.wire(self.header.ext_flags);
         self.header.ext_flags = flags;
         self.trailer = trailer;
         self.header.text_bytes = self.text.len() as u32;
         self.header.payload_bytes = self.payload.len() as u64;
     }
+}
+
+/// Bank persist always sets `EXT_BANK_REPLAY_V1`. Responses/title bits on
+/// the incoming header survive; thinking and KTM are applied from `ext`.
+pub fn bank_persist_ext_flags(keep: u8, thinking_visible: bool, has_trailer: bool) -> u8 {
+    let mut flags = EXT_BANK_REPLAY_V1 | (keep & (EXT_RESPONSES_VISIBLE | EXT_SESSION_TITLE));
+    if thinking_visible {
+        flags |= EXT_THINKING_VISIBLE;
+    }
+    if has_trailer {
+        flags |= EXT_TOOL_MAP;
+    }
+    flags
 }
 
 fn wire_ok(id: &[u8], body: &[u8]) -> bool {
@@ -188,5 +200,41 @@ mod tests {
         };
         assert_eq!(ext.ext_flags(), EXT_BANK_REPLAY_V1);
         assert!(ext.encode_trailer().is_empty());
+    }
+
+    #[test]
+    fn persist_bank_extensions_keeps_responses_visible_and_session_title() {
+        // Given: a bank record that already carries Responses/title bits
+        let mut rec = Record {
+            header: crate::format::Header {
+                quant_bits: 2,
+                reason: crate::format::Reason::BankEvict,
+                ext_flags: EXT_RESPONSES_VISIBLE | EXT_SESSION_TITLE,
+                model_id: 1,
+                tokens: 8,
+                hits: 0,
+                ctx_size: 4096,
+                created_at: 1,
+                last_used: 1,
+                payload_bytes: 1,
+                text_bytes: 4,
+            },
+            text: b"keep".to_vec(),
+            payload: b"P".to_vec(),
+            trailer: Vec::new(),
+        };
+        let ext = BankThinkingExtensions {
+            thinking_visible: true,
+            records: Vec::new(),
+        };
+
+        // When: thinking/KTM extensions are persisted onto that record
+        rec.persist_bank_extensions(&ext);
+
+        // Then: BANK_REPLAY_V1 + thinking land, and the two prior bits survive
+        assert_eq!(
+            rec.header.ext_flags,
+            EXT_BANK_REPLAY_V1 | EXT_THINKING_VISIBLE | EXT_RESPONSES_VISIBLE | EXT_SESSION_TITLE
+        );
     }
 }

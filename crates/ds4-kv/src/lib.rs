@@ -8,7 +8,8 @@ mod sha1;
 mod store;
 
 pub use extensions::{
-    decode_ktm, encode_ktm, BankThinkingExtensions, ExtensionRecord, KTM_MAGIC, KTM_VERSION,
+    bank_persist_ext_flags, decode_ktm, encode_ktm, BankThinkingExtensions, ExtensionRecord,
+    KTM_MAGIC, KTM_VERSION,
 };
 pub use format::{
     decode_file, encode_file, fill_header, key_kind, parse_header, path_for_sha, read_envelope,
