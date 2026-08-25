@@ -1,22 +1,30 @@
+use super::approval::{Approval, DENIED_EDIT};
 use super::web_tools::{io_detail, read_bytes};
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 
+mod obs;
+
 pub(crate) const EDIT: &str = "edit";
 const UPTO: &[u8] = b"[upto]";
-const CONTEXT_BEFORE: i32 = 5;
-const CONTEXT_AFTER: i32 = 8;
-const EDITED_HEAD: i32 = 18;
-const EDITED_TAIL: i32 = 18;
 
-struct LineSpan {
+pub(super) struct LineSpan {
     start: usize,
     content_end: usize,
     end: usize,
 }
 
 pub(crate) fn edit_result(path: Option<&str>, old: Option<&str>, new: Option<&str>) -> Vec<u8> {
+    edit_result_with(path, old, new, Approval::NonInteractive)
+}
+
+pub(crate) fn edit_result_with(
+    path: Option<&str>,
+    old: Option<&str>,
+    new: Option<&str>,
+    mut approval: Approval<'_>,
+) -> Vec<u8> {
     let Some(path) = path.filter(|path| !path.is_empty()) else {
         return b"Tool error: edit requires path\n".to_vec();
     };
@@ -34,6 +42,9 @@ pub(crate) fn edit_result(path: Option<&str>, old: Option<&str>, new: Option<&st
         Ok(found) => found,
         Err(error) => return wrap_error(error.as_bytes()),
     };
+    if !approval.allow_edit(path) {
+        return DENIED_EDIT.to_vec();
+    }
     apply_splice(path, &data, offset, remove_len, new.as_bytes(), anchored)
 }
 
@@ -111,7 +122,7 @@ fn find_old_span(data: &[u8], old: &[u8]) -> Result<(usize, usize, bool), String
     }
 }
 
-fn split_lines(data: &[u8]) -> Vec<LineSpan> {
+pub(super) fn split_lines(data: &[u8]) -> Vec<LineSpan> {
     let mut spans = Vec::new();
     let mut pos = 0;
     while pos < data.len() {
@@ -192,80 +203,5 @@ fn apply_splice(
     let start_line = line_for_offset(&old_spans, offset);
     let end_line = line_for_offset(&old_spans, old_last);
     let delta = new_spans.len() as i32 - old_spans.len() as i32;
-    format_edit_result(path, start_line, end_line, delta, &out, kind)
-}
-
-fn format_edit_result(
-    path: &str,
-    start_line: i32,
-    end_line: i32,
-    delta: i32,
-    new_data: &[u8],
-    kind: &str,
-) -> Vec<u8> {
-    let mut out = format!("Edited {path} using {kind}\n").into_bytes();
-    if start_line > 0 && end_line >= start_line {
-        out.extend_from_slice(
-            format!(
-                "Touched old lines {start_line}-{end_line}; current post-edit context follows.\n"
-            )
-            .as_bytes(),
-        );
-        if delta != 0 {
-            out.extend_from_slice(
-                format!(
-                    "Line shift: old lines after {end_line} moved by {delta:+} (old line {} is now line {}). Re-read before relying on old line numbers there.\n",
-                    end_line + 1,
-                    end_line + 1 + delta
-                )
-                .as_bytes(),
-            );
-        }
-        let mut anchor_end = end_line + delta;
-        if anchor_end < start_line {
-            anchor_end = start_line;
-        }
-        append_context(&mut out, path, new_data, start_line, anchor_end);
-    }
-    out
-}
-
-fn append_context(out: &mut Vec<u8>, path: &str, data: &[u8], mut start: i32, mut end: i32) {
-    let spans = split_lines(data);
-    if spans.is_empty() {
-        return;
-    }
-    let n = spans.len() as i32;
-    start = start.clamp(1, n);
-    end = end.clamp(start, n);
-    let ctx_start = (start - CONTEXT_BEFORE).max(1);
-    let ctx_end = (end + CONTEXT_AFTER).min(n);
-    out.extend_from_slice(
-        format!("Current file around edit: {path} lines {ctx_start}-{ctx_end} of {n}\n").as_bytes(),
-    );
-    let edited = end - start + 1;
-    if edited <= EDITED_HEAD + EDITED_TAIL {
-        append_lines(out, data, &spans, ctx_start, ctx_end);
-        return;
-    }
-    let head_end = start + EDITED_HEAD - 1;
-    let tail_start = end - EDITED_TAIL + 1;
-    append_lines(out, data, &spans, ctx_start, head_end);
-    out.extend_from_slice(
-        format!(
-            "... {} edited lines omitted ...\n",
-            tail_start - head_end - 1
-        )
-        .as_bytes(),
-    );
-    append_lines(out, data, &spans, tail_start, ctx_end);
-}
-
-fn append_lines(out: &mut Vec<u8>, data: &[u8], spans: &[LineSpan], from: i32, to: i32) {
-    for line in from..=to {
-        let span = &spans[(line - 1) as usize];
-        out.extend_from_slice(format!("{line} ").as_bytes());
-        out.extend_from_slice(&data[span.start..span.content_end]);
-        out.push(b'\n');
-    }
+    obs::format_edit_result(path, start_line, end_line, delta, &out, kind)
 }

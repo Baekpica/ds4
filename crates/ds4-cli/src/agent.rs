@@ -6,6 +6,7 @@ const THINK_CLOSE: &[u8] = b"</think>";
 const TOOL_UNSUPPORTED_ERROR: &str =
     "tool execution is not implemented in ds4-agent-rs; use ./ds4-agent";
 
+mod approval;
 mod bash;
 mod compact;
 mod edit;
