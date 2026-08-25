@@ -11,6 +11,7 @@ mod compact;
 mod edit;
 mod search;
 mod trace;
+mod tui;
 mod web_tools;
 mod write;
 
@@ -466,6 +467,7 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
     let mut bash_jobs = bash::BashTable::default();
     let one_shot = args.prompt.clone();
     let mut first_turn = true;
+    let surface = tui::Surface::from_stdout();
     loop {
         let prompt = if let Some(prompt) = one_shot.as_ref() {
             if !first_turn {
@@ -519,8 +521,22 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
             cached.max(0) as usize,
         )?;
         session
-            .sync(&transcript)
+            .sync_progress(&transcript, |checkpoint| {
+                let done = i32::try_from(checkpoint.current()).unwrap_or(i32::MAX);
+                let total = i32::try_from(checkpoint.total()).unwrap_or(i32::MAX);
+                tui::emit_prefill(
+                    surface,
+                    tui::PrefillView {
+                        ctx_size: args.ctx,
+                        done,
+                        total,
+                        label: 0,
+                        power_percent: args.power_percent,
+                    },
+                );
+            })
             .map_err(|error| error.to_string())?;
+        let _ = tui::clear_progress_frame(&mut std::io::stderr(), surface);
         let mut output = Vec::new();
         loop {
             let room = session
@@ -532,6 +548,7 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
             let eos = model.token_eos();
             let mut raw = Vec::new();
             let mut generated = 0i32;
+            let gen_started = std::time::Instant::now();
             while generated < max_tokens {
                 let token = session.sample(args.temp, 0, args.top_p, args.min_p, &mut rng);
                 if token < 0 {
@@ -561,6 +578,21 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
                     log.token(accepted, &piece, generated + 1)?;
                     raw.extend_from_slice(&piece);
                     generated += 1;
+                    let elapsed = gen_started.elapsed().as_secs_f64();
+                    tui::emit_generation(
+                        surface,
+                        tui::GenerationView {
+                            ctx_used: i32::try_from(transcript.len()).unwrap_or(i32::MAX),
+                            ctx_size: args.ctx,
+                            generated,
+                            gen_tps: if elapsed > 0.0 {
+                                f64::from(generated) / elapsed
+                            } else {
+                                0.0
+                            },
+                            power_percent: args.power_percent,
+                        },
+                    );
                     if web_tools::block_complete(&raw) || generated >= max_tokens {
                         stop = true;
                         break;
@@ -609,18 +641,38 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
                     .chat_append_assistant_prefix(&mut transcript, think)
                     .map_err(|error| error.to_string())?;
                 session
-                    .sync(&transcript)
+                    .sync_progress(&transcript, |checkpoint| {
+                        let done = i32::try_from(checkpoint.current()).unwrap_or(i32::MAX);
+                        let total = i32::try_from(checkpoint.total()).unwrap_or(i32::MAX);
+                        tui::emit_prefill(
+                            surface,
+                            tui::PrefillView {
+                                ctx_size: args.ctx,
+                                done,
+                                total,
+                                label: 0,
+                                power_percent: args.power_percent,
+                            },
+                        );
+                    })
                     .map_err(|error| error.to_string())?;
                 continue;
             }
             output.extend_from_slice(&project_output(&[&raw])?);
             break;
         }
+        let _ = tui::clear_progress_frame(&mut std::io::stderr(), surface);
         let stdout = std::io::stdout();
         let mut stdout = stdout.lock();
-        stdout
-            .write_all(&output)
-            .map_err(|error| error.to_string())?;
+        if surface.is_tui() {
+            tui::GeneratedSink::new(&mut stdout, surface)
+                .push(&output)
+                .map_err(|error| error.to_string())?;
+        } else {
+            stdout
+                .write_all(&output)
+                .map_err(|error| error.to_string())?;
+        }
         stdout.flush().map_err(|error| error.to_string())?;
         first_turn = false;
         if one_shot.is_some() {
@@ -1028,11 +1080,14 @@ mod tests {
         let stdin_repeat = parse_args(argv(&["--non-interactive"])).unwrap();
         assert!(stdin_repeat.non_interactive);
         assert!(stdin_repeat.prompt.is_none());
-        for flag in ["--dir-steering-file"] {
-            let error = parse_args(argv(&["--non-interactive", "-p", "hello", flag, "ignored"]))
-                .unwrap_err();
-            assert!(error.contains("not implemented"), "{flag}: {error}");
-        }
+        assert!(parse_args(argv(&[
+            "--non-interactive",
+            "-p",
+            "hello",
+            "--no-such-flag"
+        ]))
+        .unwrap_err()
+        .contains("unknown option"));
     }
 
     #[test]
