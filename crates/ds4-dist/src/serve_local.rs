@@ -92,9 +92,6 @@ where
     Stop: FnMut() -> bool,
 {
     coordinator.set_read_timeout(Some(IDLE))?;
-    if let Ok(clone) = coordinator.try_clone() {
-        worker.bind_hops(Arc::new(Mutex::new(clone)));
-    }
     let mut accepted = Vec::new();
     let rc = loop {
         if should_stop() {
@@ -109,6 +106,9 @@ where
         }
         let mut i = 0;
         while i < accepted.len() {
+            if let Ok(clone) = accepted[i].try_clone() {
+                worker.bind_hops(Arc::new(Mutex::new(clone)));
+            }
             match drive_ready(worker, &mut accepted[i]) {
                 Drive::Continue => i += 1,
                 Drive::Closed | Drive::Failed(_) => {

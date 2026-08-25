@@ -7,12 +7,12 @@ use ds4_dist::{
     send_hello, token_hash_update_span, token_span_hashes, validate_layers_for_model,
     validate_options, work_with_ids, write_frame, Coordinator, CoordinatorView, EvalOutcome,
     LocalReconnect, ReturnTarget, RouteEntry, SliceExec, Telemetry, Work, WorkBody, WorkOutput,
-    WorkRequest, Worker, WorkerInfo, MSG_ERROR, MSG_RESULT, RESULT_LOGITS, ROUTE_F_OUTPUT_LOGITS,
-    ROUTE_RETURN_UPSTREAM, TOKEN_HASH_INIT, WORK_F_INPUT_HC, WORK_F_OUTPUT_LOGITS,
-    WORK_F_RESET_SESSION,
+    WorkRequest, Worker, WorkerInfo, ERR_NEXT_CLOSED, MSG_ERROR, MSG_RESULT, RESULT_LOGITS,
+    ROUTE_F_OUTPUT_LOGITS, ROUTE_RETURN_UPSTREAM, TOKEN_HASH_INIT, WORK_F_INPUT_HC,
+    WORK_F_OUTPUT_LOGITS, WORK_F_RESET_SESSION,
 };
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -851,4 +851,234 @@ fn reconnect_local_keeps_coordinator_open_while_hop_work_completes() {
     stop_tx.send(()).unwrap();
     drop(coord);
     worker_thread.join().unwrap().unwrap();
+}
+
+fn middle_exec() -> MockExec {
+    MockExec {
+        model_id: 3,
+        n_layers: 4,
+        vocab: 8,
+        ctx_size: 128,
+        hidden_values: 2,
+        has_output: false,
+        layer_start: 0,
+        layer_end: 1,
+        hidden: vec![1.0, 2.0, 3.0, 4.0],
+        logits: Vec::new(),
+    }
+}
+
+fn two_hop_work_frame(middle_port: u16, next_port: u16) -> Vec<u8> {
+    let tokens = [1i32, 2];
+    let prefix = TOKEN_HASH_INIT;
+    let result = token_hash_update_span(prefix, &tokens);
+    let route_blob = encode_route_blob(
+        &[
+            RouteEntry {
+                host: "127.0.0.1".into(),
+                port: u32::from(middle_port),
+                layer_start: 0,
+                layer_end: 1,
+                flags: 0,
+            },
+            RouteEntry {
+                host: "127.0.0.1".into(),
+                port: u32::from(next_port),
+                layer_start: 2,
+                layer_end: 3,
+                flags: ROUTE_F_OUTPUT_LOGITS,
+            },
+        ],
+        &ReturnTarget {
+            kind: ROUTE_RETURN_UPSTREAM,
+            host: String::new(),
+            port: 0,
+        },
+    )
+    .unwrap();
+    let work = work_with_ids(
+        Work {
+            model_id: 3,
+            pos0: 0,
+            n_tokens: tokens.len() as u32,
+            layer_start: 0,
+            layer_end: 1,
+            flags: WORK_F_RESET_SESSION,
+            input_hc_bits: 32,
+            route_count: 2,
+            route_index: 0,
+            ..Work::default()
+        },
+        9,
+        11,
+        prefix,
+        result,
+    );
+    encode_work_frame(&WorkBody {
+        work,
+        tokens: tokens.to_vec(),
+        input_hc: Vec::new(),
+        route_blob,
+    })
+    .unwrap()
+}
+
+fn spawn_reconnect_worker(
+    exec: MockExec,
+    coord_addr: SocketAddr,
+    data_listener: TcpListener,
+    data_port: u16,
+    stop_rx: mpsc::Receiver<()>,
+) -> thread::JoinHandle<std::io::Result<()>> {
+    thread::spawn(move || {
+        let mut worker = Worker::new(exec);
+        let (hello, name) = worker.hello(u32::from(data_port), 128, "mock");
+        reconnect_local(
+            &mut worker,
+            LocalReconnect {
+                connect: || {
+                    let stream = TcpStream::connect(coord_addr)?;
+                    tune(&stream);
+                    Ok(stream)
+                },
+                hello: &hello,
+                model_name: &name,
+                sleep: || {},
+                should_stop: || stop_rx.try_recv().is_ok(),
+                listener: Some(&data_listener),
+            },
+        )
+    })
+}
+
+fn accept_hello(listener: &TcpListener) -> TcpStream {
+    let (stream, _) = listener.accept().unwrap();
+    tune(&stream);
+    let mut stream = stream;
+    let _ = ds4_dist::recv_hello(&mut stream).unwrap();
+    stream
+}
+
+fn assert_c_shaped_telemetry(request_id: u64, hop: u32, tel: &Telemetry) {
+    let line = format_telemetry_line(request_id, hop, tel);
+    assert!(
+        line.starts_with("ds4: distributed telemetry: "),
+        "C telemetry prefix missing: {line:?}"
+    );
+    assert!(line.contains(&format!("request={request_id}")));
+    assert!(line.contains(&format!("hop={hop}")));
+    assert!(line.contains(&format!("layers={}:{}", tel.layer_start, tel.layer_end)));
+    assert!(line.contains("eval="));
+    assert!(line.contains("downstream_wait="));
+    assert!(line.contains("forward_send="));
+    assert!(line.contains("input="));
+    assert!(line.contains("output="));
+    assert!(line.contains("MiB"));
+    assert!(line.ends_with('\n'));
+}
+
+#[test]
+fn reconnect_local_two_hop_result_includes_c_shaped_telemetry() {
+    // Given: production reconnect_local mux on a middle worker and a final hop
+    let coord_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let coord_addr = coord_listener.local_addr().unwrap();
+    let (middle_listener, middle_port) =
+        ds4_dist::open_data_listener(Some("127.0.0.1"), 0).unwrap();
+    let (final_listener, final_port) = ds4_dist::open_data_listener(Some("127.0.0.1"), 0).unwrap();
+    let (stop_mid_tx, stop_mid_rx) = mpsc::channel();
+    let (stop_fin_tx, stop_fin_rx) = mpsc::channel();
+    let (final_exec, logits) = hop_logits_exec();
+
+    let final_thread = spawn_reconnect_worker(
+        final_exec,
+        coord_addr,
+        final_listener,
+        final_port,
+        stop_fin_rx,
+    );
+    let middle_thread = spawn_reconnect_worker(
+        middle_exec(),
+        coord_addr,
+        middle_listener,
+        middle_port,
+        stop_mid_rx,
+    );
+    let coord_final = accept_hello(&coord_listener);
+    let coord_middle = accept_hello(&coord_listener);
+
+    // When: a two-hop WORK is sent on the middle worker data port
+    let frame = two_hop_work_frame(middle_port, final_port);
+    let mut hop = TcpStream::connect(("127.0.0.1", middle_port)).unwrap();
+    tune(&hop);
+    hop.write_all(&frame).unwrap();
+    let (typ, reply) = read_frame(&mut hop).unwrap();
+
+    // Then: hop RESULT carries both hops and format_telemetry_line is C-shaped
+    assert_eq!(typ, MSG_RESULT);
+    let result = decode_result_body(&reply).unwrap();
+    assert_eq!(result.hdr.status, 0);
+    assert_eq!(result.hdr.result_kind, RESULT_LOGITS);
+    assert_eq!(decode_logits_payload(&result.payload).unwrap(), logits);
+    assert_eq!(result.telemetry.len(), 2);
+    assert_eq!(result.telemetry[0].layer_start, 2);
+    assert_eq!(result.telemetry[0].layer_end, 3);
+    assert_eq!(result.telemetry[0].route_index, 1);
+    assert_eq!(result.telemetry[1].layer_start, 0);
+    assert_eq!(result.telemetry[1].layer_end, 1);
+    assert_eq!(result.telemetry[1].route_index, 0);
+    assert_c_shaped_telemetry(11, 0, &result.telemetry[0]);
+    assert_c_shaped_telemetry(11, 1, &result.telemetry[1]);
+
+    stop_mid_tx.send(()).unwrap();
+    stop_fin_tx.send(()).unwrap();
+    drop(hop);
+    drop(coord_final);
+    drop(coord_middle);
+    middle_thread.join().unwrap().unwrap();
+    final_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn reconnect_local_missing_next_hop_keeps_c_forward_error() {
+    // Given: a middle worker whose next hop accepts then closes
+    let coord_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let coord_addr = coord_listener.local_addr().unwrap();
+    let (middle_listener, middle_port) =
+        ds4_dist::open_data_listener(Some("127.0.0.1"), 0).unwrap();
+    let next_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let next_port = next_listener.local_addr().unwrap().port();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let middle_thread = spawn_reconnect_worker(
+        middle_exec(),
+        coord_addr,
+        middle_listener,
+        middle_port,
+        stop_rx,
+    );
+    let coord = accept_hello(&coord_listener);
+    let next_thread = thread::spawn(move || {
+        let (stream, _) = next_listener.accept().unwrap();
+        drop(stream);
+    });
+
+    // When: two-hop WORK is forwarded to the closed next hop
+    let frame = two_hop_work_frame(middle_port, next_port);
+    let mut hop = TcpStream::connect(("127.0.0.1", middle_port)).unwrap();
+    tune(&hop);
+    hop.write_all(&frame).unwrap();
+    let (typ, reply) = read_frame(&mut hop).unwrap();
+
+    // Then: RESULT uses the existing C forward-error string
+    assert_eq!(typ, MSG_RESULT);
+    let result = decode_result_body(&reply).unwrap();
+    assert_ne!(result.hdr.status, 0);
+    let msg = String::from_utf8_lossy(&result.payload);
+    assert_eq!(msg, ERR_NEXT_CLOSED);
+    assert!(!msg.contains("telemetry"));
+    next_thread.join().unwrap();
+
+    stop_tx.send(()).unwrap();
+    drop(hop);
+    drop(coord);
+    middle_thread.join().unwrap().unwrap();
 }
