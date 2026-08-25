@@ -488,8 +488,9 @@ fn run_chat_turn(
     let use_mtp = use_mtp_spec(args.temp, args.mtp.as_deref(), args.mtp_draft);
     let eos = model.token_eos();
     let mut generated = 0i32;
+    repl::interrupt_clear();
 
-    while generated < max_tokens {
+    while generated < max_tokens && !repl::interrupt_requested() {
         let token = session.sample(args.temp, 0, args.top_p, args.min_p, &mut rng);
         if token < 0 {
             eprintln!("ds4: decode failed: failed to sample the next token");
@@ -537,7 +538,17 @@ fn run_chat_turn(
         }
     }
     printer.finish(&mut out).map_err(|e| e.to_string())?;
-    chat.transcript.push(eos);
+    let interrupted = repl::interrupt_requested();
+    match repl::interrupt_end(interrupted, generated) {
+        repl::InterruptEnd::Rollback => {
+            chat.transcript.truncate(rollback);
+            session.invalidate();
+        }
+        repl::InterruptEnd::KeepEos => chat.transcript.push(eos),
+    }
+    if interrupted {
+        repl::interrupt_clear();
+    }
     Ok(())
 }
 
@@ -1050,6 +1061,7 @@ fn run_repl(model: &ds4_core::Model, mut args: ShadowArgs) -> Result<i32, String
             .map_err(|e| e.to_string())?;
     }
     let mut session = session_ready(model, &args, chat.ctx)?;
+    let _sigint = repl::InterruptGuard::install();
 
     print!("{}", repl::REPL_HELP);
     let stdin = io::stdin();
@@ -1058,13 +1070,20 @@ fn run_repl(model: &ds4_core::Model, mut args: ShadowArgs) -> Result<i32, String
         write!(stdout, "ds4> ").map_err(|e| e.to_string())?;
         stdout.flush().map_err(|e| e.to_string())?;
         let mut line = String::new();
-        if stdin
-            .lock()
-            .read_line(&mut line)
-            .map_err(|e| e.to_string())?
-            == 0
-        {
-            break;
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => {
+                if repl::interrupt_requested() {
+                    repl::interrupt_clear();
+                    continue;
+                }
+                break;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                repl::interrupt_clear();
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
         }
         match repl::parse_repl_line(&line) {
             Ok(repl::ReplLine::Empty) => {}

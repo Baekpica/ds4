@@ -1,5 +1,69 @@
 //! Interactive CLI commands matching `ds4_cli.c` `print_repl_help` / `run_repl`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn sigint_handler(_: libc::c_int) {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+}
+
+pub fn interrupt_requested() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
+pub fn interrupt_clear() {
+    INTERRUPTED.store(false, Ordering::SeqCst);
+}
+
+pub struct InterruptGuard {
+    old: Option<libc::sigaction>,
+}
+
+impl InterruptGuard {
+    pub fn install() -> Self {
+        interrupt_clear();
+        let mut old = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        let mut sa = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        sa.sa_sigaction = sigint_handler as *const () as usize;
+        // SAFETY: `sigemptyset` only writes the caller-owned mask.
+        unsafe {
+            libc::sigemptyset(&mut sa.sa_mask);
+        }
+        // SAFETY: installs a process-wide SIGINT handler and copies the
+        // previous action into `old` so Drop can restore it.
+        let rc = unsafe { libc::sigaction(libc::SIGINT, &sa, &mut old) };
+        Self {
+            old: (rc == 0).then_some(old),
+        }
+    }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        if let Some(old) = self.old.take() {
+            // SAFETY: restores the previous SIGINT action captured at install.
+            unsafe {
+                libc::sigaction(libc::SIGINT, &old, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptEnd {
+    Rollback,
+    KeepEos,
+}
+
+pub fn interrupt_end(interrupted: bool, generated: i32) -> InterruptEnd {
+    if interrupted && generated == 0 {
+        InterruptEnd::Rollback
+    } else {
+        InterruptEnd::KeepEos
+    }
+}
+
 pub const REPL_HELP: &str = "\
 Commands:
   /help          Show this help.
@@ -296,5 +360,13 @@ mod tests {
         assert_eq!(max.effective_think(), ds4_core::ChatThinkMode::High);
         assert!(max.wants_effort_prefix());
         assert_eq!(max.think_message(), "Thinking mode: max.");
+    }
+
+    #[test]
+    fn interrupt_end_matches_c() {
+        assert_eq!(interrupt_end(true, 0), InterruptEnd::Rollback);
+        assert_eq!(interrupt_end(true, 1), InterruptEnd::KeepEos);
+        assert_eq!(interrupt_end(false, 0), InterruptEnd::KeepEos);
+        assert_eq!(interrupt_end(false, 4), InterruptEnd::KeepEos);
     }
 }
