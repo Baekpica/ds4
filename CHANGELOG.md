@@ -5,6 +5,38 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## Unreleased
+
+- **Client reasoning_effort compat-mapping (field issue #18)** — the
+  OpenAI-surface `reasoning_effort` field no longer reaches the
+  checkpoint's prefixed tiers by default: client `high`/`xhigh`/`max`
+  resolve to prefix-free `low`. The v0.5.3 tier rename made a client
+  `"high"` start injecting DeepSeek's position-0 "write out your entire
+  deliberation" preamble (verbatim reference-encoder text), and a
+  controlled needle matrix shows that preamble degrades deep-context
+  tool calling: 6/50 completion-protocol failures at ≥96K tokens with
+  the prefix (including a deterministic greedy flip) vs 0/100 without,
+  on both v0.5.2 and v0.6.2. Agent frameworks send the field meaning
+  the OpenAI "think more" knob; llama.cpp and pre-rename engines no-op
+  it, which is the behavior restored as the default. Operators opt back
+  into the native tiers with `--reasoning-effort-native`
+  (env `DS4_REASONING_EFFORT_NATIVE=1`); the `--reasoning-effort`
+  operator default is honored as written either way. Applies to every
+  client surface (OpenAI chat/completions/responses and the Anthropic
+  `output_config.effort`); disabling thinking (`none`/`off`) stays
+  client-reachable.
+- **Mixed-spelling DSML tool-call parsing** — at depth the model
+  sometimes frays tag spellings inside one tool block (measured live at
+  ~96K: DSML envelope with plain-XML `<parameter>` tags; the issue-#18
+  capture's death loop is the model retrying exactly such calls after
+  the parser demoted them to content text and the harness answered "no
+  tool calls found"). The generated-message parser now matches each
+  element (block end, invoke open/close, parameter open/close)
+  against all three spellings independently, and a parameter value runs
+  to the earliest end-tag spelling, so mixed open/close pairs still
+  terminate. Canonical DSML parses byte-identically to before
+  (regression-tested).
+
 ## v0.6.3 — 2026-08-21
 
 - **Numerics note** — the decode-dispatch change in the full-window

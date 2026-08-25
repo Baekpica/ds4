@@ -888,6 +888,20 @@ static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effor
  * option parsing, read-only after. */
 static ds4_think_mode g_default_reasoning_effort = DS4_THINK_LOW;
 
+/* Issue #18: the OpenAI-surface reasoning_effort field is compat-mapped by
+ * default -- prefixed tiers (high/max) resolve to LOW, so a client field can
+ * never inject the checkpoint's effort preambles.  Agent frameworks send
+ * "high" meaning the OpenAI knob ("think more"), not DeepSeek's position-0
+ * "write out your entire deliberation" paragraph; delivering the paragraph
+ * degrades deep-context tool calling (needle matrix: 6/50 failures >=96K
+ * with the prefix vs 0/100 without, and it is the v0.5.2 -> v0.6.2 field
+ * regression -- v0.5.2 and llama.cpp both no-op the field).  Operators who
+ * want the checkpoint's native tiers back opt in with
+ * --reasoning-effort-native; the operator's own --reasoning-effort default
+ * is always honored as written, since setting it IS the native opt-in for
+ * that level. */
+static bool g_native_reasoning_effort = false;
+
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
     if (!s) return false;
     /* The three levels the 0731 checkpoint defines, plus the OpenAI-style
@@ -927,6 +941,15 @@ static bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
     if (!json_string(p, &effort)) return false;
     bool ok = parse_reasoning_effort_name(effort, out);
     free(effort);
+    /* Client-field entry point only (the --reasoning-effort flag parses via
+     * parse_reasoning_effort_name directly), so the compat clamp lives here:
+     * without the native opt-in, request fields cannot reach a prefixed
+     * tier.  NONE passes through -- disabling thinking stays client-reachable. */
+    if (ok && !g_native_reasoning_effort &&
+        (*out == DS4_THINK_HIGH || *out == DS4_THINK_MAX))
+    {
+        *out = DS4_THINK_LOW;
+    }
     return ok;
 }
 
@@ -4776,6 +4799,38 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
     free(s);
 }
 
+/* Issue #18 fray tolerance: at depth the model mixes DSML tag spellings
+ * inside one block (measured live: DSML envelope + plain-XML <parameter>
+ * tags; the capture's death loop is the model retrying exactly such calls
+ * after the strict parser demoted them to text and the harness answered
+ * "no tool calls found").  Every element therefore matches any of the three
+ * spellings independently, and a parameter value runs to the EARLIEST
+ * end-tag spelling so mixed open/close pairs still terminate. */
+static const char *dsml_match_any3(const char *p, const char *t0,
+                                   const char *t1, const char *t2) {
+    if (!strncmp(p, t0, strlen(t0))) return t0;
+    if (!strncmp(p, t1, strlen(t1))) return t1;
+    if (!strncmp(p, t2, strlen(t2))) return t2;
+    return NULL;
+}
+
+static const char *dsml_find_earliest3(const char *hay, const char *t0,
+                                       const char *t1, const char *t2,
+                                       const char **matched) {
+    const char *cands[3] = {t0, t1, t2};
+    const char *best = NULL;
+    const char *tag = NULL;
+    for (int i = 0; i < 3; i++) {
+        const char *s = strstr(hay, cands[i]);
+        if (s && (!best || s < best)) {
+            best = s;
+            tag = cands[i];
+        }
+    }
+    if (matched) *matched = tag;
+    return best;
+}
+
 static bool parse_generated_message_ex(const char *text, bool require_thinking_closed,
                                        char **content_out, char **reasoning_out,
                                        tool_calls *calls) {
@@ -4827,26 +4882,8 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
     size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
     const char *raw_block_start = start;
     const char *tool_calls_start = DS4_TOOL_CALLS_START;
-    const char *tool_calls_end = DS4_TOOL_CALLS_END;
-    const char *invoke_start = DS4_INVOKE_START;
-    const char *invoke_end = DS4_INVOKE_END;
-    const char *param_start = DS4_PARAM_START;
-    const char *param_end = DS4_PARAM_END;
-    if (style == 1) {
-        tool_calls_start = "<tool_calls>";
-        tool_calls_end = "</tool_calls>";
-        invoke_start = "<invoke";
-        invoke_end = "</invoke>";
-        param_start = "<parameter";
-        param_end = "</parameter>";
-    } else if (style == 2) {
-        tool_calls_start = DS4_TOOL_CALLS_START_SHORT;
-        tool_calls_end = DS4_TOOL_CALLS_END_SHORT;
-        invoke_start = DS4_INVOKE_START_SHORT;
-        invoke_end = DS4_INVOKE_END_SHORT;
-        param_start = DS4_PARAM_START_SHORT;
-        param_end = DS4_PARAM_END_SHORT;
-    }
+    if (style == 1) tool_calls_start = "<tool_calls>";
+    else if (style == 2) tool_calls_start = DS4_TOOL_CALLS_START_SHORT;
 
     const char *p = strstr(start, tool_calls_start);
     if (!p) return false;
@@ -4854,14 +4891,19 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
 
     for (;;) {
         p = skip_ascii_ws(p);
-        if (!strncmp(p, tool_calls_end, strlen(tool_calls_end))) {
-            const char *raw_block_end = p + strlen(tool_calls_end);
+        const char *block_end_tag = dsml_match_any3(p, DS4_TOOL_CALLS_END,
+                                                    DS4_TOOL_CALLS_END_SHORT,
+                                                    "</tool_calls>");
+        if (block_end_tag) {
+            const char *raw_block_end = p + strlen(block_end_tag);
             free(calls->raw_dsml);
             calls->raw_dsml = xstrndup(raw_block_start, (size_t)(raw_block_end - raw_block_start));
             split_reasoning_content(text, content_len, content_out, reasoning_out);
             return true;
         }
-        if (strncmp(p, invoke_start, strlen(invoke_start)) != 0) return false;
+        if (!dsml_match_any3(p, DS4_INVOKE_START, DS4_INVOKE_START_SHORT,
+                             "<invoke"))
+            return false;
         const char *tag_end = strchr(p, '>');
         if (!tag_end) return false;
         char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
@@ -4873,11 +4915,15 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
         buf args = {0};
         while (true) {
             p = skip_ascii_ws(p);
-            if (!strncmp(p, invoke_end, strlen(invoke_end))) {
-                p += strlen(invoke_end);
+            const char *inv_end_tag = dsml_match_any3(p, DS4_INVOKE_END,
+                                                      DS4_INVOKE_END_SHORT,
+                                                      "</invoke>");
+            if (inv_end_tag) {
+                p += strlen(inv_end_tag);
                 break;
             }
-            if (strncmp(p, param_start, strlen(param_start)) != 0) {
+            if (!dsml_match_any3(p, DS4_PARAM_START, DS4_PARAM_START_SHORT,
+                                 "<parameter")) {
                 free(name);
                 buf_free(&args);
                 return false;
@@ -4900,13 +4946,19 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
                 return false;
             }
             const char *value_start = tag_end + 1;
-            if (!param_is_string &&
-                !strncmp(skip_ascii_ws(value_start), param_start, strlen(param_start)))
-            {
+            const char *nested_tag = dsml_match_any3(skip_ascii_ws(value_start),
+                                                     DS4_PARAM_START,
+                                                     DS4_PARAM_START_SHORT,
+                                                     "<parameter");
+            if (!param_is_string && nested_tag) {
+                const char *nested_end =
+                    !strcmp(nested_tag, DS4_PARAM_START) ? DS4_PARAM_END :
+                    !strcmp(nested_tag, DS4_PARAM_START_SHORT) ? DS4_PARAM_END_SHORT :
+                    "</parameter>";
                 buf nested = {0};
                 const char *nested_p = value_start;
-                if (!dsml_parse_nested_params_object(&nested_p, param_start,
-                                                     param_end, &nested)) {
+                if (!dsml_parse_nested_params_object(&nested_p, nested_tag,
+                                                     nested_end, &nested)) {
                     free(name);
                     free(param_name);
                     buf_free(&nested);
@@ -4918,13 +4970,18 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
                                         "false");
                 buf_free(&nested);
                 p = skip_ascii_ws(nested_p);
-                if (!strncmp(p, param_end, strlen(param_end))) {
-                    p += strlen(param_end);
-                }
+                const char *outer_end_tag = dsml_match_any3(p, DS4_PARAM_END,
+                                                            DS4_PARAM_END_SHORT,
+                                                            "</parameter>");
+                if (outer_end_tag) p += strlen(outer_end_tag);
                 free(param_name);
                 continue;
             }
-            const char *value_end = strstr(value_start, param_end);
+            const char *value_end_tag = NULL;
+            const char *value_end = dsml_find_earliest3(value_start, DS4_PARAM_END,
+                                                        DS4_PARAM_END_SHORT,
+                                                        "</parameter>",
+                                                        &value_end_tag);
             if (!value_end) {
                 free(name);
                 free(param_name);
@@ -4941,7 +4998,7 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
             free(param_is_string);
             free(raw_value);
             free(value);
-            p = value_end + strlen(param_end);
+            p = value_end + strlen(value_end_tag);
         }
 
         tool_call tc = {0};
@@ -18708,6 +18765,11 @@ static void usage(FILE *fp) {
         "  --reasoning-effort LEVEL\n"
         "      Default reasoning effort for requests that do not send one: low (default),\n"
         "      high, max, or off. Explicit request values always win.\n"
+        "  --reasoning-effort-native\n"
+        "      Let client reasoning_effort fields reach the checkpoint's prefixed tiers\n"
+        "      (high/max inject DeepSeek's effort preambles at position 0). Default off:\n"
+        "      client high/max compat-map to low -- the preambles measurably degrade\n"
+        "      deep-context tool calling (issue #18). Env twin: DS4_REASONING_EFFORT_NATIVE=1.\n"
         "  --mem-floor-gb N\n"
         "      System memory admissions must always leave free, in GiB. Default: 4.\n"
         "      KV-cache growth is trimmed or rejected before free memory drops below\n"
@@ -19268,6 +19330,8 @@ static server_config parse_options(int argc, char **argv) {
             c.no_serial = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--reasoning-effort-native")) {
+            g_native_reasoning_effort = true;
         } else if (!strcmp(arg, "--reasoning-effort")) {
             const char *v = need_arg(&i, argc, argv, arg);
             if (!parse_reasoning_effort_name(v, &g_default_reasoning_effort)) {
@@ -19380,6 +19444,10 @@ static server_config parse_options(int argc, char **argv) {
         const char *ne = getenv("DS4_SERVER_NO_SERIAL");
         c.no_serial = ne && ne[0] == '1' && ne[1] == '\0';
     }
+    if (!g_native_reasoning_effort) {   /* env twin of --reasoning-effort-native */
+        const char *ne = getenv("DS4_REASONING_EFFORT_NATIVE");
+        g_native_reasoning_effort = ne && ne[0] == '1' && ne[1] == '\0';
+    }
     return c;
 }
 
@@ -19399,6 +19467,10 @@ int main(int argc, char **argv) {
                    cfg.chdir_path, strerror(errno));
         return 1;
     }
+    if (g_native_reasoning_effort)
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: native reasoning-effort tiers: client high/max "
+                   "inject the checkpoint's effort preambles");
     if (g_default_reasoning_effort != DS4_THINK_LOW) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: default reasoning effort: %s",
                    ds4_think_mode_name(g_default_reasoning_effort));
@@ -21380,6 +21452,42 @@ static void test_reasoning_effort_mapping(void) {
     TEST_ASSERT(think_mode_from_enabled(true, DS4_THINK_NONE) == DS4_THINK_NONE);
 }
 
+static void test_client_reasoning_effort_compat(void) {
+    /* Issue #18: by default a client reasoning_effort field cannot reach a
+     * prefixed tier -- "high"/"max" compat-map to LOW at the shared client
+     * parse entry (parse_reasoning_effort_value), which every endpoint's
+     * field parser goes through.  The preambles measurably degrade
+     * deep-context tool calling; llama.cpp and pre-rename engines no-op the
+     * field, and this restores that behavior as the default. */
+    const bool saved = g_native_reasoning_effort;
+    ds4_think_mode m;
+    const char *p;
+
+    g_native_reasoning_effort = false;
+    p = "\"high\""; m = DS4_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_value(&p, &m) && m == DS4_THINK_LOW);
+    p = "\"xhigh\""; m = DS4_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_value(&p, &m) && m == DS4_THINK_LOW);
+    p = "\"max\""; m = DS4_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_value(&p, &m) && m == DS4_THINK_LOW);
+    /* Disabling thinking stays client-reachable through the clamp. */
+    p = "\"off\""; m = DS4_THINK_LOW;
+    TEST_ASSERT(parse_reasoning_effort_value(&p, &m) && m == DS4_THINK_NONE);
+
+    /* --reasoning-effort-native restores the checkpoint's native tiers. */
+    g_native_reasoning_effort = true;
+    p = "\"high\""; m = DS4_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_value(&p, &m) && m == DS4_THINK_HIGH);
+    p = "\"max\""; m = DS4_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_value(&p, &m) && m == DS4_THINK_MAX);
+    g_native_reasoning_effort = saved;
+
+    /* The operator flag path (parse_reasoning_effort_name direct) is never
+     * clamped: setting --reasoning-effort IS the opt-in for that level. */
+    ds4_think_mode op = DS4_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_name("high", &op) && op == DS4_THINK_HIGH);
+}
+
 static void test_api_thinking_controls_parse(void) {
     bool enabled = true;
     const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
@@ -21389,17 +21497,28 @@ static void test_api_thinking_controls_parse(void) {
     TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
     TEST_ASSERT(enabled);
 
+    /* Client effort fields (Anthropic output_config and the OpenAI field
+     * alike) ride the issue-#18 compat clamp: prefixed tiers need the
+     * operator's --reasoning-effort-native. */
     ds4_think_mode mode = DS4_THINK_LOW;
     char oc_err[160] = {0};
     const char *anth_effort = "{\"effort\":\"max\",\"other\":true}";
     TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode, oc_err, sizeof(oc_err)));
-    TEST_ASSERT(mode == DS4_THINK_MAX);
+    TEST_ASSERT(mode == DS4_THINK_LOW);
     TEST_ASSERT(oc_err[0] == '\0');
+
+    const bool saved_native = g_native_reasoning_effort;
+    g_native_reasoning_effort = true;
+    anth_effort = "{\"effort\":\"max\",\"other\":true}";
+    mode = DS4_THINK_LOW;
+    TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode, oc_err, sizeof(oc_err)));
+    TEST_ASSERT(mode == DS4_THINK_MAX);
 
     const char *openai_effort = "\"xhigh\"";
     mode = DS4_THINK_LOW;
     TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
     TEST_ASSERT(mode == DS4_THINK_HIGH);
+    g_native_reasoning_effort = saved_native;
 }
 
 static void test_render_think_max_prompt_prefix(void) {
@@ -21653,6 +21772,69 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     free(reasoning);
     tool_calls_free(&calls);
     request_free(&r);
+}
+
+static void test_parse_mixed_style_dsml_tool_block(void) {
+    /* Issue #18 live specimen shape: DSML envelope + invoke, but plain-XML
+     * <parameter> tags inside, emitted at ~96K depth under the effort
+     * preamble.  The strict per-block style resolution demoted the whole
+     * output to content text; the harness then answered "no tool calls
+     * found" and the capture's death loop followed (flow 103 is the model
+     * saying so).  Per-element matching must recover it. */
+    const char *generated =
+        "We need to respond with submit.</think>\n\n"
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<parameter name=\"command\" string=\"true\">submit</parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, true, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(!strcmp(calls.v[0].name, "bash"));
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"submit\"") != NULL);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+
+    /* Mixed CLOSER spelling: DSML parameter opened, XML close.  The value
+     * runs to the earliest end-tag spelling. */
+    const char *mixed_close =
+        "</think>\n\n"
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</parameter>\n"
+        "</invoke>\n"
+        "</｜DSML｜tool_calls>";
+    content = NULL;
+    reasoning = NULL;
+    memset(&calls, 0, sizeof(calls));
+    TEST_ASSERT(parse_generated_message_ex(mixed_close, true, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"ls -la\"") != NULL);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+
+    /* Fully well-formed DSML must keep parsing exactly as before. */
+    const char *canonical =
+        "</think>\n\n"
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">pytest -q</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    content = NULL;
+    reasoning = NULL;
+    memset(&calls, 0, sizeof(calls));
+    TEST_ASSERT(parse_generated_message_ex(canonical, true, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"pytest -q\"") != NULL);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
 }
 
 static void test_dsml_parser_recovers_loose_nested_parameters(void) {
@@ -29241,6 +29423,7 @@ static void ds4_server_unit_tests_run(void) {
     test_version_newer_comparisons();
     test_request_defaults_use_min_p_filtering();
     test_reasoning_effort_mapping();
+    test_client_reasoning_effort_compat();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_think_effort_prefix_tiers();
@@ -29283,6 +29466,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
+    test_parse_mixed_style_dsml_tool_block();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
