@@ -562,6 +562,20 @@ extern "C" {
         errlen: usize,
     ) -> c_int;
 
+    pub fn ds4_bridge_session_copy_logits(
+        s: *mut ds4_bridge_session,
+        out: *mut c_float,
+        cap: c_int,
+    ) -> c_int;
+
+    pub fn ds4_bridge_session_output_head_bench(
+        s: *mut ds4_bridge_session,
+        iters: c_int,
+        path: *const c_char,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
     pub fn ds4_bridge_session_top_logprobs(
         s: *mut ds4_bridge_session,
         out: *mut ds4_bridge_token_score,

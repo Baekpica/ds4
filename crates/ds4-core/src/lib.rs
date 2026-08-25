@@ -88,12 +88,13 @@ use ds4_sys::{
     ds4_bridge_model_open_distributed, ds4_bridge_model_open_options,
     ds4_bridge_model_routed_quant_bits, ds4_bridge_model_run_distributed_worker,
     ds4_bridge_session, ds4_bridge_session_argmax, ds4_bridge_session_argmax_excluding,
-    ds4_bridge_session_create, ds4_bridge_session_ctx, ds4_bridge_session_distributed_route_ready,
-    ds4_bridge_session_exaone_rewind_span, ds4_bridge_session_free, ds4_bridge_session_generation,
-    ds4_bridge_session_invalidate, ds4_bridge_session_load_layer_payload,
-    ds4_bridge_session_load_payload, ds4_bridge_session_load_payload_range,
-    ds4_bridge_session_load_snapshot, ds4_bridge_session_prefill_cap, ds4_bridge_session_rewind,
-    ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
+    ds4_bridge_session_copy_logits, ds4_bridge_session_create, ds4_bridge_session_ctx,
+    ds4_bridge_session_distributed_route_ready, ds4_bridge_session_exaone_rewind_span,
+    ds4_bridge_session_free, ds4_bridge_session_generation, ds4_bridge_session_invalidate,
+    ds4_bridge_session_load_layer_payload, ds4_bridge_session_load_payload,
+    ds4_bridge_session_load_payload_range, ds4_bridge_session_load_snapshot,
+    ds4_bridge_session_output_head_bench, ds4_bridge_session_prefill_cap,
+    ds4_bridge_session_rewind, ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
     ds4_bridge_session_save_payload, ds4_bridge_session_save_snapshot, ds4_bridge_session_sync,
     ds4_bridge_session_top_logprobs, ds4_bridge_shard, ds4_bridge_snapshot,
     ds4_bridge_snapshot_create, ds4_bridge_snapshot_free, ds4_bridge_snapshot_len,
@@ -1383,6 +1384,47 @@ impl Session<'_> {
 
     /// Post-prefill distribution head, up to `k` entries (`k` clamps to the
     /// C CLI's 128). Empty when the backend keeps no logits.
+    pub fn copy_logits(&self, vocab: usize) -> Result<Vec<f32>> {
+        if vocab == 0 {
+            return Err(Error {
+                code: 1,
+                message: "vocab is empty".into(),
+            });
+        }
+        let mut out = vec![0.0f32; vocab];
+        let n = unsafe {
+            ds4_bridge_session_copy_logits(self.raw.as_ptr(), out.as_mut_ptr(), vocab as i32)
+        };
+        if n != vocab as i32 {
+            return Err(Error {
+                code: 1,
+                message: "failed to copy session logits".into(),
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn output_head_bench(&self, iters: i32, path: Option<&str>) -> Result<()> {
+        let c_path = match path {
+            Some(p) => Some(cstring_path(p)?),
+            None => None,
+        };
+        let mut err = [0u8; 512];
+        let rc = unsafe {
+            ds4_bridge_session_output_head_bench(
+                self.raw.as_ptr(),
+                iters,
+                c_path.as_ref().map_or(ptr::null(), |s| s.as_ptr()),
+                err.as_mut_ptr() as *mut c_char,
+                err.len(),
+            )
+        };
+        if rc != 0 {
+            return Err(fail(rc, &err));
+        }
+        Ok(())
+    }
+
     pub fn top_logprobs(&self, k: usize) -> Vec<TokenScore> {
         const SCORE_CAP: usize = 128;
         let k = k.clamp(1, SCORE_CAP);

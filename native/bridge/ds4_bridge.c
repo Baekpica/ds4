@@ -990,6 +990,44 @@ int ds4_bridge_session_top_logprobs(ds4_bridge_session *s,
     return n;
 }
 
+int ds4_bridge_session_copy_logits(ds4_bridge_session *s, float *out, int cap)
+{
+    if (!s || !s->session || !out || cap <= 0) return -1;
+    return ds4_session_copy_logits(s->session, out, cap);
+}
+
+int ds4_bridge_session_output_head_bench(ds4_bridge_session *s,
+                                         int iters, const char *path,
+                                         char *err, size_t errlen)
+{
+    FILE *fp;
+    int rc;
+
+    if (!s || !s->session) {
+        set_err(err, errlen, "session is NULL");
+        return 1;
+    }
+    if (iters <= 0) {
+        set_err(err, errlen, "output-head bench iters must be positive");
+        return 1;
+    }
+    if (!path || !path[0]) {
+        fp = stdout;
+    } else {
+        fp = fopen(path, "wb");
+        if (!fp) {
+            set_err(err, errlen, "failed to open output-head bench path");
+            return 1;
+        }
+    }
+    rc = ds4_session_output_head_bench(s->session, iters, fp, err, errlen);
+    if (fp != stdout && fclose(fp) != 0 && rc == 0) {
+        set_err(err, errlen, "failed to close output-head bench path");
+        return 1;
+    }
+    return rc;
+}
+
 /* Declared in ds4_gpu.h; the bridge does not include that header. */
 uint64_t ds4_gpu_substrate_outstanding(void);
 

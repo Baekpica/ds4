@@ -208,6 +208,93 @@ fn use_mtp_spec(mtp: Option<&str>, draft: i32) -> bool {
     mtp.is_some() && draft > 1 && std::env::var_os("DS4_MTP_SPEC_DISABLE").is_none()
 }
 
+fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Cuda => "cuda",
+        Backend::Metal => "metal",
+        Backend::Cpu => "cpu",
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_f32(v: f32) -> String {
+    if v.is_finite() {
+        format!("{v:.9}")
+    } else {
+        "null".into()
+    }
+}
+
+fn frontier_logits_path(dir: &str, frontier: i32) -> String {
+    format!("{dir}/frontier_{frontier:06}.logits.json")
+}
+
+fn write_frontier_logits_json(
+    args: &BenchArgs,
+    model: &Model,
+    session: &Session<'_>,
+    frontier: i32,
+    previous: i32,
+) -> Result<(), String> {
+    let Some(dir) = args.dump_frontier_logits_dir.as_deref() else {
+        return Ok(());
+    };
+    let vocab = model.vocab().n_vocab() as usize;
+    let logits = session
+        .copy_logits(vocab)
+        .map_err(|_| format!("failed to copy frontier logits at {frontier}"))?;
+    let argmax = session.argmax();
+    if !(0..logits.len() as i32).contains(&argmax) {
+        return Err(format!("failed to copy frontier logits at {frontier}"));
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("failed to create {dir}: {e}"))?;
+    let path = frontier_logits_path(dir, frontier);
+    let mut body = String::new();
+    body.push_str("{\n  \"source\":\"ds4-bench\",\n  \"model\":");
+    body.push_str(&json_escape(&args.model));
+    body.push_str(&format!(
+        ",\n  \"backend\":\"{}\",\n  \"quality\":{},\n  \"quant_bits\":{},\n  \"prompt_tokens\":{},\n  \"frontier_tokens\":{},\n  \"prefill_tokens\":{},\n  \"ctx\":{},\n  \"vocab\":{},\n  \"argmax_id\":{},\n  \"argmax_logit\":{},\n  \"logits\":[",
+        backend_name(args.backend),
+        if args.quality { "true" } else { "false" },
+        model.routed_quant_bits(),
+        frontier,
+        frontier,
+        frontier - previous,
+        args.ctx_alloc,
+        vocab,
+        argmax,
+        json_f32(logits[argmax as usize]),
+    ));
+    for (i, logit) in logits.iter().enumerate() {
+        if i > 0 {
+            body.push(',');
+        }
+        if i % 8 == 0 {
+            body.push_str("\n    ");
+        }
+        body.push_str(&json_f32(*logit));
+    }
+    body.push_str("\n  ]\n}\n");
+    std::fs::write(&path, body).map_err(|e| format!("failed to write {path}: {e}"))?;
+    Ok(())
+}
+
 fn prompt_source(args: &BenchArgs) -> Result<(&str, bool), String> {
     match (
         args.prompt_file.as_deref(),
@@ -326,11 +413,16 @@ pub fn run(args: BenchArgs) -> Result<i32, String> {
     } else {
         TokenBuffer::from_tokens(model.vocab().encode_bytes(&text))
     };
-    if prompt.len() < args.ctx_max as usize {
+    let needed_prompt = if args.output_head_bench_iters > 0 {
+        args.ctx_start
+    } else {
+        args.ctx_max
+    };
+    if prompt.len() < needed_prompt as usize {
         return Err(format!(
             "prompt has {} tokens, need at least {}",
             prompt.len(),
-            args.ctx_max
+            needed_prompt
         ));
     }
 
@@ -338,6 +430,15 @@ pub fn run(args: BenchArgs) -> Result<i32, String> {
     if uses_distributed_replay(&args) {
         wait_distributed_route(&session)?;
         maybe_warn_distributed_step_shape(&args, &session);
+    }
+    if args.output_head_bench_iters > 0 {
+        let prefix =
+            TokenBuffer::from_tokens(prompt.as_slice()[..args.ctx_start as usize].to_vec());
+        session.sync(&prefix).map_err(|e| e.to_string())?;
+        session
+            .output_head_bench(args.output_head_bench_iters, args.csv.as_deref())
+            .map_err(|e| format!("output-head bench failed: {e}"))?;
+        return Ok(0);
     }
     let mut snapshot = if uses_distributed_replay(&args) {
         None
@@ -395,6 +496,7 @@ fn run_sweep<W: Write>(
         session.sync(&prefix).map_err(|e| e.to_string())?;
         let prefill_sec = prefill_t0.elapsed().as_secs_f64();
         let prefill_tokens = frontier - previous;
+        write_frontier_logits_json(args, model, session, frontier, previous)?;
 
         if args.gen_tokens > 0 && !distributed {
             let snapshot = snapshot
@@ -922,5 +1024,16 @@ mod tests {
         assert!(!use_mtp_spec(None, 2));
         assert!(!use_mtp_spec(Some("draft.gguf"), 1));
         assert!(use_mtp_spec(Some("draft.gguf"), 2));
+    }
+
+    #[test]
+    fn frontier_logits_path_matches_c() {
+        assert_eq!(
+            frontier_logits_path("/tmp/logits", 2048),
+            "/tmp/logits/frontier_002048.logits.json"
+        );
+        assert_eq!(json_escape(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(json_f32(f32::NAN), "null");
+        assert!(json_f32(1.5).starts_with("1.5"));
     }
 }

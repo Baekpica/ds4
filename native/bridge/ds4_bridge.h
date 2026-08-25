@@ -236,6 +236,10 @@ typedef struct {
 
 int ds4_bridge_session_top_logprobs(ds4_bridge_session *s,
                                     ds4_bridge_token_score *out, int k);
+int ds4_bridge_session_copy_logits(ds4_bridge_session *s, float *out, int cap);
+int ds4_bridge_session_output_head_bench(ds4_bridge_session *s,
+                                         int iters, const char *path,
+                                         char *err, size_t errlen);
 
 /* Live CUDA memgov census.  Process-global after backend init; no model
  * handle.  Counts match ds4_mem_census.h (DS4_MEMC__COUNT x DS4_MEMD__COUNT).
