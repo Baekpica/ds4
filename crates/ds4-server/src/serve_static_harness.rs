@@ -7,7 +7,7 @@ use crate::parse::ParsedRequest;
 use crate::serve::{handle_client_inner, ServerConfig, ServerInner};
 use crate::serve_cont::ContExec;
 use crate::serve_static::{
-    static_fallback_error, OwnedStaticJob, StaticExec, StaticJob, StaticRow,
+    static_fallback_error, OwnedStaticJob, StaticExec, StaticFinish, StaticJob, StaticRow,
 };
 
 #[derive(Clone, Copy)]
@@ -34,6 +34,7 @@ impl StaticExec for SpyStatic {
                 .iter()
                 .map(|job| StaticRow {
                     tokens: job.tokens.to_vec(),
+                    finish: StaticFinish::Stop,
                 })
                 .collect()),
         }
@@ -74,10 +75,10 @@ impl ContExec for ForceStaticCont {
         0
     }
     fn encode_chat(&self, _rendered: &[u8]) -> Vec<i32> {
-        vec![1]
+        vec![77]
     }
     fn encode_text(&self, _text: &str) -> Vec<i32> {
-        vec![1]
+        vec![77]
     }
     fn generate(
         &mut self,
@@ -103,10 +104,10 @@ impl ContExec for SpyStatic {
         0
     }
     fn encode_chat(&self, _rendered: &[u8]) -> Vec<i32> {
-        vec![1]
+        vec![77]
     }
     fn encode_text(&self, _text: &str) -> Vec<i32> {
-        vec![1]
+        vec![77]
     }
     fn generate(
         &mut self,

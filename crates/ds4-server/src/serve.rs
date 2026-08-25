@@ -34,7 +34,10 @@ use crate::route::{
     route_decide, Api, RouteEnv, ThinkMode, WireSurface, LANE_CONTINUOUS, LANE_STATIC,
 };
 use crate::serve_cont::{cont_prompt_tokens, ContExec};
-use crate::serve_static::{run_static_routed, DetachedStatic, StaticJob, STATIC_WIDTH_ERR};
+use crate::serve_static::{
+    run_static_routed, write_static_completion, DetachedStatic, StaticFinish, StaticJob, StaticRow,
+    StaticSettle, STATIC_WIDTH_ERR,
+};
 use crate::stream::unix_now;
 
 #[derive(Debug, Clone)]
@@ -1090,7 +1093,18 @@ fn run_engine<W: TerminalSink>(
             },
             None => run_static_routed(&mut detached, current),
         };
-        return (LANE_STATIC, settle_static_lane(cfg, job, result, out));
+        return (
+            LANE_STATIC,
+            settle_static_lane(
+                cfg,
+                job,
+                id,
+                engine,
+                i32::try_from(tokens.len()).unwrap_or(i32::MAX),
+                result,
+                out,
+            ),
+        );
     }
     (
         crate::route::LANE_SERIAL,
@@ -1101,20 +1115,34 @@ fn run_engine<W: TerminalSink>(
 fn settle_static_lane<W: Write>(
     cfg: &ServerConfig,
     job: &PreparedJob,
-    result: Result<Vec<crate::serve_static::StaticRow>, GenerateError>,
+    id: &str,
+    engine: &dyn DecodeIo,
+    prompt_n: i32,
+    result: Result<Vec<StaticRow>, GenerateError>,
     out: &mut W,
 ) -> Settlement {
     match result {
-        Ok(_) => {
-            let ok = out
-                .write_all(&http_response_bytes(
-                    200,
-                    Some("application/json"),
-                    None,
-                    cfg.cors,
-                    "{}",
-                ))
-                .is_ok();
+        Ok(rows) => {
+            let empty = StaticRow {
+                tokens: Vec::new(),
+                finish: StaticFinish::Length,
+            };
+            let row = rows.last().unwrap_or(&empty);
+            let bytes = write_static_completion(
+                StaticSettle {
+                    parsed: &job.parsed,
+                    job_id: id,
+                    created: unix_now(),
+                    cors: cfg.cors,
+                    default_tokens: cfg.default_tokens,
+                    model_id: engine.model_id(),
+                    prompt_n,
+                    row,
+                },
+                |token| engine.token_is_stop(token),
+                |token| engine.token_text(token).unwrap_or_default(),
+            );
+            let ok = out.write_all(&bytes).is_ok();
             if ok {
                 Settlement::COMPLETED
             } else {

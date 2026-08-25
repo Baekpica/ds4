@@ -27,9 +27,40 @@ pub struct OwnedStaticJob {
     pub eos: i32,
 }
 
+/// C `ds4_batch_gen_result.finish`: 1 = EOS → `"stop"`, 0 = budget → `"length"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StaticFinish {
+    Length,
+    Stop,
+}
+
+impl StaticFinish {
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::Length => "length",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+/// C `write_batch_completion`: clamp to decode budget and force `"length"`.
+pub fn settle_static_finish(
+    finish: StaticFinish,
+    n_tokens: usize,
+    budget: i32,
+) -> (&'static str, usize) {
+    let budget = budget.max(0) as usize;
+    if n_tokens > budget {
+        ("length", budget)
+    } else {
+        (finish.reason(), n_tokens)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StaticRow {
     pub tokens: Vec<i32>,
+    pub finish: StaticFinish,
 }
 
 /// Trait seam so tests can spy on `generate_static` without a GGUF.
@@ -88,7 +119,13 @@ impl StaticExec for BatchStatic<'_, '_> {
             .generate_static(&requests)
             .map(|rows| {
                 rows.into_iter()
-                    .map(|row| StaticRow { tokens: row.tokens })
+                    .map(|row| StaticRow {
+                        tokens: row.tokens,
+                        finish: match row.finish {
+                            ds4_core::StaticBatchFinish::Budget => StaticFinish::Length,
+                            ds4_core::StaticBatchFinish::Eos => StaticFinish::Stop,
+                        },
+                    })
                     .collect()
             })
             .map_err(|err| GenerateError::Engine(err.message))
@@ -148,6 +185,10 @@ pub fn run_static_routed(
     jobs.push(current);
     run_static(exec, &jobs)
 }
+
+#[path = "serve_static_settle.rs"]
+mod settle;
+pub use settle::{write_static_completion, StaticSettle};
 
 #[cfg(test)]
 #[path = "serve_static_harness.rs"]

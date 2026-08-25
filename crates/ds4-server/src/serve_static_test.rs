@@ -129,3 +129,57 @@ fn static_routed_request_invokes_generate_static_when_n_eq_2() {
         1
     );
 }
+
+#[test]
+fn settle_static_finish_maps_c_eos_and_budget() {
+    // Given: C r->finish ? "stop" : "length"
+    // When: EOS / budget / over-budget
+    // Then: wire strings stay stop|length; over-budget clamps
+    assert_eq!(settle_static_finish(StaticFinish::Stop, 3, 8), ("stop", 3));
+    assert_eq!(
+        settle_static_finish(StaticFinish::Length, 3, 8),
+        ("length", 3)
+    );
+    assert_eq!(
+        settle_static_finish(StaticFinish::Stop, 9, 8),
+        ("length", 8)
+    );
+}
+
+#[test]
+fn static_routed_request_settles_c_chat_terminal_when_n_eq_2() {
+    // Given: LANE_STATIC n=2 success (todos 11-12 wrote "{}")
+    let mut spy = SpyStatic {
+        siblings: vec![OwnedStaticJob {
+            tokens: vec![30],
+            max_new_tokens: 1,
+            eos: -1,
+        }],
+        ..Default::default()
+    };
+
+    // When
+    let (response, inner) = drive_static_chat_with(&mut spy);
+    let text = String::from_utf8_lossy(&response);
+
+    // Then: C write_batch_completion shape; no invented timings/IDs
+    assert_eq!(spy.calls, 1);
+    assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
+    assert!(
+        text.contains("\"object\":\"chat.completion\""),
+        "missing C object: {text}"
+    );
+    assert!(
+        text.contains("\"finish_reason\":\"stop\""),
+        "missing C finish_reason: {text}"
+    );
+    assert!(
+        !text.contains("\"timings\""),
+        "C static omits timings: {text}"
+    );
+    assert!(
+        !text.contains("serial-fallback"),
+        "serial decode must not run: {text}"
+    );
+    assert_eq!(inner.runtime.requests_serial, 0);
+}
