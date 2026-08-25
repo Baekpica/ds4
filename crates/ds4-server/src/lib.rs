@@ -18,6 +18,9 @@ pub mod retry;
 pub mod route;
 pub mod serve;
 pub mod serve_cont;
+mod serve_cont_prefill;
+#[cfg(test)]
+mod serve_cont_prefill_test;
 mod serve_cont_roll;
 pub mod serve_static;
 pub mod stream;
