@@ -42,6 +42,9 @@ pub struct AgentArgs {
     mtp: Option<String>,
     mtp_draft: i32,
     mtp_margin: f32,
+    quality: bool,
+    warm_weights: bool,
+    power_percent: i32,
     non_interactive: bool,
     help: bool,
 }
@@ -65,6 +68,9 @@ impl Default for AgentArgs {
             mtp: None,
             mtp_draft: 1,
             mtp_margin: 3.0,
+            quality: false,
+            warm_weights: false,
+            power_percent: 100,
             non_interactive: false,
             help: false,
         }
@@ -179,10 +185,17 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<AgentArgs, S
                 let value = need_value(&arg, args.next())?;
                 parsed.mtp_margin = parse_f32_range(&arg, value, 0.0, 1000.0)?;
             }
+            "--quality" => parsed.quality = true,
+            "--warm-weights" => parsed.warm_weights = true,
+            "--power" => {
+                let value = need_value(&arg, args.next())?;
+                let parsed_power = parse_positive_i32(&arg, value)?;
+                if !(1..=100).contains(&parsed_power) {
+                    return Err("--power must be between 1 and 100".into());
+                }
+                parsed.power_percent = parsed_power;
+            }
             "--trace"
-            | "--quality"
-            | "--power"
-            | "--warm-weights"
             | "--dir-steering-file"
             | "--dir-steering-ffn"
             | "--dir-steering-attn"
@@ -217,6 +230,15 @@ fn mtp_open_options(args: &AgentArgs) -> Vec<ds4_core::ModelOpenOption> {
         options.push(ds4_core::ModelOpenOption::MtpDraftTokens(args.mtp_draft));
         options.push(ds4_core::ModelOpenOption::MtpMargin(args.mtp_margin));
     }
+    if args.quality {
+        options.push(ds4_core::ModelOpenOption::Quality);
+    }
+    if args.warm_weights {
+        options.push(ds4_core::ModelOpenOption::WarmWeights);
+    }
+    options.push(ds4_core::ModelOpenOption::PowerPercent(
+        args.power_percent as u8,
+    ));
     options
 }
 
@@ -482,6 +504,9 @@ fn help_text(name: &str) -> String {
            --mtp FILE             Optional MTP support GGUF.\n\
            --mtp-draft N          Maximum MTP draft tokens. Default: 1\n\
            --mtp-margin F         MTP verifier margin. Default: 3\n\
+           --quality              Prefer exact kernels where available.\n\
+           --warm-weights         Touch mapped tensor pages before generation.\n\
+           --power N              Target GPU duty cycle percentage, 1..100. Default: 100\n\
            --backend NAME         metal, cuda, or cpu.\n\
            --metal, --cuda, --cpu Select backend explicitly.\n\
            -t, --threads N        CPU helper threads.\n\
@@ -737,14 +762,7 @@ mod tests {
         assert!(parse_args(argv(&["--non-interactive"]))
             .unwrap_err()
             .contains("-p/--prompt"));
-        for flag in [
-            "--trace",
-            "--quality",
-            "--power",
-            "--warm-weights",
-            "--dir-steering-file",
-            "--role",
-        ] {
+        for flag in ["--trace", "--dir-steering-file", "--role"] {
             let error = parse_args(argv(&["--non-interactive", "-p", "hello", flag, "ignored"]))
                 .unwrap_err();
             assert!(error.contains("not implemented"), "{flag}: {error}");
@@ -778,6 +796,42 @@ mod tests {
         assert!(!use_mtp_spec(0.0, None, 2));
         assert!(!use_mtp_spec(0.0, Some("mtp.gguf"), 1));
         assert!(!use_mtp_spec(0.5, Some("mtp.gguf"), 2));
+    }
+
+    #[test]
+    fn parses_power_quality_and_warm_weight_open_options() {
+        let parsed = parse_args(argv(&[
+            "--non-interactive",
+            "-p",
+            "hello",
+            "--quality",
+            "--warm-weights",
+            "--power",
+            "40",
+        ]))
+        .unwrap();
+        assert!(parsed.quality);
+        assert!(parsed.warm_weights);
+        assert_eq!(parsed.power_percent, 40);
+        let options = mtp_open_options(&parsed);
+        assert!(options.contains(&ds4_core::ModelOpenOption::Quality));
+        assert!(options.contains(&ds4_core::ModelOpenOption::WarmWeights));
+        assert!(options.contains(&ds4_core::ModelOpenOption::PowerPercent(40)));
+        assert_eq!(
+            parse_args(argv(&["--non-interactive", "-p", "hello", "--power", "0"])).unwrap_err(),
+            "invalid value for --power: 0"
+        );
+        assert_eq!(
+            parse_args(argv(&[
+                "--non-interactive",
+                "-p",
+                "hello",
+                "--power",
+                "101"
+            ]))
+            .unwrap_err(),
+            "--power must be between 1 and 100"
+        );
     }
 
     #[test]
