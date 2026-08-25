@@ -3,6 +3,7 @@
 
 mod extensions;
 mod format;
+mod host;
 mod policy;
 mod sha1;
 mod store;
@@ -17,6 +18,7 @@ pub use format::{
     Reason, Record, EXT_BANK_REPLAY_V1, EXT_RESPONSES_VISIBLE, EXT_SESSION_TITLE,
     EXT_THINKING_VISIBLE, EXT_TOOL_MAP, FIXED_HEADER, PAYLOAD_ABI, VERSION,
 };
+pub use host::{bank_checkpoint_due_from_host, continued_store_target_from_host, HostKvView};
 pub use policy::{
     bank_checkpoint_due, chat_anchor_pos, continued_store_target, eviction_score, file_size_fits,
     store_len, EvictionContext, Options, ScoreEntry,

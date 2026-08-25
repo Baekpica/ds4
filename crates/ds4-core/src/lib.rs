@@ -1174,13 +1174,19 @@ impl Model {
             message: "ds4_bridge_session_create returned NULL".into(),
         })?;
         let prefill = unsafe { ds4_bridge_session_prefill_cap(raw.as_ptr()) };
+        let native_ctx = unsafe { ds4_bridge_session_ctx(raw.as_ptr()) };
         let host_backend = match self.backend {
             Backend::Cpu => SessionBackend::Cpu,
             Backend::Cuda | Backend::Metal => SessionBackend::Cuda,
         };
         Ok(Session {
             raw,
-            host: SessionLedger::new(self.family, host_backend, ctx_size, prefill.max(0) as u32),
+            host: SessionLedger::new(
+                self.family,
+                host_backend,
+                ledger_ctx(ctx_size, native_ctx),
+                prefill.max(0) as u32,
+            ),
             _model: PhantomData,
             _not_send: PhantomData,
         })
@@ -1304,6 +1310,14 @@ fn drop_model_native(raw: NonNull<ds4_bridge_model>) {
 impl Drop for Model {
     fn drop(&mut self) {
         drop_model_native(self.raw);
+    }
+}
+
+const fn ledger_ctx(configured: i32, native_effective: i32) -> i32 {
+    if native_effective > 0 {
+        native_effective
+    } else {
+        configured
     }
 }
 
@@ -1587,7 +1601,7 @@ impl Session<'_> {
     }
 
     pub fn ctx(&self) -> i32 {
-        unsafe { ds4_bridge_session_ctx(self.raw.as_ptr()) }
+        self.host.ctx
     }
 
     pub fn power(&self) -> i32 {
@@ -1985,7 +1999,7 @@ mod tests {
     }
 
     #[test]
-    fn session_ctx_uses_native_effective_ctx_not_configured_ledger_ctx() {
+    fn session_ctx_uses_host_ledger_not_native_scratch() {
         let session = std::mem::ManuallyDrop::new(Session {
             raw: NonNull::<ds4_bridge_session>::dangling(),
             host: SessionLedger::new(ModelFamily::DeepSeek4, SessionBackend::Cuda, 8192, 1),
@@ -1993,7 +2007,15 @@ mod tests {
             _not_send: PhantomData,
         });
 
-        assert_eq!(session.ctx(), 4096);
+        assert_eq!(session.ctx(), 8192);
+        assert_eq!(session.ctx(), session.host().ctx);
+    }
+
+    #[test]
+    fn ledger_ctx_adopts_native_effective_only_at_create_boundary() {
+        assert_eq!(ledger_ctx(8192, 4096), 4096);
+        assert_eq!(ledger_ctx(8192, 0), 8192);
+        assert_eq!(ledger_ctx(8192, -1), 8192);
     }
 
     #[no_mangle]

@@ -2,7 +2,7 @@
 //!
 //! Copied from `ds4_session_sync` / `rewrite_*` / `rewind` / `invalidate`
 //! at v0.6.3-dfm. Native CUDA still executes prefill/decode; this module
-//! decides reuse vs rebuild and is the authoritative pos/generation.
+//! decides reuse vs rebuild and is the authoritative pos/generation/ctx.
 
 use crate::shape::ModelFamily;
 
