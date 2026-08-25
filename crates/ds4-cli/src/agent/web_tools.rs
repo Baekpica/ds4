@@ -14,7 +14,9 @@ const QUERY_ARG: &str = "query";
 const VISIT_PAGE: &str = "visit_page";
 const URL_ARG: &str = "url";
 const READ_FILE: &str = "read";
+const MORE_FILE: &str = "more";
 const PATH_ARG: &str = "path";
+const COUNT_ARG: &str = "count";
 const START_LINE_ARG: &str = "start_line";
 const MAX_LINES_ARG: &str = "max_lines";
 const WHOLE_ARG: &str = "whole";
@@ -31,6 +33,20 @@ static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 pub(super) struct ToolRound {
     pub(super) visible: Vec<u8>,
     pub(super) observation: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum ReadMode {
+    #[default]
+    Numbered,
+    Raw,
+}
+
+#[derive(Default)]
+pub(super) struct ReadCursor {
+    path: Option<String>,
+    next_line: usize,
+    mode: ReadMode,
 }
 
 pub(super) trait Browser {
@@ -334,10 +350,14 @@ fn read_bytes(path: &str) -> Result<Vec<u8>, Vec<u8>> {
     Ok(data)
 }
 
-fn read_result(call: &ToolCall) -> Vec<u8> {
-    let Some(path) = call.arg(PATH_ARG).filter(|path| !path.is_empty()) else {
-        return format!("Tool error: {READ_FILE} requires {PATH_ARG}\n").into_bytes();
-    };
+fn read_range(
+    path: &str,
+    start_line: usize,
+    max_lines: Option<usize>,
+    mode: ReadMode,
+    cursor: &mut ReadCursor,
+) -> Vec<u8> {
+    *cursor = ReadCursor::default();
     let data = match read_bytes(path) {
         Ok(data) => data,
         Err(error) => {
@@ -349,17 +369,16 @@ fn read_result(call: &ToolCall) -> Vec<u8> {
     };
 
     let total_lines = Lines::new(&data).count();
-    let start_line = parse_read_int(call.arg(START_LINE_ARG), 1);
     let start_idx = start_line.saturating_sub(1).min(total_lines);
-    let whole = parse_bool(call.arg(WHOLE_ARG), false);
-    let max_lines = if whole {
-        total_lines - start_idx
-    } else {
-        parse_read_int(call.arg(MAX_LINES_ARG), READ_DEFAULT_LINES)
-    };
+    let max_lines = max_lines.unwrap_or(total_lines - start_idx);
     let end_idx = start_idx.saturating_add(max_lines).min(total_lines);
+    if end_idx < total_lines {
+        cursor.path = Some(path.to_owned());
+        cursor.next_line = end_idx + 1;
+        cursor.mode = mode;
+    }
 
-    if parse_bool(call.arg(RAW_ARG), false) {
+    if matches!(mode, ReadMode::Raw) {
         let start = Lines::new(&data)
             .nth(start_idx)
             .map(|span| span.start)
@@ -416,6 +435,32 @@ fn read_result(call: &ToolCall) -> Vec<u8> {
         out.push(b'\n');
     }
     out.into_vec()
+}
+
+fn read_result(call: &ToolCall, cursor: &mut ReadCursor) -> Vec<u8> {
+    *cursor = ReadCursor::default();
+    let Some(path) = call.arg(PATH_ARG).filter(|path| !path.is_empty()) else {
+        return format!("Tool error: {READ_FILE} requires {PATH_ARG}\n").into_bytes();
+    };
+    let start_line = parse_read_int(call.arg(START_LINE_ARG), 1);
+    let whole = parse_bool(call.arg(WHOLE_ARG), false);
+    let max_lines = (!whole).then(|| parse_read_int(call.arg(MAX_LINES_ARG), READ_DEFAULT_LINES));
+    let mode = if parse_bool(call.arg(RAW_ARG), false) {
+        ReadMode::Raw
+    } else {
+        ReadMode::Numbered
+    };
+    read_range(path, start_line, max_lines, mode, cursor)
+}
+
+fn more_result(call: &ToolCall, cursor: &mut ReadCursor) -> Vec<u8> {
+    let Some(path) = cursor.path.clone() else {
+        return b"Tool error: no previous output to continue\n".to_vec();
+    };
+    let next_line = cursor.next_line;
+    let mode = cursor.mode;
+    let count = parse_read_int(call.arg(COUNT_ARG), READ_DEFAULT_LINES);
+    read_range(&path, next_line, Some(count), mode, cursor)
 }
 
 fn count_lines(text: &str) -> usize {
@@ -536,7 +581,16 @@ fn visit_result<B: Browser>(web: &mut B, url: Option<&str>) -> String {
     out
 }
 
-pub(super) fn handle_round<B: Browser>(raw: &[u8], web: &mut B) -> Result<ToolRound, String> {
+#[cfg(test)]
+fn handle_round<B: Browser>(raw: &[u8], web: &mut B) -> Result<ToolRound, String> {
+    handle_round_with_cursor(raw, web, &mut ReadCursor::default())
+}
+
+pub(super) fn handle_round_with_cursor<B: Browser>(
+    raw: &[u8],
+    web: &mut B,
+    cursor: &mut ReadCursor,
+) -> Result<ToolRound, String> {
     let (open_at, open_len) = start(raw).ok_or_else(|| "missing DSML tool call".to_string())?;
     let calls = parse_calls(raw, open_at, open_len)?;
     let mut observation = ResultBuf::default();
@@ -557,7 +611,8 @@ pub(super) fn handle_round<B: Browser>(raw: &[u8], web: &mut B) -> Result<ToolRo
                 },
             },
             VISIT_PAGE => visit_result(web, call.arg(URL_ARG)).into_bytes(),
-            READ_FILE => read_result(call),
+            READ_FILE => read_result(call, cursor),
+            MORE_FILE => more_result(call, cursor),
             _ => return Err(TOOL_UNSUPPORTED_ERROR.into()),
         };
         observation.append(format!("Tool result {} ({}):\n", index + 1, call.name).as_bytes());
@@ -837,6 +892,48 @@ mod tests {
         .into_bytes()
     }
 
+    fn read_more_call(path: &str, read_count: &str, mode: ReadMode, counts: &[&str]) -> Vec<u8> {
+        let mut body = format!(
+            "<｜DSML｜invoke name=\"read\">\n\
+             <｜DSML｜parameter name=\"path\" string=\"true\">{path}</｜DSML｜parameter>\n\
+             <｜DSML｜parameter name=\"max_lines\" string=\"false\">{read_count}</｜DSML｜parameter>\n"
+        );
+        if matches!(mode, ReadMode::Raw) {
+            body.push_str(
+                "<｜DSML｜parameter name=\"raw\" string=\"false\">true</｜DSML｜parameter>\n",
+            );
+        }
+        body.push_str("</｜DSML｜invoke>\n");
+        for count in counts {
+            body.push_str("<｜DSML｜invoke name=\"more\">\n");
+            if *count != "-" {
+                body.push_str(&format!(
+                    "<｜DSML｜parameter name=\"count\" string=\"false\">{count}</｜DSML｜parameter>\n"
+                ));
+            }
+            body.push_str("</｜DSML｜invoke>\n");
+        }
+        format!("<｜DSML｜tool_calls>\n{body}</｜DSML｜tool_calls>").into_bytes()
+    }
+
+    fn more_call(count: Option<&str>) -> Vec<u8> {
+        let arg = count
+            .map(|count| {
+                format!(
+                    "<｜DSML｜parameter name=\"count\" string=\"false\">{count}</｜DSML｜parameter>\n"
+                )
+            })
+            .unwrap_or_default();
+        format!(
+            "<｜DSML｜tool_calls>\n\
+             <｜DSML｜invoke name=\"more\">\n\
+             {arg}\
+             </｜DSML｜invoke>\n\
+             </｜DSML｜tool_calls>"
+        )
+        .into_bytes()
+    }
+
     fn oracle() -> PathBuf {
         if let Ok(path) = std::env::var("DS4_AGENT_C_ORACLE") {
             return PathBuf::from(path);
@@ -844,29 +941,31 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/parity/agent_c_oracle")
     }
 
+    fn c_hex(command: &mut std::process::Command) -> Vec<u8> {
+        let output = command.output().expect("run C agent oracle");
+        assert!(
+            output.status.success(),
+            "C agent oracle failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::str::from_utf8(&output.stdout)
+            .expect("oracle hex UTF-8")
+            .trim()
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
     fn c_read_bytes(path: Option<&str>, args: &[Option<&str>; 4]) -> Vec<u8> {
         let path = path.unwrap_or("-");
         let oracle = oracle();
         assert!(oracle.exists(), "build C oracle: make test-agent-parity");
-        let output = std::process::Command::new(oracle)
-            .args(["read", path])
-            .args(args.iter().map(|arg| arg.unwrap_or("-")))
-            .output()
-            .expect("run C read oracle");
-        assert!(
-            output.status.success(),
-            "C read oracle failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let hex = std::str::from_utf8(&output.stdout)
-            .expect("oracle hex UTF-8")
-            .trim();
-        hex.as_bytes()
-            .chunks_exact(2)
-            .map(|pair| {
-                u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).expect("hex pair")
-            })
-            .collect()
+        c_hex(
+            std::process::Command::new(oracle)
+                .args(["read", path])
+                .args(args.iter().map(|arg| arg.unwrap_or("-"))),
+        )
     }
 
     fn c_read_observation(path: Option<&str>, args: &[Option<&str>; 4]) -> Vec<u8> {
@@ -881,18 +980,42 @@ mod tests {
     }
 
     fn c_read_twice_observation(path: &str) -> Vec<u8> {
-        let output = std::process::Command::new(oracle())
-            .args(["read2", path])
-            .output()
-            .expect("run C combined read oracle");
-        assert!(output.status.success());
-        std::str::from_utf8(&output.stdout)
-            .expect("oracle hex UTF-8")
-            .trim()
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-            .collect()
+        c_hex(std::process::Command::new(oracle()).args(["read2", path]))
+    }
+
+    fn c_more_observation(
+        path: &str,
+        read_count: &str,
+        mode: ReadMode,
+        counts: &[&str],
+    ) -> Vec<u8> {
+        let mut command = std::process::Command::new(oracle());
+        command
+            .args([
+                "more",
+                path,
+                read_count,
+                if matches!(mode, ReadMode::Raw) {
+                    "true"
+                } else {
+                    "-"
+                },
+            ])
+            .args(counts);
+        c_hex(&mut command)
+    }
+
+    fn c_more_none(count: Option<&str>) -> Vec<u8> {
+        let mut command = std::process::Command::new(oracle());
+        command.arg("more-none");
+        if let Some(count) = count {
+            command.arg(count);
+        }
+        c_hex(&mut command)
+    }
+
+    fn c_more_error(path: &str) -> Vec<u8> {
+        c_hex(std::process::Command::new(oracle()).args(["more-error", path]))
     }
 
     #[test]
@@ -1029,5 +1152,155 @@ mod tests {
             c_read_observation(Some(path_text), &[None; 4])
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn more_sequences_match_c_for_plain_raw_and_nul_data() {
+        let path = write_temp("").expect("fixture");
+        let path_text = path.to_str().expect("UTF-8 fixture path");
+        let mut web = FakeWeb {
+            result: Ok(String::new()),
+        };
+        let mut cursor = ReadCursor::default();
+
+        std::fs::write(&path, b"one\r\ntwo\nthree\rfour").unwrap();
+        let counts = ["1", "1", "1", "1"];
+        let round = handle_round_with_cursor(
+            &read_more_call(path_text, "1", ReadMode::Numbered, &counts),
+            &mut web,
+            &mut cursor,
+        )
+        .expect("plain read-more sequence");
+        assert_eq!(
+            round.observation,
+            c_more_observation(path_text, "1", ReadMode::Numbered, &counts)
+        );
+
+        let counts = ["1"];
+        let round = handle_round_with_cursor(
+            &read_more_call(path_text, "99", ReadMode::Numbered, &counts),
+            &mut web,
+            &mut cursor,
+        )
+        .expect("full read invalidates cursor");
+        assert_eq!(
+            round.observation,
+            c_more_observation(path_text, "99", ReadMode::Numbered, &counts)
+        );
+
+        std::fs::write(&path, [b'a', 0, b'b', b'\n', b'c', b'\n']).unwrap();
+        let counts = ["1", "1"];
+        let round = handle_round_with_cursor(
+            &read_more_call(path_text, "1", ReadMode::Raw, &counts),
+            &mut web,
+            &mut cursor,
+        )
+        .expect("raw read-more sequence");
+        assert_eq!(
+            round.observation,
+            c_more_observation(path_text, "1", ReadMode::Raw, &counts)
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn more_count_parsing_and_empty_cursor_match_c() {
+        let path = write_temp("one\ntwo\nthree\nfour\nfive").expect("fixture");
+        let path_text = path.to_str().expect("UTF-8 fixture path");
+        let mut web = FakeWeb {
+            result: Ok(String::new()),
+        };
+
+        for counts in [
+            &["0", "-"][..],
+            &["junk"][..],
+            &["-999999999999999999999999999999999999", "1"][..],
+            &["999999999999999999999999999999999999"][..],
+        ] {
+            let mut cursor = ReadCursor::default();
+            let round = handle_round_with_cursor(
+                &read_more_call(path_text, "1", ReadMode::Numbered, counts),
+                &mut web,
+                &mut cursor,
+            )
+            .expect("count parsing sequence");
+            assert_eq!(
+                round.observation,
+                c_more_observation(path_text, "1", ReadMode::Numbered, counts)
+            );
+        }
+
+        for count in [
+            None,
+            Some("999999999999999999999999999999999999"),
+            Some("7x"),
+        ] {
+            let mut cursor = ReadCursor::default();
+            let round = handle_round_with_cursor(&more_call(count), &mut web, &mut cursor)
+                .expect("empty cursor result");
+            let mut expected = b"Tool result 1 (more):\n".to_vec();
+            expected.extend_from_slice(&c_more_none(count));
+            assert_eq!(round.observation, expected);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn more_cursor_survives_rounds_preserves_path_and_invalidates_on_error() {
+        let target = write_temp("one\ntwo\nthree").expect("fixture");
+        let relative = PathBuf::from(format!(
+            "ds4_agent_more_link_{}_{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::os::unix::fs::symlink(&target, &relative).unwrap();
+        let relative_text = relative.to_str().expect("UTF-8 relative path");
+        let mut web = FakeWeb {
+            result: Ok(String::new()),
+        };
+        let mut cursor = ReadCursor::default();
+
+        let parity = handle_round_with_cursor(
+            &read_more_call(relative_text, "1", ReadMode::Raw, &["1"]),
+            &mut web,
+            &mut cursor,
+        )
+        .expect("relative symlink sequence");
+        assert_eq!(
+            parity.observation,
+            c_more_observation(relative_text, "1", ReadMode::Raw, &["1"])
+        );
+
+        let first = handle_round_with_cursor(
+            &read_call(Some(relative_text), &[("max_lines", "1"), ("raw", "true")]),
+            &mut web,
+            &mut cursor,
+        )
+        .expect("initial read");
+        assert!(first.observation.ends_with(
+            b"[Read truncated at line 1 of 3. continue_offset=2. Call more with count=1 to read the next chunk.]\n"
+        ));
+        let second = handle_round_with_cursor(&more_call(Some("1")), &mut web, &mut cursor)
+            .expect("continued read");
+        assert!(second.observation.ends_with(
+            b"two\n[Read truncated at line 2 of 3. continue_offset=3. Call more with count=1 to read the next chunk.]\n"
+        ));
+
+        std::fs::remove_file(&relative).unwrap();
+        let failed = handle_round_with_cursor(&more_call(Some("1")), &mut web, &mut cursor)
+            .expect("continued read error");
+        assert!(failed
+            .observation
+            .starts_with(b"Tool result 1 (more):\nTool error: open "));
+        let empty = handle_round_with_cursor(&more_call(None), &mut web, &mut cursor)
+            .expect("invalidated cursor result");
+        assert_eq!(
+            empty.observation,
+            b"Tool result 1 (more):\nTool error: no previous output to continue\n"
+        );
+        let mut sequence = failed.observation;
+        sequence.extend_from_slice(&empty.observation);
+        assert_eq!(sequence, c_more_error(relative_text));
+        std::fs::remove_file(target).unwrap();
     }
 }
