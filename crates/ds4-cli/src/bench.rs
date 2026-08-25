@@ -690,10 +690,14 @@ fn default_backend() -> Backend {
 fn help_text() -> &'static str {
     "Usage: ds4-bench-rs (--prompt-file FILE | --chat-prompt-file FILE) [options]\n\
      \n\
-     Non-MTP throughput sweep over one fixed prompt.\n\
+     Throughput sweep over one fixed prompt.\n\
      \n\
      -m, --model FILE       GGUF model path (default: ds4flash.gguf)\n\
+     --mtp FILE             Optional MTP draft GGUF for speculative decode\n\
+     --mtp-draft N          Draft tokens per speculative cycle (default: 1)\n\
+     --mtp-margin F         Non-exact MTP margin (default: 3.0)\n\
      --cuda|--metal|--cpu   Select backend\n\
+     --backend NAME         metal, cuda, or cpu\n\
      -t, --threads N        CPU helper threads\n\
      --quality              Prefer exact kernels where applicable\n\
      --warm-weights         Touch mapped tensor pages before benchmarking\n\
@@ -708,7 +712,11 @@ fn help_text() -> &'static str {
      --step-mul F           Multiplicative step (default: 1)\n\
      --step-incr N          Linear step (default: 2048)\n\
      --gen-tokens N         Greedy decode tokens (default: 128)\n\
-     --csv FILE             Write CSV instead of stdout\n"
+     --csv FILE             Write CSV instead of stdout\n\
+     --output-head-bench N  CUDA output-head verifier at --ctx-start, then exit\n\
+     --dump-frontier-logits-dir DIR\n\
+                             Write one full-logit JSON file per measured frontier\n\
+     -h, --help             Show this help\n"
 }
 
 #[cfg(test)]
@@ -1035,5 +1043,63 @@ mod tests {
         assert_eq!(json_escape(r#"a"b"#), r#""a\"b""#);
         assert_eq!(json_f32(f32::NAN), "null");
         assert!(json_f32(1.5).starts_with("1.5"));
+    }
+
+    /// C `ds4-bench --help` flags this shadow already parses (8.3 claimed modes).
+    /// `--mtp ` keeps `--mtp-draft` from counting as `--mtp`.
+    const CLAIMED_C_BENCH_FLAGS: &[&str] = &[
+        "--prompt-file",
+        "--chat-prompt-file",
+        "-sys, --system",
+        "-m, --model",
+        "--mtp ",
+        "--mtp-draft",
+        "--mtp-margin",
+        "--metal",
+        "--cuda",
+        "--cpu",
+        "--backend",
+        "-t, --threads",
+        "--quality",
+        "--warm-weights",
+        "--power",
+        "--role",
+        "--layers",
+        "--listen",
+        "--coordinator",
+        "--dist-prefill-chunk",
+        "--dist-prefill-window",
+        "--dist-activation-bits",
+        "--dist-replay-check",
+        "--debug",
+        "--ctx-start",
+        "--ctx-max",
+        "--ctx-alloc",
+        "--step-mul",
+        "--step-incr",
+        "--gen-tokens",
+        "--csv",
+        "--output-head-bench",
+        "--dump-frontier-logits-dir",
+        "-h, --help",
+    ];
+
+    /// C `ds4_bench.c` fprintf header (not a named C constant; byte-identical).
+    const C_CSV_HEADER: &str = "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_tps_ss,first_token_sec,kvcache_bytes";
+
+    #[test]
+    fn help_contains_each_claimed_c_flag() {
+        let help = format!("{}\nDistributed:\n{}", help_text(), ds4_dist::USAGE);
+        for flag in CLAIMED_C_BENCH_FLAGS {
+            assert!(
+                help.contains(flag),
+                "ds4-bench-rs help missing claimed C flag {flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn csv_header_equals_c_constant() {
+        assert_eq!(CSV_HEADER, C_CSV_HEADER);
     }
 }

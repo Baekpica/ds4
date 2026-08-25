@@ -953,6 +953,24 @@ Usage:
       (-p PROMPT | --prompt-file FILE)
   {name} -m MODEL --dump-tokens (-p PROMPT | --prompt-file FILE)
 
+C-compatible flags (same names as `ds4 --help`):
+  -m, --model FILE        GGUF model path. Default: ds4flash.gguf
+  --mtp FILE              Optional MTP support GGUF
+  --mtp-draft N           Maximum MTP draft tokens. Default: 1
+  --mtp-margin F          MTP verifier margin. Default: 3
+  -c, --ctx N             Context size. Default: 32768
+  --metal, --cuda, --cpu  Select backend explicitly
+  --backend NAME          metal, cuda, or cpu
+  -t, --threads N         CPU helper threads
+  -p, --prompt TEXT       Prompt to generate from
+  --prompt-file FILE      Read the prompt text from FILE
+  -sys, --system TEXT     System prompt
+  -n, --tokens N          Maximum tokens to generate. Default: 50000
+  --temp F --top-p F --min-p F --seed N
+  --think --nothink
+  --dump-tokens --dump-logits FILE --dump-logprobs FILE --logprobs-top-k N
+  -h, --help              Show this help
+
 --mtp/--dspark attach the DeepSeek-only sibling support models; the host
 resolves each sibling bind catalog + expected layouts, native skips that
 sibling's name walk and layout check.
@@ -1972,6 +1990,56 @@ mod tests {
     #[test]
     fn help_contains_dump_tokens() {
         assert!(help_text("ds4-rs").contains("--dump-tokens"));
+    }
+
+    /// C `ds4 --help` flags the shadow already parses (8.3 claimed modes).
+    /// `--mtp ` keeps `--mtp-draft` from counting as `--mtp`.
+    const CLAIMED_C_CLI_FLAGS: &[&str] = &[
+        "-m, --model",
+        "--mtp ",
+        "--mtp-draft",
+        "--mtp-margin",
+        "-c, --ctx",
+        "--metal",
+        "--cuda",
+        "--cpu",
+        "--backend",
+        "-t, --threads",
+        "-p, --prompt",
+        "--prompt-file",
+        "-sys, --system",
+        "-n, --tokens",
+        "--temp",
+        "--top-p",
+        "--min-p",
+        "--seed",
+        "--think",
+        "--nothink",
+        "--dump-tokens",
+        "--dump-logits",
+        "--dump-logprobs",
+        "--logprobs-top-k",
+        "--role",
+        "--layers",
+        "--listen",
+        "--coordinator",
+        "--dist-prefill-chunk",
+        "--dist-prefill-window",
+        "--dist-activation-bits",
+        "--dist-replay-check",
+        "--debug",
+        "-h, --help",
+    ];
+
+    #[test]
+    fn help_contains_each_claimed_c_flag() {
+        let help = help_text("ds4-rs");
+        for flag in CLAIMED_C_CLI_FLAGS {
+            assert!(
+                help.contains(flag),
+                "ds4-rs help missing claimed C flag {flag}"
+            );
+        }
     }
 
     #[test]
