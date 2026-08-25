@@ -53,6 +53,7 @@ pub struct ShadowArgs {
     pub prompt_file: Option<String>,
     pub dump_logprobs: Option<String>,
     pub dump_logits: Option<String>,
+    pub dump_tokens: bool,
     pub logprobs_top_k: i32,
     pub temp: f32,
     pub top_p: f32,
@@ -102,6 +103,7 @@ impl Default for ShadowArgs {
             prompt_file: None,
             dump_logprobs: None,
             dump_logits: None,
+            dump_tokens: false,
             logprobs_top_k: 20,
             temp: 1.0,
             top_p: 1.0,
@@ -210,6 +212,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<ShadowArgs, 
                 }
                 parsed.prompt_file = Some(require_value(&arg, iter.next())?);
             }
+            "--dump-tokens" => parsed.dump_tokens = true,
             "--dump-logits" => {
                 parsed.dump_logits = Some(
                     iter.next()
@@ -863,6 +866,80 @@ fn format_logits_json(dump: &LogitsDumpJson<'_>) -> String {
     body
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EvalPlan {
+    Skip,
+    Run,
+}
+
+fn eval_plan(args: &ShadowArgs) -> EvalPlan {
+    if args.dump_tokens {
+        EvalPlan::Skip
+    } else {
+        EvalPlan::Run
+    }
+}
+
+fn format_dump_tokens(ids: &[i32], lines: &[(i32, &[u8])]) -> Vec<u8> {
+    let mut out = Vec::from(b"[".as_slice());
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(b", ");
+        }
+        out.extend_from_slice(id.to_string().as_bytes());
+    }
+    out.extend_from_slice(b"]\n");
+    for (id, text) in lines {
+        out.extend_from_slice(format!("{id:6}  ").as_bytes());
+        out.extend_from_slice(text);
+        out.push(b'\n');
+    }
+    out
+}
+
+fn write_dump_tokens(
+    out: &mut impl std::io::Write,
+    ids: &[i32],
+    vocab: &ds4_core::Vocab,
+) -> Result<(), String> {
+    let table = vocab.tokens();
+    let lines: Vec<(i32, &[u8])> = ids
+        .iter()
+        .copied()
+        .filter_map(|id| {
+            if id < 0 {
+                return None;
+            }
+            table.get(id as usize).map(|text| (id, text.as_slice()))
+        })
+        .collect();
+    out.write_all(&format_dump_tokens(ids, &lines))
+        .map_err(|e| e.to_string())
+}
+
+fn run_dump_tokens(model_path: &str, text: &str) -> Result<i32, String> {
+    let id =
+        ds4_core::identify_gguf(std::path::Path::new(model_path)).map_err(|e| e.to_string())?;
+    let vocab = ds4_core::Vocab::load_path(std::path::Path::new(model_path), id.shape.family)
+        .map_err(|e| e.to_string())?;
+    let ids = vocab.encode_rendered_chat(text);
+    let mut stdout = std::io::stdout().lock();
+    write_dump_tokens(&mut stdout, &ids, &vocab)?;
+    Ok(0)
+}
+
+fn run_dump_tokens_cli(args: &ShadowArgs) -> Result<i32, String> {
+    if args.prompt.is_none() && args.prompt_file.is_none() {
+        return Err("ds4: --dump-tokens requires -p or --prompt-file".into());
+    }
+    let text = prompt_text(args)?;
+    let model_path = args
+        .model
+        .as_deref()
+        .ok_or_else(|| "missing -m/--model (or pass --help)".to_string())?;
+    run_dump_tokens(model_path, &text)
+}
+
 fn write_logits_file(path: &str, body: &str) -> Result<(), String> {
     use std::io::Write;
     let mut fp = std::fs::File::create(path)
@@ -945,6 +1022,7 @@ Usage:
       --logprobs-top-k K (-p PROMPT | --prompt-file FILE)
   {name} --cuda -m MODEL [--nothink] --dump-logits F \\
       (-p PROMPT | --prompt-file FILE)
+  {name} -m MODEL --dump-tokens (-p PROMPT | --prompt-file FILE)
 
 --mtp/--dspark attach the DeepSeek-only sibling support models; the host
 resolves each sibling bind catalog + expected layouts, native skips that
@@ -953,6 +1031,8 @@ sibling's name walk and layout check.
 the engine, argmax decode, host stop set); ctx grows to fit prompt+n
 unless -c is explicit.
 --dump-logits writes full next-token logits as JSON after prompt prefill.
+--dump-tokens tokenizes -p/--prompt-file exactly as written, then exits
+without inference.
 One-shot sampling uses the native C sampler; an explicit --seed is
 reproducible across the C and Rust hosts.
 Thinking tags follow the C non-TTY byte contract; ANSI coloring is omitted.
@@ -987,6 +1067,9 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
     if args.help {
         print!("{}", help_text(name));
         return Ok(0);
+    }
+    if eval_plan(&args) == EvalPlan::Skip {
+        return run_dump_tokens_cli(&args);
     }
     if args.session_plan {
         let cmd = args
@@ -1103,12 +1186,14 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
         && args.prompt_file.is_none()
         && args.dump_logprobs.is_none()
         && args.dump_logits.is_none()
+        && !args.dump_tokens
         && !args.lifecycle_only
         && !raw_token_diagnostic;
     if !want_repl
         && !worker
         && args.dump_logprobs.is_none()
         && args.dump_logits.is_none()
+        && !args.dump_tokens
         && !args.lifecycle_only
         && !raw_token_diagnostic
     {
@@ -1866,6 +1951,39 @@ mod tests {
         assert_eq!(
             body,
             "{\n  \"source\":\"ds4\",\n  \"model\":\"m.gguf\",\n  \"backend\":\"cuda\",\n  \"quant_bits\":2,\n  \"prompt_tokens\":3,\n  \"ctx\":128,\n  \"vocab\":3,\n  \"argmax_token\":{\"id\":1,\"text\":\"a\",\"bytes\":[97]},\n  \"argmax_logit\":1.5,\n  \"logits\":[\n    1,1.5,null\n  ]\n}\n"
+        );
+    }
+
+    #[test]
+    fn parses_dump_tokens() {
+        let parsed = parse_args(args(&["--dump-tokens", "-p", "hi"])).unwrap();
+        assert!(parsed.dump_tokens);
+        assert_eq!(parsed.prompt.as_deref(), Some("hi"));
+        assert!(parsed.dump_logits.is_none());
+        assert!(parsed.dump_logprobs.is_none());
+    }
+
+    #[test]
+    fn help_contains_dump_tokens() {
+        assert!(help_text("ds4-rs").contains("--dump-tokens"));
+    }
+
+    #[test]
+    fn dump_tokens_missing_prompt_errors_like_c() {
+        let parsed = parse_args(args(&["--dump-tokens"])).unwrap();
+        assert_eq!(
+            run_dump_tokens_cli(&parsed).unwrap_err(),
+            "ds4: --dump-tokens requires -p or --prompt-file"
+        );
+    }
+
+    #[test]
+    fn dump_tokens_path_does_not_call_eval() {
+        let parsed = parse_args(args(&["--dump-tokens", "-p", "hi"])).unwrap();
+        assert_eq!(eval_plan(&parsed), EvalPlan::Skip);
+        assert_eq!(
+            format_dump_tokens(&[7, 8], &[(7, b"ab".as_slice()), (8, b"cd".as_slice())]),
+            b"[7, 8]\n     7  ab\n     8  cd\n"
         );
     }
 }
