@@ -3280,4 +3280,6 @@ mod owner_tests {
         assert_eq!(g.runtime.requests_canceled, 1);
         assert_eq!(g.runtime.requests_inflight, 0);
     }
+
+    mod stream_disconnect;
 }

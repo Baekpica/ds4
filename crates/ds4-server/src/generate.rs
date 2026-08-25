@@ -933,12 +933,11 @@ pub(crate) fn responses_ids(job_id: &str) -> (String, String, String) {
 }
 
 fn flush(w: &mut Writer, out: &mut impl Write) -> Result<(), GenerateError> {
-    if w.out.is_empty() {
-        return Ok(());
+    if !w.out.is_empty() {
+        out.write_all(&w.out).map_err(|_| GenerateError::Io)?;
+        w.out.clear();
     }
-    out.write_all(&w.out).map_err(|_| GenerateError::Io)?;
-    w.out.clear();
-    Ok(())
+    out.flush().map_err(|_| GenerateError::Io)
 }
 
 fn append_recovery_suffix(engine: &mut dyn DecodeIo, suffix: &[u8]) -> Result<i32, GenerateError> {
@@ -1030,12 +1029,16 @@ fn decode_pass(
                 }
                 Api::Anthropic => {
                     if let Some(st) = anth.as_mut() {
-                        anthropic_sse_stream_update(w, req, job_id, st, view, false);
+                        if !anthropic_sse_stream_update(w, req, job_id, st, view, false) {
+                            return Err(GenerateError::Io);
+                        }
                     }
                 }
                 Api::Responses => {
                     if let Some(st) = resp.as_mut() {
-                        responses_sse_stream_update(w, req, st, view, false);
+                        if !responses_sse_stream_update(w, req, st, view, false) {
+                            return Err(GenerateError::Io);
+                        }
                     }
                 }
             }
@@ -1396,7 +1399,7 @@ pub(crate) fn generate_terminal_at(
             }
             Api::Anthropic => {
                 if let Some(st) = anth.as_mut() {
-                    anthropic_sse_finish_live(
+                    if !anthropic_sse_finish_live(
                         &mut w,
                         &req,
                         job_id,
@@ -1406,12 +1409,14 @@ pub(crate) fn generate_terminal_at(
                         matched_stop.as_deref(),
                         completion,
                         &parsed_gen.calls,
-                    );
+                    ) {
+                        return Err(GenerateError::Io);
+                    }
                 }
             }
             Api::Responses => {
                 if let Some(st) = resp.as_mut() {
-                    responses_sse_finish_live(
+                    if !responses_sse_finish_live(
                         &mut w,
                         &req,
                         st,
@@ -1422,7 +1427,9 @@ pub(crate) fn generate_terminal_at(
                         0,
                         created,
                         &parsed_gen.calls,
-                    );
+                    ) {
+                        return Err(GenerateError::Io);
+                    }
                 }
             }
         }
