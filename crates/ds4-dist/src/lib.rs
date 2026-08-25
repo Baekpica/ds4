@@ -2,6 +2,7 @@
 //! codecs only — do not `#[repr(C)]` records onto the socket.
 
 mod activation;
+mod assemble;
 mod codec;
 mod coordinator;
 mod exec;
@@ -28,6 +29,11 @@ pub use activation::{
     bits_or_default, bits_valid, decode_activation, encode_activation, f16_to_f32, f32_to_f16,
     f32_to_f8_e4m3, f8_e4m3_to_f32, values_from_wire_bytes, wire_bytes, wire_bytes_from_f32_bytes,
     BITS_DEFAULT,
+};
+pub use assemble::{
+    assemble_worker, print_worker_listen_banner, slice_meta, worker_hello, worker_listen_banner,
+    worker_listen_port, worker_model_name, worker_plan, AssembledWorker, SliceMeta,
+    WorkerListenBanner, WorkerPlan, UNKNOWN_MODEL_NAME,
 };
 pub use codec::{
     bytes_have_nul, decode_frame_header, decode_hello_payload, decode_snapshot_begin_body,

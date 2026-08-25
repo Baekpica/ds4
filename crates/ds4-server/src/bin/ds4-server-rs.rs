@@ -6,7 +6,8 @@ use ds4_core::{Backend, DistributedConfig, DistributedRole, Model};
 use ds4_server::kv_cli::DiskKvArgs;
 use ds4_server::{
     accept_loop, accept_loop_with_engine, accept_loop_with_engine_cont, listen,
-    model_id_from_gguf_path, ContLane, DistArgs, NativeDecode, ServerConfig,
+    model_id_from_gguf_path, run_assembled_worker, server_launch, ContLane, DistArgs, NativeDecode,
+    ServerConfig, ServerLaunch, WORKER_REQUIRES_MODEL,
 };
 
 fn distributed_config(opt: &ds4_dist::Options) -> Option<DistributedConfig> {
@@ -123,7 +124,8 @@ fn main() {
     }
 
     let native_dist = distributed_config(&dist.opt);
-    let worker = dist.opt.role == ds4_dist::Role::Worker;
+    let launch = server_launch(dist.opt.role, model_path.is_some())
+        .unwrap_or_else(|error| cli_error(&error));
     let model = match model_path.as_deref() {
         Some(path) => {
             let opened = match native_dist.as_ref() {
@@ -145,12 +147,12 @@ fn main() {
         }
         None => None,
     };
-    if worker {
+    if launch == ServerLaunch::Worker {
         let Some(model) = model else {
-            cli_error("ds4-server-rs: --role worker requires -m/--model");
+            cli_error(WORKER_REQUIRES_MODEL);
         };
         model.boot_prewarm();
-        match model.run_distributed_worker(cfg.ctx) {
+        match run_assembled_worker(&model, cfg.ctx, &dist.opt) {
             Ok(rc) => std::process::exit(rc),
             Err(e) => {
                 eprintln!("ds4-server-rs: {e}");

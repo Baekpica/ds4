@@ -24,6 +24,9 @@ pub mod stream;
 mod tool_memory;
 pub mod tool_stream;
 pub mod tools;
+pub mod worker;
+#[cfg(feature = "native")]
+pub mod worker_run;
 
 pub use admit::{
     enqueue, enqueue_release, enqueue_shed_error, mint_job_id, next_job_id, preparse_shed,
@@ -125,3 +128,6 @@ pub use tools::{
     assign_tool_ids, parse_generated_for_model_id, parse_generated_for_response,
     parse_generated_message, ParsedGenerated, SemAccum, SemFeed,
 };
+pub use worker::{server_launch, ServerLaunch, WORKER_REQUIRES_MODEL};
+#[cfg(feature = "native")]
+pub use worker_run::run_assembled_worker;
