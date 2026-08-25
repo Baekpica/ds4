@@ -322,7 +322,7 @@ pub(crate) fn parse_bool(value: Option<&str>, default: bool) -> bool {
     default
 }
 
-fn io_detail(error: &std::io::Error) -> String {
+pub(super) fn io_detail(error: &std::io::Error) -> String {
     let detail = error.to_string();
     if error.raw_os_error().is_some() {
         if let Some(at) = detail.rfind(" (os error ") {
@@ -673,6 +673,9 @@ pub(super) fn handle_round_with_cursor<B: Browser>(
             READ_FILE => read_result(call, cursor),
             MORE_FILE => more_result(call, cursor),
             LIST_DIR => list_result(call),
+            super::write::WRITE => {
+                super::write::write_result(call.arg(PATH_ARG), call.arg("content"))
+            }
             super::search::SEARCH => match super::search::search_result(super::search::SearchArgs {
                 query: call.arg(QUERY_ARG),
                 path: call.arg(PATH_ARG),

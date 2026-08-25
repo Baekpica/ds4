@@ -8,9 +8,12 @@ const TOOL_UNSUPPORTED_ERROR: &str =
 
 mod search;
 mod web_tools;
+mod write;
 
 #[cfg(test)]
 mod search_parity;
+#[cfg(test)]
+mod write_parity;
 
 #[derive(Debug)]
 pub struct AgentArgs {
@@ -385,7 +388,7 @@ fn help_text(name: &str) -> String {
     format!(
         "Usage: {name} --non-interactive -p TEXT [options]\n\
          \n\
-         One-turn ds4-agent shadow. Supports google_search, visit_page, read, more, list, and search. \
+         One-turn ds4-agent shadow. Supports google_search, visit_page, read, more, list, search, and write. \
          Use ./ds4-agent for other tools, interactive, KV, MTP, or distributed execution.\n\
          \n\
          Options:\n\
@@ -660,7 +663,7 @@ mod tests {
     #[test]
     fn help_names_the_supported_tool_subset() {
         let help = help_text("ds4-agent-rs");
-        assert!(help.contains("google_search, visit_page, read, more, list, and search"));
+        assert!(help.contains("google_search, visit_page, read, more, list, search, and write"));
         assert!(!help.contains("Tool calls are rejected"));
     }
 }

@@ -20,7 +20,8 @@ static void oracle_usage(void)
             "project THINK CHUNK... | read PATH START MAX WHOLE RAW | "
             "read2 PATH | more PATH READ_COUNT RAW [COUNT...] | "
             "more-none [COUNT] | more-error PATH | list [PATH] | "
-            "search [QUERY [PATH [MODE [GLOB [CASE [CONTEXT [MAX]]]]]]]\n");
+            "search [QUERY [PATH [MODE [GLOB [CASE [CONTEXT [MAX]]]]]]] | "
+            "write [PATH [CONTENT]]\n");
     exit(2);
 }
 
@@ -207,6 +208,23 @@ int main(int argc, char **argv)
             }
         }
         char *result = agent_tool_search(NULL, &call);
+        print_hex(result, strlen(result));
+        free(result);
+        agent_tool_call_free(&call);
+        return 0;
+    }
+
+    if (argc >= 2 && argc <= 4 && strcmp(argv[1], "write") == 0) {
+        agent_tool_call call = {.name = xstrdup("write")};
+        if (argc >= 3 && strcmp(argv[2], "-") != 0) {
+            agent_tool_call_add_arg(&call, "path", argv[2], strlen(argv[2]),
+                                    true);
+        }
+        if (argc >= 4 && strcmp(argv[3], "-") != 0) {
+            agent_tool_call_add_arg(&call, "content", argv[3], strlen(argv[3]),
+                                    true);
+        }
+        char *result = agent_tool_write(NULL, &call);
         print_hex(result, strlen(result));
         free(result);
         agent_tool_call_free(&call);
