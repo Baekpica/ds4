@@ -448,7 +448,7 @@ test-tokenizer-parity: tests/parity/tokenizer_c_oracle tests/parity/vocab_c_orac
 
 test-agent-parity: test-tokenizer-parity tests/parity/agent_c_oracle
 	DS4_AGENT_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/agent_c_oracle \
-		cargo test -p ds4-cli --lib agent::tests
+		cargo test -p ds4-cli --lib agent::
 
 tests/parity/session_c_oracle: tests/parity/session_c_oracle.c ds4.c ds4.h native/bridge/ds4_host_load.h
 	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \

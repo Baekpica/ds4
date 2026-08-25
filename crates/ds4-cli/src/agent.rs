@@ -352,7 +352,7 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
             output.extend_from_slice(&project_output(&[&round.visible])?);
             model
                 .vocab()
-                .chat_append_message(&mut transcript, "tool", round.observation.as_bytes())
+                .chat_append_message(&mut transcript, "tool", &round.observation)
                 .map_err(|error| error.to_string())?;
             model
                 .vocab()
@@ -380,8 +380,8 @@ fn help_text(name: &str) -> String {
     format!(
         "Usage: {name} --non-interactive -p TEXT [options]\n\
          \n\
-         One-turn ds4-agent shadow. Tool calls are rejected; use ./ds4-agent \
-         for interactive, tool, KV, MTP, or distributed execution.\n\
+         One-turn ds4-agent shadow. Supports google_search, visit_page, and read. \
+         Use ./ds4-agent for other tools, interactive, KV, MTP, or distributed execution.\n\
          \n\
          Options:\n\
            -m, --model FILE        GGUF model path. Default: ds4flash.gguf\n\
@@ -650,5 +650,12 @@ mod tests {
                 .unwrap_err();
             assert!(error.contains("not implemented"), "{flag}: {error}");
         }
+    }
+
+    #[test]
+    fn help_names_the_supported_tool_subset() {
+        let help = help_text("ds4-agent-rs");
+        assert!(help.contains("google_search, visit_page, and read"));
+        assert!(!help.contains("Tool calls are rejected"));
     }
 }

@@ -17,7 +17,8 @@ static void oracle_usage(void)
 {
     fprintf(stderr,
             "usage: agent_c_oracle prompt | datetime WHEN | dsml TEXT | "
-            "project THINK CHUNK...\n");
+            "project THINK CHUNK... | read PATH START MAX WHOLE RAW | "
+            "read2 PATH\n");
     exit(2);
 }
 
@@ -78,6 +79,48 @@ int main(int argc, char **argv)
         close(worker.wake_fd[0]);
         close(worker.wake_fd[1]);
         pthread_mutex_destroy(&worker.mu);
+        return 0;
+    }
+
+    if (argc == 7 && strcmp(argv[1], "read") == 0) {
+        static const char *names[] = {
+            "path", "start_line", "max_lines", "whole", "raw"
+        };
+        agent_worker worker = {0};
+        agent_tool_call call = {.name = xstrdup("read")};
+        for (int i = 0; i < 5; i++) {
+            const char *value = argv[i + 2];
+            if (strcmp(value, "-") != 0) {
+                agent_tool_call_add_arg(&call, names[i], value, strlen(value),
+                                        i == 0);
+            }
+        }
+        char *result = agent_tool_read(&worker, &call);
+        print_hex(result, strlen(result));
+        free(result);
+        agent_tool_call_free(&call);
+        return 0;
+    }
+
+    if (argc == 3 && strcmp(argv[1], "read2") == 0) {
+        agent_worker worker = {0};
+        agent_buf all = {0};
+        for (int i = 0; i < 2; i++) {
+            agent_tool_call call = {.name = xstrdup("read")};
+            agent_tool_call_add_arg(&call, "path", argv[2], strlen(argv[2]), true);
+            char *result = agent_tool_read(&worker, &call);
+            char header[128];
+            snprintf(header, sizeof(header), "Tool result %d (read):\n", i + 1);
+            agent_buf_puts(&all, header);
+            agent_buf_puts(&all, result);
+            if (result[0] && result[strlen(result) - 1] != '\n')
+                agent_buf_puts(&all, "\n");
+            free(result);
+            agent_tool_call_free(&call);
+        }
+        char *result = agent_buf_take(&all);
+        print_hex(result, strlen(result));
+        free(result);
         return 0;
     }
 
