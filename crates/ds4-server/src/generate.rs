@@ -14,11 +14,12 @@ use std::time::{Duration, Instant};
 #[cfg(any(feature = "native", test))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use ds4_kv::Store as KvStore;
 #[cfg(any(feature = "native", test))]
 use ds4_kv::{
     chat_anchor_pos as kv_chat_anchor_pos, continued_store_target as kv_continued_store_target,
-    store_len as kv_store_len, Header as KvHeader, Reason as KvReason, Store as KvStore,
-    EXT_THINKING_VISIBLE, EXT_TOOL_MAP,
+    store_len as kv_store_len, Header as KvHeader, Reason as KvReason, EXT_THINKING_VISIBLE,
+    EXT_TOOL_MAP,
 };
 
 use crate::dsml::{SampleOverride, SamplePolicy};
@@ -71,6 +72,9 @@ impl From<RenderError> for GenerateError {
 
 pub trait DecodeIo {
     fn model_id(&self) -> i32;
+    fn kv_store_mut(&mut self) -> Option<&mut KvStore> {
+        None
+    }
     fn tokenize_text(&self, text: &str) -> Result<Vec<i32>, GenerateError>;
     fn tokenize_rendered_chat(&self, text: &[u8]) -> Result<Vec<i32>, GenerateError>;
     fn tokenizes_control_literals(&self) -> bool {
@@ -102,6 +106,9 @@ pub trait DecodeIo {
     }
     fn remember_tool_replay(&mut self, _calls: &[ToolCall], _raw_dsml: &str) {}
     fn maybe_store_continued(&mut self) -> Result<(), GenerateError> {
+        Ok(())
+    }
+    fn shutdown(&mut self) -> Result<(), GenerateError> {
         Ok(())
     }
     fn eval(&mut self, token: i32) -> Result<(), GenerateError>;
@@ -207,7 +214,7 @@ fn kv_now() -> u64 {
 }
 
 #[cfg(any(feature = "native", test))]
-fn kv_identity(model_id: i32, quant_bits: i32, ctx: i32) -> Option<(u8, u8, u32)> {
+pub(crate) fn kv_identity(model_id: i32, quant_bits: i32, ctx: i32) -> Option<(u8, u8, u32)> {
     let model_id = u8::try_from(model_id).ok()?;
     let quant_bits = match quant_bits {
         2 | 4 => quant_bits as u8,
@@ -228,7 +235,7 @@ fn intermediate_prefill_eligible(
 }
 
 #[cfg(any(feature = "native", test))]
-fn kv_header(model_id: u8, quant_bits: u8, ctx: u32, tokens: u32) -> KvHeader {
+pub(crate) fn kv_header(model_id: u8, quant_bits: u8, ctx: u32, tokens: u32) -> KvHeader {
     let now = kv_now();
     KvHeader {
         quant_bits,
@@ -768,7 +775,7 @@ pub fn render_prompt(parsed: &ParsedRequest, model_id: i32) -> Result<Vec<u8>, G
     }
 }
 
-fn ordinary_disk_cache_eligible(parsed: &ParsedRequest) -> bool {
+pub(crate) fn ordinary_disk_cache_eligible(parsed: &ParsedRequest) -> bool {
     parsed.api == Api::Openai
         && !think_mode_enabled(parsed.think_mode)
         && !parsed.has_tools
@@ -1918,6 +1925,10 @@ impl DecodeIo for NativeDecode<'_> {
         self.model.model_id()
     }
 
+    fn kv_store_mut(&mut self) -> Option<&mut KvStore> {
+        self.store.as_mut()
+    }
+
     fn tokenize_text(&self, text: &str) -> Result<Vec<i32>, GenerateError> {
         if let Some(v) = self.vocab {
             return Ok(v.encode_text(text));
@@ -2033,6 +2044,43 @@ impl DecodeIo for NativeDecode<'_> {
             sync_elapsed: Duration::ZERO,
         };
         try_store_continued(&mut io, store, identity)?;
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), GenerateError> {
+        let Some(identity) = kv_identity(
+            self.model.model_id(),
+            self.model.routed_quant_bits(),
+            self.ctx(),
+        ) else {
+            return Ok(());
+        };
+        let vocab = self.vocab.unwrap_or_else(|| self.model.vocab());
+        let (Some(session), Some(store), checkpoint, tool_memory) = (
+            &mut self.session,
+            &mut self.store,
+            &self.thinking_visible,
+            &self.tool_memory,
+        ) else {
+            return Ok(());
+        };
+        let mut io = NativeSerialKvIo {
+            session,
+            vocab,
+            tool_memory,
+            prefill_checkpoints: false,
+            sync_elapsed: Duration::ZERO,
+        };
+        let (model_id, quant_bits, ctx) = identity;
+        try_store_live(
+            &mut io,
+            store,
+            model_id,
+            quant_bits,
+            ctx,
+            KvReason::Shutdown,
+            checkpoint.as_ref(),
+        )?;
         Ok(())
     }
 

@@ -50,9 +50,10 @@ pub struct ServerConfig {
     pub out_agg_evict_min_bytes: u64,
     pub disconnect_abort: bool,
     pub have_engine: bool,
+    pub stop_requested: Option<fn() -> bool>,
 }
 
-fn env_i32_bound(name: &str, default: i32) -> i32 {
+pub(crate) fn env_i32_bound(name: &str, default: i32) -> i32 {
     let value = std::env::var_os(name);
     parse_i32_bound(value.as_deref(), default)
 }
@@ -136,6 +137,7 @@ impl Default for ServerConfig {
                 std::env::var_os("DS4_SERVER_DISCONNECT_ABORT").as_deref(),
             ),
             have_engine: false,
+            stop_requested: None,
         }
     }
 }
@@ -1032,6 +1034,7 @@ fn run_engine<W: TerminalSink>(
 ) -> (u8, Settlement) {
     if dec.lane == LANE_CONTINUOUS {
         if let Some(exec) = cont.as_mut() {
+            let store = engine.kv_store_mut();
             let result = exec.generate(
                 &job.parsed,
                 id,
@@ -1039,6 +1042,7 @@ fn run_engine<W: TerminalSink>(
                 cfg.cors,
                 cfg.default_tokens,
                 arrived_at,
+                store,
                 out,
             );
             if !matches!(result, Err(GenerateError::Unsupported(_))) {
@@ -1188,19 +1192,39 @@ fn accept_error_retryable(_kind: ErrorKind) -> bool {
     true
 }
 
-fn retry_accept(kind: ErrorKind) {
+fn retry_accept(kind: ErrorKind, polling_stop: bool) {
     if kind != ErrorKind::Interrupted {
-        thread::sleep(Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(if polling_stop { 10 } else { 1 }));
     }
+}
+
+fn stop_requested(cfg: &ServerConfig) -> bool {
+    cfg.stop_requested.is_some_and(|stop| stop())
 }
 
 pub fn accept_loop(listener: TcpListener, cfg: ServerConfig) {
     let inner = Arc::new(Mutex::new(ServerInner::from_cfg(&cfg)));
+    let polling_stop = cfg.stop_requested.is_some();
+    if polling_stop {
+        if let Err(error) = listener.set_nonblocking(true) {
+            eprintln!("ds4-server-rs: stop polling unavailable: {error}");
+            lock_inner(&inner).admit.stopping = true;
+            return;
+        }
+    }
     loop {
+        if stop_requested(&cfg) {
+            break;
+        }
         let mut stream = match listener.accept() {
-            Ok((stream, _)) => stream,
+            Ok((stream, _)) => {
+                if stop_requested(&cfg) {
+                    break;
+                }
+                stream
+            }
             Err(e) if accept_error_retryable(e.kind()) => {
-                retry_accept(e.kind());
+                retry_accept(e.kind(), polling_stop);
                 continue;
             }
             Err(_) => break,
@@ -1425,15 +1449,31 @@ fn owner_loop(
     mut cont: Option<&mut dyn ContExec>,
 ) {
     let inner = Arc::new(Mutex::new(ServerInner::from_cfg(&cfg)));
+    let polling_stop = cfg.stop_requested.is_some();
+    if polling_stop {
+        if let Err(error) = listener.set_nonblocking(true) {
+            eprintln!("ds4-server-rs: stop polling unavailable: {error}");
+            shutdown_owner(engine, cont);
+            return;
+        }
+    }
     let (jobs_tx, jobs_rx) = mpsc::channel();
     let accept_cfg = cfg.clone();
     let accept_inner = Arc::clone(&inner);
     let accept = thread::Builder::new().spawn(move || {
         loop {
+            if stop_requested(&accept_cfg) {
+                break;
+            }
             let stream = match listener.accept() {
-                Ok((stream, _)) => stream,
+                Ok((stream, _)) => {
+                    if stop_requested(&accept_cfg) {
+                        break;
+                    }
+                    stream
+                }
                 Err(e) if accept_error_retryable(e.kind()) => {
-                    retry_accept(e.kind());
+                    retry_accept(e.kind(), polling_stop);
                     continue;
                 }
                 Err(_) => break,
@@ -1450,6 +1490,7 @@ fn owner_loop(
     });
     if accept.is_err() {
         lock_inner(&inner).admit.stopping = true;
+        shutdown_owner(engine, cont);
         return;
     }
 
@@ -1458,6 +1499,19 @@ fn owner_loop(
             Some(exec) => run_owner_job(&cfg, &inner, engine, Some(&mut **exec), job),
             None => run_owner_job(&cfg, &inner, engine, None, job),
         }
+    }
+    shutdown_owner(engine, cont);
+}
+
+fn shutdown_owner(
+    engine: &mut dyn DecodeIo,
+    mut cont: Option<&mut dyn ContExec>,
+) {
+    if let Err(error) = engine.shutdown() {
+        eprintln!("ds4-server-rs: serial shutdown checkpoint failed: {error}");
+    }
+    if let Some(exec) = cont.as_deref_mut() {
+        exec.shutdown(engine.kv_store_mut());
     }
 }
 
@@ -1498,16 +1552,27 @@ mod owner_tests {
     use crate::parse::{ParseEnv, ParsedRequest};
     use crate::route::WireSurface;
     use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    static TEST_STOP: AtomicBool = AtomicBool::new(false);
+    static TEST_STOP_POLLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn test_stop_requested() -> bool {
+        TEST_STOP_POLLS.fetch_add(1, Ordering::Relaxed);
+        TEST_STOP.load(Ordering::Relaxed)
+    }
 
     enum TestCont {
         Accept,
         Reject,
         Fail,
+        Shutdown(Arc<Mutex<Vec<&'static str>>>),
     }
 
     struct SlowPrepDecode {
         sampled: bool,
         pos: i32,
+        shutdown_order: Option<Arc<Mutex<Vec<&'static str>>>>,
     }
 
     struct DisconnectDecode {
@@ -1591,6 +1656,12 @@ mod owner_tests {
         fn ctx(&self) -> i32 { 8192 }
         fn generation(&self) -> u64 { 1 }
         fn invalidate(&mut self) { self.pos = 0; }
+        fn shutdown(&mut self) -> Result<(), GenerateError> {
+            if let Some(order) = &self.shutdown_order {
+                order.lock().unwrap().push("serial");
+            }
+            Ok(())
+        }
     }
 
     impl ContExec for TestCont {
@@ -1618,6 +1689,7 @@ mod owner_tests {
             cors: bool,
             _default_tokens: i32,
             _t_arrive: Instant,
+            _store: Option<&mut ds4_kv::Store>,
             out: &mut dyn Write,
         ) -> Result<GenerateOutcome, GenerateError> {
             match self {
@@ -1639,6 +1711,13 @@ mod owner_tests {
                 }
                 Self::Reject => Err(GenerateError::Unsupported("serial fallback")),
                 Self::Fail => Err(GenerateError::Engine("native failure".into())),
+                Self::Shutdown(_) => unreachable!("shutdown-only continuous lane generated"),
+            }
+        }
+
+        fn shutdown(&mut self, _store: Option<&mut ds4_kv::Store>) {
+            if let Self::Shutdown(order) = self {
+                order.lock().unwrap().push("bank");
             }
         }
     }
@@ -2451,7 +2530,11 @@ mod owner_tests {
         prepared.parsed.max_tokens_set = true;
         let lease = admit_test_job(&inner, &prepared);
         let (job, drain) = owner_job(prepared, lease);
-        let mut engine = SlowPrepDecode { sampled: false, pos: 0 };
+        let mut engine = SlowPrepDecode {
+            sampled: false,
+            pos: 0,
+            shutdown_order: None,
+        };
 
         run_owner_job(&cfg, &inner, &mut engine, None, job);
         let response = String::from_utf8(settle_drain(drain)).unwrap();
@@ -2506,6 +2589,43 @@ mod owner_tests {
         assert!(accept_error_retryable(ErrorKind::TimedOut));
         assert!(accept_error_retryable(ErrorKind::InvalidInput));
         assert!(accept_error_retryable(ErrorKind::PermissionDenied));
+    }
+
+    #[test]
+    fn stop_drains_then_saves_serial_before_continuous_banks() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut cfg = test_cfg();
+        cfg.stop_requested = Some(test_stop_requested);
+        TEST_STOP.store(false, Ordering::Relaxed);
+        TEST_STOP_POLLS.store(0, Ordering::Relaxed);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let thread_order = Arc::clone(&order);
+        let (done_tx, done_rx) = mpsc::channel();
+        let owner = thread::spawn(move || {
+            let mut engine = SlowPrepDecode {
+                sampled: false,
+                pos: 0,
+                shutdown_order: Some(Arc::clone(&thread_order)),
+            };
+            let mut cont = TestCont::Shutdown(thread_order);
+            owner_loop(listener, cfg, &mut engine, Some(&mut cont));
+            done_tx.send(()).unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while TEST_STOP_POLLS.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(TEST_STOP_POLLS.load(Ordering::Relaxed) > 0);
+        TEST_STOP.store(true, Ordering::Relaxed);
+        if done_rx.recv_timeout(Duration::from_secs(1)).is_err() {
+            let _ = TcpStream::connect(addr);
+            panic!("owner loop did not stop after the stop predicate changed");
+        }
+        owner.join().unwrap();
+
+        assert_eq!(*order.lock().unwrap(), ["serial", "bank"]);
     }
 
     #[test]

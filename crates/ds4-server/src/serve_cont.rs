@@ -7,12 +7,20 @@
 //! by the needs word, so this path never re-decodes.
 
 use std::io::Write;
+#[cfg(any(feature = "native", test))]
+use std::path::Path;
 use std::time::Instant;
 
+use ds4_kv::Store as KvStore;
+#[cfg(any(feature = "native", test))]
+use ds4_kv::{Reason as KvReason, EXT_BANK_REPLAY_V1};
+#[cfg(feature = "native")]
+use ds4_kv::bank_checkpoint_due;
+
 use crate::dsml::{SamplePolicy, SampleOverride};
-use crate::generate::{
-    render_prompt, stream_req_from_parsed, GenerateError, GenerateOutcome,
-};
+#[cfg(any(feature = "native", test))]
+use crate::generate::ordinary_disk_cache_eligible;
+use crate::generate::{render_prompt, stream_req_from_parsed, GenerateError, GenerateOutcome};
 use crate::parse::{ParsedRequest, ToolChoice};
 use crate::parse::{DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_TOP_P};
 use crate::render::syntax_for_model_id;
@@ -331,6 +339,133 @@ fn last_delta(raw: &[u8], emit_limit: usize, piece_len: usize) -> Option<&[u8]> 
     Some(&raw[start..emit_limit])
 }
 
+#[cfg(any(feature = "native", test))]
+fn bank_scope(parsed: &ParsedRequest) -> bool {
+    parsed.kind == ReqKind::Chat && ordinary_disk_cache_eligible(parsed)
+}
+
+#[cfg(any(feature = "native", test))]
+#[derive(Debug, Default)]
+struct WarmBank {
+    record: Option<WarmRecord>,
+    stored_tokens: i32,
+}
+
+#[cfg(any(feature = "native", test))]
+#[derive(Debug)]
+struct WarmRecord {
+    text: Vec<u8>,
+    generation: u64,
+}
+
+#[cfg(any(feature = "native", test))]
+fn committed_key(
+    prompt: &[u8],
+    tokens: &[i32],
+    mut token_text: impl FnMut(i32) -> Vec<u8>,
+) -> Vec<u8> {
+    let mut key = prompt.to_vec();
+    for &token in tokens.iter().take(tokens.len().saturating_sub(1)) {
+        key.extend(token_text(token));
+    }
+    key
+}
+
+#[cfg(any(feature = "native", test))]
+fn warm_admit_tokens(
+    warm: &WarmBank,
+    prompt: &[u8],
+    snapshot_tokens: &[i32],
+    generation: u64,
+    seq_cap: i32,
+    tokenize_suffix: impl FnOnce(&[u8]) -> Vec<i32>,
+) -> Option<(Vec<i32>, i32)> {
+    let record = warm.record.as_ref()?;
+    if record.generation != generation {
+        return None;
+    }
+    let key = &record.text;
+    if key.is_empty() || key.len() >= prompt.len() || !prompt.starts_with(key) {
+        return None;
+    }
+    let cached = i32::try_from(snapshot_tokens.len()).ok().filter(|n| *n > 0)?;
+    let mut tokens = snapshot_tokens.to_vec();
+    tokens.extend(tokenize_suffix(&prompt[key.len()..]));
+    if tokens.len() <= snapshot_tokens.len()
+        || i32::try_from(tokens.len()).ok().filter(|n| *n <= seq_cap).is_none()
+    {
+        return None;
+    }
+    Some((tokens, cached))
+}
+
+#[cfg(any(feature = "native", test))]
+fn disk_restore_allowed(
+    warm: &WarmBank,
+    live: Option<(u64, usize)>,
+    disk_tokens: u32,
+    pin_min: i32,
+) -> bool {
+    let Some(record) = warm.record.as_ref() else {
+        return true;
+    };
+    let Some((generation, live_tokens)) = live else {
+        return true;
+    };
+    if record.generation != generation {
+        return true;
+    }
+    let Ok(pin_min) = usize::try_from(pin_min) else {
+        return false;
+    };
+    pin_min > 0 && disk_tokens as usize >= pin_min && live_tokens < pin_min
+}
+
+#[cfg(any(feature = "native", test))]
+fn bank_retire_allowed(bank_enabled: bool, admitted: bool, done_called: bool) -> bool {
+    bank_enabled && admitted && done_called
+}
+
+#[cfg(any(feature = "native", test))]
+fn save_bank_record(
+    store: &mut KvStore,
+    warm: &mut WarmBank,
+    identity: (u8, u8, u32),
+    committed: i32,
+    generation: u64,
+    reason: KvReason,
+    save_payload: impl FnOnce(&Path) -> Result<(), GenerateError>,
+) -> Result<bool, GenerateError> {
+    if committed <= 0 {
+        return Ok(false);
+    }
+    let Some(text) = warm
+        .record
+        .as_ref()
+        .filter(|record| record.generation == generation)
+        .map(|record| &record.text)
+        .filter(|text| !text.is_empty())
+        .cloned()
+    else {
+        return Ok(false);
+    };
+    let tokens = u32::try_from(committed)
+        .map_err(|_| GenerateError::Engine("bank token count exceeds u32".into()))?;
+    let (model_id, quant_bits, ctx) = identity;
+    let mut header = crate::generate::kv_header(model_id, quant_bits, ctx, tokens);
+    header.reason = reason;
+    header.ext_flags = EXT_BANK_REPLAY_V1;
+    let payload = store
+        .payload_temp()
+        .map_err(|error| GenerateError::Engine(error.to_string()))?;
+    save_payload(payload.path())?;
+    store
+        .write_payload_file(header, &text, payload.path(), &[])
+        .map_err(|error| GenerateError::Engine(error.to_string()))?;
+    warm.stored_tokens = committed;
+    Ok(true)
+}
+
 /// Trait seam so `handle_client_inner` can drive a continuous lane without
 /// the native feature (tests supply a scripted implementation).
 pub trait ContExec {
@@ -346,8 +481,11 @@ pub trait ContExec {
         cors: bool,
         default_tokens: i32,
         t_arrive: Instant,
+        store: Option<&mut KvStore>,
         out: &mut dyn Write,
     ) -> Result<GenerateOutcome, GenerateError>;
+
+    fn shutdown(&mut self, _store: Option<&mut KvStore>) {}
 }
 
 /// Render + tokenize a request for routing (`prompt_len` feeds
@@ -377,12 +515,17 @@ mod native {
     /// Native continuous lane: engine batch context + host vocab. Width-1
     /// (the accept loop admits one request at a time).
     pub struct ContLane<'m> {
-        pub batch: BatchCtx<'m>,
-        pub vocab: &'m Vocab,
-        pub model_id: i32,
+        batch: BatchCtx<'m>,
+        vocab: &'m Vocab,
+        model_id: i32,
+        quant_bits: i32,
+        ctx: i32,
         /// Family EOT for the per-seq stop, like the C server's job prep;
         /// the engine's `-1` default is the base EOS, not the family EOT.
-        pub eos: i32,
+        eos: i32,
+        warm: WarmBank,
+        warm_pin_min: i32,
+        warm_checkpoint: bool,
     }
 
     struct OneJob<'a, W: Write> {
@@ -398,6 +541,8 @@ mod native {
         io_failed: bool,
         host_abort: bool,
         engine_eos: bool,
+        capture_done: bool,
+        done_tokens: Vec<i32>,
         n_cached: i32,
         n_computed: i32,
         t_arrive: Instant,
@@ -458,8 +603,11 @@ mod native {
             true
         }
 
-        fn on_done(&mut self, _user: usize, _tokens: &[i32], finish: i32) {
+        fn on_done(&mut self, _user: usize, tokens: &[i32], finish: i32) {
             self.engine_eos = finish == 1;
+            if self.capture_done {
+                self.done_tokens.extend_from_slice(tokens);
+            }
             self.t_done = Some(Instant::now());
         }
 
@@ -484,6 +632,192 @@ mod native {
                 self.push(&head);
             }
             !self.io_failed
+        }
+    }
+
+    impl<'m> ContLane<'m> {
+        pub fn new(
+            batch: BatchCtx<'m>,
+            vocab: &'m Vocab,
+            model_id: i32,
+            quant_bits: i32,
+            ctx: i32,
+            eos: i32,
+        ) -> Self {
+            let warm_pin_min = crate::serve::env_i32_bound("DS4_SERVER_PIN_MIN_TOKENS", 65536);
+            let warm_checkpoint = std::env::var_os("DS4_SERVER_BANK_CHECKPOINT")
+                .is_none_or(|value| value != "0");
+            Self {
+                batch,
+                vocab,
+                model_id,
+                quant_bits,
+                ctx,
+                eos,
+                warm: WarmBank::default(),
+                warm_pin_min,
+                warm_checkpoint,
+            }
+        }
+
+        fn identity(&self) -> Option<(u8, u8, u32)> {
+            crate::generate::kv_identity(self.model_id, self.quant_bits, self.ctx)
+        }
+
+        fn warm_plan(&self, prompt: &[u8]) -> Option<(Vec<i32>, i32)> {
+            let snapshot = self.batch.bank_snapshot(0).ok()?;
+            warm_admit_tokens(
+                &self.warm,
+                prompt,
+                &snapshot.tokens,
+                snapshot.generation,
+                self.batch.seq_cap(),
+                |suffix| self.vocab.encode_rendered_bytes(suffix),
+            )
+        }
+
+        fn disk_plan(
+            &mut self,
+            store: &mut KvStore,
+            prompt: &[u8],
+        ) -> Option<(Vec<i32>, i32)> {
+            let identity = self.identity()?;
+            let (path, envelope) = store
+                .bank_text_prefix_candidate(prompt, identity.0, identity.1, identity.2)
+                .ok()??;
+            let live = self
+                .batch
+                .bank_snapshot(0)
+                .ok()
+                .map(|snapshot| (snapshot.generation, snapshot.tokens.len()));
+            if !disk_restore_allowed(
+                &self.warm,
+                live,
+                envelope.header.tokens,
+                self.warm_pin_min,
+            ) {
+                return None;
+            }
+            let snapshot = match self.batch.load_bank_payload_range(
+                0,
+                &path,
+                envelope.payload_offset,
+                envelope.header.payload_bytes,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    eprintln!("ds4-server-rs: bank restore skipped: {error}");
+                    return None;
+                }
+            };
+            if usize::try_from(envelope.header.tokens).ok() != Some(snapshot.tokens.len()) {
+                let _ = store.discard_bank(&path);
+                return None;
+            }
+            let committed = i32::try_from(snapshot.tokens.len()).ok()?;
+            self.warm.record = Some(WarmRecord {
+                text: envelope.text,
+                generation: snapshot.generation,
+            });
+            self.warm.stored_tokens = committed;
+            let _ = store.touch_hit(&path);
+            warm_admit_tokens(
+                &self.warm,
+                prompt,
+                &snapshot.tokens,
+                snapshot.generation,
+                self.batch.seq_cap(),
+                |suffix| self.vocab.encode_rendered_bytes(suffix),
+            )
+        }
+
+        fn retire(&mut self, bank: i32, prompt: &[u8], done_tokens: &[i32]) {
+            if bank != 0 {
+                return;
+            }
+            let Ok(snapshot) = self.batch.bank_snapshot(0) else {
+                self.warm.record = None;
+                return;
+            };
+            if snapshot.tokens.is_empty() {
+                self.warm.record = None;
+                return;
+            }
+            let key = if done_tokens.is_empty() {
+                let retained = committed_key(&[], &snapshot.tokens, |token| {
+                    self.vocab.token_text(token)
+                });
+                if retained.is_empty() || !prompt.starts_with(&retained) {
+                    self.warm.record = None;
+                    return;
+                }
+                self.warm.stored_tokens = self
+                    .warm
+                    .stored_tokens
+                    .min(snapshot.tokens.len() as i32);
+                retained
+            } else {
+                committed_key(prompt, done_tokens, |token| self.vocab.token_text(token))
+            };
+            self.warm.record = (!key.is_empty()).then_some(WarmRecord {
+                text: key,
+                generation: snapshot.generation,
+            });
+        }
+
+        fn persist_bank(
+            &mut self,
+            store: &mut KvStore,
+            reason: KvReason,
+            min_committed: i32,
+            due_only: bool,
+        ) {
+            if min_committed <= 0 {
+                return;
+            }
+            let Some(identity) = self.identity() else { return };
+            let Ok(snapshot) = self.batch.bank_snapshot(0) else {
+                return;
+            };
+            let Ok(committed) = i32::try_from(snapshot.tokens.len()) else {
+                return;
+            };
+            let min_committed = min_committed.max(store.opt.min_tokens);
+            if self
+                .warm
+                .record
+                .as_ref()
+                .is_none_or(|record| record.generation != snapshot.generation)
+                || committed < min_committed
+                || (due_only
+                    && !bank_checkpoint_due(
+                        &store.opt,
+                        committed,
+                        self.warm.stored_tokens,
+                    ))
+            {
+                return;
+            }
+            let (batch, state) = (&mut self.batch, &mut self.warm);
+            if let Err(error) = save_bank_record(
+                store,
+                state,
+                identity,
+                committed,
+                snapshot.generation,
+                reason,
+                |path| {
+                    batch
+                        .save_bank_payload(0, path)
+                        .map_err(|error| GenerateError::Engine(error.to_string()))
+                },
+            ) {
+                eprintln!("ds4-server-rs: bank checkpoint failed reason={reason:?}: {error}");
+            }
+        }
+
+        fn shutdown_banks(&mut self, store: &mut KvStore) {
+            self.persist_bank(store, KvReason::BankShutdown, 1, false);
         }
     }
 
@@ -512,6 +846,7 @@ mod native {
             cors: bool,
             default_tokens: i32,
             t_arrive: Instant,
+            mut store: Option<&mut KvStore>,
             out: &mut dyn Write,
         ) -> Result<GenerateOutcome, GenerateError> {
             let prompt = render_prompt(parsed, self.model_id)?;
@@ -535,7 +870,37 @@ mod native {
                 self.batch.seq_cap(),
             );
             let (temperature, top_k, top_p, min_p) = stepper.sampling(parsed);
-            let mut admit = ContAdmit::cold(1, tokens, stepper.max_tokens.max(1));
+            let width_one = self.batch.max_seq() == 1;
+            let bank_enabled = width_one && bank_scope(parsed);
+            let canonical_tokens = tokens;
+            let warm = if bank_enabled {
+                self.warm_plan(&stepper.prompt).or_else(|| {
+                    store
+                        .as_deref_mut()
+                        .and_then(|store| self.disk_plan(store, &stepper.prompt))
+                })
+            } else {
+                None
+            };
+            if width_one && warm.is_none() {
+                if let Some(store) = store.as_deref_mut() {
+                    self.persist_bank(
+                        store,
+                        KvReason::BankEvict,
+                        self.warm_pin_min,
+                        false,
+                    );
+                }
+                self.warm.record = None;
+                self.warm.stored_tokens = 0;
+            }
+            let (admit_tokens, n_cached) = warm.unwrap_or((canonical_tokens, 0));
+            let mut admit = ContAdmit::cold(1, admit_tokens, stepper.max_tokens.max(1));
+            if bank_enabled {
+                admit.place_bank = 1;
+                admit.n_cached = n_cached;
+                self.warm.record = None;
+            }
             admit.eos = self.eos;
             admit.temperature = temperature;
             admit.top_k = top_k;
@@ -553,6 +918,8 @@ mod native {
                 io_failed: false,
                 host_abort: false,
                 engine_eos: false,
+                capture_done: bank_enabled,
+                done_tokens: Vec::new(),
                 n_cached: 0,
                 n_computed: 0,
                 t_arrive,
@@ -560,19 +927,7 @@ mod native {
                 t_first: None,
                 t_done: None,
             };
-            self.batch
-                .continuous_generate(&mut job)
-                .map_err(|e| GenerateError::Engine(e.to_string()))?;
-            if !job.admitted {
-                /* Engine declined (oversized/budget): no bytes were sent,
-                 * the caller falls back to the serial lane. */
-                return Err(GenerateError::Unsupported(
-                    "continuous admission rejected; serial fallback",
-                ));
-            }
-            if job.io_failed {
-                return Err(GenerateError::Io);
-            }
+            let native_result = self.batch.continuous_generate(&mut job);
             let timings = {
                 let done = job.t_done.unwrap_or_else(Instant::now);
                 let completion = job.stepper.completion();
@@ -597,14 +952,49 @@ mod native {
             let n_cached = job.n_cached;
             let n_computed = job.n_computed;
             let io_ok = !job.io_failed;
+            let done_called = job.t_done.is_some();
+            let done_tokens = std::mem::take(&mut job.done_tokens);
+            let admitted = job.admitted;
             drop(job);
             drop(adapter);
+            if bank_retire_allowed(bank_enabled, admitted, done_called) {
+                self.retire(0, &stepper.prompt, &done_tokens);
+                if self.warm_checkpoint {
+                    if let Some(store) = store.as_deref_mut() {
+                        self.persist_bank(
+                            store,
+                            KvReason::BankCheckpoint,
+                            self.warm_pin_min,
+                            true,
+                        );
+                    }
+                }
+            }
+            if let Err(error) = native_result {
+                return Err(GenerateError::Engine(error.to_string()));
+            }
+            if !admitted {
+                /* Engine declined (oversized/budget): no bytes were sent,
+                 * the caller falls back to the serial lane. */
+                return Err(GenerateError::Unsupported(
+                    "continuous admission rejected; serial fallback",
+                ));
+            }
+            if !io_ok {
+                return Err(GenerateError::Io);
+            }
             let (tail, outcome) = stepper.finalize(engine_eos, n_cached, n_computed, timings, cors);
             if io_ok && !tail.is_empty() {
                 out.write_all(&tail).map_err(|_| GenerateError::Io)?;
                 let _ = out.flush();
             }
             Ok(outcome)
+        }
+
+        fn shutdown(&mut self, store: Option<&mut KvStore>) {
+            if let Some(store) = store {
+                self.shutdown_banks(store);
+            }
         }
     }
 
@@ -630,5 +1020,194 @@ impl ContStepper {
     /// is never fed.
     pub fn mark_stop(&mut self) {
         self.finish = "stop";
+    }
+}
+
+#[cfg(test)]
+mod bank_tests {
+    use super::*;
+    use crate::parse::{parse_chat_request, ParseEnv};
+    use crate::route::{Api, ReqKind, ThinkMode};
+    use ds4_kv::{Options, Reason, Store, EXT_BANK_REPLAY_V1};
+    use std::fs;
+
+    fn temp_store(tag: &str) -> (std::path::PathBuf, Store) {
+        let dir = std::env::temp_dir().join(format!(
+            "ds4-server-bank-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn bank_scope_is_openai_chat_without_thinking_or_tools() {
+        let mut env = ParseEnv::default();
+        env.default_effort = ThinkMode::None;
+        let mut parsed = parse_chat_request(
+            &env,
+            r#"{"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#,
+        )
+        .unwrap();
+        assert!(bank_scope(&parsed));
+
+        parsed.api = Api::Anthropic;
+        assert!(!bank_scope(&parsed));
+        parsed.api = Api::Openai;
+        parsed.kind = ReqKind::Completion;
+        assert!(!bank_scope(&parsed));
+        parsed.kind = ReqKind::Chat;
+        parsed.think_mode = ThinkMode::Low;
+        assert!(!bank_scope(&parsed));
+        parsed.think_mode = ThinkMode::None;
+        parsed.has_tools = true;
+        assert!(!bank_scope(&parsed));
+        parsed.has_tools = false;
+        parsed.has_tool_results = true;
+        assert!(!bank_scope(&parsed));
+        parsed.has_tool_results = false;
+        parsed.live_call_ids.push("call_1".into());
+        assert!(!bank_scope(&parsed));
+    }
+
+    #[test]
+    fn warm_key_drops_the_uncommitted_last_sample() {
+        assert_eq!(
+            committed_key(b"prompt:", &[1, 2, 3], |token| vec![b'0' + token as u8]),
+            b"prompt:12"
+        );
+        assert_eq!(committed_key(b"prompt:", &[], |_| unreachable!()), b"prompt:");
+    }
+
+    #[test]
+    fn warm_match_requires_a_strict_suffix_and_exact_snapshot_tokens() {
+        let warm = WarmBank {
+            record: Some(WarmRecord {
+                text: b"shared".to_vec(),
+                generation: 7,
+            }),
+            stored_tokens: 0,
+        };
+        assert!(warm_admit_tokens(&warm, b"shared", &[10, 11], 7, 8, |_| vec![12]).is_none());
+        assert!(warm_admit_tokens(&warm, b"other", &[10, 11], 7, 8, |_| vec![12]).is_none());
+        assert!(warm_admit_tokens(&warm, b"shared suffix", &[10, 11], 8, 8, |_| vec![12])
+            .is_none());
+        let (tokens, cached) = warm_admit_tokens(
+            &warm,
+            b"shared suffix",
+            &[10, 11],
+            7,
+            8,
+            |suffix| {
+                assert_eq!(suffix, b" suffix");
+                vec![20, 21]
+            },
+        )
+        .unwrap();
+        assert_eq!(tokens, vec![10, 11, 20, 21]);
+        assert_eq!(cached, 2);
+        assert!(warm_admit_tokens(&warm, b"shared suffix", &[10, 11], 7, 3, |_| vec![20, 21])
+            .is_none());
+    }
+
+    #[test]
+    fn disk_restore_replaces_only_empty_stale_or_shallow_live_banks() {
+        let empty = WarmBank::default();
+        assert!(disk_restore_allowed(&empty, Some((7, 70_000)), 1, 65_536));
+
+        let live = WarmBank {
+            record: Some(WarmRecord {
+                text: b"live".to_vec(),
+                generation: 7,
+            }),
+            stored_tokens: 0,
+        };
+        assert!(disk_restore_allowed(&live, Some((8, 70_000)), 1, 65_536));
+        assert!(disk_restore_allowed(
+            &live,
+            Some((7, 32_000)),
+            70_000,
+            65_536,
+        ));
+        assert!(!disk_restore_allowed(
+            &live,
+            Some((7, 70_000)),
+            70_000,
+            65_536,
+        ));
+        assert!(!disk_restore_allowed(
+            &live,
+            Some((7, 32_000)),
+            32_000,
+            65_536,
+        ));
+    }
+
+    #[test]
+    fn bank_retires_only_after_native_done() {
+        assert!(bank_retire_allowed(true, true, true));
+        assert!(!bank_retire_allowed(false, true, true));
+        assert!(!bank_retire_allowed(true, false, true));
+        assert!(!bank_retire_allowed(true, true, false));
+    }
+
+    #[test]
+    fn bank_save_stages_before_reuse_and_advances_marker_only_on_success() {
+        let (dir, mut store) = temp_store("save-order");
+        let mut warm = WarmBank {
+            record: Some(WarmRecord {
+                text: b"shared prefix".to_vec(),
+                generation: 7,
+            }),
+            stored_tokens: 1,
+        };
+        assert!(!save_bank_record(
+            &mut store,
+            &mut warm,
+            (0, 2, 8192),
+            3,
+            8,
+            Reason::BankShutdown,
+            |_| panic!("stale records must not stage payloads"),
+        )
+        .unwrap());
+        assert!(store.entries().is_empty());
+        assert_eq!(warm.stored_tokens, 1);
+        assert!(save_bank_record(
+            &mut store,
+            &mut warm,
+            (0, 2, 8192),
+            3,
+            7,
+            Reason::BankShutdown,
+            |path| fs::write(path, b"opaque").map_err(|e| GenerateError::Engine(e.to_string())),
+        )
+        .unwrap());
+        assert_eq!(warm.stored_tokens, 3);
+        let path = store.entries()[0].path.clone();
+        let record = store.read(&path).unwrap();
+        assert_eq!(record.header.reason, Reason::BankShutdown);
+        assert_eq!(record.header.ext_flags, EXT_BANK_REPLAY_V1);
+        assert_eq!(record.header.tokens, 3);
+        assert_eq!(record.header.ctx_size, 8192);
+        assert_eq!(record.text, b"shared prefix");
+        assert_eq!(record.payload, b"opaque");
+
+        warm.stored_tokens = 1;
+        let error = save_bank_record(
+            &mut store,
+            &mut warm,
+            (0, 2, 8192),
+            3,
+            7,
+            Reason::BankShutdown,
+            |_| Err(GenerateError::Engine("stage failed".into())),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "stage failed");
+        assert_eq!(warm.stored_tokens, 1);
+        assert_eq!(store.read(&path).unwrap().payload, b"opaque");
+        let _ = fs::remove_dir_all(dir);
     }
 }

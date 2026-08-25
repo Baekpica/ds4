@@ -8,11 +8,51 @@
 
 use std::ffi::CString;
 use std::os::raw::{c_char, c_float, c_int, c_void};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 unsafe extern "C" {
     fn atoi(value: *const c_char) -> c_int;
     fn strtoull(value: *const c_char, end: *mut *mut c_char, base: c_int) -> u64;
     fn atof(value: *const c_char) -> f64;
+    #[cfg(unix)]
+    fn signal(sig: c_int, handler: usize) -> usize;
+    #[cfg(unix)]
+    fn _exit(status: c_int) -> !;
+}
+
+#[cfg(unix)]
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn stop_signal_handler(_signal: c_int) {
+    if STOP_REQUESTED.swap(true, Ordering::Relaxed) {
+        unsafe { _exit(130) }
+    }
+}
+
+#[cfg(unix)]
+pub fn install_stop_handlers() -> bool {
+    STOP_REQUESTED.store(false, Ordering::Relaxed);
+    unsafe {
+        let handler = stop_signal_handler as *const () as usize;
+        signal(2, handler) != usize::MAX && signal(15, handler) != usize::MAX
+    }
+}
+
+#[cfg(not(unix))]
+pub fn install_stop_handlers() -> bool {
+    true
+}
+
+#[cfg(unix)]
+pub fn stop_requested() -> bool {
+    STOP_REQUESTED.load(Ordering::Relaxed)
+}
+
+#[cfg(not(unix))]
+pub fn stop_requested() -> bool {
+    false
 }
 
 pub fn libc_atoi(value: &[u8]) -> i32 {

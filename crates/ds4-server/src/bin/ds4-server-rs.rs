@@ -114,12 +114,14 @@ fn main() {
                         batch.max_seq(),
                         batch.seq_cap()
                     );
-                    Some(ContLane {
+                    Some(ContLane::new(
                         batch,
-                        vocab: model.vocab(),
-                        model_id: model.model_id(),
-                        eos: model.token_eos(),
-                    })
+                        model.vocab(),
+                        model.model_id(),
+                        model.routed_quant_bits(),
+                        cfg.ctx,
+                        model.token_eos(),
+                    ))
                 }
                 Err(e) => {
                     eprintln!("ds4-server-rs: continuous lane unavailable ({e}); serial only");
@@ -135,6 +137,12 @@ fn main() {
     if let Some(ref model) = model {
         model.boot_prewarm();
     }
+
+    if !ds4_sys::install_stop_handlers() {
+        eprintln!("ds4-server-rs: failed to install stop handlers");
+        std::process::exit(1);
+    }
+    cfg.stop_requested = Some(ds4_sys::stop_requested);
 
     let listener = listen(&cfg).unwrap_or_else(|e| {
         eprintln!(

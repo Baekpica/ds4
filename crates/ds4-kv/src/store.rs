@@ -344,13 +344,23 @@ impl Store {
     }
 
     pub fn discard(&mut self, path: &Path) -> io::Result<()> {
+        self.discard_inner(path, true)
+    }
+
+    pub fn discard_bank(&mut self, path: &Path) -> io::Result<()> {
+        self.discard_inner(path, false)
+    }
+
+    fn discard_inner(&mut self, path: &Path, reset_continued: bool) -> io::Result<()> {
         if !self.entries.iter().any(|entry| entry.path == path) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "KVC discard path is not a catalog entry",
             ));
         }
-        self.continued_last_store_tokens = 0;
+        if reset_continued {
+            self.continued_last_store_tokens = 0;
+        }
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -733,6 +743,25 @@ mod tests {
         assert_eq!(store.entries().len(), 1);
         assert_eq!(store.entries()[0].path, retained);
         assert_eq!(store.continued_last_store_tokens, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bank_discard_preserves_the_serial_checkpoint_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "ds4-kv-bank-discard-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let discarded = store.write(rec(b"bank-corrupt", 512)).unwrap();
+        store.continued_last_store_tokens = 777;
+
+        store.discard_bank(&discarded).unwrap();
+
+        assert!(!discarded.exists());
+        assert!(store.entries().is_empty());
+        assert_eq!(store.continued_last_store_tokens, 777);
         let _ = fs::remove_dir_all(&dir);
     }
 
