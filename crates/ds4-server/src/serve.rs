@@ -1039,6 +1039,11 @@ fn run_engine<W: TerminalSink>(
     if dec.lane == LANE_CONTINUOUS {
         if let Some(exec) = cont.as_mut() {
             let store = engine.kv_store_mut();
+            let mut bank_protected = |bank, live| {
+                lock_inner(inner)
+                    .creg
+                    .bank_protected(bank, live, monotonic_now())
+            };
             let result = exec.generate(
                 &job.parsed,
                 id,
@@ -1046,6 +1051,7 @@ fn run_engine<W: TerminalSink>(
                 cfg.cors,
                 cfg.default_tokens,
                 arrived_at,
+                &mut bank_protected,
                 store,
                 out,
             );
@@ -1693,6 +1699,7 @@ mod owner_tests {
             cors: bool,
             _default_tokens: i32,
             _t_arrive: Instant,
+            _bank_protected: &mut dyn FnMut(i32, Option<(u64, i32)>) -> bool,
             _store: Option<&mut ds4_kv::Store>,
             out: &mut dyn Write,
         ) -> Result<GenerateOutcome, GenerateError> {
@@ -2495,6 +2502,45 @@ mod owner_tests {
         assert_eq!(g.admit.inflight_body_bytes, 0);
         assert_eq!(g.runtime.requests_completed, 1);
         assert_eq!(g.runtime.requests_inflight, 0);
+    }
+
+    #[test]
+    fn queued_bank_pin_releases_after_failed_job() {
+        let cfg = test_cfg();
+        let inner = Arc::new(Mutex::new(ServerInner::from_cfg(&cfg)));
+        let now = monotonic_now();
+        {
+            let mut g = lock_inner(&inner);
+            g.creg.grace_s = 0.0;
+            g.creg.publish_bank(
+                Api::Responses,
+                &["call-bank".into()],
+                2,
+                7,
+                100,
+                now,
+            );
+        }
+        let mut prepared = queued_completion("tool output", 19);
+        prepared.surface = WireSurface::Responses;
+        prepared.parsed.api = Api::Responses;
+        prepared.parsed.live_call_ids = vec!["call-bank".into()];
+        prepared.parsed.responses_requires_live_tool_state = true;
+        let lease = admit_test_job(&inner, &prepared);
+        assert!(lock_inner(&inner)
+            .creg
+            .bank_protected(2, Some((7, 100)), monotonic_now()));
+        let (job, drain) = owner_job(prepared, lease);
+        let mut engine = ScriptedDecode::from_pieces(&[]);
+        engine.pos = 100;
+
+        run_owner_job(&cfg, &inner, &mut engine, None, job);
+        let response = String::from_utf8(settle_drain(drain)).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 409 Conflict"), "{response}");
+        assert!(!lock_inner(&inner)
+            .creg
+            .bank_protected(2, Some((7, 100)), monotonic_now()));
     }
 
     #[test]

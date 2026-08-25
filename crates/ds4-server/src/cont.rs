@@ -340,6 +340,41 @@ impl ContRegistry {
         }
     }
 
+    /// C `cont_record_bank_protects`: an unverified native reference fails
+    /// closed for eviction, while a proven generation/frontier mismatch does not.
+    pub fn bank_protected(
+        &self,
+        bank: i32,
+        live: Option<(u64, i32)>,
+        now: f64,
+    ) -> bool {
+        if bank < 0 {
+            return false;
+        }
+        self.records.iter().any(|record| {
+            if record.state != ContState::LiveFrontier
+                || record.owner != ContOwner::BatchBank
+                || record.owner_id != bank
+            {
+                return false;
+            }
+            if let Some((generation, frontier)) = live {
+                if generation == 0
+                    || frontier <= 0
+                    || record.owner_gen != generation
+                    || record.frontier != frontier
+                {
+                    return false;
+                }
+            }
+            let in_grace = self.grace_s > 0.0 && now - record.publish_time < self.grace_s;
+            let pinned = record.hard_refs > 0
+                && self.pin_deadline_s > 0.0
+                && now < record.pin_expiry;
+            in_grace || pinned
+        })
+    }
+
     pub fn pin_live(&mut self, proto: Api, id: &str, now: f64) -> Option<ContPin> {
         self.expire(now);
         let i = self.find_idx(proto as u8, id)?;
@@ -750,6 +785,30 @@ pub fn dump_script(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bank_protection_requires_a_current_reference_or_a_live_pin() {
+        let mut registry = ContRegistry::default();
+        let ids = csv(&["toolu_bank"]);
+        registry.grace_s = 10.0;
+        registry.ttl_s = 100.0;
+        registry.pin_deadline_s = 20.0;
+        registry.publish_bank(Api::Anthropic, &ids, 2, 7, 100, 100.0);
+
+        assert!(registry.bank_protected(2, Some((7, 100)), 105.0));
+        assert!(!registry.bank_protected(2, Some((8, 100)), 105.0));
+        assert!(!registry.bank_protected(2, Some((7, 101)), 105.0));
+        assert!(registry.bank_protected(2, None, 105.0));
+
+        registry.rewind_live_publish(11.0);
+        assert!(!registry.bank_protected(2, Some((7, 100)), 105.0));
+        let pin = registry
+            .pin_live(Api::Anthropic, "toolu_bank", 105.0)
+            .expect("the live bank record pins");
+        assert!(registry.bank_protected(2, Some((7, 100)), 105.0));
+        registry.unpin(pin);
+        assert!(!registry.bank_protected(2, Some((7, 100)), 105.0));
+    }
 
     #[test]
     fn pin_survives_duplicate_id_republish() {

@@ -501,10 +501,12 @@ fn warm_match_pick(banks: &[WarmBank], prompt: &[u8]) -> Option<usize> {
 #[cfg(any(feature = "native", test))]
 fn warm_victim_pick(
     banks: &[WarmBank],
+    protected: &[bool],
     exclude: Option<usize>,
     pin_min: i32,
     evict_lru: bool,
 ) -> Option<usize> {
+    debug_assert!(protected.is_empty() || protected.len() == banks.len());
     let mut superseded = None;
     let mut superseded_use = u64::MAX;
     let mut shallow = None;
@@ -513,7 +515,7 @@ fn warm_victim_pick(
     let mut deep_use = u64::MAX;
 
     for (bank, state) in banks.iter().enumerate() {
-        if Some(bank) == exclude {
+        if Some(bank) == exclude || protected.get(bank).copied().unwrap_or(false) {
             continue;
         }
         if state.record.is_none() {
@@ -564,26 +566,30 @@ struct WarmPlacement {
 #[cfg(any(feature = "native", test))]
 fn warm_placement(
     banks: &[WarmBank],
+    protected: &[bool],
     source: usize,
     cached: i32,
     pin_min: i32,
     fork_enabled: bool,
-) -> WarmPlacement {
+) -> Option<WarmPlacement> {
     let target = (fork_enabled && (pin_min <= 0 || cached < pin_min))
-        .then(|| warm_victim_pick(banks, Some(source), pin_min, false))
+        .then(|| warm_victim_pick(banks, protected, Some(source), pin_min, false))
         .flatten();
     if let Some(target) = target {
-        return WarmPlacement {
+        return Some(WarmPlacement {
             source,
             target,
             fork: true,
-        };
+        });
     }
-    WarmPlacement {
+    if protected.get(source).copied().unwrap_or(false) {
+        return None;
+    }
+    Some(WarmPlacement {
         source,
         target: source,
         fork: false,
-    }
+    })
 }
 
 #[cfg(any(feature = "native", test))]
@@ -735,6 +741,8 @@ pub trait ContExec {
     fn seq_cap(&self) -> i32;
     fn encode_chat(&self, rendered: &[u8]) -> Vec<i32>;
     fn encode_text(&self, text: &str) -> Vec<i32>;
+    /// `bank_protected` keeps registry locking outside the native owner; a
+    /// missing live reference asks the registry to preserve C's fail-closed rule.
     fn generate(
         &mut self,
         parsed: &ParsedRequest,
@@ -743,6 +751,7 @@ pub trait ContExec {
         cors: bool,
         default_tokens: i32,
         t_arrive: Instant,
+        bank_protected: &mut dyn FnMut(i32, Option<(u64, i32)>) -> bool,
         store: Option<&mut KvStore>,
         out: &mut dyn Write,
     ) -> Result<GenerateOutcome, GenerateError>;
@@ -974,7 +983,6 @@ mod native {
                 |suffix| self.vocab.encode_rendered_bytes(suffix),
             )?;
             self.warm[source].committed_tokens = cached;
-            self.note_use(source);
             Some(WarmAdmitPlan {
                 source,
                 tokens,
@@ -982,9 +990,26 @@ mod native {
             })
         }
 
-        fn disk_victim(&self, disk_tokens: u32) -> Option<usize> {
+        fn protected_banks(
+            &self,
+            bank_protected: &mut dyn FnMut(i32, Option<(u64, i32)>) -> bool,
+        ) -> Vec<bool> {
+            self.warm
+                .iter()
+                .enumerate()
+                .map(|(bank, state)| {
+                    let live = state.record.as_ref().map(|record| {
+                        (record.generation, state.committed_tokens)
+                    });
+                    bank_protected(i32::try_from(bank).unwrap_or(-1), live)
+                })
+                .collect()
+        }
+
+        fn disk_victim(&self, protected: &[bool], disk_tokens: u32) -> Option<usize> {
             if let Some(bank) = warm_victim_pick(
                 &self.warm,
+                protected,
                 None,
                 self.warm_pin_min,
                 false,
@@ -996,6 +1021,7 @@ mod native {
             }
             let bank = warm_victim_pick(
                 &self.warm,
+                protected,
                 None,
                 self.warm_pin_min,
                 true,
@@ -1008,12 +1034,13 @@ mod native {
             &mut self,
             store: &mut KvStore,
             prompt: &[u8],
+            protected: &[bool],
         ) -> Option<WarmAdmitPlan> {
             let identity = self.identity()?;
             let (path, envelope) = store
                 .bank_text_prefix_candidate(prompt, identity.0, identity.1, identity.2)
                 .ok()??;
-            let target = self.disk_victim(envelope.header.tokens)?;
+            let target = self.disk_victim(protected, envelope.header.tokens)?;
             if !disk_restore_target_allowed(
                 &self.warm,
                 target,
@@ -1160,15 +1187,18 @@ mod native {
         fn place_warm(
             &mut self,
             plan: &WarmAdmitPlan,
+            protected: &[bool],
             store: Option<&mut KvStore>,
-        ) -> WarmPlacement {
+        ) -> Option<WarmPlacement> {
             let placement = warm_placement(
                 &self.warm,
+                protected,
                 plan.source,
                 plan.cached,
                 self.warm_pin_min,
                 self.warm_fork,
-            );
+            )?;
+            self.note_use(placement.source);
             if placement.fork {
                 if let Some(store) = store {
                     self.persist_bank(
@@ -1185,12 +1215,17 @@ mod native {
             } else {
                 self.warm[placement.source].record = None;
             }
-            placement
+            Some(placement)
         }
 
-        fn place_cold(&mut self, store: Option<&mut KvStore>) -> Option<usize> {
+        fn place_cold(
+            &mut self,
+            protected: &[bool],
+            store: Option<&mut KvStore>,
+        ) -> Option<usize> {
             let target = warm_victim_pick(
                 &self.warm,
+                protected,
                 None,
                 self.warm_pin_min,
                 true,
@@ -1242,6 +1277,7 @@ mod native {
             cors: bool,
             default_tokens: i32,
             t_arrive: Instant,
+            bank_protected: &mut dyn FnMut(i32, Option<(u64, i32)>) -> bool,
             mut store: Option<&mut KvStore>,
             out: &mut dyn Write,
         ) -> Result<GenerateOutcome, GenerateError> {
@@ -1268,17 +1304,20 @@ mod native {
             let (temperature, top_k, top_p, min_p) = stepper.sampling(parsed);
             let bank_enabled = bank_scope(parsed);
             let canonical_tokens = tokens;
+            let protected = self.protected_banks(bank_protected);
             let warm = if bank_enabled {
                 self.warm_plan(&stepper.prompt).or_else(|| {
                     store
                         .as_deref_mut()
-                        .and_then(|store| self.disk_plan(store, &stepper.prompt))
+                        .and_then(|store| self.disk_plan(store, &stepper.prompt, &protected))
                 })
             } else {
                 None
             };
-            let mut admit = if let Some(plan) = warm {
-                let placement = self.place_warm(&plan, store.as_deref_mut());
+            let placement = warm.as_ref().and_then(|plan| {
+                self.place_warm(plan, &protected, store.as_deref_mut())
+            });
+            let mut admit = if let (Some(plan), Some(placement)) = (warm, placement) {
                 let mut admit = ContAdmit::cold(1, plan.tokens, stepper.max_tokens.max(1));
                 admit.place_bank = i32::try_from(placement.target + 1).unwrap_or(0);
                 admit.n_cached = plan.cached;
@@ -1287,11 +1326,13 @@ mod native {
                 }
                 admit
             } else {
-                let target = self.place_cold(store.as_deref_mut());
+                let target = self
+                    .place_cold(&protected, store.as_deref_mut())
+                    .ok_or(GenerateError::Unsupported(
+                        "continuous banks are protected; serial fallback",
+                    ))?;
                 let mut admit = ContAdmit::cold(1, canonical_tokens, stepper.max_tokens.max(1));
-                admit.place_bank = target
-                    .and_then(|bank| i32::try_from(bank + 1).ok())
-                    .unwrap_or(0);
+                admit.place_bank = i32::try_from(target + 1).unwrap_or(0);
                 admit
             };
             admit.eos = self.eos;
@@ -1542,14 +1583,14 @@ mod bank_tests {
         let mut banks = vec![warm("trunk", 30), WarmBank::default(), warm("tenant", 10)];
         banks[0].committed_tokens = 70_000;
         assert_eq!(
-            warm_victim_pick(&banks, None, 65_536, true),
+            warm_victim_pick(&banks, &[], None, 65_536, true),
             Some(1)
         );
 
         banks[1] = warm("trunk child", 20);
         banks[1].committed_tokens = 70_000;
         assert_eq!(
-            warm_victim_pick(&banks, None, 65_536, true),
+            warm_victim_pick(&banks, &[], None, 65_536, true),
             Some(0)
         );
 
@@ -1559,25 +1600,25 @@ mod bank_tests {
         banks[0].committed_tokens = 70_000;
         banks[1].committed_tokens = 70_000;
         assert_eq!(
-            warm_victim_pick(&banks, None, 65_536, true),
+            warm_victim_pick(&banks, &[], None, 65_536, true),
             Some(2)
         );
         banks[2].committed_tokens = 90_000;
-        assert_eq!(warm_victim_pick(&banks, None, 65_536, true), Some(1));
+        assert_eq!(warm_victim_pick(&banks, &[], None, 65_536, true), Some(1));
     }
 
     #[test]
     fn fork_target_never_spends_a_plain_tenant_record() {
         let banks = vec![warm("source", 3), warm("tenant-a", 1), warm("tenant-b", 2)];
         assert_eq!(
-            warm_victim_pick(&banks, Some(0), 65_536, false),
+            warm_victim_pick(&banks, &[], Some(0), 65_536, false),
             None
         );
 
         let mut spare = banks;
         spare[2] = WarmBank::default();
         assert_eq!(
-            warm_victim_pick(&spare, Some(0), 65_536, false),
+            warm_victim_pick(&spare, &[], Some(0), 65_536, false),
             Some(2)
         );
     }
@@ -1586,25 +1627,70 @@ mod bank_tests {
     fn warm_fork_preserves_the_trunk_only_when_a_safe_target_exists() {
         let mut with_spare = vec![warm("trunk", 3), warm("tenant", 1), WarmBank::default()];
         assert_eq!(
-            warm_placement(&with_spare, 0, 10, 65_536, true),
-            WarmPlacement {
+            warm_placement(&with_spare, &[], 0, 10, 65_536, true),
+            Some(WarmPlacement {
                 source: 0,
                 target: 2,
                 fork: true,
-            }
+            })
         );
 
         let no_spare = vec![warm("trunk", 3), warm("tenant-a", 1), warm("tenant-b", 2)];
         assert_eq!(
-            warm_placement(&no_spare, 0, 10, 65_536, true),
-            WarmPlacement {
+            warm_placement(&no_spare, &[], 0, 10, 65_536, true),
+            Some(WarmPlacement {
                 source: 0,
                 target: 0,
                 fork: false,
-            }
+            })
         );
         with_spare[0].committed_tokens = 70_000;
-        assert!(!warm_placement(&with_spare, 0, 70_000, 65_536, true).fork);
+        assert!(!warm_placement(&with_spare, &[], 0, 70_000, 65_536, true)
+            .unwrap()
+            .fork);
+    }
+
+    #[test]
+    fn protected_trunk_forks_safely_or_refuses_in_place_extension() {
+        let with_spare = vec![warm("trunk", 3), WarmBank::default()];
+        assert!(warm_placement(&with_spare, &[true, false], 0, 10, 65_536, true)
+            .is_some_and(|placement| placement.fork && placement.target == 1));
+
+        let no_spare = vec![warm("trunk", 3), warm("tenant", 2)];
+        assert_eq!(
+            warm_placement(&no_spare, &[true, false], 0, 10, 65_536, true),
+            None
+        );
+    }
+
+    #[test]
+    fn victim_selection_skips_a_protected_bank_at_every_tier() {
+        let mut banks = vec![WarmBank::default(), warm("shallow", 1), warm("deep", 2)];
+        banks[2].committed_tokens = 70_000;
+        assert_eq!(
+            warm_victim_pick(&banks, &[true, false, false], None, 65_536, true),
+            Some(1)
+        );
+
+        banks[0] = warm("trunk", 1);
+        banks[1] = warm("trunk child", 2);
+        assert_eq!(
+            warm_victim_pick(&banks, &[true, false, false], None, 65_536, false),
+            None
+        );
+
+        banks[0] = warm("shallow", 1);
+        banks[1].committed_tokens = 70_000;
+        assert_eq!(
+            warm_victim_pick(&banks, &[true, false, false], None, 65_536, true),
+            Some(1)
+        );
+
+        let all_protected = [true, true, true];
+        assert_eq!(
+            warm_victim_pick(&banks, &all_protected, None, 65_536, true),
+            None
+        );
     }
 
     #[test]
