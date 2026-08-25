@@ -204,6 +204,10 @@ fn uses_distributed_replay(args: &BenchArgs) -> bool {
     args.dist.role == ds4_dist::Role::Coordinator
 }
 
+fn use_mtp_spec(mtp: Option<&str>, draft: i32) -> bool {
+    mtp.is_some() && draft > 1 && std::env::var_os("DS4_MTP_SPEC_DISABLE").is_none()
+}
+
 fn prompt_source(args: &BenchArgs) -> Result<(&str, bool), String> {
     match (
         args.prompt_file.as_deref(),
@@ -271,7 +275,7 @@ pub fn run(args: BenchArgs) -> Result<i32, String> {
     let (prompt_path, chat_prompt) = prompt_source(&args)?;
     let text = read_prompt(prompt_path)?;
     let native_dist = crate::distributed_config(&args.dist);
-    let mut open_options = Vec::with_capacity(3);
+    let mut open_options = Vec::with_capacity(5);
     if args.quality {
         open_options.push(ModelOpenOption::Quality);
     }
@@ -279,14 +283,41 @@ pub fn run(args: BenchArgs) -> Result<i32, String> {
         open_options.push(ModelOpenOption::WarmWeights);
     }
     open_options.push(ModelOpenOption::PowerPercent(args.power_percent as u8));
-    let model = Model::open_configured(
-        &args.model,
-        args.backend,
-        args.threads,
-        false,
-        native_dist.as_ref(),
-        &open_options,
-    )
+    if args.mtp.is_some() {
+        open_options.push(ModelOpenOption::MtpDraftTokens(args.mtp_draft));
+        open_options.push(ModelOpenOption::MtpMargin(args.mtp_margin));
+    }
+    let model = if let Some(config) = native_dist.as_ref() {
+        Model::open_distributed_options(
+            &args.model,
+            args.backend,
+            args.threads,
+            false,
+            args.mtp.as_deref(),
+            None,
+            config,
+            &open_options,
+        )
+    } else if args.mtp.is_some() {
+        Model::open_with_support_options(
+            &args.model,
+            args.backend,
+            args.threads,
+            false,
+            args.mtp.as_deref(),
+            None,
+            &open_options,
+        )
+    } else {
+        Model::open_configured(
+            &args.model,
+            args.backend,
+            args.threads,
+            false,
+            None,
+            &open_options,
+        )
+    }
     .map_err(|e| e.to_string())?;
     let prompt = if chat_prompt {
         model
@@ -353,6 +384,7 @@ fn run_sweep<W: Write>(
     out.flush().map_err(|e| e.to_string())?;
 
     let eos = model.token_eos();
+    let use_mtp = use_mtp_spec(args.mtp.as_deref(), args.mtp_draft);
     let distributed = uses_distributed_replay(args);
     let mut previous = 0;
     let mut frontier = args.ctx_start;
@@ -389,10 +421,23 @@ fn run_sweep<W: Write>(
                     "failed to choose non-EOS token at frontier {frontier}"
                 ));
             }
-            session
-                .eval(token)
-                .map_err(|e| format!("decode at frontier {frontier} failed: {e}"))?;
-            generated += 1;
+            if use_mtp {
+                let accepted = session
+                    .eval_speculative_argmax(token, args.gen_tokens - generated, eos)
+                    .map_err(|e| {
+                        format!("speculative decode at frontier {frontier} failed: {e}")
+                    })?;
+                for t in accepted {
+                    if t != eos && generated < args.gen_tokens {
+                        generated += 1;
+                    }
+                }
+            } else {
+                session
+                    .eval(token)
+                    .map_err(|e| format!("decode at frontier {frontier} failed: {e}"))?;
+                generated += 1;
+            }
             if after_first.is_none() {
                 after_first = Some(Instant::now());
                 first_call_tokens = generated;
@@ -870,5 +915,12 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(err.contains("invalid value for --mtp-margin"));
+    }
+
+    #[test]
+    fn mtp_spec_follows_c_gates() {
+        assert!(!use_mtp_spec(None, 2));
+        assert!(!use_mtp_spec(Some("draft.gguf"), 1));
+        assert!(use_mtp_spec(Some("draft.gguf"), 2));
     }
 }
