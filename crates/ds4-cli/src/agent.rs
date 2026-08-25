@@ -7,6 +7,7 @@ const TOOL_UNSUPPORTED_ERROR: &str =
     "tool execution is not implemented in ds4-agent-rs; use ./ds4-agent";
 
 mod bash;
+mod compact;
 mod edit;
 mod search;
 mod web_tools;
@@ -14,6 +15,8 @@ mod write;
 
 #[cfg(test)]
 mod bash_parity;
+#[cfg(test)]
+mod compact_parity;
 #[cfg(test)]
 mod edit_parity;
 #[cfg(test)]
@@ -370,9 +373,11 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
             )
             .map_err(|_| TOOL_UNSUPPORTED_ERROR.to_string())?;
             output.extend_from_slice(&project_output(&[&round.visible])?);
+            let observation =
+                fit_tool_observation(model.vocab(), &transcript, args.ctx, round.observation)?;
             model
                 .vocab()
-                .chat_append_message(&mut transcript, "tool", &round.observation)
+                .chat_append_message(&mut transcript, "tool", &observation)
                 .map_err(|error| error.to_string())?;
             model
                 .vocab()
@@ -427,6 +432,23 @@ fn help_text(name: &str) -> String {
 
 fn built_in_tools_prompt() -> &'static str {
     BUILT_IN_TOOLS_PROMPT
+}
+
+fn fit_tool_observation(
+    vocab: &ds4_core::Vocab,
+    transcript: &ds4_core::TokenBuffer,
+    ctx: i32,
+    observation: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let mut projected = ds4_core::TokenBuffer::from_tokens(transcript.as_slice().to_vec());
+    vocab
+        .chat_append_message(&mut projected, "tool", &observation)
+        .map_err(|error| error.to_string())?;
+    let projected_len = i32::try_from(projected.len()).unwrap_or(i32::MAX);
+    if projected_len + compact::TOOL_RESULT_RESERVE_TOKENS < ctx {
+        return Ok(observation);
+    }
+    Ok(compact::overflow_error(projected_len, ctx))
 }
 
 fn format_datetime_context(when: &str) -> String {

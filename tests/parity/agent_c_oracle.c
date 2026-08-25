@@ -24,7 +24,9 @@ static void oracle_usage(void)
             "write [PATH [CONTENT]] | edit [PATH [OLD [NEW]]] | "
             "bash [COMMAND [TIMEOUT [REFRESH]]] | "
             "bash-status [JOB [PID [REFRESH]]] | "
-            "bash-stop [JOB [PID [REFRESH]]]\n");
+            "bash-stop [JOB [PID [REFRESH]]] | "
+            "should-compact CTX USED | tail-start CTX BOTTOM SYS USER TOKENS... | "
+            "overflow-error PROJECTED CTX\n");
     exit(2);
 }
 
@@ -328,6 +330,60 @@ int main(int argc, char **argv)
         print_hex(result, strlen(result));
         free(result);
         agent_tool_call_free(&call);
+        return 0;
+    }
+
+    if (argc == 4 && strcmp(argv[1], "should-compact") == 0) {
+        int ctx = atoi(argv[2]);
+        int used = atoi(argv[3]);
+        int yes = 0;
+        if (ctx > 0 && used > 0) {
+            if (used >= (ctx * AGENT_COMPACT_SOFT_PERCENT) / 100) {
+                yes = 1;
+            } else {
+                int free_threshold = AGENT_COMPACT_MIN_FREE_TOKENS;
+                int proportional = ctx / 4;
+                if (free_threshold > proportional) free_threshold = proportional;
+                yes = ctx - used <= free_threshold;
+            }
+        }
+        printf("%d\n", yes);
+        return 0;
+    }
+
+    if (argc >= 6 && strcmp(argv[1], "tail-start") == 0) {
+        int ctx = atoi(argv[2]);
+        int bottom = atoi(argv[3]);
+        int sys_len = atoi(argv[4]);
+        int user_id = atoi(argv[5]);
+        int n = argc - 6;
+        int tail_budget = ctx / AGENT_COMPACT_TAIL_DIVISOR;
+        if (tail_budget > AGENT_COMPACT_TAIL_CAP_TOKENS)
+            tail_budget = AGENT_COMPACT_TAIL_CAP_TOKENS;
+        if (tail_budget < 1) tail_budget = 1;
+        int target = bottom - tail_budget;
+        if (target < sys_len) target = sys_len;
+        int start = target;
+        if (user_id >= 0) {
+            for (int i = target; i < bottom && i < n; i++) {
+                if (atoi(argv[6 + i]) == user_id) {
+                    start = i;
+                    break;
+                }
+            }
+        }
+        printf("%d\n", start);
+        return 0;
+    }
+
+    if (argc == 4 && strcmp(argv[1], "overflow-error") == 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "Tool error: tool result still does not fit after context compaction "
+                 "(projected_prompt=%d tokens, ctx=%d, reserve=%d). "
+                 "Retry with a smaller read/search/bash output.\n",
+                 atoi(argv[2]), atoi(argv[3]), AGENT_TOOL_RESULT_RESERVE_TOKENS);
+        print_hex(msg, strlen(msg));
         return 0;
     }
 
