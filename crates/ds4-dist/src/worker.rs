@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
-use crate::activation::bits_or_default;
+use crate::activation::{bits_or_default, wire_bytes};
 use crate::codec::{
     decode_hello_payload, encode_hello_payload, u64_from_halves, CodecError, Hello, Work,
     MSG_ERROR, MSG_HELLO, MSG_SNAPSHOT_LOAD_BEGIN, MSG_SNAPSHOT_SAVE_REQ, MSG_WORK, RESULT_ACK,
@@ -12,6 +12,7 @@ use crate::codec::{
     WORK_F_VALID_MASK,
 };
 use crate::exec::{SliceExec, WorkRequest};
+use crate::forward::ERR_FORWARD_HIDDEN;
 use crate::hash::{token_hash_update_span, TOKEN_HASH_INIT};
 use crate::native_snapshot::{dispatch_worker_snapshot, MemorySnapshotStore, SnapshotStore};
 use crate::relay::{forward_work_blocking, local_work_telemetry, now_sec, usec_since};
@@ -343,8 +344,15 @@ impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
             } else {
                 fwd.work.flags &= !WORK_F_OUTPUT_LOGITS;
             }
-            fwd.input_hc = out.hidden.unwrap_or_default();
-            if let Err(msg) = forward_work_blocking(&next, &fwd, stream) {
+            let hidden = out.hidden.unwrap_or_default();
+            let output_bytes =
+                match wire_bytes(bits_or_default(work.input_hc_bits), hidden.len() as u64) {
+                    Some(n) => n,
+                    None => return fail(ERR_FORWARD_HIDDEN.into()),
+                };
+            let telemetry = local_work_telemetry(&work, eval_usec, output_bytes);
+            fwd.input_hc = hidden;
+            if let Err(msg) = forward_work_blocking(&next, &fwd, stream, telemetry) {
                 return fail(msg);
             }
             return Ok(None);

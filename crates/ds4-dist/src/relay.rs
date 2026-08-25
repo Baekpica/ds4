@@ -15,7 +15,7 @@ use crate::forward::{
 };
 use crate::reconnect::connect_endpoint;
 use crate::route::RouteEntry;
-use crate::transport::{read_frame, write_frame};
+use crate::transport::read_frame;
 use crate::work::{
     decode_result_body, encode_result_frame, encode_work_frame, result_request_id, WorkBody,
 };
@@ -202,13 +202,19 @@ pub fn forward_work_blocking<W: Write>(
     next: &RouteEntry,
     body: &WorkBody,
     upstream: &mut W,
+    mut local: Telemetry,
 ) -> Result<(), String> {
     let mut hop = connect_endpoint(&next.host, next.port as u16).map_err(|_| ERR_FORWARD)?;
     let frame = encode_work_frame(body).map_err(|e| e.to_string())?;
+    let send_t0 = now_sec();
     hop.write_all(&frame).map_err(|_| ERR_FORWARD)?;
+    let send_t1 = now_sec();
+    local.forward_send_usec = usec_since(send_t0, send_t1);
     let (typ, reply) = read_frame(&mut hop).map_err(|_| ERR_FORWARD)?;
     if typ != MSG_RESULT {
         return Err(ERR_INVALID_RESULT.into());
     }
-    write_frame(upstream, typ, &reply).map_err(|e| e.to_string())
+    local.downstream_wait_usec = usec_since(send_t1, now_sec());
+    let prepended = prepend_telemetry(&reply, local).map_err(|e| e.to_string())?;
+    upstream.write_all(&prepended).map_err(|e| e.to_string())
 }

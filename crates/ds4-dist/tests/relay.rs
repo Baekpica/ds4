@@ -7,9 +7,10 @@ use std::thread;
 use std::time::Duration;
 
 use ds4_dist::{
-    decode_result_body, encode_result_frame, local_work_telemetry, ok_result_hdr,
-    prepend_telemetry, read_frame, result_request_id, usec_since, Forwarder, PendingRequest,
-    ResultBody, Telemetry, Work, ERR_NEXT_CLOSED, FRAME_HEADER_BYTES, MSG_RESULT, RESULT_ACK,
+    decode_result_body, encode_result_frame, forward_work_blocking, local_work_telemetry,
+    ok_result_hdr, prepend_telemetry, read_frame, result_request_id, usec_since, Forwarder,
+    PendingRequest, ResultBody, RouteEntry, Telemetry, Work, WorkBody, ERR_NEXT_CLOSED,
+    FRAME_HEADER_BYTES, MSG_RESULT, RESULT_ACK,
 };
 
 fn pending(id: u64) -> PendingRequest {
@@ -179,4 +180,53 @@ fn forwarder_reports_closed_connection() {
     assert_eq!(id, 3);
     assert_eq!(msg, ERR_NEXT_CLOSED);
     forwarder.shutdown();
+}
+
+#[test]
+fn blocking_forward_prepends_local_telemetry() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let next = RouteEntry {
+        host: "127.0.0.1".into(),
+        port: addr.port() as u32,
+        layer_start: 2,
+        layer_end: 3,
+        flags: 0,
+    };
+    let work = Work {
+        layer_start: 1,
+        layer_end: 1,
+        route_index: 0,
+        pos0: 4,
+        n_tokens: 1,
+        token_bytes: 4,
+        request_lo: 7,
+        ..Work::default()
+    };
+    let body = WorkBody {
+        work,
+        tokens: vec![1],
+        input_hc: vec![1.0, 2.0],
+        route_blob: Vec::new(),
+    };
+    let local = local_work_telemetry(&work, 11, 8);
+    let next_thread = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        tune(&stream);
+        let (_typ, _body) = read_frame(&mut stream).unwrap();
+        stream.write_all(&result_frame(7, b"logits")).unwrap();
+    });
+    let mut upstream = Vec::new();
+    forward_work_blocking(&next, &body, &mut upstream, local).unwrap();
+    let mut cur = std::io::Cursor::new(upstream);
+    let (typ, payload) = read_frame(&mut cur).unwrap();
+    assert_eq!(typ, MSG_RESULT);
+    let decoded = decode_result_body(&payload).unwrap();
+    assert_eq!(decoded.payload, b"logits");
+    assert_eq!(decoded.telemetry.len(), 1);
+    assert_eq!(decoded.telemetry[0].eval_usec, 11);
+    assert_eq!(decoded.telemetry[0].layer_start, 1);
+    assert_eq!(decoded.telemetry[0].input_bytes, 4);
+    assert_eq!(decoded.telemetry[0].output_bytes, 8);
+    next_thread.join().unwrap();
 }
