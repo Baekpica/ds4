@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::{Arc, Mutex};
 
 use crate::activation::{bits_or_default, wire_bytes};
 use crate::codec::{
@@ -14,6 +16,7 @@ use crate::codec::{
 use crate::exec::{SliceExec, WorkRequest};
 use crate::forward::ERR_FORWARD_HIDDEN;
 use crate::hash::{token_hash_update_span, TOKEN_HASH_INIT};
+use crate::hops::ForwarderPool;
 use crate::native_snapshot::{dispatch_worker_snapshot, MemorySnapshotStore, SnapshotStore};
 use crate::relay::{forward_work_blocking, local_work_telemetry, now_sec, usec_since};
 use crate::route::{decode_route_blob, validate_route_blob};
@@ -46,6 +49,7 @@ pub struct Worker<E: SliceExec, S: SnapshotStore = MemorySnapshotStore> {
     pub exec: E,
     sessions: HashMap<u64, u64>,
     store: S,
+    hops: ForwarderPool,
 }
 
 impl<E: SliceExec> Worker<E> {
@@ -60,6 +64,7 @@ impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
             exec,
             sessions: HashMap::new(),
             store,
+            hops: ForwarderPool::new(),
         }
     }
 
@@ -131,7 +136,24 @@ impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
         )
     }
 
-    pub fn serve<Stream: Read + Write>(&mut self, stream: &mut Stream) -> std::io::Result<()> {
+    pub(crate) fn bind_hops(&mut self, upstream: Arc<Mutex<TcpStream>>) {
+        self.hops.bind(upstream);
+    }
+
+    pub(crate) fn shutdown_hops(&mut self) {
+        self.hops.shutdown();
+    }
+
+    pub fn serve(&mut self, stream: &mut TcpStream) -> std::io::Result<()> {
+        if let Ok(clone) = stream.try_clone() {
+            self.bind_hops(Arc::new(Mutex::new(clone)));
+        }
+        let rc = self.drive(stream);
+        self.shutdown_hops();
+        rc
+    }
+
+    fn drive<Stream: Read + Write>(&mut self, stream: &mut Stream) -> std::io::Result<()> {
         loop {
             let (typ, body) = match read_frame(stream) {
                 Ok(v) => v,
@@ -352,7 +374,12 @@ impl<E: SliceExec, S: SnapshotStore> Worker<E, S> {
                 };
             let telemetry = local_work_telemetry(&work, eval_usec, output_bytes);
             fwd.input_hc = hidden;
-            if let Err(msg) = forward_work_blocking(&next, &fwd, stream, telemetry) {
+            let hop = if self.hops.is_bound() {
+                self.hops.forward(&next, &fwd, telemetry)
+            } else {
+                forward_work_blocking(&next, &fwd, stream, telemetry)
+            };
+            if let Err(msg) = hop {
                 return fail(msg);
             }
             return Ok(None);

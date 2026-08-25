@@ -1,16 +1,16 @@
 //! Persistent forwarder relay and telemetry prepend.
 
 use std::io::Write;
-use std::net::TcpListener;
-use std::sync::mpsc;
+use std::net::{TcpListener, TcpStream};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use ds4_dist::{
     decode_result_body, encode_result_frame, forward_work_blocking, local_work_telemetry,
     ok_result_hdr, prepend_telemetry, read_frame, result_request_id, usec_since, Forwarder,
-    PendingRequest, ResultBody, RouteEntry, Telemetry, Work, WorkBody, ERR_NEXT_CLOSED,
-    FRAME_HEADER_BYTES, MSG_RESULT, RESULT_ACK,
+    ForwarderPool, PendingRequest, ResultBody, RouteEntry, Telemetry, Work, WorkBody,
+    ERR_NEXT_CLOSED, FRAME_HEADER_BYTES, MSG_RESULT, RESULT_ACK,
 };
 
 fn pending(id: u64) -> PendingRequest {
@@ -228,5 +228,69 @@ fn blocking_forward_prepends_local_telemetry() {
     assert_eq!(decoded.telemetry[0].layer_start, 1);
     assert_eq!(decoded.telemetry[0].input_bytes, 4);
     assert_eq!(decoded.telemetry[0].output_bytes, 8);
+    next_thread.join().unwrap();
+}
+
+#[test]
+fn pool_reuses_forwarder_and_prepends_telemetry() {
+    let next_l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let up_l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let next_addr = next_l.local_addr().unwrap();
+    let up_addr = up_l.local_addr().unwrap();
+    let upstream = TcpStream::connect(up_addr).unwrap();
+    tune(&upstream);
+    let (mut up_peer, _) = up_l.accept().unwrap();
+    tune(&up_peer);
+    let mut pool = ForwarderPool::new();
+    pool.bind(Arc::new(Mutex::new(upstream)));
+    let next = RouteEntry {
+        host: "127.0.0.1".into(),
+        port: next_addr.port() as u32,
+        layer_start: 2,
+        layer_end: 3,
+        flags: 0,
+    };
+    let work = Work {
+        layer_start: 1,
+        layer_end: 1,
+        n_tokens: 1,
+        token_bytes: 4,
+        request_lo: 7,
+        ..Work::default()
+    };
+    let body = WorkBody {
+        work,
+        tokens: vec![1],
+        input_hc: vec![1.0, 2.0],
+        route_blob: Vec::new(),
+    };
+    let next_thread = thread::spawn(move || {
+        let (mut stream, _) = next_l.accept().unwrap();
+        tune(&stream);
+        let (_typ, _body) = read_frame(&mut stream).unwrap();
+        stream.write_all(&result_frame(7, b"logits")).unwrap();
+        let (_typ, _body) = read_frame(&mut stream).unwrap();
+        stream.write_all(&result_frame(8, b"again")).unwrap();
+    });
+    pool.forward(&next, &body, local_work_telemetry(&work, 11, 8))
+        .unwrap();
+    assert_eq!(pool.len(), 1);
+    let mut body2 = body;
+    body2.work.request_lo = 8;
+    pool.forward(&next, &body2, local_work_telemetry(&work, 12, 8))
+        .unwrap();
+    assert_eq!(pool.len(), 1);
+    let (typ, payload) = read_frame(&mut up_peer).unwrap();
+    assert_eq!(typ, MSG_RESULT);
+    let decoded = decode_result_body(&payload).unwrap();
+    assert_eq!(decoded.payload, b"logits");
+    assert_eq!(decoded.telemetry.len(), 1);
+    assert_eq!(decoded.telemetry[0].eval_usec, 11);
+    let (typ, payload) = read_frame(&mut up_peer).unwrap();
+    assert_eq!(typ, MSG_RESULT);
+    let decoded = decode_result_body(&payload).unwrap();
+    assert_eq!(decoded.payload, b"again");
+    assert_eq!(decoded.telemetry[0].eval_usec, 12);
+    pool.shutdown();
     next_thread.join().unwrap();
 }

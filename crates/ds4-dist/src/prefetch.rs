@@ -170,16 +170,20 @@ impl<E: SliceExec + Send, S: SnapshotStore + Send> Worker<E, S> {
         let depth = prefetch_depth();
         let queue = Arc::new(JobQueue::new(depth));
         let worker = Mutex::new(&mut *self);
-        let writer = Mutex::new(stream.try_clone()?);
+        let writer = Arc::new(Mutex::new(stream.try_clone()?));
         let mut reader = stream.try_clone()?;
+        worker
+            .lock()
+            .expect("worker hops")
+            .bind_hops(Arc::clone(&writer));
         eprintln!("{}", prefetch_enabled_message(depth));
 
-        thread::scope(|scope| {
+        let rc = thread::scope(|scope| {
             let eval = scope.spawn(|| -> io::Result<()> {
                 while let Some(payload) = queue.pop() {
                     let reply = {
                         let mut w = worker.lock().expect("worker eval");
-                        w.process_work(&payload, &mut MutexWrite(&writer))?
+                        w.process_work(&payload, &mut MutexWrite(writer.as_ref()))?
                     };
                     if let Some(frame) = reply {
                         writer.lock().expect("worker write").write_all(&frame)?;
@@ -217,7 +221,7 @@ impl<E: SliceExec + Send, S: SnapshotStore + Send> Worker<E, S> {
                 }
                 if typ == MSG_SNAPSHOT_SAVE_REQ || typ == MSG_SNAPSHOT_LOAD_BEGIN {
                     let mut w = worker.lock().expect("worker snapshot");
-                    let mut out = writer.lock().expect("worker write");
+                    let mut out = writer.lock().expect("worker snapshot");
                     w.apply_snapshot(&mut *out, typ, &body)?;
                     continue;
                 }
@@ -247,6 +251,8 @@ impl<E: SliceExec + Send, S: SnapshotStore + Send> Worker<E, S> {
                 (None, Err(e)) => Err(e),
                 (None, Ok(())) => Ok(()),
             }
-        })
+        });
+        self.shutdown_hops();
+        rc
     }
 }

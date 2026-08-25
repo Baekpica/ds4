@@ -7,6 +7,7 @@ mod coordinator;
 mod exec;
 mod forward;
 mod hash;
+mod hops;
 mod memory_snapshot;
 mod native_snapshot;
 mod options;
@@ -55,6 +56,7 @@ pub use forward::{
     ERR_TELEMETRY_TOO_LARGE, FORWARD_WINDOW_DEFAULT, FORWARD_WINDOW_MAX, FORWARD_WINDOW_MIN,
 };
 pub use hash::{token_hash_prefix, token_hash_update, token_hash_update_span, TOKEN_HASH_INIT};
+pub use hops::ForwarderPool;
 pub use native_snapshot::{
     apply_snapshot_load, dispatch_worker_snapshot, prepare_snapshot_save, MemorySnapshotStore,
     SnapshotLoad, SnapshotSave, SnapshotStore, TempShard,
