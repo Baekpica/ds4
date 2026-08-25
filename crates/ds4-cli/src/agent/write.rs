@@ -7,13 +7,13 @@ use std::os::unix::ffi::OsStrExt;
 pub(crate) const WRITE: &str = "write";
 
 pub(crate) fn write_result(path: Option<&str>, content: Option<&str>) -> Vec<u8> {
-    write_result_with(path, content, Approval::NonInteractive)
+    write_result_with(path, content, &mut Approval::NonInteractive)
 }
 
 pub(crate) fn write_result_with(
     path: Option<&str>,
     content: Option<&str>,
-    mut approval: Approval<'_>,
+    approval: &mut Approval<'_>,
 ) -> Vec<u8> {
     let Some(path) = path.filter(|path| !path.is_empty()) else {
         return b"Tool error: write requires path\n".to_vec();

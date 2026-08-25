@@ -18,6 +18,8 @@ mod web_tools;
 mod write;
 
 #[cfg(test)]
+mod approval_round;
+#[cfg(test)]
 mod bash_parity;
 #[cfg(test)]
 mod compact_parity;
@@ -471,6 +473,7 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
     let mut web = web_tools::non_interactive_web();
     let mut read_cursor = web_tools::ReadCursor::default();
     let mut bash_jobs = bash::BashTable::default();
+    let mut ask = approval::StdinAsk;
     let one_shot = args.prompt.clone();
     let mut first_turn = true;
     let surface = tui::Surface::from_stdout();
@@ -637,11 +640,17 @@ pub fn run(name: &str, args: AgentArgs) -> Result<i32, String> {
                     &mut transcript,
                     "soft limit before tool continuation",
                 )?;
+                let mut gate = if args.non_interactive {
+                    approval::Approval::NonInteractive
+                } else {
+                    approval::Approval::Interactive(&mut ask)
+                };
                 let round = web_tools::handle_round_with_tools(
                     &raw,
                     &mut web,
                     &mut read_cursor,
                     &mut bash_jobs,
+                    &mut gate,
                 )
                 .map_err(|_| TOOL_UNSUPPORTED_ERROR.to_string())?;
                 output.extend_from_slice(&project_output(&[&round.visible])?);

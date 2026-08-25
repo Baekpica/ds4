@@ -162,7 +162,7 @@ mod tests {
         let out = write_result_with(
             Some(path_text),
             Some("new"),
-            Approval::Interactive(&mut ask),
+            &mut Approval::Interactive(&mut ask),
         );
         assert_eq!(out, DENIED_WRITE);
         assert_eq!(ask.asked, 1);
@@ -175,7 +175,7 @@ mod tests {
         let path = temp_path("overwrite.txt");
         std::fs::write(&path, b"old").unwrap();
         let path_text = path.to_str().expect("utf8");
-        let out = write_result_with(Some(path_text), Some("z"), Approval::NonInteractive);
+        let out = write_result_with(Some(path_text), Some("z"), &mut Approval::NonInteractive);
         assert_eq!(out, format!("Wrote 1 bytes to {path_text}\n").into_bytes());
         assert_eq!(std::fs::read(&path).unwrap(), b"z");
         std::fs::remove_file(path).unwrap();
@@ -192,7 +192,7 @@ mod tests {
         let out = write_result_with(
             Some(path_text),
             Some("hello"),
-            Approval::Interactive(&mut ask),
+            &mut Approval::Interactive(&mut ask),
         );
         assert_eq!(out, format!("Wrote 5 bytes to {path_text}\n").into_bytes());
         assert_eq!(ask.asked, 1);
@@ -206,7 +206,7 @@ mod tests {
             answers: vec![true],
             asked: 0,
         };
-        let out = write_result_with(None, Some("x"), Approval::Interactive(&mut ask));
+        let out = write_result_with(None, Some("x"), &mut Approval::Interactive(&mut ask));
         assert_eq!(out, b"Tool error: write requires path\n");
         assert_eq!(ask.asked, 0);
     }
@@ -224,7 +224,7 @@ mod tests {
             Some(path_text),
             Some("alpha"),
             Some("beta"),
-            Approval::Interactive(&mut ask),
+            &mut Approval::Interactive(&mut ask),
         );
         assert_eq!(out, DENIED_EDIT);
         assert_eq!(ask.asked, 1);
@@ -241,7 +241,7 @@ mod tests {
             Some(path_text),
             Some("alpha"),
             Some("beta"),
-            Approval::NonInteractive,
+            &mut Approval::NonInteractive,
         );
         assert!(out.starts_with(format!("Edited {path_text} using old/new replacement").as_bytes()));
         assert_eq!(std::fs::read(&path).unwrap(), b"beta\nkeep\n");
@@ -261,7 +261,7 @@ mod tests {
             Some(path_text),
             Some("aaa"),
             Some("y"),
-            Approval::Interactive(&mut ask),
+            &mut Approval::Interactive(&mut ask),
         );
         assert!(out.starts_with(b"Tool error: "));
         assert_eq!(ask.asked, 0);

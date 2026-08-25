@@ -16,14 +16,14 @@ pub(super) struct LineSpan {
 }
 
 pub(crate) fn edit_result(path: Option<&str>, old: Option<&str>, new: Option<&str>) -> Vec<u8> {
-    edit_result_with(path, old, new, Approval::NonInteractive)
+    edit_result_with(path, old, new, &mut Approval::NonInteractive)
 }
 
 pub(crate) fn edit_result_with(
     path: Option<&str>,
     old: Option<&str>,
     new: Option<&str>,
-    mut approval: Approval<'_>,
+    approval: &mut Approval<'_>,
 ) -> Vec<u8> {
     let Some(path) = path.filter(|path| !path.is_empty()) else {
         return b"Tool error: edit requires path\n".to_vec();

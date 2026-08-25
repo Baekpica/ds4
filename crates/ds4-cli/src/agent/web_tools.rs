@@ -1,3 +1,4 @@
+use super::approval::Approval;
 use super::TOOL_UNSUPPORTED_ERROR;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -651,7 +652,13 @@ pub(super) fn handle_round_with_cursor<B: Browser>(
     web: &mut B,
     cursor: &mut ReadCursor,
 ) -> Result<ToolRound, String> {
-    handle_round_with_tools(raw, web, cursor, &mut super::bash::BashTable::default())
+    handle_round_with_tools(
+        raw,
+        web,
+        cursor,
+        &mut super::bash::BashTable::default(),
+        &mut Approval::NonInteractive,
+    )
 }
 
 pub(super) fn handle_round_with_tools<B: Browser>(
@@ -659,6 +666,7 @@ pub(super) fn handle_round_with_tools<B: Browser>(
     web: &mut B,
     cursor: &mut ReadCursor,
     jobs: &mut super::bash::BashTable,
+    approval: &mut Approval<'_>,
 ) -> Result<ToolRound, String> {
     let (open_at, open_len) = start(raw).ok_or_else(|| "missing DSML tool call".to_string())?;
     let calls = parse_calls(raw, open_at, open_len)?;
@@ -684,11 +692,14 @@ pub(super) fn handle_round_with_tools<B: Browser>(
             MORE_FILE => more_result(call, cursor),
             LIST_DIR => list_result(call),
             super::write::WRITE => {
-                super::write::write_result(call.arg(PATH_ARG), call.arg("content"))
+                super::write::write_result_with(call.arg(PATH_ARG), call.arg("content"), approval)
             }
-            super::edit::EDIT => {
-                super::edit::edit_result(call.arg(PATH_ARG), call.arg("old"), call.arg("new"))
-            }
+            super::edit::EDIT => super::edit::edit_result_with(
+                call.arg(PATH_ARG),
+                call.arg("old"),
+                call.arg("new"),
+                approval,
+            ),
             super::bash::BASH | super::bash::BASH_STATUS | super::bash::BASH_STOP => {
                 super::bash::bash_result(
                     jobs,

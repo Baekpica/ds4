@@ -1,3 +1,4 @@
+use super::approval::Approval;
 use super::bash::{bash_result, parse_timeout, BashArgs, BashTable, BASH, BASH_STATUS};
 use super::web_tools::{handle_round_with_tools, Browser, ReadCursor};
 use std::path::PathBuf;
@@ -158,6 +159,7 @@ fn bash_echo_done_observation_matches_c_shape() {
         &mut web,
         &mut cursor,
         &mut jobs,
+        &mut Approval::NonInteractive,
     )
     .expect("bash echo");
     let rust_body = rust
