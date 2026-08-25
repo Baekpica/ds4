@@ -1233,9 +1233,7 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
 
     if worker {
         model.boot_prewarm();
-        return model
-            .run_distributed_worker(args.ctx)
-            .map_err(|e| e.to_string());
+        return worker_run::run_assembled_worker(&model, args.ctx, &args.dist);
     }
 
     if args.dump_logits.is_some() {
@@ -1506,6 +1504,53 @@ mod tests {
         assert_eq!(native.layer_start, 21);
         assert_eq!(native.layer_end, u32::MAX);
         assert!(native.has_output);
+    }
+
+    #[test]
+    fn worker_role_and_layers_hello_uses_bound_listen_port() {
+        // Given: worker role + layers, listen port unset
+        let parsed = parse_args(args(&[
+            "--role",
+            "worker",
+            "--layers",
+            "20:output",
+            "--coordinator",
+            "127.0.0.1",
+            "7000",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.dist.role, ds4_dist::Role::Worker);
+        assert!(parsed.dist.layers.set);
+
+        // When: bind from listen_host / listen_port (0 if unset) and plan HELLO
+        let requested = worker_run::worker_listen_port(parsed.dist.listen_port);
+        let (_listener, port) =
+            ds4_dist::open_data_listener(parsed.dist.listen_host.as_deref(), requested).unwrap();
+        let meta = session_exec::slice_meta(7, &ds4_core::SHAPE_FLASH, 4096, &parsed.dist.layers);
+        let plan = worker_run::worker_plan(&meta, 2, u32::from(port), ds4_core::SHAPE_FLASH.name);
+
+        // Then: HELLO carries the bound nonzero data port
+        assert_eq!(requested, 0);
+        assert_ne!(plan.hello.listen_port, 0);
+        assert_eq!(plan.hello.listen_port, u32::from(port));
+    }
+
+    #[test]
+    fn worker_missing_coordinator_host_errors_via_validate_options() {
+        // Given: worker role + layers, no coordinator host
+        let err = parse_args(args(&["--role", "worker", "--layers", "20:output"])).unwrap_err();
+
+        // When/Then: validate_options (via parse_args) still requires coordinator
+        assert_eq!(err, "--role worker requires --coordinator HOST PORT");
+        let mut opt = ds4_dist::Options {
+            role: ds4_dist::Role::Worker,
+            ..ds4_dist::Options::default()
+        };
+        opt.layers.set = true;
+        assert_eq!(
+            ds4_dist::validate_options(&opt).unwrap_err(),
+            "--role worker requires --coordinator HOST PORT"
+        );
     }
 
     #[test]

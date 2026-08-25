@@ -4,10 +4,10 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use ds4_core::Session;
-use ds4_dist::{Hello, Worker};
+use ds4_core::{Model, Session};
+use ds4_dist::{Hello, Options, Worker};
 
-use crate::session_exec::{SessionSliceExec, SliceMeta};
+use crate::session_exec::{slice_meta, SessionSliceExec, SliceMeta};
 use crate::session_snapshot::SessionSnapshotStore;
 use crate::worker_hello::{worker_hello, worker_model_name};
 
@@ -82,6 +82,63 @@ pub fn worker_listen_banner(spec: &WorkerListenBanner<'_>) -> String {
 
 pub fn print_worker_listen_banner(spec: &WorkerListenBanner<'_>) {
     eprintln!("{}", worker_listen_banner(spec));
+}
+
+pub fn worker_listen_port(listen_port: i32) -> u16 {
+    u16::try_from(listen_port).unwrap_or(0)
+}
+
+pub fn run_assembled_worker(model: &Model, ctx: i32, dist: &Options) -> Result<i32, String> {
+    let session = Rc::new(RefCell::new(model.session(ctx).map_err(|e| e.to_string())?));
+    let (listener, bound) = ds4_dist::open_data_listener(
+        dist.listen_host.as_deref(),
+        worker_listen_port(dist.listen_port),
+    )
+    .map_err(|e| e.to_string())?;
+    let shape = &model.bind_plan().shape;
+    let mut meta = slice_meta(
+        u32::try_from(model.model_id()).unwrap_or(0),
+        shape,
+        u32::try_from(ctx).unwrap_or(0),
+        &dist.layers,
+    );
+    meta.vocab = u32::try_from(model.vocab().n_vocab().max(0)).unwrap_or(0);
+    let mut assembled = assemble_worker(
+        session,
+        meta,
+        u32::try_from(model.routed_quant_bits().max(0)).unwrap_or(0),
+        u32::from(bound),
+        shape.name,
+    );
+    let host = dist
+        .coordinator_host
+        .as_deref()
+        .ok_or("--role worker requires --coordinator HOST PORT")?;
+    print_worker_listen_banner(&WorkerListenBanner {
+        layer_start: assembled.hello.layer_start,
+        has_output: assembled.hello.has_output != 0,
+        layer_end: assembled.hello.layer_end,
+        model_id: model.model_id(),
+        listen_host: dist.listen_host.as_deref(),
+        listen_port: assembled.hello.listen_port,
+        coordinator_host: host,
+        coordinator_port: dist.coordinator_port,
+    });
+    let port = u16::try_from(dist.coordinator_port)
+        .map_err(|_| "--role worker requires --coordinator HOST PORT")?;
+    ds4_dist::reconnect_local(
+        &mut assembled.worker,
+        ds4_dist::LocalReconnect {
+            connect: || ds4_dist::connect_endpoint(host, port),
+            hello: &assembled.hello,
+            model_name: &assembled.model_name,
+            sleep: ds4_dist::sleep_reconnect,
+            should_stop: || false,
+            listener: Some(&listener),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(0)
 }
 
 #[cfg(test)]
