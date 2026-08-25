@@ -18,6 +18,7 @@ mod payload;
 mod progress;
 mod session;
 mod shape;
+mod sibling;
 mod tensors;
 mod tok;
 mod validate;
@@ -62,6 +63,7 @@ pub use shape::{
     DeepSeekDims, ModelFamily, Shape, Variant, SHAPE_DOTS3_NOTE_PREV, SHAPE_FLASH,
     SHAPE_KEXAONE_236B, SHAPE_MOTIF3, SHAPE_PRO, SHAPE_SOLAR_OPEN2_250B,
 };
+pub use sibling::SiblingAttach;
 pub use tensors::{
     apply_host_dir, consume_host_dir, dump_apply_tapes, dump_consume_tapes, dump_nbytes_table,
     dump_sibling_script, model_split_sibling_path, tensor_nbytes, tensor_type_name, TensorError,
@@ -365,6 +367,8 @@ pub struct Model {
     backend: Backend,
     inventory: TensorInventory,
     bind_plan: BindPlan,
+    mtp: Option<SiblingAttach>,
+    dspark: Option<SiblingAttach>,
     vocab: Vocab,
     _distributed: Option<FfiDistributed>,
     _not_send: PhantomData<*const ()>,
@@ -826,38 +830,17 @@ fn save_payload_checked(
     Ok(())
 }
 
-/// Host-resolved DeepSeek sibling (MTP / DSpark drafter): the path CString
-/// and the packed bind map must outlive the bridge open call.
+/// Packed sibling bind map for the bridge open call only. Host lifecycle
+/// lives in [`SiblingAttach`]; this must outlive the FFI open.
 struct FfiSupport {
     path: CString,
     map: FfiBindMap,
 }
 
-fn pack_support(
-    kind: &str,
-    path: &str,
-    shape: Shape,
-    resolve: impl Fn(Shape, &TensorInventory) -> BindPlan,
-    validate: impl Fn(&BindPlan) -> std::result::Result<(), LayoutError>,
-) -> Result<FfiSupport> {
-    let inv = TensorInventory::open(std::path::Path::new(path)).map_err(|e| Error {
-        code: 1,
-        message: format!("{kind} tensor inventory failed: {}", e.token()),
-    })?;
-    let plan = resolve(shape, &inv);
-    if let Some(name) = plan.missing_required().first() {
-        return Err(Error {
-            code: 1,
-            message: format!("{kind} required tensor is missing: {name}"),
-        });
-    }
-    validate(&plan).map_err(|e| Error {
-        code: 1,
-        message: format!("{kind} layout failed: {}", e.token()),
-    })?;
+fn pack_sibling_ffi(attach: &SiblingAttach) -> Result<FfiSupport> {
     Ok(FfiSupport {
-        path: cstring_path(path)?,
-        map: pack_host_bind_map(&plan)?,
+        path: cstring_path(attach.path())?,
+        map: pack_host_bind_map(attach.bind_plan())?,
     })
 }
 
@@ -1001,14 +984,6 @@ impl Model {
             code: 1,
             message: format!("identify failed: {}", e.token()),
         })?;
-        if (mtp_path.is_some() || dspark_path.is_some())
-            && identified.shape.family != ModelFamily::DeepSeek4
-        {
-            return Err(Error {
-                code: 1,
-                message: "MTP and DSpark support models are DeepSeek-only".into(),
-            });
-        }
         let g = GgufFile::open(std::path::Path::new(path)).map_err(|e| Error {
             code: 1,
             message: format!("validate failed: {}", e.token()),
@@ -1050,26 +1025,16 @@ impl Model {
         let mut ffi_plan = pack_bind_plan(&bind_plan, &inventory)?;
         let mut ffi_bind = pack_host_bind_map(&bind_plan)?;
         let mut ffi_dir = pack_tensor_dir(&inventory)?;
-        let mut mtp_support = match mtp_path {
-            None => None,
-            Some(p) => Some(pack_support(
-                "mtp",
-                p,
-                identified.shape,
-                BindPlan::resolve_mtp,
-                validate_mtp_layouts,
-            )?),
-        };
-        let mut dspark_support = match dspark_path {
-            None => None,
-            Some(p) => Some(pack_support(
-                "dspark",
-                p,
-                identified.shape,
-                BindPlan::resolve_dspark,
-                |plan| validate_dspark_layouts(plan, DSPARK_MARKOV_RANK),
-            )?),
-        };
+        let (mtp, dspark) = sibling::attach_siblings(
+            identified.shape.family,
+            identified.shape,
+            sibling::SiblingPaths {
+                mtp: mtp_path,
+                dspark: dspark_path,
+            },
+        )?;
+        let mut mtp_support = mtp.as_ref().map(pack_sibling_ffi).transpose()?;
+        let mut dspark_support = dspark.as_ref().map(pack_sibling_ffi).transpose()?;
         let mut err = [0u8; 512];
         let check = unsafe {
             ds4_bridge_bind_plan_check(ffi_plan.as_c(), err.as_mut_ptr() as *mut c_char, err.len())
@@ -1149,6 +1114,8 @@ impl Model {
             backend,
             inventory,
             bind_plan,
+            mtp,
+            dspark,
             vocab,
             _distributed: ffi_distributed,
             _not_send: PhantomData,
@@ -1165,6 +1132,14 @@ impl Model {
 
     pub fn bind_plan(&self) -> &BindPlan {
         &self.bind_plan
+    }
+
+    pub fn mtp(&self) -> Option<&SiblingAttach> {
+        self.mtp.as_ref()
+    }
+
+    pub fn dspark(&self) -> Option<&SiblingAttach> {
+        self.dspark.as_ref()
     }
 
     pub fn vocab(&self) -> &Vocab {
