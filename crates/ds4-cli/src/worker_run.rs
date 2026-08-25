@@ -1,5 +1,6 @@
 //! Assemble a same-thread worker from shared Session exec/store.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -47,6 +48,40 @@ pub fn assemble_worker<'m>(
         model_name: plan.model_name,
         worker: Worker::with_store(exec, store),
     }
+}
+
+pub struct WorkerListenBanner<'a> {
+    pub layer_start: u32,
+    pub has_output: bool,
+    pub layer_end: u32,
+    pub model_id: i32,
+    pub listen_host: Option<&'a str>,
+    pub listen_port: u32,
+    pub coordinator_host: &'a str,
+    pub coordinator_port: i32,
+}
+
+pub fn worker_listen_banner(spec: &WorkerListenBanner<'_>) -> String {
+    let layer_end: Cow<'_, str> = if spec.has_output {
+        Cow::Borrowed("output")
+    } else {
+        Cow::Owned(spec.layer_end.to_string())
+    };
+    let listen_host = spec.listen_host.unwrap_or("*");
+    format!(
+        "ds4: distributed worker: layers {}:{} model_id={} data_listen={}:{} connecting to coordinator {}:{}",
+        spec.layer_start,
+        layer_end,
+        spec.model_id,
+        listen_host,
+        spec.listen_port,
+        spec.coordinator_host,
+        spec.coordinator_port,
+    )
+}
+
+pub fn print_worker_listen_banner(spec: &WorkerListenBanner<'_>) {
+    eprintln!("{}", worker_listen_banner(spec));
 }
 
 #[cfg(test)]
@@ -107,5 +142,84 @@ mod tests {
         assert_eq!(plan.hello.listen_port, 7100);
         assert_eq!(plan.model_name, SHAPE_FLASH.name);
         assert_eq!(plan.hello.model_name_len, SHAPE_FLASH.name.len() as u32);
+    }
+
+    #[test]
+    fn worker_listen_banner_contains_data_listen_and_coordinator() {
+        // Given: known worker meta (C layers 20:output, model_id 7)
+        let layers = Layers {
+            start: 20,
+            end: 20,
+            has_output: true,
+            set: true,
+        };
+        let meta = slice_meta(7, &SHAPE_FLASH, 4096, &layers);
+        let plan = worker_plan(&meta, 2, 7100, SHAPE_FLASH.name);
+
+        // When: format the C boot stderr line
+        let line = worker_listen_banner(&WorkerListenBanner {
+            layer_start: plan.hello.layer_start,
+            has_output: plan.hello.has_output != 0,
+            layer_end: plan.hello.layer_end,
+            model_id: i32::try_from(plan.hello.model_id).expect("model_id fits i32"),
+            listen_host: Some("127.0.0.1"),
+            listen_port: plan.hello.listen_port,
+            coordinator_host: "10.0.0.1",
+            coordinator_port: 1234,
+        });
+
+        // Then: C tokens and full fprintf shape
+        assert!(
+            line.contains("data_listen="),
+            "banner must contain data_listen=: {line}"
+        );
+        assert!(
+            line.contains("connecting to coordinator"),
+            "banner must contain connecting to coordinator: {line}"
+        );
+        assert_eq!(
+            line,
+            "ds4: distributed worker: layers 20:output model_id=7 data_listen=127.0.0.1:7100 connecting to coordinator 10.0.0.1:1234"
+        );
+        assert_eq!(
+            ds4_dist::connected_message("10.0.0.1", "1234"),
+            "ds4: distributed worker: connected to coordinator 10.0.0.1:1234"
+        );
+        assert_eq!(
+            ds4_dist::disconnected_message(false),
+            "ds4: distributed worker: coordinator disconnected; reconnecting"
+        );
+    }
+
+    #[test]
+    fn worker_listen_banner_prints_star_when_host_missing() {
+        // Given: no listen host (C listen_host == NULL)
+        let spec = WorkerListenBanner {
+            layer_start: 20,
+            has_output: false,
+            layer_end: 30,
+            model_id: 7,
+            listen_host: None,
+            listen_port: 7100,
+            coordinator_host: "10.0.0.1",
+            coordinator_port: 1234,
+        };
+
+        // When: format the C boot stderr line
+        let line = worker_listen_banner(&spec);
+
+        // Then: missing host is `*` like C
+        assert!(
+            line.contains("data_listen=*:7100"),
+            "missing host must print *: {line}"
+        );
+        assert!(
+            line.contains("connecting to coordinator"),
+            "banner must contain connecting to coordinator: {line}"
+        );
+        assert_eq!(
+            line,
+            "ds4: distributed worker: layers 20:30 model_id=7 data_listen=*:7100 connecting to coordinator 10.0.0.1:1234"
+        );
     }
 }
