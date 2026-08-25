@@ -146,6 +146,61 @@ pub fn think_max_active(ctx: i32) -> bool {
     ctx >= THINK_MAX_MIN_CTX
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplThinkCmd {
+    None,
+    Low,
+    Max,
+}
+
+pub struct ReplChat {
+    pub transcript: ds4_core::TokenBuffer,
+    pub prefix_tokens: usize,
+    pub think: ReplThinkCmd,
+    pub ctx: i32,
+}
+
+impl ReplChat {
+    pub fn new(nothink: bool, ctx: i32) -> Self {
+        Self {
+            transcript: ds4_core::TokenBuffer::new(),
+            prefix_tokens: 0,
+            think: if nothink {
+                ReplThinkCmd::None
+            } else {
+                ReplThinkCmd::Low
+            },
+            ctx,
+        }
+    }
+
+    pub fn effective_think(&self) -> ds4_core::ChatThinkMode {
+        match self.think {
+            ReplThinkCmd::None => ds4_core::ChatThinkMode::None,
+            ReplThinkCmd::Low => ds4_core::ChatThinkMode::Low,
+            ReplThinkCmd::Max if think_max_active(self.ctx) => ds4_core::ChatThinkMode::High,
+            ReplThinkCmd::Max => ds4_core::ChatThinkMode::Low,
+        }
+    }
+
+    pub fn thinking_enabled(&self) -> bool {
+        self.effective_think() != ds4_core::ChatThinkMode::None
+    }
+
+    pub fn think_message(&self) -> &'static str {
+        think_mode_message(match self.think {
+            ReplThinkCmd::None => ThinkRepl::None,
+            ReplThinkCmd::Low => ThinkRepl::High,
+            ReplThinkCmd::Max if think_max_active(self.ctx) => ThinkRepl::Max,
+            ReplThinkCmd::Max => ThinkRepl::HighBelowCtx,
+        })
+    }
+
+    pub fn wants_effort_prefix(&self) -> bool {
+        matches!(self.effective_think(), ds4_core::ChatThinkMode::High)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +268,33 @@ mod tests {
         assert_eq!(think_mode_message(ThinkRepl::None), "Thinking mode: none.");
         assert!(!think_max_active(32768));
         assert!(think_max_active(393216));
+    }
+
+    #[test]
+    fn repl_chat_think_gates_match_c() {
+        let low = ReplChat::new(false, 32768);
+        assert_eq!(low.effective_think(), ds4_core::ChatThinkMode::Low);
+        assert!(low.thinking_enabled());
+        assert!(!low.wants_effort_prefix());
+        assert_eq!(low.think_message(), "Thinking mode: high.");
+
+        let none = ReplChat::new(true, 32768);
+        assert_eq!(none.effective_think(), ds4_core::ChatThinkMode::None);
+        assert!(!none.thinking_enabled());
+        assert_eq!(none.think_message(), "Thinking mode: none.");
+
+        let mut max = ReplChat::new(false, 32768);
+        max.think = ReplThinkCmd::Max;
+        assert_eq!(max.effective_think(), ds4_core::ChatThinkMode::Low);
+        assert!(!max.wants_effort_prefix());
+        assert_eq!(
+            max.think_message(),
+            "Thinking mode: high (ctx below 393216)."
+        );
+
+        max.ctx = THINK_MAX_MIN_CTX;
+        assert_eq!(max.effective_think(), ds4_core::ChatThinkMode::High);
+        assert!(max.wants_effort_prefix());
+        assert_eq!(max.think_message(), "Thinking mode: max.");
     }
 }

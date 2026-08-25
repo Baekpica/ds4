@@ -264,6 +264,28 @@ impl TokenBuffer {
         self.tokens.push(token);
     }
 
+    pub fn truncate(&mut self, len: usize) {
+        self.tokens.truncate(len);
+    }
+
+    pub fn insert(&mut self, mut index: usize, tokens: &[i32]) {
+        if tokens.is_empty() {
+            return;
+        }
+        if index > self.tokens.len() {
+            index = self.tokens.len();
+        }
+        self.tokens.splice(index..index, tokens.iter().copied());
+    }
+
+    pub fn remove(&mut self, index: usize, n: usize) {
+        if n == 0 || index >= self.tokens.len() {
+            return;
+        }
+        let end = (index + n).min(self.tokens.len());
+        self.tokens.drain(index..end);
+    }
+
     pub fn len(&self) -> usize {
         self.tokens.len()
     }
@@ -1745,6 +1767,23 @@ mod tests {
         buf.push(2);
         assert_eq!(buf.as_slice(), &[1, 2]);
         assert_eq!(buf.len(), 2);
+    }
+
+    #[test]
+    fn token_buffer_insert_remove_truncate_match_c() {
+        let mut buf = TokenBuffer::from_tokens(vec![1, 2, 3]);
+        buf.insert(1, &[8, 9]);
+        assert_eq!(buf.as_slice(), &[1, 8, 9, 2, 3]);
+        buf.remove(1, 2);
+        assert_eq!(buf.as_slice(), &[1, 2, 3]);
+        buf.truncate(1);
+        assert_eq!(buf.as_slice(), &[1]);
+        buf.insert(8, &[4]);
+        assert_eq!(buf.as_slice(), &[1, 4]);
+        buf.remove(4, 2);
+        assert_eq!(buf.as_slice(), &[1, 4]);
+        buf.insert(0, &[]);
+        assert_eq!(buf.as_slice(), &[1, 4]);
     }
 
     #[test]

@@ -424,6 +424,123 @@ impl TokenPrinter {
     }
 }
 
+fn apply_effort_prefix(
+    vocab: &ds4_core::Vocab,
+    chat: &mut repl::ReplChat,
+    session: Option<&mut ds4_core::Session<'_>>,
+) {
+    let want = chat.wants_effort_prefix();
+    if want && chat.prefix_tokens == 0 {
+        let mut prefix = ds4_core::TokenBuffer::new();
+        vocab.chat_append_effort_prefix(&mut prefix, chat.effective_think());
+        chat.transcript.insert(1, prefix.as_slice());
+        chat.prefix_tokens = prefix.len();
+        if let Some(session) = session {
+            session.invalidate();
+        }
+    } else if !want && chat.prefix_tokens > 0 {
+        chat.transcript.remove(1, chat.prefix_tokens);
+        chat.prefix_tokens = 0;
+        if let Some(session) = session {
+            session.invalidate();
+        }
+    }
+}
+
+fn run_chat_turn(
+    model: &ds4_core::Model,
+    args: &ShadowArgs,
+    chat: &mut repl::ReplChat,
+    session: &mut ds4_core::Session<'_>,
+    user_text: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let vocab = model.vocab();
+    apply_effort_prefix(vocab, chat, Some(session));
+    let rollback = chat.transcript.len();
+    vocab
+        .chat_append_message(&mut chat.transcript, "user", user_text.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let think = chat.effective_think();
+    vocab
+        .chat_append_assistant_prefix(&mut chat.transcript, think)
+        .map_err(|e| e.to_string())?;
+
+    if let Err(e) = session.sync(&chat.transcript) {
+        chat.transcript.truncate(rollback);
+        eprintln!("ds4: prompt processing failed: {e}");
+        return Ok(());
+    }
+
+    let max_tokens = sampled_generation_limit(session.ctx(), session.pos(), args.n_predict);
+    let mut rng = args.seed;
+    if rng == 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        rng = (now ^ (u64::from(std::process::id()) << 32)) | 1;
+    }
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut printer = TokenPrinter::new(chat.thinking_enabled());
+    let use_mtp = use_mtp_spec(args.temp, args.mtp.as_deref(), args.mtp_draft);
+    let eos = model.token_eos();
+    let mut generated = 0i32;
+
+    while generated < max_tokens {
+        let token = session.sample(args.temp, 0, args.top_p, args.min_p, &mut rng);
+        if token < 0 {
+            eprintln!("ds4: decode failed: failed to sample the next token");
+            printer.finish(&mut out).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        if model.token_is_stop(token) {
+            break;
+        }
+        let accepted = if use_mtp {
+            match session.eval_speculative_argmax(token, max_tokens - generated, eos) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("ds4: decode failed: {e}");
+                    printer.finish(&mut out).map_err(|e| e.to_string())?;
+                    return Ok(());
+                }
+            }
+        } else if let Err(e) = session.eval(token) {
+            eprintln!("ds4: decode failed: {e}");
+            printer.finish(&mut out).map_err(|e| e.to_string())?;
+            return Ok(());
+        } else {
+            vec![token]
+        };
+        let mut stop = false;
+        for t in accepted {
+            if model.token_is_stop(t) {
+                stop = true;
+                break;
+            }
+            let piece = model.token_text(t).map_err(|e| e.to_string())?;
+            printer
+                .write_text(&mut out, &piece)
+                .map_err(|e| e.to_string())?;
+            out.flush().map_err(|e| e.to_string())?;
+            chat.transcript.push(t);
+            generated += 1;
+            if generated >= max_tokens {
+                break;
+            }
+        }
+        if stop {
+            break;
+        }
+    }
+    printer.finish(&mut out).map_err(|e| e.to_string())?;
+    chat.transcript.push(eos);
+    Ok(())
+}
+
 fn run_one_shot(model: &ds4_core::Model, args: &ShadowArgs, text: &str) -> Result<i32, String> {
     use std::io::Write;
 
@@ -921,6 +1038,19 @@ pub fn run(name: &str, args: ShadowArgs) -> Result<i32, String> {
 fn run_repl(model: &ds4_core::Model, mut args: ShadowArgs) -> Result<i32, String> {
     use std::io::{self, BufRead, Write};
 
+    let mut chat = repl::ReplChat::new(args.nothink, args.ctx);
+    let vocab = model.vocab();
+    vocab
+        .chat_begin(&mut chat.transcript)
+        .map_err(|e| e.to_string())?;
+    apply_effort_prefix(vocab, &mut chat, None);
+    if !args.system.is_empty() {
+        vocab
+            .chat_append_message(&mut chat.transcript, "system", args.system.as_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+    let mut session = session_ready(model, &args, chat.ctx)?;
+
     print!("{}", repl::REPL_HELP);
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -941,25 +1071,29 @@ fn run_repl(model: &ds4_core::Model, mut args: ShadowArgs) -> Result<i32, String
             Ok(repl::ReplLine::Help) => print!("{}", repl::REPL_HELP),
             Ok(repl::ReplLine::Quit) => break,
             Ok(repl::ReplLine::Think) => {
+                chat.think = repl::ReplThinkCmd::Low;
                 args.nothink = false;
-                println!("{}", repl::think_mode_message(repl::ThinkRepl::High));
+                apply_effort_prefix(vocab, &mut chat, Some(&mut session));
+                println!("{}", chat.think_message());
             }
             Ok(repl::ReplLine::ThinkMax) => {
+                chat.think = repl::ReplThinkCmd::Max;
                 args.nothink = false;
-                let mode = if repl::think_max_active(args.ctx) {
-                    repl::ThinkRepl::Max
-                } else {
-                    repl::ThinkRepl::HighBelowCtx
-                };
-                println!("{}", repl::think_mode_message(mode));
+                apply_effort_prefix(vocab, &mut chat, Some(&mut session));
+                println!("{}", chat.think_message());
             }
             Ok(repl::ReplLine::NoThink) => {
+                chat.think = repl::ReplThinkCmd::None;
                 args.nothink = true;
-                println!("{}", repl::think_mode_message(repl::ThinkRepl::None));
+                apply_effort_prefix(vocab, &mut chat, Some(&mut session));
+                println!("{}", chat.think_message());
             }
             Ok(repl::ReplLine::Ctx(n)) => {
                 args.ctx = n;
                 args.ctx_set = true;
+                chat.ctx = n;
+                session = session_ready(model, &args, chat.ctx)?;
+                apply_effort_prefix(vocab, &mut chat, Some(&mut session));
             }
             Ok(repl::ReplLine::Power(None)) => {
                 println!("Power: 100%.");
@@ -970,10 +1104,10 @@ fn run_repl(model: &ds4_core::Model, mut args: ShadowArgs) -> Result<i32, String
             Ok(repl::ReplLine::Read(path)) => {
                 let text = std::fs::read_to_string(&path)
                     .map_err(|e| format!("ds4: failed to read {path}: {e}"))?;
-                run_one_shot(model, &args, &text)?;
+                run_chat_turn(model, &args, &mut chat, &mut session, &text)?;
             }
             Ok(repl::ReplLine::Prompt(text)) => {
-                run_one_shot(model, &args, &text)?;
+                run_chat_turn(model, &args, &mut chat, &mut session, &text)?;
             }
             Err(err) => eprint!("{}", err.message()),
         }
