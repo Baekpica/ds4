@@ -7,14 +7,14 @@
 
 | 항목 | 값 |
 |---|---|
-| Branch | `rust-host` (ahead of `origin/rust-host`) |
-| HEAD | `fba963e` `Rust(server): Host C serial_session_ensure_fit rightsize` |
+| Branch | `rust-host` (`origin/rust-host`와 동기화; 이 스탬프가 다음 CAND) |
+| HEAD | `05a9357` `Rust(server): Tick cont lane entry on the stranded fallback` (마지막 코드). 이 문서 스탬프가 그 위. |
 | C golden | `v0.6.3-dfm` (`516456fe35510e4fb8350396c9d88807ac1f760b`) |
 | 기본 바이너리 | 여전히 C (`ds4` / `ds4-server` / `ds4-bench` / `ds4-agent`) |
 | Rust shadow | `ds4-rs` / `ds4-server-rs` / `ds4-bench-rs` / `ds4-agent-rs` |
-| Phase 9 | **NOT_GREEN** — 이름 승격·SPLIT 문서·`dfm-rs` 생성 없음 |
+| Phase 9 | **NOT_GREEN** — 이름 승격·`SPLIT_READINESS.md` 없음. `Baekpica/dfm-rs`는 스캐폴드만 (`a293973`, 시딩 전). |
 | 플랜 | `.omo/plans/rust-host-remaining-to-phase-9.md` (todos 1–61 `[x]`, F1–F4는 최종 감사) |
-| 작업트리 재검증 | 2026-08-26 16:30 KST. serial rightsize 호스트 이식 커밋(`fba963e`) + Motif rust serial 4-surface 재스탬프 + cheap/parity 재스탬프 (§3.11) |
+| 작업트리 재검증 | 2026-08-26 19:00 KST. §10 셰이크아웃 drain + ENGINE_GAPS E-2..E-5 C-control 확정 (§3.14). |
 
 증거는 `.omo/evidence/task-*-rust-host-remaining-to-phase-9.txt`에 있다
 (untracked, `git add` 금지 목록).
@@ -26,9 +26,11 @@
 호스트 잔여 **코드 슬라이스(Wave A–B)와 cheap-gate는 닫혔다.**
 DeepSeek KV/static과 Motif ABBA/tool-map/evict/periodic도 **PASS**다.
 Rust HTTP `CONTINUOUS=0` n=1은 C `worker_main`처럼 serial로 접힌다
-(`40a321c`). Wave C TickOp 소비, Motif partial HTTP `cached=0`,
-EXAONE standalone serial graph rightsize가 남아 계약상 **GREEN이 아니고**,
-production 이름은 C다.
+(`40a321c`). §10 셰이크아웃(CAND `f368131`)은 drain됐다. 남은
+BLOCKED는 TickOp KEEP와 ENGINE_GAPS E-1..E-5(전부 C-control
+reproduced → 공식 런에서 `PASS*` 가능). 계약상 **GREEN이 아니고**,
+production 이름은 C다. 공식 60셀은 `05a9357`+이 스탬프 CAND에서 다시
+돈다.
 
 대략:
 
@@ -296,9 +298,10 @@ PASS다.**
    `PASS*(engine-gap E-n)`으로 표기하고 todo-54 판정에서 PASS로
    계수한다. C는 통과하는데 Rust만 실패하면 FAIL 유지. 셀 삭제·완화
    금지. 레지스트리는 [ENGINE_GAPS.md](ENGINE_GAPS.md)
-   (E-1 Motif partial cached=0 / E-2 EXAONE prewarm IMA — 둘 다
-   C-control reproduced; **E-3 Solar IMA는 C-control pending** —
-   §10 rerun의 Solar 그룹에서 대조 필수).
+   (E-1 Motif partial cached=0 / E-2 EXAONE prewarm IMA / **E-3
+   Solar IMA** / E-4 Motif batch 디코드 / E-5 Motif resident RSS —
+   전부 C-control reproduced. E-3는 셰이크아웃 G3 C standalone 부트
+   + golden `test_solar_session`으로 확정).
 2. **dfm-rs 시딩은 문서대로**: SPLIT_READINESS green 후 genesis SHA를
    `a293973` 위에 ancestry force-push. 그 전에는 코드 push 금지.
 3. **로컬 클론은 workspace 루트** `../dfm-rs` (이동 완료; main
@@ -311,12 +314,13 @@ web_tools.rs cwd flake proper fix(`0f8b1cb` — dirty 해소, tracked
 클린), split 문서 통합(`de372e9` — 두 초안 SUPERSEDED로 tracked화),
 ENGINE_GAPS.md(`054109c`), workspace CLAUDE.md에 dfm-rs 행 추가.
 
-**남은 로드맵 (승인된 플랜 §Track 1–2):** 후보 HEAD 동결 → todo-53
-60셀 §10 전면 재실행(G0 no-model / G1 DeepSeek / G2 Motif+ABBA /
-G3 Solar+E-3 C-대조 / G4 EXAONE / G5 dots3; 약 5 반나절) → todo-54
-판정 → GREEN이면 §18.2 원자 승격(Rust가 기본 이름, C→`*-c`, proof
-oracle `./ds4-c` 재배선 + 동일-inode/해시 가드) → 승격 후 §10 전량
-재실행 + §18.3 pre/post SHA 동일성 → STATUS/PARITY 재도색(todo 55) →
+**남은 로드맵 (승인된 플랜 §Track 1–2):** T1.2 하니스(CTX=8192,
+owner-resident, 새 CAND 증거 경로) → T1.3 후보 HEAD 동결(`05a9357`+이
+스탬프) → todo-53 60셀 §10 **공식** 재실행(G0 no-model / G1 DeepSeek
+/ G2 Motif+ABBA / G3 Solar / G4 EXAONE / G5 dots3) → todo-54 판정 →
+GREEN이면 §18.2 원자 승격(Rust가 기본 이름, C→`*-c`, proof oracle
+`./ds4-c` 재배선 + 동일-inode/해시 가드) → 승격 후 §10 전량 재실행 +
+§18.3 pre/post SHA 동일성 → STATUS/PARITY 재도색(todo 55) →
 soak(§18.1 hard blocker; DeepSeek 2h 혼합 트래픽) →
 SPLIT_READINESS.md + genesis 태그(todo 57) → dfm-rs ancestry
 force-push → naming Phase A/B(§6) → v0.1.0-rc.N → v0.1.0.
@@ -326,6 +330,44 @@ force-push → naming Phase A/B(§6) → v0.1.0-rc.N → v0.1.0.
 페이지 캐시 드랍이라 결과에는 영향이 없지만 규율 위반이므로 다음 하니스는
 owner 생존 중 clear_cache를 건너뛰도록 고칠 것. 최종 owner teardown 후의
 clear_cache와 host 확인(compute 앱 0, avail 117Gi)은 정상.
+
+### 3.14 2026-08-26 저녁 — §10 셰이크아웃 drain (CAND `f368131`, 공식 표 아님)
+
+증거: `.omo/evidence/task-53-rerun-f368131.txt`,
+`scratch/rust-host-live/gate-20260826/`. **todo-54 판정 금지** — 이
+런은 하니스/호스트 갭 노출용. 공식 60셀은 다음 CAND에서 다시 돈다.
+
+셀 집계 (중복 (5.5) 포함 61행): PASS 43 / FAIL 18.
+
+닫힌 것:
+
+- (11) Motif barrier width=2: C·Rust 둘 다 200/stop, 503 없음
+- (13) Motif ABBA+RSS: PASS. prefill 99.9%, decode 100.3%, TTFT
+  +1.1%, host HWM +1.0%
+  (`g2-logs/abba-rss.log`, ratios pass=true)
+
+호스트 갭 → 이미 수리:
+
+- (10.*) 12셀 FAIL. stranded cont fallback이 continuous lane entry를
+  안 찍음 (C는 serial+continuous 둘 다 tick; `ds4_server.c` ~10794).
+  **`05a9357`로 수리·push.** 같은 런의 픽스처는 `-c 2048`이라 cont
+  레인 펀딩 불가 (budget 70.4 MiB < projection 126.5 MiB). 공식 셀은
+  `CTX=8192`.
+
+엔진 갭 (golden v0.6.3-dfm worktree 4/4 동일 실패, `a3325ff` 무관):
+
+| 셀 | 분류 |
+|---|---|
+| (7.3) / E-2 | candidate `test-exaone-batch`: logits readback IMA. golden: `cudaStreamBeginCapture (dense)` → `cudaMallocAsync :139` |
+| (6.4) / E-3 | C standalone Solar `-c 2048` `cudaFreeAsync :167` 재현. golden `test_solar_session`도 BeginCapture/`cudaMallocAsync :139` |
+| (5.6) / E-4 | Motif batch row 1 `got=2753,173,122,689 want=2753,173,203024,439` (candidate=golden 바이트 동일) |
+| (5.5) / E-5 | VMM owner 하 RSS 370,412 KiB > 262,144 (golden 동일 수치) |
+
+(8.3) dots3-resident는 셰이크아웃에서 owner 없이 실패 (하니스 전제).
+공식 G5는 owner 변형. golden A/B는 아직 없음 — owner 런이 RSS/IMA로
+죽으면 그때 E-n.
+
+ENGINE_GAPS.md는 E-2/E-3 확장 + E-4/E-5 신설. 엔진 수리 커밋 없음.
 
 ---
 
@@ -700,17 +742,19 @@ Motif continuous+static 4 surface, family Makefile 셀,
 serial rightsize 호스트 이식(`fba963e`) + Motif rust serial 4-surface
 재스탬프 (§3.11).
 
-남아 있는 BLOCKED (GREEN 금지):
+남아 있는 BLOCKED (GREEN 금지; 공식 런에서 `PASS*` 가능한 것은 표기):
 
 1. TickOp 소비 — C continuous 루프 KEEP. 새 CUDA 스케줄러를 만들지 말 것
-2. Motif partial HTTP `cached=0` — C Motif `last_done` stats 갭
-3. EXAONE standalone (C·Rust 공통) — boot prewarm CUDA IMA (exaone prefill
-   logits readback; §3.12 C 대조로 엔진 측 확정, CUDA KEEP). rightsize는
-   `fba963e`로 이식됐고, EXAONE rust serial 생성은 owner+worker에서
-   200+decode+`serial=1` PASS (§3.12 phase C)
+2. Motif partial HTTP `cached=0` — E-1, C-control reproduced → `PASS*`
+3. EXAONE standalone / `test-exaone-batch` IMA — E-2 → `PASS*`
+   (정본은 owner+worker serial, §3.12 phase C)
 4. sibling mmap — KEEP
-5. Solar standalone rust — boot_prewarm IMA (CUDA KEEP). owner+worker는 PASS
+5. Solar standalone / `test-solar-session` IMA — E-3 → `PASS*`
+   (정본은 owner+worker)
+6. Motif batch 디코드 divergence — E-4 → `PASS*`
+7. Motif resident RSS 한계 — E-5 → `PASS*`
 
+다음 손: T1.2 하니스 → T1.3 CAND 동결 → 공식 §10 60셀.
 §10 전체를 FAIL=0 / BLOCKED=0으로 다시 채운 뒤에만 GREEN/Phase 9를 논한다.
 production 이름 변경, `SPLIT_READINESS.md`, `dfm-rs`,
 `STATUS.md` / `PARITY_MATRIX.md` 재작성은 하지 않는다.

@@ -35,28 +35,65 @@ C `v0.6.3-dfm`과 Rust 호스트가 **동일하게** 보이는 엔진 측 결함
   (exaone prefill logits readback). 이후 CUDA 컨텍스트가 오염되어 모든
   alloc이 IMA로 실패 → 요청은 `lazy session graph alloc failed` 500.
   메모리 용량 문제 아님 (avail ~35 GiB, ctx=512에서도 재현).
-- **C-control:** **reproduced** — C `ds4-server` 동일 플래그에서 같은
-  IMA·같은 500 (2026-08-26 phase B).
+- **C-control:** **reproduced** — ① C `ds4-server` 동일 플래그에서 같은
+  IMA·같은 500 (2026-08-26 phase B); ② `test-exaone-batch`(순수 C)도
+  같은 클래스 IMA로 실패했다. candidate는 "exaone prefill logits
+  readback" (`g4-logs/exaone-batch.log`); **v0.6.3-dfm golden
+  `test_exaone_batch`는 `cudaStreamBeginCapture (dense)` →
+  `cudaMallocAsync` `ds4_ggml_stubs.cu:139`**
+  (`golden-logs/exaone-batch.log`). rust-host 무관.
 - **Canonical 경로:** VMM owner + worker는 정상 — worker prewarm 2.0s
   PASS, serial 생성 200 (`openai_chat_serial=1`, TTFT 480 ms).
 - **증거:**
   `scratch/rust-host-live/task53/exaone-serial-rightsize-20260826-154403/`
-  (phase A rust / phase B C-control / phase C owner+worker).
+  (phase A rust / phase B C-control / phase C owner+worker),
+  `gate-20260826/g4-logs/exaone-batch.log`,
+  `gate-20260826/golden-logs/exaone-batch.log`.
 - **스코프:** 엔진 (EXAONE prefill + in-process artifacts 경로, CUDA).
 - **상태:** Open.
 
-## E-3 — Solar-Open2 standalone boot-prewarm `cudaFreeAsync` IMA
+## E-3 — Solar-Open2 standalone boot-prewarm / session-test IMA
 
 - **증상:** standalone `-c 2048` 부트의 boot_prewarm에서 `cudaFreeAsync`
-  IMA (`cuda/mmq/ds4_ggml_stubs.cu:167`).
-- **C-control:** **pending** — rust standalone에서만 관측됨. §10 rerun의
-  Solar 그룹(G3)에서 **같은 플래그의 C standalone 부트 1회로 대조**해야
-  한다. C가 재현하면 E-2와 같은 클래스로 확정; C가 통과하면 이 항목은
-  엔진 갭이 아니라 **호스트 측 조사 항목으로 격상**되며 annotation
-  근거로 쓸 수 없다 (GREEN 블로커).
+  IMA (`cuda/mmq/ds4_ggml_stubs.cu:167`); `test-solar-session`(순수 C
+  테스트 바이너리)에서도 같은 클래스 IMA (`cudaMallocAsync`
+  `ds4_ggml_stubs.cu:139`, `cudaStreamBeginCapture (dense)` 실패).
+- **C-control:** **reproduced** — ① C `ds4-server` standalone Solar
+  `-c 2048` 부트에서 동일 IMA (2026-08-26 §10 셰이크아웃 G3,
+  `gate-20260826/g3-logs/e3-c-control.server.log`); ② **v0.6.3-dfm
+  golden worktree의 `test_solar_session`도 동일 IMA·동일 지점**
+  (`gate-20260826/golden-logs/solar-session.log`). rust-host C delta
+  (`a3325ff`) 무관.
 - **Canonical 경로:** VMM owner + rust worker `-c 2048` PASS
   (chat `ok` stop, `continuous=1`, TTFT 254 ms).
 - **증거:** `scratch/rust-host-live/family-serve-20260826-retry/solar/`
-  (workspace-level scratch).
-- **스코프:** 미정 (C-control 결과에 따라 엔진 또는 호스트).
-- **상태:** Open — C-control 필요.
+  (workspace-level), `gate-20260826/g3-logs/`, `gate-20260826/golden-logs/`.
+- **스코프:** 엔진 (Solar in-process 경로, CUDA).
+- **상태:** Open.
+
+## E-4 — Motif-3 batch 테스트 디코드 divergence
+
+- **증상:** `test-motif3-batch`가 row 1에서 기대 토큰과 불일치
+  (`got=2753,173,122,689 want=2753,173,203024,439`).
+- **C-control:** **reproduced** — v0.6.3-dfm golden worktree의
+  `test_motif3_batch`가 **바이트 동일한 divergence**로 실패
+  (`gate-20260826/golden-logs/motif-batch.log`). rust-host 무관;
+  기대 벡터가 현 GGUF/드라이버/커널 상태와 어긋나는 pre-existing.
+- **증거:** `gate-20260826/g2-logs/motif-batch.log` (candidate),
+  `gate-20260826/golden-logs/motif-batch.log` (golden).
+- **스코프:** 엔진/픽스처 (Motif batch 기대값 재검증 필요).
+- **상태:** Open.
+
+## E-5 — Motif-3 residency smoke RSS 한계 초과
+
+- **증상:** VMM owner 하에 `test-motif3-resident`가 source GGUF map RSS
+  370,412 KiB로 한계(262,144 KiB)를 초과해 실패 (VMM import 직후에도
+  350,312 KiB).
+- **C-control:** **reproduced** — v0.6.3-dfm golden 바이너리도 **동일
+  수치**로 실패 (`gate-20260826/golden-logs/motif-resident.log`).
+  rust-host 무관; 드라이버/커널(610.43.02 / 6.17.0-1031)의 map fault
+  동작 대비 스모크 한계가 낡은 pre-existing.
+- **증거:** `gate-20260826/g2-logs/motif-resident-owner.log` (candidate),
+  `gate-20260826/golden-logs/motif-resident.log` (golden).
+- **스코프:** 엔진/테스트 한계 (residency 스모크 한계 재산정 필요).
+- **상태:** Open.
