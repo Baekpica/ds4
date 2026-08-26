@@ -69,6 +69,35 @@ impl ContMemGov for AdmitAlways {
     }
 }
 
+#[cfg(any(feature = "native", test))]
+fn gov_status_from_core(status: ds4_core::GovStatus) -> GovStatus {
+    match status {
+        ds4_core::GovStatus::Admit => GovStatus::Admit,
+        ds4_core::GovStatus::RefuseClass => GovStatus::RefuseClass,
+        ds4_core::GovStatus::RefuseLive => GovStatus::RefuseLive,
+        ds4_core::GovStatus::RetryObs => GovStatus::RetryObs,
+        ds4_core::GovStatus::Unsupported => GovStatus::Unsupported,
+        ds4_core::GovStatus::Fault => GovStatus::Fault,
+    }
+}
+
+/// Host D0b evaluator at the rolling-admit seam. `proposed_outstanding`
+/// is an absolute lease replacement (sec 6.2), not a token count. Do not
+/// invent a tokens-to-bytes formula here.
+#[cfg(any(feature = "native", test))]
+pub(crate) struct HostMemGov {
+    pub ledger: ds4_core::GovLedger,
+    pub obs: ds4_core::MemObservation,
+    pub claim: ds4_core::GovClaim,
+}
+
+#[cfg(any(feature = "native", test))]
+impl ContMemGov for HostMemGov {
+    fn charge(&mut self, _prompt_n: i32, _max_new: i32) -> GovStatus {
+        gov_status_from_core(ds4_core::gov_evaluate(&self.ledger, &self.obs, &self.claim).status())
+    }
+}
+
 /// Charge one rolling admit. `Ok` means place the job; `Err` is the same
 /// typed reason C/serial-cont would tick on `/metrics`.
 pub(crate) fn charge_roll_admit(
@@ -340,5 +369,93 @@ mod tests {
         // Then: first admits; second is the same live_headroom refuse
         assert_eq!(first, Ok(()));
         assert_eq!(second, Err(RejectReason::LiveHeadroom));
+    }
+
+    fn c_d0b_ledger() -> ds4_core::GovLedger {
+        let mut lg = ds4_core::GovLedger::default();
+        let mut faults = 0;
+        assert!(ds4_core::gov_lease_publish(
+            &mut lg,
+            ds4_core::GovConsumer::EngineBoot as i32,
+            10000,
+            10000,
+            0,
+            &mut faults
+        ));
+        assert!(ds4_core::gov_lease_publish(
+            &mut lg,
+            ds4_core::GovConsumer::Prewarm as i32,
+            200,
+            200,
+            0,
+            &mut faults
+        ));
+        assert!(ds4_core::gov_lease_publish(
+            &mut lg,
+            ds4_core::GovConsumer::BatchBankPlan as i32,
+            1200,
+            1000,
+            0,
+            &mut faults
+        ));
+        assert!(ds4_core::gov_lease_publish(
+            &mut lg,
+            ds4_core::GovConsumer::SerialSession as i32,
+            0,
+            0,
+            200,
+            &mut faults
+        ));
+        lg.floor_bytes = 600;
+        lg.substrate_outstanding = 50;
+        lg
+    }
+
+    fn bank_claim(proposed: u64, class_limit: u64) -> ds4_core::GovClaim {
+        ds4_core::GovClaim {
+            requester: ds4_core::GovConsumer::BatchBankPlan as i32,
+            memc: 12,
+            domain: 0,
+            proposed_outstanding: proposed,
+            operation_transient: 0,
+            class_limit,
+        }
+    }
+
+    fn host_gov(free_bytes: u64, proposed: u64, class_limit: u64) -> super::HostMemGov {
+        super::HostMemGov {
+            ledger: c_d0b_ledger(),
+            obs: ds4_core::MemObservation {
+                status: ds4_core::MemObsStatus::Ok,
+                source: ds4_core::MemObsSource::MeminfoAvailable,
+                free_bytes,
+                total_bytes: 20000,
+            },
+            claim: bank_claim(proposed, class_limit),
+        }
+    }
+
+    #[test]
+    fn host_mem_gov_admits_c_d0b_exact_headroom() {
+        let mut gov = host_gov(1350, 1500, 2000);
+        assert_eq!(charge_roll_admit(&mut gov, 1, 1), Ok(()));
+    }
+
+    #[test]
+    fn host_mem_gov_refuses_live_one_byte_short() {
+        let mut gov = host_gov(1349, 1500, 2000);
+        assert_eq!(
+            charge_roll_admit(&mut gov, 1, 1),
+            Err(RejectReason::LiveHeadroom)
+        );
+    }
+
+    #[test]
+    fn host_mem_gov_refuses_class_before_live() {
+        let mut gov = host_gov(u64::MAX / 2, 2500, 2000);
+        assert_eq!(
+            charge_roll_admit(&mut gov, 1, 1),
+            Err(RejectReason::ClassBudget)
+        );
     }
 }
