@@ -70,6 +70,14 @@ impl From<RenderError> for GenerateError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeGraphFit {
+    pub need_bytes: u64,
+    pub avail_bytes: u64,
+    pub headroom_bytes: u64,
+    pub fail_open: bool,
+}
+
 pub trait DecodeIo {
     fn model_id(&self) -> i32;
     fn kv_store_mut(&mut self) -> Option<&mut KvStore> {
@@ -120,6 +128,9 @@ pub trait DecodeIo {
         min_p: f32,
         rng: &mut u64,
     ) -> i32;
+    fn native_graph_fit(&self, _ctx: i32) -> Option<NativeGraphFit> {
+        None
+    }
     fn pos(&self) -> i32;
     fn ctx(&self) -> i32;
     fn generation(&self) -> u64;
@@ -1965,6 +1976,16 @@ impl DecodeIo for NativeDecode<'_> {
             return v.is_stop(token);
         }
         self.model.token_is_stop(token)
+    }
+
+    fn native_graph_fit(&self, ctx: i32) -> Option<NativeGraphFit> {
+        let quote = self.model.session_graph_fit_quote(ctx)?;
+        Some(NativeGraphFit {
+            need_bytes: quote.need_bytes,
+            avail_bytes: quote.avail_bytes,
+            headroom_bytes: quote.headroom_bytes,
+            fail_open: quote.fail_open,
+        })
     }
 
     fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError> {

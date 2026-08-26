@@ -140,6 +140,35 @@ pub(crate) const fn unquoted_serial_fit() -> SerialFitQuote {
     }
 }
 
+/// Map C `ds4_session_graph_fit_quote` bytes. `fail_open` means the
+/// probe had no budget numbers; treat that as quote failure so the
+/// caller keeps the unquoted margin instead of inventing a refuse.
+pub(crate) fn serial_fit_from_native(
+    need_bytes: u64,
+    avail_bytes: u64,
+    headroom_bytes: u64,
+    reclaimable_bytes: u64,
+    fail_open: bool,
+) -> Option<SerialFitQuote> {
+    if fail_open {
+        return None;
+    }
+    Some(SerialFitQuote {
+        avail: AvailBytes::from_raw(avail_bytes),
+        need: NeedBytes::from_raw(need_bytes),
+        reclaimable: ReclaimableBytes::from_raw(reclaimable_bytes),
+        headroom: HeadroomBytes::from_raw(headroom_bytes),
+    })
+}
+
+/// Test override, then a live quote, else the unquoted margin.
+pub(crate) fn resolve_serial_fit(
+    configured: Option<SerialFitQuote>,
+    live: Option<SerialFitQuote>,
+) -> SerialFitQuote {
+    configured.or(live).unwrap_or_else(unquoted_serial_fit)
+}
+
 /// One serial fit-quote plus what idle banks can still return.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SerialReclaimAsk {

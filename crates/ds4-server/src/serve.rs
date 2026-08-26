@@ -36,8 +36,8 @@ use crate::route::{
 };
 use crate::serve_cont::{cont_prompt_tokens, ContExec};
 use crate::serve_serial_reclaim::{
-    serial_capacity_refuse_msg, serial_reclaim_gate, unquoted_serial_fit, MemFloor, SerialFitQuote,
-    SerialReclaimOutcome,
+    resolve_serial_fit, serial_capacity_refuse_msg, serial_fit_from_native, serial_reclaim_gate,
+    MemFloor, SerialFitQuote, SerialReclaimOutcome,
 };
 use crate::serve_static::{
     run_static_routed, write_static_completion, DetachedStatic, StaticFinish, StaticJob, StaticRow,
@@ -1369,7 +1369,16 @@ fn run_serial<W: TerminalSink>(
         };
     }
 
-    let quote = cfg.serial_fit.unwrap_or_else(unquoted_serial_fit);
+    let live = engine.native_graph_fit(cfg.ctx).and_then(|quote| {
+        serial_fit_from_native(
+            quote.need_bytes,
+            quote.avail_bytes,
+            quote.headroom_bytes,
+            0,
+            quote.fail_open,
+        )
+    });
+    let quote = resolve_serial_fit(cfg.serial_fit, live);
     match serial_reclaim_gate(quote.ask(MemFloor::from_gb(cfg.mem_floor_gb))) {
         SerialReclaimOutcome::Admit { .. } => {}
         SerialReclaimOutcome::Refuse { .. } => {

@@ -6,9 +6,9 @@ use crate::generate::ScriptedDecode;
 use crate::serve::{handle_client_inner, ServerConfig, ServerInner};
 use crate::serve_cont_roll::RejectReason;
 use crate::serve_serial_reclaim::{
-    serial_capacity_refuse_msg, serial_reclaim_gate, serial_reclaim_rank, unquoted_serial_fit,
-    AvailBytes, HeadroomBytes, MemFloor, NeedBytes, ReclaimBank, ReclaimableBytes, SerialFitQuote,
-    SerialReclaimAsk, SerialReclaimOutcome,
+    resolve_serial_fit, serial_capacity_refuse_msg, serial_fit_from_native, serial_reclaim_gate,
+    serial_reclaim_rank, unquoted_serial_fit, AvailBytes, HeadroomBytes, MemFloor, NeedBytes,
+    ReclaimBank, ReclaimableBytes, SerialFitQuote, SerialReclaimAsk, SerialReclaimOutcome,
 };
 
 const GIB: u64 = 1 << 30;
@@ -128,6 +128,28 @@ fn mem_floor_cli_wins_over_env() {
 fn unquoted_live_fit_admits_without_harder_refuse() {
     let out = serial_reclaim_gate(unquoted_serial_fit().ask(MemFloor::from_gb(4)));
     assert_eq!(out, SerialReclaimOutcome::Admit { reclaimed: 0 });
+}
+
+#[test]
+fn fail_open_quote_falls_back_to_unquoted_margin() {
+    assert!(serial_fit_from_native(7_090_000_000, 5_460_000_000, 0, 0, true).is_none());
+    let quote = resolve_serial_fit(None, None);
+    assert_eq!(
+        serial_reclaim_gate(quote.ask(MemFloor::from_gb(4))),
+        SerialReclaimOutcome::Admit { reclaimed: 0 }
+    );
+}
+
+#[test]
+fn live_quote_numbers_drive_the_gate_without_raising_the_floor() {
+    let quote = serial_fit_from_native(7_090_000_000, 5_460_000_000, 256, 6_000_000_000, false)
+        .expect("numbered quote");
+    let out = serial_reclaim_gate(quote.ask(MemFloor::from_gb(4)));
+    assert!(out.admitted(), "{out:?}");
+    assert_eq!(
+        resolve_serial_fit(Some(unquoted_serial_fit()), Some(quote)),
+        unquoted_serial_fit()
+    );
 }
 
 fn drive_serial_completion(cfg: &ServerConfig) -> Vec<u8> {
