@@ -93,6 +93,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     (void)out; (void)e; (void)ctx_size; STUB("ds4_session_create");
 }
 void ds4_session_free(ds4_session *s) { (void)s; STUB("ds4_session_free"); }
+int ds4_session_power(ds4_session *s) {
+    (void)s; STUB("ds4_session_power");
+}
+int ds4_session_set_power(ds4_session *s, int power_percent) {
+    (void)s; (void)power_percent; STUB("ds4_session_set_power");
+}
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     (void)s; (void)err; (void)errlen;
     bridge_sync_calls++;
@@ -117,6 +123,35 @@ void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *
 }
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
     (void)s; (void)token; (void)err; (void)errlen; STUB("ds4_session_eval");
+}
+int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
+                                        int max_tokens, int eos_token,
+                                        int *accepted, int accepted_cap,
+                                        char *err, size_t errlen) {
+    (void)s; (void)first_token; (void)max_tokens; (void)eos_token;
+    (void)accepted; (void)accepted_cap; (void)err; (void)errlen;
+    STUB("ds4_session_eval_speculative_argmax");
+}
+int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen) {
+    (void)s; (void)err; (void)errlen;
+    STUB("ds4_session_layer_slice_reset");
+}
+int ds4_session_eval_layer_slice(ds4_session *s,
+                                 const int *tokens,
+                                 uint32_t n_tokens,
+                                 uint32_t pos0,
+                                 uint32_t layer_start,
+                                 uint32_t layer_end,
+                                 const float *input_hc,
+                                 float *output_hc,
+                                 bool output_logits,
+                                 float *logits,
+                                 char *err,
+                                 size_t errlen) {
+    (void)s; (void)tokens; (void)n_tokens; (void)pos0;
+    (void)layer_start; (void)layer_end; (void)input_hc; (void)output_hc;
+    (void)output_logits; (void)logits; (void)err; (void)errlen;
+    STUB("ds4_session_eval_layer_slice");
 }
 int ds4_session_argmax(ds4_session *s) { (void)s; STUB("ds4_session_argmax"); }
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
@@ -150,6 +185,22 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
     (void)s; (void)fp; (void)err; (void)errlen; STUB("ds4_session_save_payload");
 }
+int ds4_session_save_layer_payload(ds4_session *s, FILE *fp,
+                                   uint32_t layer_start, uint32_t layer_end,
+                                   char *err, size_t errlen) {
+    (void)s; (void)fp; (void)layer_start; (void)layer_end;
+    (void)err; (void)errlen;
+    STUB("ds4_session_save_layer_payload");
+}
+int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
+                                   uint64_t payload_bytes,
+                                   const int *tokens, uint32_t n_tokens,
+                                   uint32_t layer_start, uint32_t layer_end,
+                                   char *err, size_t errlen) {
+    (void)s; (void)fp; (void)payload_bytes; (void)tokens; (void)n_tokens;
+    (void)layer_start; (void)layer_end; (void)err; (void)errlen;
+    STUB("ds4_session_load_layer_payload");
+}
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes,
                              char *err, size_t errlen) {
     (void)s; (void)err; (void)errlen;
@@ -180,6 +231,14 @@ void ds4_encode_chat_prompt(ds4_engine *e, const char *system, const char *promp
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     (void)s; (void)out; (void)k; STUB("ds4_session_top_logprobs");
 }
+int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
+    (void)s; (void)out; (void)cap; STUB("ds4_session_copy_logits");
+}
+int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp,
+                                  char *err, size_t errlen) {
+    (void)s; (void)iters; (void)fp; (void)err; (void)errlen;
+    STUB("ds4_session_output_head_bench");
+}
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {
     (void)e; (void)text; (void)out; STUB("ds4_tokenize_rendered_chat");
 }
@@ -206,6 +265,10 @@ int ds4_batch_ctx_max_seq(const ds4_batch_ctx *ctx) {
 }
 int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
 int ds4_batch_ctx_seq_cap(const ds4_batch_ctx *ctx) { (void)ctx; return 0; }
+bool ds4_batch_ctx_supports_partial_reuse(const ds4_batch_ctx *ctx) {
+    (void)ctx;
+    return false;
+}
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx,
                                     const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens,

@@ -316,6 +316,7 @@ void ds4_bridge_batch_ctx_destroy(ds4_bridge_batch_ctx *c);
 int ds4_bridge_batch_ctx_max_seq(ds4_bridge_batch_ctx *c);
 int ds4_bridge_batch_ctx_raw_cap(ds4_bridge_batch_ctx *c);
 int ds4_bridge_batch_ctx_seq_cap(ds4_bridge_batch_ctx *c);
+int ds4_bridge_batch_ctx_supports_partial_reuse(ds4_bridge_batch_ctx *c);
 
 /* Static greedy batch over the persistent native context.  Prompts and output
  * arrays are caller-owned.  Successful token streams are copied contiguously,

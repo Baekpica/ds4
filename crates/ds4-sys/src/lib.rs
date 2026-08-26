@@ -634,6 +634,8 @@ extern "C" {
 
     pub fn ds4_bridge_batch_ctx_seq_cap(c: *mut ds4_bridge_batch_ctx) -> c_int;
 
+    pub fn ds4_bridge_batch_ctx_supports_partial_reuse(c: *mut ds4_bridge_batch_ctx) -> c_int;
+
     pub fn ds4_bridge_batch_ctx_generate_static(
         c: *mut ds4_bridge_batch_ctx,
         prompt_tokens: *const *const i32,

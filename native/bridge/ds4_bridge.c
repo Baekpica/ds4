@@ -1239,6 +1239,12 @@ int ds4_bridge_batch_ctx_seq_cap(ds4_bridge_batch_ctx *c)
     return ds4_batch_ctx_seq_cap(c->ctx);
 }
 
+int ds4_bridge_batch_ctx_supports_partial_reuse(ds4_bridge_batch_ctx *c)
+{
+    if (!c || !c->ctx) return 0;
+    return ds4_batch_ctx_supports_partial_reuse(c->ctx);
+}
+
 int ds4_bridge_batch_ctx_generate_static(
         ds4_bridge_batch_ctx *c,
         const int32_t *const *prompt_tokens,
