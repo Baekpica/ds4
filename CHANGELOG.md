@@ -15,20 +15,27 @@ and resolved identically to llama.cpp.
 
 - **`--reasoning-replay keep|drop`** (env `DS4_REASONING_REPLAY=drop`) —
   agent scaffolds that echo assistant messages verbatim re-send
-  `reasoning_content`, and the tool-context chat render re-emitted it
-  inside `<think>` blocks. llama-server drops it by default and
-  DeepSeek's reference API rejects it, so on the identical conversation
-  this engine ran 16-28% deeper per turn, entering the depth band where
-  the 2.4-bpw quant's tool-protocol adherence slips (measured: 50% of
-  turns settle as prose completion reports instead of tool calls at
-  70-80K prompt tokens). `drop` renders history assistant turns in the
-  lean `</think>` replay form; assistant turns being continued (after
-  the last user-like message) always keep their reasoning. Measured
-  steady-state cost: a one-turn-tail re-prefill (~270 tokens / ~0.6 s)
-  absorbed by the cont bank's partial-prefix admission. Default stays
-  `keep` (byte-identical prior behavior, warm in-place reuse for
-  echoing clients); the default is expected to flip to `drop` in a
-  future release.
+  `reasoning_content`, and the tool-context chat render re-emits it
+  inside `<think>` blocks. That is the V4 reference format: the
+  reference encoding disables thinking-drop whenever tools are present,
+  and DeepSeek's API requires the echo in tool loops (it returns 400
+  when `reasoning_content` is not passed back). llama-server's template
+  default drops it, a deviation from the reference format, and on the
+  identical conversation that deviation runs 16-28% shallower per turn.
+  Depth is where the 2.4-bpw quant's tool-protocol adherence slips
+  (measured: 50% of turns settle as prose completion reports instead of
+  tool calls at 70-80K prompt tokens), so on low-bit quants the
+  deviation pays. `drop` reproduces it opt-in: history assistant turns
+  render in the lean `</think>` replay form; assistant turns being
+  continued (after the last user-like message) always keep their
+  reasoning. Measured steady-state cost: a one-turn-tail re-prefill
+  (~270 tokens / ~0.6 s) absorbed by the cont bank's partial-prefix
+  admission. The default stays `keep`, which is both the byte-identical
+  prior behavior and the reference-faithful one; `drop` is the
+  recommended setting for long agent loops on low-bit quants.
+  (Correction note, 2026-08-26: this entry originally claimed
+  DeepSeek's API rejects replayed reasoning; the opposite is true in
+  tool loops, per their thinking-mode guide.)
 - **`--tool-slip-resample`** (env `DS4_TOOL_SLIP_RESAMPLE=1`, off by
   default) — when a continuously-batched non-streaming tools-armed chat
   turn settles at `finish=stop` with no tool calls, the request is

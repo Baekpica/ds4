@@ -904,15 +904,20 @@ static bool g_native_reasoning_effort = false;
 
 /* Issue #18 residual: agent scaffolds that echo assistant messages verbatim
  * re-send reasoning_content, and the tool-context render re-emits it inside
- * <think>...</think> -- the conversation then runs 16-28% deeper per turn
- * than the same transcript on llama.cpp (default drops it) or DeepSeek's
- * reference API (rejects it), entering the depth band where the quant's
- * tool-protocol adherence slips (measured 50% no-tool-call turns at 70-80K).
- * --reasoning-replay drop renders history assistant turns lean; the cont
- * bank's partial-prefix admission absorbs the divergence at a measured cost
- * of a one-turn tail re-prefill (~270 tokens / ~0.6s per turn).  Default
- * keeps the replay (warm in-place reuse for echoing clients); assistant
- * turns being CONTINUED (after the last user message) always keep their
+ * <think>...</think>.  That IS the V4 reference format: the reference
+ * encoding disables drop_thinking whenever tools are present, and
+ * DeepSeek's API returns 400 in tool loops when reasoning_content is NOT
+ * passed back (api-docs thinking-mode guide, verified 2026-08-26).  The
+ * cost is depth: the conversation runs 16-28% deeper per turn than on
+ * llama.cpp, whose template default drops replayed reasoning (a deviation
+ * from the reference format), and depth is where the low-bit quant's
+ * tool-protocol adherence slips (measured 50% no-tool-call turns at
+ * 70-80K).  --reasoning-replay drop reproduces llama.cpp's deviation
+ * opt-in, trading format fidelity for shallower context; the cont bank's
+ * partial-prefix admission absorbs the divergence at a measured cost of a
+ * one-turn tail re-prefill (~270 tokens / ~0.6s per turn).  Default keeps
+ * the replay (reference-faithful, warm in-place reuse); assistant turns
+ * being CONTINUED (after the last user message) always keep their
  * reasoning regardless. */
 static bool g_reasoning_replay_drop = false;
 
@@ -18931,11 +18936,13 @@ static void usage(FILE *fp) {
         "      default. Env twin: DS4_TOOL_SLIP_RESAMPLE=1.\n"
         "  --reasoning-replay MODE\n"
         "      keep (default): reasoning_content echoed by the client in tool-context\n"
-        "      history renders back into <think> blocks (keeps the rendered prefix\n"
-        "      aligned with live KV for warm in-place reuse). drop: render history\n"
-        "      assistant turns lean, like llama.cpp's default and DeepSeek's API --\n"
-        "      the conversation runs 16-28%% shallower per turn on echoing agent\n"
-        "      scaffolds, at the cost of a one-turn-tail re-prefill per turn.\n"
+        "      history renders back into <think> blocks -- the V4 reference format\n"
+        "      (DeepSeek's API requires the echo in tool loops), and it keeps the\n"
+        "      rendered prefix aligned with live KV for warm in-place reuse. drop:\n"
+        "      render history assistant turns lean, like llama.cpp's template\n"
+        "      default (a deviation from the reference format) -- 16-28%% shallower\n"
+        "      conversations on echoing agent scaffolds, at the cost of a one-turn-\n"
+        "      tail re-prefill per turn; measured to help low-bit quants at depth.\n"
         "      Assistant turns being continued (after the last user message) always\n"
         "      keep their reasoning. Env twin: DS4_REASONING_REPLAY=drop.\n"
         "  --reasoning-effort LEVEL\n"

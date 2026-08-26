@@ -273,19 +273,25 @@ workloads; see the changelog for the receipts):
 
 **`--reasoning-replay keep|drop`** (env `DS4_REASONING_REPLAY=drop`).
 Most OpenAI-style agent scaffolds echo each assistant message back
-verbatim, including `reasoning_content`. Under the default `keep`, the
-tool-context render re-emits that reasoning inside `<think>` blocks, which
-keeps the rendered prefix byte-aligned with the live KV (warm in-place
-reuse, no re-prefill). The cost is depth: llama-server drops replayed
-reasoning by default and DeepSeek's API rejects it, so on the identical
-conversation this server runs 16-28% deeper per turn, and depth is where
-low-bit quants start missing the tool-call protocol. `drop` renders
-history assistant turns in the lean `</think>` replay form instead;
-the bank's partial-prefix admission absorbs the divergence at the cost of
-a one-turn-tail re-prefill (~270 tokens measured). An assistant turn being
-continued (after the last user-like message) always keeps its reasoning.
-For agent workloads on quantized weights, `drop` is the recommended
-setting and is expected to become the default.
+verbatim, including `reasoning_content`. That is what DeepSeek specifies
+for this model family: the V4 reference encoding keeps reasoning for
+every turn whenever tools are present, and DeepSeek's API requires the
+echo in tool loops (it returns 400 when `reasoning_content` is not
+passed back). Under the default `keep`, the tool-context render honors
+that format and re-emits the reasoning inside `<think>` blocks, which
+also keeps the rendered prefix byte-aligned with the live KV (warm
+in-place reuse, no re-prefill). The cost is depth: llama-server's
+template default drops replayed reasoning, a deviation from the
+reference format, and on the identical conversation that deviation runs
+16-28% shallower per turn. Depth is where low-bit quants start missing
+the tool-call protocol, so on this ship quant the deviation pays.
+`drop` reproduces it opt-in, rendering history assistant turns in the
+lean `</think>` replay form; the bank's partial-prefix admission absorbs
+the divergence at the cost of a one-turn-tail re-prefill (~270 tokens
+measured). An assistant turn being continued (after the last user-like
+message) always keeps its reasoning. For long agent loops on low-bit
+quants, `drop` is the recommended setting; the default stays `keep`,
+the reference-faithful behavior.
 
 **`--tool-slip-resample`** (env `DS4_TOOL_SLIP_RESAMPLE=1`, off by
 default). At depth a quantized model occasionally answers a tools-armed
