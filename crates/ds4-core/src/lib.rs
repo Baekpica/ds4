@@ -94,19 +94,18 @@ use ds4_sys::{
     ds4_bridge_bind_plan, ds4_bridge_bind_plan_check, ds4_bridge_bind_slot,
     ds4_bridge_distributed_options, ds4_bridge_encode_chat_prompt, ds4_bridge_eval,
     ds4_bridge_eval_speculative_argmax, ds4_bridge_graph_fit_quote, ds4_bridge_model,
-    ds4_bridge_model_boot_prewarm, ds4_bridge_model_free, ds4_bridge_model_id,
-    ds4_bridge_model_open, ds4_bridge_model_open_distributed, ds4_bridge_model_open_options,
-    ds4_bridge_model_routed_quant_bits, ds4_bridge_model_run_distributed_worker,
-    ds4_bridge_session, ds4_bridge_session_argmax, ds4_bridge_session_argmax_excluding,
-    ds4_bridge_session_copy_logits, ds4_bridge_session_create, ds4_bridge_session_ctx,
-    ds4_bridge_session_distributed_route_ready, ds4_bridge_session_eval_layer_slice,
-    ds4_bridge_session_exaone_rewind_span, ds4_bridge_session_free, ds4_bridge_session_generation,
-    ds4_bridge_session_graph_fit_quote, ds4_bridge_session_invalidate,
-    ds4_bridge_session_layer_slice_reset, ds4_bridge_session_load_layer_payload,
-    ds4_bridge_session_load_payload, ds4_bridge_session_load_payload_range,
-    ds4_bridge_session_load_snapshot, ds4_bridge_session_output_head_bench,
-    ds4_bridge_session_power, ds4_bridge_session_prefill_cap, ds4_bridge_session_rewind,
-    ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
+    ds4_bridge_model_boot_prewarm, ds4_bridge_model_free, ds4_bridge_model_open,
+    ds4_bridge_model_open_distributed, ds4_bridge_model_open_options,
+    ds4_bridge_model_run_distributed_worker, ds4_bridge_session, ds4_bridge_session_argmax,
+    ds4_bridge_session_argmax_excluding, ds4_bridge_session_copy_logits, ds4_bridge_session_create,
+    ds4_bridge_session_ctx, ds4_bridge_session_distributed_route_ready,
+    ds4_bridge_session_eval_layer_slice, ds4_bridge_session_exaone_rewind_span,
+    ds4_bridge_session_free, ds4_bridge_session_generation, ds4_bridge_session_graph_fit_quote,
+    ds4_bridge_session_invalidate, ds4_bridge_session_layer_slice_reset,
+    ds4_bridge_session_load_layer_payload, ds4_bridge_session_load_payload,
+    ds4_bridge_session_load_payload_range, ds4_bridge_session_load_snapshot,
+    ds4_bridge_session_output_head_bench, ds4_bridge_session_power, ds4_bridge_session_prefill_cap,
+    ds4_bridge_session_rewind, ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
     ds4_bridge_session_save_payload, ds4_bridge_session_save_snapshot,
     ds4_bridge_session_set_power, ds4_bridge_session_sync, ds4_bridge_session_top_logprobs,
     ds4_bridge_shard, ds4_bridge_snapshot, ds4_bridge_snapshot_create, ds4_bridge_snapshot_free,
@@ -882,9 +881,9 @@ fn pack_sibling_ffi(attach: &SiblingAttach) -> Result<FfiSupport> {
 //   ds4_bridge_model_open / open_distributed (open_impl)
 //   ds4_bridge_model_free (Drop: session before model, siblings before base)
 //   ds4_bridge_model_boot_prewarm (device graph/weight warm)
-// MOVE later (host already has the data, or production already left):
-//   ds4_bridge_model_id -> Shape::model_id from identify_gguf
-//   ds4_bridge_model_routed_quant_bits -> host inventory tensor types
+// MOVED (host catalog, no FFI):
+//   model_id / routed_quant_bits
+// MOVE later (production already left):
 //   ds4_bridge_model_run_distributed_worker -> assemble_worker (oracle FFI)
 impl Model {
     pub fn open(
@@ -1212,14 +1211,16 @@ impl Model {
             Backend::Cpu => SessionBackend::Cpu,
             Backend::Cuda | Backend::Metal => SessionBackend::Cuda,
         };
+        let mut host = SessionLedger::new(
+            self.family,
+            host_backend,
+            ledger_ctx(ctx_size, native_ctx),
+            prefill.max(0) as u32,
+        );
+        host.set_n_swa(self.bind_plan.shape.n_swa);
         Ok(Session {
             raw,
-            host: SessionLedger::new(
-                self.family,
-                host_backend,
-                ledger_ctx(ctx_size, native_ctx),
-                prefill.max(0) as u32,
-            ),
+            host,
             _model: PhantomData,
             _not_send: PhantomData,
         })
@@ -1229,12 +1230,18 @@ impl Model {
         unsafe { ds4_bridge_model_boot_prewarm(self.raw.as_ptr()) }
     }
 
-    pub fn model_id(&self) -> i32 {
-        unsafe { ds4_bridge_model_id(self.raw.as_ptr()) }
+    pub fn shape(&self) -> Shape {
+        self.bind_plan.shape
     }
 
+    /// C `ds4_engine_model_id` is `DS4_MODEL_VARIANT`. Host shape is the truth.
+    pub fn model_id(&self) -> i32 {
+        self.bind_plan.shape.model_id()
+    }
+
+    /// C `ds4_engine_routed_quant_bits` walks base `ffn_gate_exps`.
     pub fn routed_quant_bits(&self) -> i32 {
-        unsafe { ds4_bridge_model_routed_quant_bits(self.raw.as_ptr()) }
+        self.bind_plan.routed_quant_bits()
     }
 
     pub fn session_graph_fit_quote(&self, ctx_size: i32) -> Option<GraphFitQuote> {
@@ -1374,7 +1381,11 @@ impl Session<'_> {
     }
 
     pub fn last_plan(&self, tokens: &[i32]) -> SyncPlan {
-        let span = unsafe { ds4_bridge_session_exaone_rewind_span(self.raw.as_ptr()) };
+        let span = if self.host.family == ModelFamily::ExaoneMoe {
+            unsafe { ds4_bridge_session_exaone_rewind_span(self.raw.as_ptr()) }
+        } else {
+            0
+        };
         self.host.plan_sync(tokens, span)
     }
 

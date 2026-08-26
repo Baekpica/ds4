@@ -664,6 +664,24 @@ impl BindPlan {
         }
     }
 
+    /// C `ds4_engine_routed_quant_bits`: first base `ffn_gate_exps` wins.
+    /// Q4_K → 4, any other present type → 2, none → 0.
+    pub fn routed_quant_bits(&self) -> i32 {
+        const T_Q4_K: u32 = 12;
+        for slot in &self.slots {
+            if slot.name.starts_with("mtp.") || slot.name.starts_with("dspark.") {
+                continue;
+            }
+            if !slot.name.contains("ffn_gate_exps") {
+                continue;
+            }
+            if let Some(tensor) = &slot.tensor {
+                return if tensor.typ == T_Q4_K { 4 } else { 2 };
+            }
+        }
+        0
+    }
+
     pub fn missing_required(&self) -> Vec<&str> {
         self.slots
             .iter()
@@ -1079,4 +1097,62 @@ pub fn dump_bind_lookup_tapes() -> String {
     let (rc, err, idx) = host_bind_lookup(Some((3, Some(&ok))), Some("token_embd.weight"), 8);
     out.push_str(&lookup_line("ok", rc, &err, idx));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shape::SHAPE_FLASH;
+    use crate::tensors::TensorInfo;
+
+    fn gate(name: &str, typ: u32) -> BindSlot {
+        BindSlot {
+            name: name.into(),
+            need: BindNeed::Required,
+            tensor: Some(TensorInfo {
+                name: name.into(),
+                ndim: 2,
+                dim: [1, 1, 0, 0, 0, 0, 0, 0],
+                typ,
+                rel_offset: 0,
+                abs_offset: 0,
+                elements: 1,
+                bytes: 1,
+                shard: 0,
+            }),
+            index: Some(0),
+        }
+    }
+
+    fn plan(slots: Vec<BindSlot>) -> BindPlan {
+        BindPlan {
+            shape: SHAPE_FLASH,
+            slots,
+            n_shards: 1,
+            data_pos: 0,
+            alignment: 32,
+            page: 4096,
+        }
+    }
+
+    #[test]
+    fn routed_quant_bits_matches_c_gate_type() {
+        assert_eq!(plan(vec![]).routed_quant_bits(), 0);
+        assert_eq!(
+            plan(vec![gate("blk.0.ffn_gate_exps.weight", 12)]).routed_quant_bits(),
+            4
+        );
+        assert_eq!(
+            plan(vec![gate("blk.0.ffn_gate_exps.weight", 10)]).routed_quant_bits(),
+            2
+        );
+        assert_eq!(
+            plan(vec![
+                gate("mtp.0.ffn_gate_exps.weight", 12),
+                gate("blk.2.ffn_gate_exps.weight", 16),
+            ])
+            .routed_quant_bits(),
+            2
+        );
+    }
 }
