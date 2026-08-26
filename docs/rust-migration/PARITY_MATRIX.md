@@ -1,9 +1,24 @@
 # Parity matrix
 
-> **Freshness (2026-08-26):** the cell states below predate the rust-host
-> campaign waves and are **stale**. The live authority is the newest
-> `RUST_HOST_CAMPAIGN_STATUS-*.md` + `HANDOFF-*-KST.md` in this directory;
-> this matrix is redrawn only from a fresh §10 re-run at promotion time.
+> **Freshness (2026-08-26 22:40 KST):** restamped from post-promote §10
+> CAND `cb11c0b`. Live authority remains the campaign status doc.
+> Production defaults are Rust. Historical phase-gate notes below are
+> kept as provenance; the 60-cell table is the gate.
+
+## Post-promote §10 (`cb11c0b`)
+
+Evidence: `.omo/evidence/task-53-rerun-cb11c0b.txt`.
+PASS 55 + PASS* 5 (E-2..E-6) + FAIL 0 + BLOCKED 0.
+
+| Axis | Result |
+|---|---|
+| Numerical | family kernels + mmq PASS; family IMA/decode gaps = E-2..E-6 (C-shared) |
+| Token | DeepSeek logprob vectors PASS; Motif batch expected-vector miss = E-4 |
+| KV | DeepSeek 4-way ordinary/continued/tool-map/periodic/evict/partial PASS; Motif shutdown 4-way PASS |
+| Wire/API | DeepSeek 4 surfaces × serial/cont/static PASS (C=`ds4-server-c`, Rust=`ds4-server`); barrier width=2 PASS |
+| Performance | Motif ABBA PASS (prefill 99.95%, decode 100%, TTFT +1.1%, HWM +1.0%); proofs smoke/long/opp-c/rust-opp-c PASS |
+
+Soak (2h mixed DeepSeek) is not in this table.
 
 “Rust works” is not `cargo build`. A host change is accepted only
 when all five axes that it can affect are green. CUDA optimization

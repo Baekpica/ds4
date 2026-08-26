@@ -1,12 +1,10 @@
 # Migration status
 
-> **Freshness (2026-08-26):** this matrix predates the rust-host campaign
-> waves and is **stale below this banner**. The live authority for what is
-> done, blocked, and KEEP is the newest
-> `RUST_HOST_CAMPAIGN_STATUS-*.md` + `HANDOFF-*-KST.md` in this directory.
-> Per the campaign contract this matrix is redrawn only from a fresh §10
-> re-run at promotion time — cells here must not be upgraded piecemeal.
-> Phase 9 is NOT_GREEN; production binaries are still C.
+> **Freshness (2026-08-26 22:40 KST):** restamped from post-promote §10
+> CAND `cb11c0b` (`task-53-rerun-cb11c0b.txt`, FAIL=0 BLOCKED=0,
+> PASS* = E-2..E-6). Default names are Rust. C oracles are `*-c`.
+> `ds4-eval` stays C. Soak (T1.8) and `SPLIT_READINESS.md` are still
+> pending. Engine gaps live in [ENGINE_GAPS.md](ENGINE_GAPS.md).
 
 Update this table in the same commit that changes a subsystem’s
 state. Colors: `green` = gate passed, `yellow` = partial / in
@@ -51,22 +49,23 @@ Rust. They must not be read as production-path integration.
 | 6 | Distributed runtime port | **isolated parity green** (`make test-dist-parity`); production still uses C pipelined prefetch, snapshot, and `ds4_dist_session_*` |
 | 7 | Server shadow by feature | **partial** — bounded owner-FIFO/terminal/disconnect CPU contract is green at `6545d44`; fixtures, live Motif serial/width-1 continuous, scoped ordinary serial Motif disk replay, scoped DeepSeek intermediate-prefill replay, scoped DeepSeek tool-map four-way, and scoped width-1 bank shutdown/replay are green, but static, live multi-client continuous batching, multi-bank fork/partial semantics, Anthropic/Responses continuous, and the remaining KV policies/surfaces are missing |
 | 8 | `ds4.c` decomposition | **partial** — metadata, mmap catalogs, tokenizer (including family chat-transcript framing), and ledger slices are green; engine/model/session/scheduler execution and CUDA upload remain native |
-| 9 | Promote Rust binaries to default names | **not started** — blocked on Rust model/session/scheduler ownership, leaf-crate production integration, a narrow CUDA ABI, full CLI/bench/agent/server parity, native-drift proof, pre/post family regression, and pre-split performance/soak evidence |
-| split | `SPLIT_READINESS.md` + `dfm-rs` genesis | blocked on the full pre-split readiness gate; do not create the document or repository yet |
+| 9 | Promote Rust binaries to default names | **names promoted** (`cb11c0b`). Makefile copies Cargo `*-rs` bins onto `ds4` / `ds4-server` / `ds4-bench` / `ds4-agent`. C oracles are `ds4-c` / `ds4-server-c` / `ds4-bench-c` / `ds4-agent-c`. Post-promote §10 GREEN. Soak not yet run. |
+| split | `SPLIT_READINESS.md` + `dfm-rs` genesis | blocked on soak (T1.8); do not seed `dfm-rs` yet |
 
 ## Current default binaries
 
 | Name | Implementation |
 |---|---|
-| `ds4` | C |
-| `ds4-server` | C |
-| `ds4-bench` | C |
-| `ds4-eval` | C |
-| `ds4-agent` | C |
-| `ds4-rs` | Partial Rust CLI host, same C CUDA core (`make ds4-rs`); diagnostics plus greedy, seeded-sampling, and non-TTY thinking-output one-shot paths are host-owned. TTY color, MTP, REPL, batch, and distributed CLI remain C-only |
-| `ds4-bench-rs` | Local raw-prompt benchmark shadow with the C incremental sync, snapshot/decode/restore timing, and 8-column CSV contract. Live CUDA two-frontier smoke is green; MTP, distributed, chat prompt, logits dump, output-head, warm, quality, and power modes remain C-only |
-| `ds4-agent-rs` | One-turn `--non-interactive -p` no-tool agent shadow over the native model/session/CUDA bridge. Rust owns the built-in tool prompt, transcript assembly, datetime message, sampling loop, and non-TTY projection for this narrow lane; interactive/stdin-repeat, tool execution, KV/resume, MTP, and distributed paths remain C-only |
-| `ds4-server-rs` | Partial Rust HTTP host over the native model/session/scheduler bridge. Client threads parse and drain bounded output while one Rust owner executes native inference through FIFO. Serial, ordinary visible cold + evict/replay, final-sync/decode continued checkpoints, scoped DeepSeek ordinary-serial intermediate-prefill checkpoints, scoped DeepSeek OpenAI Chat no-think tool-map replay, width-1 OpenAI continuous, and scoped width-1 OpenAI Chat no-think/no-tools bank shutdown/replay paths exist; static, live multi-client continuous batching, multi-bank fork/partial replay, bank tool/thinking integration, and Anthropic/Responses continuous do not |
+| `ds4` | Rust host, same C CUDA core (Cargo bin still `ds4-rs`) |
+| `ds4-server` | Rust HTTP host over native CUDA (`--listen`) |
+| `ds4-bench` | Rust bench host |
+| `ds4-agent` | Rust agent host |
+| `ds4-eval` | C (unchanged) |
+| `ds4-c` | C CLI oracle |
+| `ds4-server-c` | C HTTP oracle (`--host`) |
+| `ds4-bench-c` | C bench oracle |
+| `ds4-agent-c` | C agent oracle |
+| `ds4-rs` / `ds4-server-rs` / … | Deprecated aliases (copy of the Rust defaults) |
 | `ds4_weight_server` | native CUDA (unchanged) |
 
 Phase 3/7 live Motif evidence is in `scratch/rust-host-live/` (tmux + workspace-local `../scripts/guarded-run.sh`, outside this repository; sequential C then Rust, `clear_cache` between loads). Production defaults stay C. Live CUDA census on `ds4-server-rs` is green (`census_supported=1`, epoch 1636, weight_artifact 86.07 GiB, observation ok). Live DSpark sibling FFI is green (DeepSeek-V4-Flash-IQ2XXS + DSpark-drafter-Q2K-Q8: C env fallback `Hi` 29.27/21.27 t/s with strict C validate; Rust `--dspark` host-map bind + layout skip, 9 decode ids; sequential, teardown + `clear_cache`). The Rust server has a continuous lane (`--cont-width`, default 2; one active job behind the FIFO owner): `ds4_bridge_batch_ctx_create_fit` + `ds4_bridge_continuous_generate` drive the native rolling scheduler, the host owns per-token stop/tool/think semantics (`ContStepper`), and live Motif routes `openai_chat_continuous` with `Hi.` / stop / 13+2 — byte-equal to C. Client ingress is now concurrent, but the owner still runs each job to completion, so multi-client rolling width is not yet live-proven. Same-lane ABBA is recorded (PARITY_MATRIX: Rust 590.8/592.9 t/s prefill vs C 579.2/633.9; decode within 1%; all four completions byte-identical).

@@ -1,21 +1,21 @@
 # rust-host 캠페인 현황 (2026-08-26 KST)
 
 이 문서는 `rust-host`에서 Phase 2–8 잔여 슬라이스를 닫고 §10 비교까지 돌린
-뒤의 **작업 기록 + 남은 일**이다. `STATUS.md` / `PARITY_MATRIX.md`는
-승격 전 재실행 없이 다시 그리지 않는다. Phase 9와 `SPLIT_READINESS.md`는
-아직 열리지 않았다.
+뒤의 **작업 기록 + 남은 일**이다. 이름 승격(`cb11c0b`)과 post-promote
+§10 GREEN 이후 `STATUS.md` / `PARITY_MATRIX.md`를 이 스탬프에서 다시
+그렸다. Soak와 `SPLIT_READINESS.md`는 아직이다.
 
 | 항목 | 값 |
 |---|---|
 | Branch | `rust-host` (`origin/rust-host`와 동기화) |
-| HEAD | `05a9357` 마지막 코드. 공식 표 CAND는 `11c59e4` (그 위 docs). |
+| HEAD | `cb11c0b` `Make: Promote Rust host to the default binary names` |
 | C golden | `v0.6.3-dfm` (`516456fe35510e4fb8350396c9d88807ac1f760b`) |
-| 기본 바이너리 | 여전히 C (`ds4` / `ds4-server` / `ds4-bench` / `ds4-agent`) |
-| Rust shadow | `ds4-rs` / `ds4-server-rs` / `ds4-bench-rs` / `ds4-agent-rs` |
-| §10 todo-54 | **GREEN** (호스트-패리티; PASS* 포함). 증거 `task-54-rerun-11c59e4.txt` |
-| Phase 9 | **미실행** — 이름 승격(T1.5) 전. `SPLIT_READINESS.md` 없음. `dfm-rs`는 스캐폴드만. |
+| 기본 바이너리 | **Rust** (`ds4` / `ds4-server` / `ds4-bench` / `ds4-agent`). C 오라클 `*-c`. `ds4-eval`은 C. |
+| §10 pre-promote | GREEN (`11c59e4`) |
+| §10 post-promote | **GREEN** (`cb11c0b`, `task-54-rerun-cb11c0b.txt`) |
+| Phase 9 names | **promoted** (`cb11c0b`). Soak / `SPLIT_READINESS.md` / dfm-rs 시딩은 아직. |
 | 플랜 | `.omo/plans/rust-host-remaining-to-phase-9.md` (todos 1–61 `[x]`, F1–F4는 최종 감사) |
-| 작업트리 재검증 | 2026-08-26 20:30 KST. 공식 60셀 GREEN (§3.15). |
+| 작업트리 재검증 | 2026-08-26 22:40 KST. post-promote §10 GREEN (§3.16). |
 
 증거는 `.omo/evidence/task-*-rust-host-remaining-to-phase-9.txt`에 있다
 (untracked, `git add` 금지 목록).
@@ -24,11 +24,12 @@
 
 ## 1. 한 줄 결론
 
-호스트-패리티 **§10 GREEN** (CAND `11c59e4`, todo-54). 60셀
-FAIL=0 BLOCKED=0. PASS* 5셀은 E-2..E-6 (C-control reproduced).
-production 이름은 아직 C. Phase 9 승격(T1.5)은 다음 일이다.
-`STATUS.md` / `PARITY_MATRIX.md` / `SPLIT_READINESS.md` / dfm-rs
-시딩은 승격 후 재실행(T1.6) 전 금지.
+이름 승격 완료. pre-promote와 post-promote §10 모두 **GREEN**
+(`11c59e4`, `cb11c0b`). 기본 이름은 Rust, C는 `*-c`. PASS* = E-2..E-6.
+다음: T1.8 soak 2h. `SPLIT_READINESS.md` / dfm-rs 시딩은 soak 전 금지.
+
+`ds4-c` SHA는 T1.6 `proof-cuda-opp-c` relink로 e9efb70e→95fa6828
+(여전히 C CLI). 다른 오라클·Rust 기본 이름은 T1.5 매핑 유지.
 
 대략:
 
@@ -383,12 +384,25 @@ G2 첫 패스는 `barrier_pair` `set -u`로 (11)에서 죽음. (11)/(13)은
 `run-g2-rem2.sh`로 재스탬프. (8.3) golden `516456f`가 candidate와
 같은 chunk/ring 수치로 실패 → E-6.
 
-호스트 FAIL은 없다. 엔진 갭은 ENGINE_GAPS에만 남는다. **이름 승격은
-아직 없다.**
+호스트 FAIL은 없다. 엔진 갭은 ENGINE_GAPS에만 남는다.
+
+### 3.16 2026-08-26 밤 — T1.5 승격 + T1.6 post-promote GREEN
+
+이름: `cb11c0b`. Rust 기본, C=`*-c`, `ds4-eval` C.
+
+post-promote 표: `.omo/evidence/task-53-rerun-cb11c0b.txt` —
+60셀 PASS 55 + PASS* 5 + FAIL 0 + BLOCKED 0. (11)/(13) 포함
+한 패스에 PASS. FAIL 시그니처는 pre-promote와 동일 (E-2..E-6).
+
+§18.3: Rust 기본 4종 + C `ds4-server-c`/`ds4-bench-c`/`ds4-agent-c`/
+`ds4-eval`은 T1.5 해시 유지. **`ds4-c`만** proof-cuda-opp-c relink로
+e9efb70e→95fa6828 (C CLI 정체 유지).
+
+STATUS/PARITY는 이 표로 재스탬프. 다음 soak.
 
 ---
 
-## 4. §10 비교 결과 (CAND `11c59e4` = GREEN)
+## 4. §10 비교 결과 (pre `11c59e4` GREEN; post `cb11c0b` GREEN)
 
 계약: **모든 열거 셀이 PASS**여야 GREEN. FAIL 또는 BLOCKED가 하나라도 있으면
 NOT_GREEN. crate 컴파일은 GREEN이 아니다.
@@ -768,9 +782,7 @@ serial rightsize 호스트 이식(`fba963e`) + Motif rust serial 4-surface
 5. E-3 Solar IMA — 정본 owner+worker
 6. E-4 Motif batch / E-5 Motif RSS / E-6 dots3 chunk/ring
 
-다음 손: **T1.5 원자 승격**. `STATUS.md` / `PARITY_MATRIX.md` /
-`SPLIT_READINESS.md` / dfm-rs 시딩은 T1.6 전 금지.
-production 이름 변경, `SPLIT_READINESS.md`, `dfm-rs`,
-`STATUS.md` / `PARITY_MATRIX.md` 재작성은 하지 않는다.
+다음 손: **T1.8 soak** (DeepSeek, `./ds4-server`, 2h). 그다음
+SPLIT_READINESS + genesis. 엔진 갭 커밋과 호스트 커밋은 섞지 않는다.
 
 라이브는 항상: **한 모델 → guarded-run → 측정 → 프로세스 종료 → clear_cache → 다음.**
