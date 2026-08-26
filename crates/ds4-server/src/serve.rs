@@ -943,7 +943,7 @@ pub fn handle_client_inner(
             code,
             msg,
             cfg.cors,
-            Some(retry),
+            retry,
         ));
         return;
     }
@@ -1644,7 +1644,7 @@ fn queue_client(
         drop(g);
         let _ = send_all_nonblocking(
             &mut stream,
-            &wire_http_error_bytes(surface, code, msg, cfg.cors, Some(retry)),
+            &wire_http_error_bytes(surface, code, msg, cfg.cors, retry),
         );
         return;
     }

@@ -138,20 +138,21 @@ pub fn next_job_id(s: &mut AdmitState, kind: ReqKind) -> String {
 /// C `client_main` enqueue Stopping body (`ds4_server.c`).
 pub const SERVER_SHUTTING_DOWN: &str = "server shutting down";
 
-pub fn enqueue_shed_error(v: EnqVerdict) -> Option<(u8, i32, i32, &'static str)> {
+pub fn enqueue_shed_error(v: EnqVerdict) -> Option<(u8, i32, Option<i32>, &'static str)> {
     match v {
         EnqVerdict::Ok => None,
-        EnqVerdict::Stopping => Some((SHED_CLIENTS, 503, 10, SERVER_SHUTTING_DOWN)),
+        // C client_main Stopping uses wire_http_error (no Retry-After).
+        EnqVerdict::Stopping => Some((SHED_CLIENTS, 503, None, SERVER_SHUTTING_DOWN)),
         EnqVerdict::ShedQueueDepth => Some((
             SHED_QUEUE_DEPTH,
             429,
-            5,
+            Some(5),
             "request queue is full; retry later",
         )),
         EnqVerdict::ShedQueueBytes => Some((
             SHED_QUEUE_BYTES,
             429,
-            5,
+            Some(5),
             "server request-body budget exhausted; retry later",
         )),
     }
@@ -170,7 +171,18 @@ mod tests {
         // Then: exact C production bytes, not the invented "is"
         assert_eq!(shed.0, SHED_CLIENTS);
         assert_eq!(shed.1, 503);
+        assert_eq!(shed.2, None);
         assert_eq!(shed.3, "server shutting down");
         assert_ne!(shed.3, "server is shutting down");
+    }
+
+    #[test]
+    fn queue_full_429_keeps_c_retry_after() {
+        let depth = enqueue_shed_error(EnqVerdict::ShedQueueDepth).expect("depth sheds");
+        assert_eq!(depth.1, 429);
+        assert_eq!(depth.2, Some(5));
+        let bytes = enqueue_shed_error(EnqVerdict::ShedQueueBytes).expect("bytes sheds");
+        assert_eq!(bytes.1, 429);
+        assert_eq!(bytes.2, Some(5));
     }
 }

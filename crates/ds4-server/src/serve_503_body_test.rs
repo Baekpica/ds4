@@ -48,18 +48,8 @@ fn assert_c_503_message(response: &str, msg: &str) {
         None,
     ))
     .unwrap();
-    let expected_retry = String::from_utf8(wire_http_error_bytes(
-        WireSurface::OpenaiChat,
-        503,
-        msg,
-        false,
-        Some(10),
-    ))
-    .unwrap();
-    assert!(
-        response == expected || response == expected_retry,
-        "{response}"
-    );
+    assert_eq!(response, expected);
+    assert!(!response.contains("Retry-After:"), "{response}");
     assert!(
         !response.contains("generation remains on C ds4-server"),
         "{response}"
@@ -111,15 +101,17 @@ fn stopping_enqueue_503_matches_c_client_main() {
     // Then: C "server shutting down"
     let (_, _, retry, msg) = enqueue_shed_error(crate::admit::EnqVerdict::Stopping).unwrap();
     assert_eq!(msg, C_SHUTTING_DOWN);
+    assert_eq!(retry, None);
     let expected = String::from_utf8(wire_http_error_bytes(
         WireSurface::OpenaiChat,
         503,
         C_SHUTTING_DOWN,
         false,
-        Some(retry),
+        retry,
     ))
     .unwrap();
     assert_eq!(response, expected);
+    assert!(!response.contains("Retry-After:"), "{response}");
 }
 
 #[test]
