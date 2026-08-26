@@ -20,6 +20,7 @@ mod relay;
 mod route;
 mod serve_local;
 mod snapshot;
+mod snapshot_gather;
 mod snapshot_temp;
 mod transport;
 mod work;
@@ -97,6 +98,10 @@ pub use route::{
     decode_route_blob, encode_route_blob, validate_route_blob, ReturnTarget, RouteEntry,
 };
 pub use snapshot::{coordinator_load_snapshot, coordinator_save_snapshot, SnapshotMeta};
+pub use snapshot_gather::{
+    gather_kv_shards, scatter_kv_shards, GatherShard, GatheredShards, ERR_EMPTY_SHARD,
+    ERR_NO_TIMELINE,
+};
 pub use transport::{read_frame, write_frame};
 pub use work::{
     decode_logits_payload, decode_result_body, decode_work_body, encode_logits_payload,
