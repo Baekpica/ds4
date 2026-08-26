@@ -37,7 +37,7 @@ use crate::route::{
 use crate::serve_cont::{cont_prompt_tokens, ContExec};
 use crate::serve_serial_reclaim::{
     resolve_serial_fit, serial_capacity_refuse_msg, serial_fit_from_native, serial_reclaim_gate,
-    MemFloor, SerialFitQuote, SerialReclaimOutcome,
+    serial_reclaim_want, AvailBytes, MemFloor, SerialFitQuote, SerialReclaimOutcome,
 };
 use crate::serve_static::{
     run_static_routed, write_static_completion, DetachedStatic, StaticFinish, StaticJob, StaticRow,
@@ -1247,7 +1247,7 @@ fn run_engine<W: TerminalSink>(
     }
     (
         crate::route::LANE_SERIAL,
-        run_serial(cfg, inner, job, id, engine, out, arrived_at),
+        run_serial(cfg, inner, job, id, engine, cont, out, arrived_at),
     )
 }
 
@@ -1323,6 +1323,7 @@ fn run_serial<W: TerminalSink>(
     job: &PreparedJob,
     id: &str,
     engine: &mut dyn DecodeIo,
+    cont: Option<&mut dyn ContExec>,
     out: &mut W,
     arrived_at: Instant,
 ) -> Settlement {
@@ -1378,8 +1379,18 @@ fn run_serial<W: TerminalSink>(
             quote.fail_open,
         )
     });
-    let quote = resolve_serial_fit(cfg.serial_fit, live);
-    match serial_reclaim_gate(quote.ask(MemFloor::from_gb(cfg.mem_floor_gb))) {
+    let mut quote = resolve_serial_fit(cfg.serial_fit, live);
+    let floor = MemFloor::from_gb(cfg.mem_floor_gb);
+    let mut ask = quote.ask(floor);
+    let want = serial_reclaim_want(ask);
+    if want > 0 {
+        if let Some(exec) = cont {
+            let released = exec.trim_idle_banks(want);
+            quote.avail = AvailBytes::from_raw(quote.avail.raw().saturating_add(released));
+            ask = quote.ask(floor);
+        }
+    }
+    match serial_reclaim_gate(ask) {
         SerialReclaimOutcome::Admit { .. } => {}
         SerialReclaimOutcome::Refuse { .. } => {
             let prompt_n = match job.parsed.prompt_text.as_deref() {

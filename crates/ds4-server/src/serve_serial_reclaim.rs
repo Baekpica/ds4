@@ -226,6 +226,16 @@ const fn fits_above_floor(avail: AvailBytes, need: NeedBytes, floor: MemFloor) -
     avail.raw().saturating_sub(floor.bytes()) >= need.raw()
 }
 
+/// C `serial_session_ensure_fit` collect want: deficit + headroom.
+pub(crate) fn serial_reclaim_want(ask: SerialReclaimAsk) -> u64 {
+    if fits_above_floor(ask.avail, ask.need, ask.floor) {
+        return 0;
+    }
+    let usable = ask.avail.raw().saturating_sub(ask.floor.bytes());
+    let deficit = ask.need.raw().saturating_sub(usable);
+    deficit.saturating_add(ask.headroom.raw())
+}
+
 /// C `serial_reclaim_gate`: reclaim idle pages before a typed refuse.
 /// Usable = avail − floor; the floor is never spent.
 pub(crate) fn serial_reclaim_gate(ask: SerialReclaimAsk) -> SerialReclaimOutcome {

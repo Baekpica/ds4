@@ -1264,6 +1264,12 @@ int ds4_bridge_batch_ctx_supports_partial_reuse(ds4_bridge_batch_ctx *c)
     return ds4_batch_ctx_supports_partial_reuse(c->ctx);
 }
 
+uint64_t ds4_bridge_batch_ctx_trim_free(ds4_bridge_batch_ctx *c, uint64_t want_bytes)
+{
+    if (!c || !c->ctx || want_bytes == 0) return 0;
+    return ds4_batch_ctx_trim_free(c->ctx, want_bytes);
+}
+
 int ds4_bridge_batch_ctx_generate_static(
         ds4_bridge_batch_ctx *c,
         const int32_t *const *prompt_tokens,

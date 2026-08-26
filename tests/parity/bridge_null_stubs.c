@@ -274,6 +274,11 @@ bool ds4_batch_ctx_supports_partial_reuse(const ds4_batch_ctx *ctx) {
     (void)ctx;
     return false;
 }
+uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
+    (void)ctx;
+    (void)want_bytes;
+    return 0;
+}
 int ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx,
                                     const ds4_tokens *prompts, int n,
                                     const int *max_new_tokens,

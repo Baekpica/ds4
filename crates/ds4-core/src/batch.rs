@@ -18,8 +18,8 @@ use ds4_sys::{
     ds4_bridge_batch_ctx_create_fit, ds4_bridge_batch_ctx_destroy,
     ds4_bridge_batch_ctx_generate_static, ds4_bridge_batch_ctx_max_seq,
     ds4_bridge_batch_ctx_raw_cap, ds4_bridge_batch_ctx_seq_cap,
-    ds4_bridge_batch_ctx_supports_partial_reuse, ds4_bridge_cont_request, ds4_bridge_cont_stats,
-    ds4_bridge_continuous_generate,
+    ds4_bridge_batch_ctx_supports_partial_reuse, ds4_bridge_batch_ctx_trim_free,
+    ds4_bridge_cont_request, ds4_bridge_cont_stats, ds4_bridge_continuous_generate,
 };
 
 use crate::{cstring_payload_path, fail, Error, Model, Result};
@@ -284,6 +284,10 @@ impl BatchCtx<'_> {
 
     pub fn supports_partial_reuse(&self) -> bool {
         unsafe { ds4_bridge_batch_ctx_supports_partial_reuse(self.raw.as_ptr()) != 0 }
+    }
+
+    pub fn trim_free(&mut self, want_bytes: u64) -> u64 {
+        unsafe { ds4_bridge_batch_ctx_trim_free(self.raw.as_ptr(), want_bytes) }
     }
 
     /// Runs one fixed group to completion on the persistent native context.
@@ -617,6 +621,14 @@ mod tests {
     }
 
     #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_batch_ctx_trim_free(
+        _c: *mut ds4_bridge_batch_ctx,
+        want_bytes: u64,
+    ) -> u64 {
+        want_bytes
+    }
+
+    #[no_mangle]
     unsafe extern "C" fn ds4_bridge_batch_ctx_bank_snapshot(
         _c: *mut ds4_bridge_batch_ctx,
         bank: i32,
@@ -693,6 +705,13 @@ mod tests {
     #[test]
     fn partial_reuse_capability_is_read_from_the_native_batch() {
         assert!(fake_batch().supports_partial_reuse());
+    }
+
+    #[test]
+    fn trim_free_forwards_want_to_the_native_batch() {
+        let mut batch = fake_batch();
+        assert_eq!(batch.trim_free(0), 0);
+        assert_eq!(batch.trim_free(4096), 4096);
     }
 
     #[test]

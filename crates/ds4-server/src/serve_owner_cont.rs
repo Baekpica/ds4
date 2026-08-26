@@ -165,6 +165,7 @@ fn settle_roll_job(
             &job.prepared,
             id,
             engine,
+            None,
             &mut job.sink,
             arrived_at,
         )

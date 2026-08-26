@@ -888,6 +888,10 @@ pub struct ContPair<'a> {
 pub trait ContExec {
     fn model_id(&self) -> i32;
     fn seq_cap(&self) -> i32;
+    /// One C trim (`ds4_batch_ctx_trim_free`). Host does not implement trim.
+    fn trim_idle_banks(&mut self, _want_bytes: u64) -> u64 {
+        0
+    }
     fn encode_chat(&self, rendered: &[u8]) -> Vec<i32>;
     fn encode_text(&self, text: &str) -> Vec<i32>;
     /// `bank_hold_retry` keeps registry locking outside the native owner; a
@@ -1928,6 +1932,10 @@ mod native {
 
         fn seq_cap(&self) -> i32 {
             self.batch.seq_cap()
+        }
+
+        fn trim_idle_banks(&mut self, want_bytes: u64) -> u64 {
+            self.batch.trim_free(want_bytes)
         }
 
         fn encode_chat(&self, rendered: &[u8]) -> Vec<i32> {

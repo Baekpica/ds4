@@ -7,8 +7,9 @@ use crate::serve::{handle_client_inner, ServerConfig, ServerInner};
 use crate::serve_cont_roll::RejectReason;
 use crate::serve_serial_reclaim::{
     resolve_serial_fit, serial_capacity_refuse_msg, serial_fit_from_native, serial_reclaim_gate,
-    serial_reclaim_rank, unquoted_serial_fit, AvailBytes, HeadroomBytes, MemFloor, NeedBytes,
-    ReclaimBank, ReclaimableBytes, SerialFitQuote, SerialReclaimAsk, SerialReclaimOutcome,
+    serial_reclaim_rank, serial_reclaim_want, unquoted_serial_fit, AvailBytes, HeadroomBytes,
+    MemFloor, NeedBytes, ReclaimBank, ReclaimableBytes, SerialFitQuote, SerialReclaimAsk,
+    SerialReclaimOutcome,
 };
 
 const GIB: u64 = 1 << 30;
@@ -128,6 +129,16 @@ fn mem_floor_cli_wins_over_env() {
 fn unquoted_live_fit_admits_without_harder_refuse() {
     let out = serial_reclaim_gate(unquoted_serial_fit().ask(MemFloor::from_gb(4)));
     assert_eq!(out, SerialReclaimOutcome::Admit { reclaimed: 0 });
+}
+
+#[test]
+fn reclaim_want_is_zero_when_the_quote_already_fits() {
+    assert_eq!(
+        serial_reclaim_want(unquoted_serial_fit().ask(MemFloor::from_gb(4))),
+        0
+    );
+    let short = ask(5, 3, 4, 1);
+    assert!(serial_reclaim_want(short) > 0);
 }
 
 #[test]

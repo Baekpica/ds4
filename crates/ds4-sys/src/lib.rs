@@ -653,6 +653,8 @@ extern "C" {
 
     pub fn ds4_bridge_batch_ctx_supports_partial_reuse(c: *mut ds4_bridge_batch_ctx) -> c_int;
 
+    pub fn ds4_bridge_batch_ctx_trim_free(c: *mut ds4_bridge_batch_ctx, want_bytes: u64) -> u64;
+
     pub fn ds4_bridge_batch_ctx_generate_static(
         c: *mut ds4_bridge_batch_ctx,
         prompt_tokens: *const *const i32,
