@@ -501,6 +501,18 @@ pub(crate) struct WarmRecord {
     pub(crate) trailer: Vec<u8>,
 }
 
+/// Keep Responses/title bits across retire so the next persist still
+/// writes them. Trailer is rebuilt at persist time.
+#[cfg(any(feature = "native", test))]
+fn retired_record(prev: Option<&WarmRecord>, key: Vec<u8>, generation: u64) -> Option<WarmRecord> {
+    (!key.is_empty()).then(|| WarmRecord {
+        text: key,
+        generation,
+        ext_flags: prev.map(|record| record.ext_flags).unwrap_or(0),
+        trailer: Vec::new(),
+    })
+}
+
 #[cfg(any(feature = "native", test))]
 fn warm_match_pick(banks: &[WarmBank], prompt: &[u8]) -> Option<usize> {
     let mut best = None;
@@ -1521,12 +1533,8 @@ mod native {
                     .stored_tokens
                     .min(snapshot.tokens.len() as i32);
             }
-            self.warm[bank].record = (!key.is_empty()).then_some(WarmRecord {
-                text: key,
-                generation: snapshot.generation,
-                ext_flags: 0,
-                trailer: Vec::new(),
-            });
+            self.warm[bank].record =
+                retired_record(self.warm[bank].record.as_ref(), key, snapshot.generation);
         }
 
         fn persist_bank(
@@ -2545,6 +2553,28 @@ mod bank_tests {
         assert_eq!(retired_bank(true, true, true, Some(2), 3), Some(2));
         assert_eq!(retired_bank(true, true, true, None, 3), None);
         assert_eq!(retired_bank(true, true, true, Some(3), 3), None);
+    }
+
+    #[test]
+    fn bank_retire_keeps_prior_warm_ext_flags() {
+        use ds4_kv::{EXT_RESPONSES_VISIBLE, EXT_SESSION_TITLE};
+        let prev = WarmRecord {
+            text: b"old".to_vec(),
+            generation: 1,
+            ext_flags: EXT_RESPONSES_VISIBLE | EXT_SESSION_TITLE,
+            trailer: b"ktm".to_vec(),
+        };
+        let retired = retired_record(Some(&prev), b"new-key".to_vec(), 9).unwrap();
+        assert_eq!(retired.text, b"new-key");
+        assert_eq!(retired.generation, 9);
+        assert_eq!(retired.ext_flags, EXT_RESPONSES_VISIBLE | EXT_SESSION_TITLE);
+        assert!(retired_record(Some(&prev), Vec::new(), 9).is_none());
+        assert_eq!(
+            retired_record(None, b"fresh".to_vec(), 2)
+                .unwrap()
+                .ext_flags,
+            0
+        );
     }
 
     #[test]
