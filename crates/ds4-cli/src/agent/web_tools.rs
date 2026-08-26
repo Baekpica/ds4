@@ -1442,10 +1442,17 @@ mod tests {
     }
 
     fn c_list_bytes(path: Option<&str>) -> Vec<u8> {
+        c_list_bytes_at(path, None)
+    }
+
+    fn c_list_bytes_at(path: Option<&str>, cwd: Option<&std::path::Path>) -> Vec<u8> {
         let oracle = oracle();
         assert!(oracle.exists(), "build C oracle: make test-agent-parity");
         let mut command = std::process::Command::new(oracle);
         command.arg("list");
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
         match path {
             Some(path) => {
                 command.arg(path);
@@ -1509,8 +1516,11 @@ mod tests {
         assert!(empty
             .observation
             .starts_with(b"Tool result 1 (list):\n.:\n"));
-        assert_eq!(c_list_bytes(Some("-")), c_list_bytes(None));
-        assert!(c_list_bytes(None).starts_with(b".:\n"));
+        assert_eq!(
+            c_list_bytes_at(Some("-"), Some(&root)),
+            c_list_bytes_at(None, Some(&root))
+        );
+        assert!(c_list_bytes_at(None, Some(&root)).starts_with(b".:\n"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
