@@ -45,6 +45,20 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    const uint64_t short_plan = qwen4exp_graph_bytes_estimate(4096u, 256u);
+    const uint64_t long_plan = qwen4exp_graph_bytes_estimate(262144u, 256u);
+    const uint64_t wide_plan = qwen4exp_graph_bytes_estimate(262144u, 512u);
+    if (short_plan == 0u || long_plan <= short_plan || wide_plan <= long_plan ||
+        long_plan < (UINT64_C(12) << 30) || long_plan > (UINT64_C(18) << 30)) {
+        fprintf(stderr,
+                "Qwen4Exp graph memory plan is invalid: short=%.2f long=%.2f wide=%.2f GiB\n",
+                (double)short_plan / 1073741824.0,
+                (double)long_plan / 1073741824.0,
+                (double)wide_plan / 1073741824.0);
+        model_close(&model);
+        return 1;
+    }
+
     ds4_str quantization = {0};
     const bool external_ple =
         model_get_string(&model, "general.quantization", &quantization) &&
