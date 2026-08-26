@@ -285,6 +285,10 @@ native/bridge/ds4_bridge.o: native/bridge/ds4_bridge.c native/bridge/ds4_bridge.
 # Phase 3 shadows: Rust main, existing C/CUDA objects. Do not replace ./ds4.
 DS4_RS_ROOT := $(abspath .)
 DS4_RS_LINK_OBJS := native/bridge/ds4_bridge.o $(CORE_OBJS)
+# Cargo honors an externally supplied CARGO_TARGET_DIR. Copy the binary from
+# that same directory so sandboxed/CI builds cannot silently publish a stale
+# workspace-local target/release artifact.
+DS4_RS_TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),target)
 ifeq ($(UNAME_S),Darwin)
 DS4_RS_LIBS := -C link-arg=-framework -C link-arg=Foundation \
 	-C link-arg=-framework -C link-arg=Metal -C link-arg=-lm
@@ -302,19 +306,19 @@ ds4-rs: native/bridge/ds4_bridge.o $(CORE_OBJS)
 	cargo rustc -p ds4-cli --bin ds4-rs --release --features native -- \
 		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
 		$(DS4_RS_LIBS)
-	cp -f target/release/ds4-rs $@
+	cp -f "$(DS4_RS_TARGET_DIR)/release/ds4-rs" $@
 
 ds4-agent-rs: native/bridge/ds4_bridge.o $(CORE_OBJS)
 	cargo rustc -p ds4-cli --bin ds4-agent-rs --release --features native -- \
 		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
 		$(DS4_RS_LIBS)
-	cp -f target/release/ds4-agent-rs $@
+	cp -f "$(DS4_RS_TARGET_DIR)/release/ds4-agent-rs" $@
 
 ds4-bench-rs: native/bridge/ds4_bridge.o $(CORE_OBJS)
 	cargo rustc -p ds4-cli --bin ds4-bench-rs --release --features native -- \
 		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
 		$(DS4_RS_LIBS)
-	cp -f target/release/ds4-bench-rs $@
+	cp -f "$(DS4_RS_TARGET_DIR)/release/ds4-bench-rs" $@
 
 # Phase 4: C KVC oracle linked against ds4_kvstore.o (no CUDA engine).
 tests/parity/kv_c_oracle: tests/parity/kv_c_oracle.c tests/parity/kv_c_stubs.c ds4_kvstore.o
@@ -466,7 +470,7 @@ ds4-server-rs: native/bridge/ds4_bridge.o $(CORE_OBJS)
 	cargo rustc -p ds4-server --bin ds4-server-rs --release --features native -- \
 		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
 		$(DS4_RS_LIBS)
-	cp -f target/release/ds4-server-rs $@
+	cp -f "$(DS4_RS_TARGET_DIR)/release/ds4-server-rs" $@
 
 ds4_cli.o: ds4_cli.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
