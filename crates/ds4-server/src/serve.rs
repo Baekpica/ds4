@@ -67,6 +67,7 @@ pub struct ServerConfig {
     pub out_agg_cap_bytes: u64,
     pub out_agg_evict_min_bytes: u64,
     pub disconnect_abort: bool,
+    pub continuous: bool,
     pub have_engine: bool,
     pub stop_requested: Option<fn() -> bool>,
     pub mem_floor_gb: u64,
@@ -165,6 +166,7 @@ impl Default for ServerConfig {
             disconnect_abort: parse_default_on(
                 std::env::var_os("DS4_SERVER_DISCONNECT_ABORT").as_deref(),
             ),
+            continuous: parse_default_on(std::env::var_os("DS4_SERVER_CONTINUOUS").as_deref()),
             have_engine: false,
             stop_requested: None,
             mem_floor_gb: mem_floor_gb_from_env(),
@@ -1121,7 +1123,7 @@ fn run_prepared<W: TerminalSink>(
     let (cont_tools_anthropic, cont_tools_responses) = process_cont_tools();
     let route_env = RouteEnv {
         coalesce: cont_gate.is_some(),
-        have_cont: cont_gate.is_some(),
+        have_cont: cont_gate.is_some() && cfg.continuous,
         cont_anthropic: parse_default_on(std::env::var_os("DS4_SERVER_CONT_ANTHROPIC").as_deref()),
         cont_responses: parse_default_on(std::env::var_os("DS4_SERVER_CONT_RESPONSES").as_deref()),
         cont_tools_anthropic,

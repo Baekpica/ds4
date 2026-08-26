@@ -17,6 +17,7 @@ use crate::serve_static::{
 struct OwnerSpy {
     calls: usize,
     ns: Vec<usize>,
+    seq_cap: i32,
 }
 
 impl StaticExec for OwnerSpy {
@@ -42,7 +43,7 @@ impl ContExec for OwnerSpy {
         0
     }
     fn seq_cap(&self) -> i32 {
-        0
+        self.seq_cap
     }
     fn encode_chat(&self, _rendered: &[u8]) -> Vec<i32> {
         vec![77]
@@ -97,6 +98,34 @@ fn static_chat_job(inner: &Arc<Mutex<ServerInner>>, tag: &str) -> (OwnerJob, Job
 }
 
 #[test]
+fn late_sibling_joins_when_coalesce_wait_is_set() {
+    let cfg = ServerConfig {
+        continuous: false,
+        have_engine: true,
+        default_tokens: 8,
+        ..ServerConfig::default()
+    };
+    let inner = Arc::new(Mutex::new(ServerInner::from_cfg(&cfg)));
+    let (job_a, drain_a) = static_chat_job(&inner, "a");
+    let (job_b, drain_b) = static_chat_job(&inner, "b");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        tx.send(job_b).unwrap();
+    });
+    let mut spy = OwnerSpy::default();
+    let mut engine = ScriptedDecode::from_pieces(&[b"serial-fallback"]);
+    std::env::set_var("DS4_SERVER_COALESCE_WAIT_MS", "100");
+    let leftover = run_owner_maybe_coalesce(&cfg, &inner, &mut engine, &mut spy, job_a, &rx);
+    std::env::remove_var("DS4_SERVER_COALESCE_WAIT_MS");
+
+    assert!(leftover.is_none());
+    assert_eq!(spy.ns, vec![2]);
+    let _ = drain_a.done.recv();
+    let _ = drain_b.done.recv();
+}
+
+#[test]
 fn two_queued_static_jobs_coalesce_on_owner_fifo() {
     let cfg = ServerConfig {
         have_engine: true,
@@ -110,6 +139,47 @@ fn two_queued_static_jobs_coalesce_on_owner_fifo() {
     tx.send(job_b).unwrap();
     drop(tx);
     let mut spy = OwnerSpy::default();
+    let mut engine = ScriptedDecode::from_pieces(&[b"serial-fallback"]);
+
+    let leftover = run_owner_maybe_coalesce(&cfg, &inner, &mut engine, &mut spy, job_a, &rx);
+
+    assert!(leftover.is_none());
+    assert_eq!(spy.calls, 1);
+    assert_eq!(spy.ns, vec![2]);
+    let text_a = String::from_utf8(drain_a.state.take()).unwrap();
+    let text_b = String::from_utf8(drain_b.state.take()).unwrap();
+    let _ = drain_a.done.recv();
+    let _ = drain_b.done.recv();
+    assert!(text_a.starts_with("HTTP/1.1 200 OK"), "{text_a}");
+    assert!(text_b.starts_with("HTTP/1.1 200 OK"), "{text_b}");
+    assert!(!text_a.contains("serial-fallback"), "{text_a}");
+    assert!(!text_b.contains("serial-fallback"), "{text_b}");
+    let g = lock_inner(&inner);
+    assert_eq!(g.runtime.requests_serial, 0);
+    assert_eq!(
+        g.metrics.route_requests[WireSurface::OpenaiChat as usize][LANE_STATIC as usize],
+        2
+    );
+}
+
+#[test]
+fn continuous_zero_keeps_the_batch_ctx_for_two_short_static_jobs() {
+    let cfg = ServerConfig {
+        continuous: false,
+        have_engine: true,
+        default_tokens: 8,
+        ..ServerConfig::default()
+    };
+    let inner = Arc::new(Mutex::new(ServerInner::from_cfg(&cfg)));
+    let (job_a, drain_a) = static_chat_job(&inner, "a");
+    let (job_b, drain_b) = static_chat_job(&inner, "b");
+    let (tx, rx) = mpsc::channel();
+    tx.send(job_b).unwrap();
+    drop(tx);
+    let mut spy = OwnerSpy {
+        seq_cap: 8,
+        ..OwnerSpy::default()
+    };
     let mut engine = ScriptedDecode::from_pieces(&[b"serial-fallback"]);
 
     let leftover = run_owner_maybe_coalesce(&cfg, &inner, &mut engine, &mut spy, job_a, &rx);

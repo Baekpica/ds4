@@ -17,7 +17,7 @@ pub(super) fn run_owner_maybe_roll(
     let prompt_len = cont_prompt_tokens(exec, &job.prepared.parsed)
         .map(|(_, toks)| toks.len() as i32)
         .unwrap_or(0);
-    let env = roll_route_env(exec, prompt_len);
+    let env = roll_route_env(cfg, exec, prompt_len);
     let dec = route_decide(job.prepared.parsed.needs, job.prepared.surface, &env);
     if dec.lane != LANE_CONTINUOUS {
         run_owner_job(cfg, inner, engine, Some(exec), job);
@@ -44,7 +44,7 @@ pub(super) fn run_owner_maybe_roll(
     let second_len = cont_prompt_tokens(exec, &second.prepared.parsed)
         .map(|(_, toks)| toks.len() as i32)
         .unwrap_or(0);
-    let second_env = roll_route_env(exec, second_len);
+    let second_env = roll_route_env(cfg, exec, second_len);
     let second_dec = route_decide(
         second.prepared.parsed.needs,
         second.prepared.surface,
@@ -58,11 +58,11 @@ pub(super) fn run_owner_maybe_roll(
     None
 }
 
-fn roll_route_env(exec: &dyn ContExec, prompt_len: i32) -> RouteEnv {
+fn roll_route_env(cfg: &ServerConfig, exec: &dyn ContExec, prompt_len: i32) -> RouteEnv {
     let (cont_tools_anthropic, cont_tools_responses) = process_cont_tools();
     RouteEnv {
         coalesce: true,
-        have_cont: true,
+        have_cont: cfg.continuous,
         cont_anthropic: parse_default_on(std::env::var_os("DS4_SERVER_CONT_ANTHROPIC").as_deref()),
         cont_responses: parse_default_on(std::env::var_os("DS4_SERVER_CONT_RESPONSES").as_deref()),
         cont_tools_anthropic,

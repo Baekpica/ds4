@@ -1,5 +1,6 @@
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::generate::GenerateError;
@@ -30,7 +31,7 @@ pub(super) fn run_owner_maybe_coalesce(
     let tokens = cont_prompt_tokens(exec, &job.prepared.parsed)
         .map(|(_, toks)| toks)
         .unwrap_or_default();
-    let env = static_route_env(exec, tokens.len() as i32);
+    let env = static_route_env(cfg, exec, tokens.len() as i32);
     let dec = route_decide(job.prepared.parsed.needs, job.prepared.surface, &env);
     if dec.lane != LANE_STATIC {
         return super::owner_cont::run_owner_maybe_roll(cfg, inner, engine, exec, job, jobs_rx);
@@ -40,7 +41,15 @@ pub(super) fn run_owner_maybe_coalesce(
         .map(|owner| owner.coalesce_limits())
         .unwrap_or_default();
     let mut batch = vec![Member { job, tokens }];
-    let lookahead = gather_peers(cfg, exec, &env, limits, &mut batch, jobs_rx);
+    let lookahead = gather_peers(
+        cfg,
+        exec,
+        &env,
+        limits,
+        &mut batch,
+        jobs_rx,
+        coalesce_wait_from_env(),
+    );
     if batch.len() < 2 {
         let Member { job, .. } = batch.remove(0);
         run_owner_job(cfg, inner, engine, Some(exec), job);
@@ -50,11 +59,11 @@ pub(super) fn run_owner_maybe_coalesce(
     lookahead
 }
 
-fn static_route_env(exec: &dyn ContExec, prompt_len: i32) -> RouteEnv {
+fn static_route_env(cfg: &ServerConfig, exec: &dyn ContExec, prompt_len: i32) -> RouteEnv {
     let (cont_tools_anthropic, cont_tools_responses) = process_cont_tools();
     RouteEnv {
         coalesce: true,
-        have_cont: true,
+        have_cont: cfg.continuous,
         cont_anthropic: parse_default_on(std::env::var_os("DS4_SERVER_CONT_ANTHROPIC").as_deref()),
         cont_responses: parse_default_on(std::env::var_os("DS4_SERVER_CONT_RESPONSES").as_deref()),
         cont_tools_anthropic,
@@ -64,6 +73,18 @@ fn static_route_env(exec: &dyn ContExec, prompt_len: i32) -> RouteEnv {
     }
 }
 
+fn coalesce_wait_from_env() -> Duration {
+    // Same knob as C coalesce_gather: default 0 (drain only). A small
+    // positive window lets two concurrent short HTTP jobs join n=2
+    // instead of collapsing each to serial.
+    let ms = std::env::var("DS4_SERVER_COALESCE_WAIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(0);
+    Duration::from_millis(ms as u64)
+}
+
 fn gather_peers(
     cfg: &ServerConfig,
     exec: &dyn ContExec,
@@ -71,14 +92,29 @@ fn gather_peers(
     limits: CoalesceLimits,
     batch: &mut Vec<Member>,
     jobs_rx: &Receiver<OwnerJob>,
+    wait: Duration,
 ) -> Option<OwnerJob> {
+    let deadline = (!wait.is_zero()).then(|| Instant::now() + wait);
     loop {
         if batch.len() >= limits.clamp().cap {
             return None;
         }
         let next = match jobs_rx.try_recv() {
             Ok(job) => job,
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return None,
+            Err(TryRecvError::Disconnected) => return None,
+            Err(TryRecvError::Empty) => {
+                let Some(deadline) = deadline else {
+                    return None;
+                };
+                let now = Instant::now();
+                if now >= deadline {
+                    return None;
+                }
+                match jobs_rx.recv_timeout(deadline.saturating_duration_since(now)) {
+                    Ok(job) => job,
+                    Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return None,
+                }
+            }
         };
         if cfg.max_queue_age_s > 0.0
             && next.prepared.arrived_at.elapsed().as_secs_f64() > cfg.max_queue_age_s
