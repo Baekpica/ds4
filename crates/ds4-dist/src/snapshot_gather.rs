@@ -1,7 +1,7 @@
 //! Coordinator KV gather order from `ds4_dist_session_save_payload`.
 //!
 //! Host owns shard walk, empty-shard refusal, and token hashing. Layer
-//! payload bytes and DSV4 header/logits merge stay native.
+//! GPU bytes stay native; DSV4 header merge lives in `snapshot_merge`.
 
 use crate::hash::token_hash_prefix;
 

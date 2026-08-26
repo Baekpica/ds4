@@ -21,6 +21,7 @@ mod route;
 mod serve_local;
 mod snapshot;
 mod snapshot_gather;
+mod snapshot_merge;
 mod snapshot_temp;
 mod transport;
 mod work;
@@ -101,6 +102,10 @@ pub use snapshot::{coordinator_load_snapshot, coordinator_save_snapshot, Snapsho
 pub use snapshot_gather::{
     gather_kv_shards, scatter_kv_shards, GatherShard, GatheredShards, ERR_EMPTY_SHARD,
     ERR_NO_TIMELINE,
+};
+pub use snapshot_merge::{
+    kv_state_bytes, layer_tensor_bytes, merge_session_payload, parse_layer_payload, DistKvLayout,
+    ParsedLayerShard, ERR_METADATA, ERR_TENSOR_BYTES, LAYER_MAGIC, SESSION_MAGIC,
 };
 pub use transport::{read_frame, write_frame};
 pub use work::{
