@@ -285,6 +285,42 @@ avail ~35 GiB, ctx=512에서도 동일 — 용량 문제가 아니다.)
 serial 생성(200 + 실제 decode + `serial=1`)은 정본 owner+worker 경로에서
 PASS다.**
 
+### 3.13 2026-08-26 저녁 — 2-트랙 플랜 확정 + Track 0
+
+사용자가 `Baekpica/dfm-rs`를 선생성하고(스캐폴드 `a293973`) 2-트랙 실행
+플랜을 승인했다. 이 문서와 `DFM_RS_SPLIT_PLAN.md`("실행 전제 변경 기록"
+절)가 그 기록이다. **사용자 확정 결정 4건:**
+
+1. **GREEN 스코프 = 호스트-패리티.** 게이트 셀의 실패 모드가 **같은
+   명령의 C 대조 실행**으로 동일 재현되고 그 대조가 증거로 기록되면
+   `PASS*(engine-gap E-n)`으로 표기하고 todo-54 판정에서 PASS로
+   계수한다. C는 통과하는데 Rust만 실패하면 FAIL 유지. 셀 삭제·완화
+   금지. 레지스트리는 [ENGINE_GAPS.md](ENGINE_GAPS.md)
+   (E-1 Motif partial cached=0 / E-2 EXAONE prewarm IMA — 둘 다
+   C-control reproduced; **E-3 Solar IMA는 C-control pending** —
+   §10 rerun의 Solar 그룹에서 대조 필수).
+2. **dfm-rs 시딩은 문서대로**: SPLIT_READINESS green 후 genesis SHA를
+   `a293973` 위에 ancestry force-push. 그 전에는 코드 push 금지.
+3. **로컬 클론은 workspace 루트** `../dfm-rs` (이동 완료; main
+   protection 없음·PUBLIC·non-fork 확인).
+4. **push 상시 승인**: rust-host는 origin과 동기화 유지, 검증된 커밋
+   단위마다 push.
+
+Track 0 완료 내역: rust-host push(`e9b1de0`→origin, 이후 계속),
+web_tools.rs cwd flake proper fix(`0f8b1cb` — dirty 해소, tracked
+클린), split 문서 통합(`de372e9` — 두 초안 SUPERSEDED로 tracked화),
+ENGINE_GAPS.md(`054109c`), workspace CLAUDE.md에 dfm-rs 행 추가.
+
+**남은 로드맵 (승인된 플랜 §Track 1–2):** 후보 HEAD 동결 → todo-53
+60셀 §10 전면 재실행(G0 no-model / G1 DeepSeek / G2 Motif+ABBA /
+G3 Solar+E-3 C-대조 / G4 EXAONE / G5 dots3; 약 5 반나절) → todo-54
+판정 → GREEN이면 §18.2 원자 승격(Rust가 기본 이름, C→`*-c`, proof
+oracle `./ds4-c` 재배선 + 동일-inode/해시 가드) → 승격 후 §10 전량
+재실행 + §18.3 pre/post SHA 동일성 → STATUS/PARITY 재도색(todo 55) →
+soak(§18.1 hard blocker; DeepSeek 2h 혼합 트래픽) →
+SPLIT_READINESS.md + genesis 태그(todo 57) → dfm-rs ancestry
+force-push → naming Phase A/B(§6) → v0.1.0-rc.N → v0.1.0.
+
 운영 메모: 이 스크립트의 worker teardown이 owner가 아직 살아 있는 상태에서
 `clear_cache`를 한 번 호출했다 (`TEARDOWN_COMPUTE_STILL_ALIVE` 후).
 페이지 캐시 드랍이라 결과에는 영향이 없지만 규율 위반이므로 다음 하니스는
