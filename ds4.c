@@ -19667,6 +19667,130 @@ static bool plain_graph_add_inplace(ds4_gpu_tensor *dst,
     return ds4_gpu_add_tensor(dst, dst, add, (uint32_t)count) != 0;
 }
 
+typedef struct {
+    uint32_t capacity;
+    uint32_t hidden_size;
+    uint32_t hc_count;
+    uint32_t lowrank;
+    bool has_injection;
+    ds4_gpu_tensor *normed;
+    ds4_gpu_tensor *low;
+    ds4_gpu_tensor *mix_logits;
+    ds4_gpu_tensor *inject_logits;
+    ds4_gpu_tensor *mixed;
+    ds4_gpu_tensor *injection;
+    uint64_t bytes;
+} ds4_qwen_hc_ws;
+
+static void qwen4exp_hc_ws_free(ds4_qwen_hc_ws *ws) {
+    if (!ws) return;
+    ds4_gpu_tensor **all[] = {
+        &ws->normed, &ws->low, &ws->mix_logits, &ws->inject_logits,
+        &ws->mixed, &ws->injection,
+    };
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+        ds4_gpu_tensor_free(*all[i]);
+        *all[i] = NULL;
+    }
+    memset(ws, 0, sizeof(*ws));
+}
+
+static bool qwen4exp_hc_ws_alloc(ds4_qwen_hc_ws *ws,
+                                 uint32_t capacity,
+                                 uint32_t hidden_size,
+                                 uint32_t hc_count,
+                                 uint32_t lowrank) {
+    if (!ws || capacity == 0u || hidden_size == 0u || hc_count == 0u ||
+        lowrank == 0u) return false;
+    memset(ws, 0, sizeof(*ws));
+    ws->capacity = capacity;
+    ws->hidden_size = hidden_size;
+    ws->hc_count = hc_count;
+    ws->lowrank = lowrank;
+    const uint64_t width = (uint64_t)hidden_size * hc_count;
+#define QWEN_HC_ALLOC(field, count)                                           \
+    do {                                                                       \
+        const uint64_t qwen_count_ = (uint64_t)(count);                       \
+        if (qwen_count_ > UINT64_MAX / sizeof(float)) {                       \
+            qwen4exp_hc_ws_free(ws);                                           \
+            return false;                                                      \
+        }                                                                      \
+        const uint64_t qwen_bytes_ = qwen_count_ * sizeof(float);             \
+        ws->field = ds4_gpu_tensor_alloc(qwen_bytes_);                        \
+        if (!ws->field) {                                                      \
+            qwen4exp_hc_ws_free(ws);                                           \
+            return false;                                                      \
+        }                                                                      \
+        ws->bytes += qwen_bytes_;                                              \
+    } while (0)
+    QWEN_HC_ALLOC(normed,       (uint64_t)capacity * width);
+    QWEN_HC_ALLOC(low,          (uint64_t)capacity * lowrank);
+    QWEN_HC_ALLOC(mix_logits,   (uint64_t)capacity * width);
+    QWEN_HC_ALLOC(inject_logits,(uint64_t)capacity * hc_count);
+    QWEN_HC_ALLOC(mixed,        (uint64_t)capacity * hidden_size);
+    QWEN_HC_ALLOC(injection,    (uint64_t)capacity * hc_count);
+#undef QWEN_HC_ALLOC
+    return true;
+}
+
+static bool qwen4exp_hc_begin(ds4_qwen_hc_ws *ws,
+                              const ds4_model *model,
+                              const ds4_qwen_hc_weights *weights,
+                              const ds4_gpu_tensor *hyper_input,
+                              uint32_t rows) {
+    if (!ws || !model || !weights || !hyper_input || rows == 0u ||
+        rows > ws->capacity || !weights->norm || !weights->mix_down ||
+        !weights->mix_up) return false;
+    const uint64_t width = (uint64_t)ws->hidden_size * ws->hc_count;
+    if (width > UINT32_MAX || weights->norm->type != DS4_TENSOR_F32 ||
+        weights->mix_down->type != DS4_TENSOR_BF16 ||
+        weights->mix_up->type != DS4_TENSOR_BF16 ||
+        weights->norm->dim[0] != width ||
+        weights->mix_down->dim[0] != width ||
+        weights->mix_down->dim[1] != ws->lowrank ||
+        weights->mix_up->dim[0] != ws->lowrank ||
+        weights->mix_up->dim[1] != width ||
+        (weights->inject &&
+         (weights->inject->type != DS4_TENSOR_BF16 ||
+          weights->inject->dim[0] != width ||
+          weights->inject->dim[1] != ws->hc_count))) return false;
+
+    ws->has_injection = weights->inject != NULL;
+    return ds4_gpu_qwen4exp_group_rms_norm_rows_tensor(
+               ws->normed, hyper_input, model->map, model->size,
+               weights->norm->abs_offset, (uint32_t)width,
+               ws->hidden_size, rows, DS4_RMS_EPS) != 0 &&
+           plain_graph_matmul_tensor(
+               ws->low, model, weights->mix_down, width, ws->lowrank,
+               ws->normed, rows) &&
+           ds4_gpu_qwen4exp_hc_down_silu_tensor(
+               ws->low, ws->low, (uint64_t)rows * ws->lowrank,
+               ws->hc_count) != 0 &&
+           plain_graph_matmul_tensor(
+               ws->mix_logits, model, weights->mix_up, ws->lowrank,
+               width, ws->low, rows) &&
+           (!weights->inject || plain_graph_matmul_tensor(
+               ws->inject_logits, model, weights->inject, width,
+               ws->hc_count, ws->normed, rows)) &&
+           ds4_gpu_qwen4exp_hc_mix_inject_tensor(
+               ws->mixed, weights->inject ? ws->injection : NULL,
+               ws->normed, ws->mix_logits,
+               weights->inject ? ws->inject_logits : NULL,
+               rows, ws->hidden_size, ws->hc_count) != 0;
+}
+
+static bool qwen4exp_hc_finish(ds4_qwen_hc_ws *ws,
+                               const ds4_gpu_tensor *hyper_input,
+                               const ds4_gpu_tensor *block_output,
+                               ds4_gpu_tensor *output,
+                               uint32_t rows) {
+    return ws && hyper_input && block_output && output &&
+           ws->has_injection && rows != 0u && rows <= ws->capacity &&
+           ds4_gpu_qwen4exp_hc_residual_tensor(
+               output, hyper_input, block_output, ws->injection,
+               rows, ws->hidden_size, ws->hc_count) != 0;
+}
+
 /* Qwen4Exp Gated DeltaNet scratch and persistent state are deliberately
  * separate. A serving session owns one state pair per linear-attention layer,
  * while the largest activation buffers are reused layer by layer. */
