@@ -19,7 +19,9 @@ use crate::admit::{
 };
 use crate::cont::{monotonic_now, place_bank_continuation, ContOwner, ContPin, ContRegistry};
 use crate::error::{http_response_bytes, wire_http_error_bytes};
-use crate::generate::{generate_terminal_at, DecodeIo, GenerateError, GenerateOutcome};
+use crate::generate::{
+    generate_terminal_prepared, prepare_serial_prompt, DecodeIo, GenerateError, GenerateOutcome,
+};
 use crate::http::{
     chunked_enabled, parse_surface_for_path, read_http_request, shed_surface_for_path,
 };
@@ -31,10 +33,15 @@ use crate::metrics::{
 use crate::models::{model_id_known, model_one_json, models_list_json};
 use crate::parse::{parse_request, ParseEnv};
 use crate::route::{
-    route_decide, Api, RouteEnv, ThinkMode, WireSurface, LANE_CONTINUOUS, LANE_STATIC,
-    NEED_BANK_FRONTIER,
+    decode_budget, route_decide, Api, RouteEnv, ThinkMode, WireSurface, LANE_CONTINUOUS,
+    LANE_STATIC, NEED_BANK_FRONTIER,
 };
 use crate::serve_cont::{cont_prompt_tokens, ContExec};
+use crate::serve_cont_roll::RejectReason;
+use crate::serve_serial_fit::{
+    serial_fit_bounds, serial_live_preserve_msg, serial_session_fit_plan, SerialFitPlan,
+    SerialFrameKind,
+};
 use crate::serve_serial_reclaim::{
     resolve_serial_fit, serial_capacity_refuse_msg, serial_fit_from_native, serial_reclaim_gate,
     serial_reclaim_want, AvailBytes, MemFloor, SerialFitQuote, SerialReclaimOutcome,
@@ -71,6 +78,9 @@ pub struct ServerConfig {
     pub have_engine: bool,
     pub stop_requested: Option<fn() -> bool>,
     pub mem_floor_gb: u64,
+    /// C `DS4_SERVER_SERIAL_RIGHTSIZE` (v0.5.2 inc1): false only for the
+    /// exact value "0", which restores the fail-at-full-`-c` behavior.
+    pub serial_rightsize: bool,
     pub(crate) serial_fit: Option<SerialFitQuote>,
 }
 
@@ -170,6 +180,9 @@ impl Default for ServerConfig {
             have_engine: false,
             stop_requested: None,
             mem_floor_gb: mem_floor_gb_from_env(),
+            serial_rightsize: parse_default_on(
+                std::env::var_os("DS4_SERVER_SERIAL_RIGHTSIZE").as_deref(),
+            ),
             serial_fit: None,
         }
     }
@@ -1335,7 +1348,7 @@ fn run_serial<W: TerminalSink>(
     job: &PreparedJob,
     id: &str,
     engine: &mut dyn DecodeIo,
-    cont: Option<&mut dyn ContExec>,
+    mut cont: Option<&mut dyn ContExec>,
     out: &mut W,
     arrived_at: Instant,
 ) -> Settlement {
@@ -1396,7 +1409,7 @@ fn run_serial<W: TerminalSink>(
     let mut ask = quote.ask(floor);
     let want = serial_reclaim_want(ask);
     if want > 0 {
-        if let Some(exec) = cont {
+        if let Some(exec) = cont.as_deref_mut() {
             let released = exec.trim_idle_banks(want);
             quote.avail = AvailBytes::from_raw(quote.avail.raw().saturating_add(released));
             ask = quote.ask(floor);
@@ -1411,27 +1424,45 @@ fn run_serial<W: TerminalSink>(
             }
             .map(|toks| i32::try_from(toks.len()).unwrap_or(i32::MAX))
             .unwrap_or(0);
-            let ok = out
-                .write_all(&wire_http_error_bytes(
-                    job.surface,
-                    503,
-                    &serial_capacity_refuse_msg(prompt_n),
-                    cfg.cors,
-                    None,
-                ))
-                .is_ok();
-            return if ok {
-                Settlement::COMPLETED
-            } else {
-                Settlement::CANCELED
-            };
+            return refuse_serial_capacity(cfg, inner, job, i64::from(prompt_n), out);
         }
     }
 
+    // C worker `run_job_single`: hold → `serial_session_ensure_fit` →
+    // generate. Phase 1 (render+tokenize) runs first so the fit decision
+    // sizes from the exact sync-bound token count.
+    let prep = match prepare_serial_prompt(engine, parsed) {
+        Ok(prep) => prep,
+        Err(error) => return settle_generation_result(cfg, job, Err(error), out),
+    };
+    // RequiredMiss frames were answered with the protocol-native 409 above;
+    // a still-live requires_live frame is C's SERIAL_FRAME_RESOLVED_LIVE.
+    let frame = if requires_live {
+        SerialFrameKind::ResolvedLive
+    } else {
+        SerialFrameKind::Canonical
+    };
+    let mut prompt_len = i64::try_from(prep.tokens.len()).unwrap_or(i64::MAX);
+    if frame == SerialFrameKind::ResolvedLive {
+        // C preflight sizes the effective live frame (live tokens + suffix),
+        // not the client frame. The retained frontier is a hard lower bound.
+        prompt_len = prompt_len.max(i64::from(engine.pos()));
+    }
+    let budget = i64::from(decode_budget(
+        prep.parsed.max_tokens_set,
+        prep.parsed.max_tokens,
+        cfg.default_tokens,
+    ));
+    if let Some(refusal) = ensure_serial_session_fit(
+        cfg, inner, job, engine, cont, frame, prompt_len, budget, out,
+    ) {
+        return refusal;
+    }
+
     lock_inner(inner).runtime.requests_serial += 1;
-    let result = generate_terminal_at(
+    let result = generate_terminal_prepared(
         engine,
-        parsed,
+        prep,
         id,
         unix_now(),
         cfg.cors,
@@ -1458,6 +1489,229 @@ fn run_serial<W: TerminalSink>(
     }
     lock_inner(inner).creg.demote_serial();
     if out.write_all(&terminal).is_ok() {
+        Settlement::COMPLETED
+    } else {
+        Settlement::CANCELED
+    }
+}
+
+/// C `serial_session_ensure_fit` driver. The serial session was created for
+/// boot `-c` and its S6 lazy graph is sized by that ctx, not the request —
+/// on a bank-holding boot the full graph can never fit and every serial
+/// request dies at the alloc. A serial request needs only prompt+budget
+/// positions: when the full graph cannot fit, re-create the (still
+/// graphless) session at the largest ctx the fit probe passes, bounded by
+/// what the request could use. When even a minimal output window cannot
+/// fit, refuse 503 (retryable capacity), never the doomed alloc.
+/// Returns `Some(settlement)` after writing a refusal.
+#[allow(clippy::too_many_arguments)]
+fn ensure_serial_session_fit<W: Write>(
+    cfg: &ServerConfig,
+    inner: &Mutex<ServerInner>,
+    job: &PreparedJob,
+    engine: &mut dyn DecodeIo,
+    cont: Option<&mut dyn ContExec>,
+    frame: SerialFrameKind,
+    prompt_len: i64,
+    budget: i64,
+    out: &mut W,
+) -> Option<Settlement> {
+    // Stub/test engines have no native serial session: pass native and
+    // never invent a rightsize or a refuse.
+    let probe = engine.serial_session_probe()?;
+    let bounds = serial_fit_bounds(prompt_len, budget, i64::from(cfg.ctx));
+    let cur_ctx = i64::from(probe.cur_ctx);
+    // C: a mandatory live continuation is never resized — the retained
+    // session holds the only copy of the frontier. Preserve and refuse.
+    if frame == SerialFrameKind::ResolvedLive && cur_ctx < bounds.live_need_min {
+        return Some(refuse_serial_live_preserve(
+            cfg,
+            inner,
+            job,
+            prompt_len,
+            bounds.live_need_min,
+            cur_ctx,
+            out,
+        ));
+    }
+    // C scope gates: DS4_SERVER_SERIAL_RIGHTSIZE=0 and serial-only boots
+    // (no batch ctx) keep the v0.5.1 contract — alloc at -c, loud native
+    // fit refusal when genuinely doomed.
+    if !cfg.serial_rightsize {
+        return None;
+    }
+    let mut exec = cont?;
+    let current_fits = if probe.graph_pending && cur_ctx <= bounds.request_cap {
+        match engine.native_graph_fit(probe.cur_ctx) {
+            Some(quote) => quote.fits,
+            None => true, // no native probe: fail open like the C CPU leg
+        }
+    } else {
+        true
+    };
+    match serial_session_fit_plan(
+        cur_ctx,
+        probe.graph_pending,
+        bounds.need_min,
+        bounds.request_cap,
+        current_fits,
+        frame,
+    ) {
+        SerialFitPlan::Reuse | SerialFitPlan::PassNative => None,
+        SerialFitPlan::RefusePreserve => Some(refuse_serial_live_preserve(
+            cfg,
+            inner,
+            job,
+            prompt_len,
+            bounds.need_min,
+            cur_ctx,
+            out,
+        )),
+        SerialFitPlan::Resize => {
+            // Free BEFORE probing so a committed right-sized graph's own
+            // GiBs count as available for its replacement (the C regrow
+            // case). The live continuation records described that session's
+            // content — demote so continuations get the honest native 409.
+            engine.serial_session_reset();
+            lock_inner(inner).creg.demote_serial();
+            let need_min_ctx = i32::try_from(bounds.need_min).unwrap_or(i32::MAX);
+            let mut min_fits = fit_settle_probe(engine, need_min_ctx);
+            if !min_fits {
+                // C deepmem D4-2: collect from the commons before refusing.
+                // The quote's exact deficit bounds the collect (deficit +
+                // headroom slack); a numberless quote keeps the
+                // whole-commons shape. One C trim, then the same settle
+                // window; a still-unfittable request refuses as before.
+                let want = match engine.native_graph_fit(need_min_ctx) {
+                    Some(quote) if quote.deficit_bytes > 0 => {
+                        quote.deficit_bytes.saturating_add(quote.headroom_bytes)
+                    }
+                    _ => u64::MAX,
+                };
+                if exec.trim_idle_banks(want) > 0 {
+                    min_fits = fit_settle_probe(engine, need_min_ctx);
+                }
+            }
+            let mut target: i64 = 0;
+            if min_fits {
+                // Search bound: what the request could use, plus
+                // continuation headroom so a serial conversation grows for
+                // many turns inside one session. Invariant: lo fits.
+                let mut lo = bounds.need_min;
+                let mut hi = bounds.request_cap;
+                while hi - lo > 1024 {
+                    let mid = lo + (hi - lo) / 2;
+                    let fits = engine
+                        .native_graph_fit(i32::try_from(mid).unwrap_or(i32::MAX))
+                        .is_none_or(|quote| quote.fits);
+                    if fits {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                target = lo;
+            }
+            if target > 0 {
+                if let Ok(()) =
+                    engine.serial_session_rightsize(i32::try_from(target).unwrap_or(i32::MAX))
+                {
+                    eprintln!(
+                        "ds4-server-rs: serial session right-sized ctx={cur_ctx} -> {target} \
+                         (boot -c {}; request-bounded beside the batch banks, prompt={prompt_len} \
+                         budget={budget}) (DS4_SERVER_SERIAL_RIGHTSIZE=0 restores full--c alloc)",
+                        cfg.ctx
+                    );
+                    return None;
+                }
+            }
+            // Refusal: leave the lane in boot shape (the Rust host restores
+            // the session lazily) so later requests re-probe fresh.
+            engine.serial_session_reset();
+            eprintln!(
+                "ds4-server-rs: serial right-size: no graph fits (prompt={prompt_len} \
+                 need_min={} boot -c {}); refusing 503",
+                bounds.need_min, cfg.ctx
+            );
+            Some(refuse_serial_capacity(cfg, inner, job, prompt_len, out))
+        }
+    }
+}
+
+/// C ensure-fit settle window: freed graph bytes reach MemAvailable with
+/// driver-reclaim lag (the WAIT_MEM class); give the fit probe a bounded
+/// settle window. An engine without a native probe fails open.
+fn fit_settle_probe(engine: &dyn DecodeIo, ctx: i32) -> bool {
+    for _ in 0..20 {
+        match engine.native_graph_fit(ctx) {
+            Some(quote) if quote.fits => return true,
+            None => return true,
+            Some(_) => {}
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// C `serial_session_ensure_fit` final refusal: typed 503, retryable
+/// capacity. Counts the C `JOB_OUT_REFUSED_DEEP_SERIAL` outcome and the
+/// typed serial live-headroom rejection.
+fn refuse_serial_capacity<W: Write>(
+    cfg: &ServerConfig,
+    inner: &Mutex<ServerInner>,
+    job: &PreparedJob,
+    prompt_len: i64,
+    out: &mut W,
+) -> Settlement {
+    {
+        let mut g = lock_inner(inner);
+        g.runtime.requests_refused_deep_serial += 1;
+        g.runtime.rejected[1][RejectReason::LiveHeadroom as usize] += 1;
+    }
+    let prompt_n = i32::try_from(prompt_len).unwrap_or(i32::MAX);
+    let ok = out
+        .write_all(&wire_http_error_bytes(
+            job.surface,
+            503,
+            &serial_capacity_refuse_msg(prompt_n),
+            cfg.cors,
+            None,
+        ))
+        .is_ok();
+    if ok {
+        Settlement::COMPLETED
+    } else {
+        Settlement::CANCELED
+    }
+}
+
+/// C `serial_live_capacity_refuse`: the retained live continuation cannot
+/// extend inside its serial context; preserve the frontier and refuse.
+fn refuse_serial_live_preserve<W: Write>(
+    cfg: &ServerConfig,
+    inner: &Mutex<ServerInner>,
+    job: &PreparedJob,
+    effective_len: i64,
+    need_min: i64,
+    cur_ctx: i64,
+    out: &mut W,
+) -> Settlement {
+    eprintln!(
+        "ds4-server-rs: live serial continuation needs {effective_len} tokens \
+         (minimum={need_min}) but retained session ctx={cur_ctx}; preserving frontier \
+         and refusing 503"
+    );
+    lock_inner(inner).runtime.requests_refused_deep_serial += 1;
+    let ok = out
+        .write_all(&wire_http_error_bytes(
+            job.surface,
+            503,
+            &serial_live_preserve_msg(effective_len, cur_ctx),
+            cfg.cors,
+            None,
+        ))
+        .is_ok();
+    if ok {
         Settlement::COMPLETED
     } else {
         Settlement::CANCELED
@@ -1878,7 +2132,9 @@ pub fn enq_verdict_name(v: EnqVerdict) -> &'static str {
 #[cfg(test)]
 mod owner_tests {
     use super::*;
-    use crate::generate::{generate_and_write_at, GenerateOutcome, ScriptedDecode};
+    use crate::generate::{
+        generate_and_write_at, generate_terminal_at, GenerateOutcome, ScriptedDecode,
+    };
     use crate::parse::{ParseEnv, ParsedRequest};
     use crate::route::WireSurface;
     use std::io::{Read, Write};
@@ -3369,4 +3625,291 @@ mod owner_tests {
     }
 
     mod stream_disconnect;
+
+    // C `serial_session_ensure_fit` driver behavior (v0.5.2 inc1).
+    use crate::generate::{NativeGraphFit, SerialSessionProbe};
+    use ds4_kv::Store as KvStore;
+
+    struct FitProbeDecode {
+        probe: SerialSessionProbe,
+        fits_at_or_below: i32,
+        rightsized: Option<i32>,
+        resets: u32,
+    }
+
+    impl FitProbeDecode {
+        fn new(cur_ctx: i32, graph_pending: bool, fits_at_or_below: i32) -> Self {
+            Self {
+                probe: SerialSessionProbe {
+                    cur_ctx,
+                    graph_pending,
+                },
+                fits_at_or_below,
+                rightsized: None,
+                resets: 0,
+            }
+        }
+    }
+
+    impl DecodeIo for FitProbeDecode {
+        fn model_id(&self) -> i32 {
+            0
+        }
+        fn tokenize_text(&self, _text: &str) -> Result<Vec<i32>, GenerateError> {
+            Ok(vec![1])
+        }
+        fn tokenize_rendered_chat(&self, _text: &[u8]) -> Result<Vec<i32>, GenerateError> {
+            Ok(vec![1])
+        }
+        fn token_text(&self, _token: i32) -> Result<Vec<u8>, GenerateError> {
+            Ok(b"x".to_vec())
+        }
+        fn token_is_stop(&self, _token: i32) -> bool {
+            true
+        }
+        fn sync(&mut self, _tokens: &[i32]) -> Result<(), GenerateError> {
+            Ok(())
+        }
+        fn eval(&mut self, _token: i32) -> Result<(), GenerateError> {
+            Ok(())
+        }
+        fn sample(&mut self, _t: f32, _k: i32, _p: f32, _m: f32, _rng: &mut u64) -> i32 {
+            0
+        }
+        fn native_graph_fit(&self, ctx: i32) -> Option<NativeGraphFit> {
+            Some(NativeGraphFit {
+                fits: ctx <= self.fits_at_or_below,
+                need_bytes: 0,
+                avail_bytes: 0,
+                headroom_bytes: 0,
+                deficit_bytes: 0,
+                fail_open: false,
+            })
+        }
+        fn serial_session_probe(&self) -> Option<SerialSessionProbe> {
+            Some(self.probe)
+        }
+        fn serial_session_rightsize(&mut self, target: i32) -> Result<(), GenerateError> {
+            self.rightsized = Some(target);
+            self.probe = SerialSessionProbe {
+                cur_ctx: target,
+                graph_pending: true,
+            };
+            Ok(())
+        }
+        fn serial_session_reset(&mut self) {
+            self.resets += 1;
+        }
+        fn pos(&self) -> i32 {
+            0
+        }
+        fn ctx(&self) -> i32 {
+            self.probe.cur_ctx
+        }
+        fn generation(&self) -> u64 {
+            0
+        }
+        fn invalidate(&mut self) {}
+    }
+
+    struct NoTrimCont;
+
+    impl ContExec for NoTrimCont {
+        fn model_id(&self) -> i32 {
+            0
+        }
+        fn seq_cap(&self) -> i32 {
+            0
+        }
+        fn encode_chat(&self, _rendered: &[u8]) -> Vec<i32> {
+            Vec::new()
+        }
+        fn encode_text(&self, _text: &str) -> Vec<i32> {
+            Vec::new()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn generate(
+            &mut self,
+            _parsed: &ParsedRequest,
+            _job_id: &str,
+            _created: i64,
+            _cors: bool,
+            _default_tokens: i32,
+            _t_arrive: Instant,
+            _bank_hold_retry: &mut dyn FnMut(i32, Option<(u64, i32)>) -> Option<i32>,
+            _store: Option<&mut KvStore>,
+            _out: &mut dyn Write,
+        ) -> Result<GenerateOutcome, GenerateError> {
+            Err(GenerateError::Unsupported("test cont"))
+        }
+    }
+
+    fn serial_fit_cfg(boot_ctx: i32) -> ServerConfig {
+        let mut cfg = ServerConfig::test_cfg();
+        cfg.ctx = boot_ctx;
+        cfg.serial_rightsize = true;
+        cfg
+    }
+
+    #[test]
+    fn serial_fit_resizes_pending_full_ctx_session() {
+        let cfg = serial_fit_cfg(250_000);
+        let inner = Mutex::new(ServerInner::from_cfg(&cfg));
+        let job = queued_completion("hello", 32);
+        let mut engine = FitProbeDecode::new(250_000, true, 40_000);
+        let mut cont = NoTrimCont;
+        let mut out = Vec::new();
+
+        let refusal = ensure_serial_session_fit(
+            &cfg,
+            &inner,
+            &job,
+            &mut engine,
+            Some(&mut cont),
+            SerialFrameKind::Canonical,
+            26,
+            384,
+            &mut out,
+        );
+        assert!(refusal.is_none());
+        assert_eq!(engine.resets, 1, "free before probing (the regrow case)");
+        // request_cap = prompt + budget + 32768; the search stops within
+        // 1024 of the cap and the target must fit.
+        let target = engine.rightsized.expect("session re-created");
+        let cap = 26 + 384 + 32768;
+        assert!(target >= cap - 1024 && target <= cap, "target={target}");
+        assert!(out.is_empty(), "no refusal bytes on the resize path");
+    }
+
+    #[test]
+    fn serial_fit_refuses_when_no_graph_fits() {
+        let cfg = serial_fit_cfg(250_000);
+        let inner = Mutex::new(ServerInner::from_cfg(&cfg));
+        let job = queued_completion("hello", 32);
+        let mut engine = FitProbeDecode::new(250_000, true, 0);
+        let mut cont = NoTrimCont;
+        let mut out = Vec::new();
+
+        let refusal = ensure_serial_session_fit(
+            &cfg,
+            &inner,
+            &job,
+            &mut engine,
+            Some(&mut cont),
+            SerialFrameKind::Canonical,
+            26,
+            384,
+            &mut out,
+        );
+        assert!(refusal.is_some());
+        assert!(engine.rightsized.is_none());
+        assert_eq!(engine.resets, 2, "free before probing + boot-shape restore");
+        let response = String::from_utf8_lossy(&out);
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(
+            response.contains("no session graph fits beside the batch banks"),
+            "{response}"
+        );
+        let g = lock_inner(&inner);
+        assert_eq!(g.runtime.requests_refused_deep_serial, 1);
+        assert_eq!(
+            g.runtime.rejected[1][RejectReason::LiveHeadroom as usize],
+            1
+        );
+    }
+
+    #[test]
+    fn serial_fit_preserves_live_continuation_frontier() {
+        let cfg = serial_fit_cfg(250_000);
+        let inner = Mutex::new(ServerInner::from_cfg(&cfg));
+        let job = queued_completion("hello", 32);
+        // Committed 2048-ctx session retaining the only continuation copy.
+        let mut engine = FitProbeDecode::new(2048, false, 40_000);
+        let mut cont = NoTrimCont;
+        let mut out = Vec::new();
+
+        let refusal = ensure_serial_session_fit(
+            &cfg,
+            &inner,
+            &job,
+            &mut engine,
+            Some(&mut cont),
+            SerialFrameKind::ResolvedLive,
+            5000,
+            1024,
+            &mut out,
+        );
+        assert!(refusal.is_some());
+        assert_eq!(engine.resets, 0, "the frontier must be preserved");
+        assert!(engine.rightsized.is_none());
+        let response = String::from_utf8_lossy(&out);
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(response.contains("replay the full history"), "{response}");
+        let g = lock_inner(&inner);
+        assert_eq!(g.runtime.requests_refused_deep_serial, 1);
+        assert_eq!(
+            g.runtime.rejected[1][RejectReason::LiveHeadroom as usize],
+            0
+        );
+    }
+
+    #[test]
+    fn serial_fit_reuses_committed_session_and_skips_scope_gates() {
+        let cfg = serial_fit_cfg(8192);
+        let inner = Mutex::new(ServerInner::from_cfg(&cfg));
+        let job = queued_completion("hello", 32);
+
+        // Committed and big enough: reuse.
+        let mut engine = FitProbeDecode::new(8192, false, 0);
+        let mut cont = NoTrimCont;
+        let mut out = Vec::new();
+        assert!(ensure_serial_session_fit(
+            &cfg,
+            &inner,
+            &job,
+            &mut engine,
+            Some(&mut cont),
+            SerialFrameKind::Canonical,
+            100,
+            384,
+            &mut out,
+        )
+        .is_none());
+        assert_eq!(engine.resets, 0);
+
+        // DS4_SERVER_SERIAL_RIGHTSIZE=0 keeps the v0.5.1 contract.
+        let mut off = serial_fit_cfg(8192);
+        off.serial_rightsize = false;
+        let mut engine = FitProbeDecode::new(8192, true, 0);
+        assert!(ensure_serial_session_fit(
+            &off,
+            &inner,
+            &job,
+            &mut engine,
+            Some(&mut cont),
+            SerialFrameKind::Canonical,
+            9000,
+            384,
+            &mut out,
+        )
+        .is_none());
+        assert_eq!(engine.resets, 0);
+
+        // Serial-only boot (no batch ctx): full--c session IS the serving
+        // configuration.
+        let mut engine = FitProbeDecode::new(8192, true, 0);
+        assert!(ensure_serial_session_fit(
+            &cfg,
+            &inner,
+            &job,
+            &mut engine,
+            None,
+            SerialFrameKind::Canonical,
+            9000,
+            384,
+            &mut out,
+        )
+        .is_none());
+        assert_eq!(engine.resets, 0);
+    }
 }

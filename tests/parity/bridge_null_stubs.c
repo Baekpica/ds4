@@ -164,6 +164,9 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 }
 int ds4_session_pos(ds4_session *s) { (void)s; STUB("ds4_session_pos"); }
 int ds4_session_ctx(ds4_session *s) { (void)s; STUB("ds4_session_ctx"); }
+int ds4_session_graph_pending(const ds4_session *s) {
+    (void)s; STUB("ds4_session_graph_pending");
+}
 void ds4_session_rewind(ds4_session *s, int pos) {
     (void)s; (void)pos; STUB("ds4_session_rewind");
 }

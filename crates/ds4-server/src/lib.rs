@@ -26,6 +26,7 @@ mod serve_cont_prefill;
 #[cfg(test)]
 mod serve_cont_prefill_test;
 mod serve_cont_roll;
+mod serve_serial_fit;
 mod serve_serial_reclaim;
 #[cfg(test)]
 mod serve_serial_reclaim_test;

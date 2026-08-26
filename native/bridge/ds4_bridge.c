@@ -561,6 +561,12 @@ int ds4_bridge_session_ctx(ds4_bridge_session *s)
     return ds4_session_ctx(s->session);
 }
 
+int ds4_bridge_session_graph_pending(ds4_bridge_session *s)
+{
+    if (!s || !s->session) return 0;
+    return ds4_session_graph_pending(s->session);
+}
+
 int ds4_bridge_session_power(ds4_bridge_session *s)
 {
     if (!s || !s->session) return 100;

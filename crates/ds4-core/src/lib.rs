@@ -100,12 +100,12 @@ use ds4_sys::{
     ds4_bridge_session_argmax_excluding, ds4_bridge_session_copy_logits, ds4_bridge_session_create,
     ds4_bridge_session_ctx, ds4_bridge_session_distributed_route_ready,
     ds4_bridge_session_eval_layer_slice, ds4_bridge_session_free, ds4_bridge_session_generation,
-    ds4_bridge_session_graph_fit_quote, ds4_bridge_session_invalidate,
-    ds4_bridge_session_layer_slice_reset, ds4_bridge_session_load_layer_payload,
-    ds4_bridge_session_load_payload, ds4_bridge_session_load_payload_range,
-    ds4_bridge_session_load_snapshot, ds4_bridge_session_output_head_bench,
-    ds4_bridge_session_power, ds4_bridge_session_prefill_cap, ds4_bridge_session_rewind,
-    ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
+    ds4_bridge_session_graph_fit_quote, ds4_bridge_session_graph_pending,
+    ds4_bridge_session_invalidate, ds4_bridge_session_layer_slice_reset,
+    ds4_bridge_session_load_layer_payload, ds4_bridge_session_load_payload,
+    ds4_bridge_session_load_payload_range, ds4_bridge_session_load_snapshot,
+    ds4_bridge_session_output_head_bench, ds4_bridge_session_power, ds4_bridge_session_prefill_cap,
+    ds4_bridge_session_rewind, ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
     ds4_bridge_session_save_payload, ds4_bridge_session_save_snapshot,
     ds4_bridge_session_set_power, ds4_bridge_session_sync, ds4_bridge_session_top_logprobs,
     ds4_bridge_shard, ds4_bridge_snapshot, ds4_bridge_snapshot_create, ds4_bridge_snapshot_free,
@@ -1652,6 +1652,13 @@ impl Session<'_> {
 
     pub fn ctx(&self) -> i32 {
         self.host.ctx
+    }
+
+    /// C `ds4_session_graph_pending`: true while the S6 lazy graph alloc is
+    /// still deferred. A pending session can be re-created at another ctx for
+    /// free; a committed graph's capacity is spent.
+    pub fn graph_pending(&self) -> bool {
+        unsafe { ds4_bridge_session_graph_pending(self.raw.as_ptr()) != 0 }
     }
 
     pub fn power(&self) -> i32 {

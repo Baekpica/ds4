@@ -72,10 +72,31 @@ impl From<RenderError> for GenerateError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NativeGraphFit {
+    /// C quote verdict at the probed ctx (`ds4_engine_session_graph_fits`).
+    /// Family fit checks (EXAONE/Solar/Motif/dots3) report only this bit;
+    /// their byte fields stay zero.
+    pub fits: bool,
     pub need_bytes: u64,
     pub avail_bytes: u64,
     pub headroom_bytes: u64,
+    pub deficit_bytes: u64,
     pub fail_open: bool,
+}
+
+/// C `serial_session_ensure_fit` view of the serial session lane.
+/// `None` from [`DecodeIo::serial_session_probe`] means the engine has no
+/// native serial session (stub/test engines): the host must pass native and
+/// never invent a rightsize or a refuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SerialSessionProbe {
+    /// Current session ctx; the boot `-c` when no session exists yet (the
+    /// Rust host creates the serial session lazily, which is C's boot-shape
+    /// lazy session by another name).
+    pub cur_ctx: i32,
+    /// C `ds4_session_graph_pending`: true when the graph alloc is still
+    /// deferred (including "no session yet"). A pending session can be
+    /// re-created at another ctx for free.
+    pub graph_pending: bool,
 }
 
 pub trait DecodeIo {
@@ -131,6 +152,21 @@ pub trait DecodeIo {
     fn native_graph_fit(&self, _ctx: i32) -> Option<NativeGraphFit> {
         None
     }
+    /// C `serial_session_ensure_fit` inputs. `None` = no native serial
+    /// session lane; the host ensure-fit passes native.
+    fn serial_session_probe(&self) -> Option<SerialSessionProbe> {
+        None
+    }
+    /// C `ds4_session_free` + `ds4_session_create(target)`: replace the
+    /// serial session with a right-sized one. The old session's live
+    /// records die with it (the caller demotes the registry).
+    fn serial_session_rightsize(&mut self, _target_ctx: i32) -> Result<(), GenerateError> {
+        Ok(())
+    }
+    /// C refusal shape: free the session so the server keeps its boot
+    /// invariant and later requests re-probe fresh (the Rust host restores
+    /// lazily on next use instead of eagerly re-creating at boot ctx).
+    fn serial_session_reset(&mut self) {}
     fn pos(&self) -> i32;
     fn ctx(&self) -> i32;
     fn generation(&self) -> u64;
@@ -1126,18 +1162,22 @@ pub fn generate_and_write_at(
     Ok(outcome)
 }
 
-/// Runs serial generation while withholding only the final wire terminal.
-/// Streaming headers/deltas still flow through `out` as they are produced.
-pub(crate) fn generate_terminal_at(
+/// Serial phase 1: everything before the prompt sync — blocked check, tool
+/// replay restore, required prefixes, render, tokenize. Split out so the
+/// server's `ensure_serial_session_fit` (C `serial_session_ensure_fit`) can
+/// size the session from the exact sync-bound token count without a second
+/// render+tokenize pass.
+pub(crate) struct PreparedSerialPrompt {
+    pub(crate) parsed: ParsedRequest,
+    pub(crate) tool_replay: bool,
+    pub(crate) prompt: Vec<u8>,
+    pub(crate) tokens: Vec<i32>,
+}
+
+pub(crate) fn prepare_serial_prompt(
     engine: &mut dyn DecodeIo,
     parsed: &ParsedRequest,
-    job_id: &str,
-    created: i64,
-    cors: bool,
-    default_tokens: i32,
-    t_arrive: Instant,
-    out: &mut impl Write,
-) -> Result<(GenerateOutcome, Vec<u8>), GenerateError> {
+) -> Result<PreparedSerialPrompt, GenerateError> {
     if let Some(msg) = generation_blocked(parsed, engine.model_id()) {
         return Err(GenerateError::Unsupported(msg));
     }
@@ -1162,6 +1202,57 @@ pub(crate) fn generate_terminal_at(
         }
         ReqKind::Chat => engine.tokenize_rendered_chat(&prompt)?,
     };
+    Ok(PreparedSerialPrompt {
+        parsed,
+        tool_replay,
+        prompt,
+        tokens,
+    })
+}
+
+/// Runs serial generation while withholding only the final wire terminal.
+/// Streaming headers/deltas still flow through `out` as they are produced.
+pub(crate) fn generate_terminal_at(
+    engine: &mut dyn DecodeIo,
+    parsed: &ParsedRequest,
+    job_id: &str,
+    created: i64,
+    cors: bool,
+    default_tokens: i32,
+    t_arrive: Instant,
+    out: &mut impl Write,
+) -> Result<(GenerateOutcome, Vec<u8>), GenerateError> {
+    let prep = prepare_serial_prompt(engine, parsed)?;
+    generate_terminal_prepared(
+        engine,
+        prep,
+        job_id,
+        created,
+        cors,
+        default_tokens,
+        t_arrive,
+        out,
+    )
+}
+
+/// Serial phase 2: prompt sync onward, on a [`PreparedSerialPrompt`].
+pub(crate) fn generate_terminal_prepared(
+    engine: &mut dyn DecodeIo,
+    prep: PreparedSerialPrompt,
+    job_id: &str,
+    created: i64,
+    cors: bool,
+    default_tokens: i32,
+    t_arrive: Instant,
+    out: &mut impl Write,
+) -> Result<(GenerateOutcome, Vec<u8>), GenerateError> {
+    let PreparedSerialPrompt {
+        parsed,
+        tool_replay,
+        prompt,
+        tokens,
+    } = prep;
+    let syntax = syntax_for_model_id(engine.model_id());
     let t_prefill = Instant::now();
     let cached = if tool_replay {
         engine.sync_tool_replay_prompt(&prompt, &tokens)?
@@ -1981,11 +2072,47 @@ impl DecodeIo for NativeDecode<'_> {
     fn native_graph_fit(&self, ctx: i32) -> Option<NativeGraphFit> {
         let quote = self.model.session_graph_fit_quote(ctx)?;
         Some(NativeGraphFit {
+            fits: quote.fits,
             need_bytes: quote.need_bytes,
             avail_bytes: quote.avail_bytes,
             headroom_bytes: quote.headroom_bytes,
+            deficit_bytes: quote.deficit_bytes,
             fail_open: quote.fail_open,
         })
+    }
+
+    fn serial_session_probe(&self) -> Option<SerialSessionProbe> {
+        Some(match &self.session {
+            Some(s) => SerialSessionProbe {
+                cur_ctx: s.ctx(),
+                graph_pending: s.graph_pending(),
+            },
+            // No session yet: the C boot-shape lazy session (pending at -c).
+            None => SerialSessionProbe {
+                cur_ctx: self.ctx,
+                graph_pending: true,
+            },
+        })
+    }
+
+    fn serial_session_rightsize(&mut self, target_ctx: i32) -> Result<(), GenerateError> {
+        // Free BEFORE creating so a committed right-sized graph's own GiBs
+        // count as available for its replacement (the C regrow case).
+        self.session = None;
+        self.session_disk_storable = false;
+        self.thinking_visible = None;
+        let s = self
+            .model
+            .session(target_ctx)
+            .map_err(|e| GenerateError::Engine(e.to_string()))?;
+        self.session = Some(s);
+        Ok(())
+    }
+
+    fn serial_session_reset(&mut self) {
+        self.session = None;
+        self.session_disk_storable = false;
+        self.thinking_visible = None;
     }
 
     fn sync(&mut self, tokens: &[i32]) -> Result<(), GenerateError> {

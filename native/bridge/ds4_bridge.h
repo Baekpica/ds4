@@ -185,6 +185,9 @@ int ds4_bridge_session_argmax_excluding(ds4_bridge_session *s,
                                         int32_t excluded_id);
 int ds4_bridge_session_pos(ds4_bridge_session *s);
 int ds4_bridge_session_ctx(ds4_bridge_session *s);
+/* 1 while the S6 lazy graph alloc is still deferred; a pending session can be
+ * re-created at a different ctx for free (ds4_session_graph_pending). */
+int ds4_bridge_session_graph_pending(ds4_bridge_session *s);
 int ds4_bridge_session_power(ds4_bridge_session *s);
 int ds4_bridge_session_set_power(ds4_bridge_session *s, int power_percent);
 void ds4_bridge_session_rewind(ds4_bridge_session *s, int pos);
