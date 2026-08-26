@@ -1223,6 +1223,15 @@ fn run_engine<W: TerminalSink>(
                 };
                 return (LANE_CONTINUOUS, settlement);
             }
+            // C lane-entry counters (ds4_server.c route_metrics_record):
+            // cont_admit success ticks continuous BEFORE the engine's
+            // funding verdict, and the stranded fallback's generate_job
+            // entry then ticks serial too. Mirror the two-entry shape on
+            // the Unsupported fold — this return path ends in run_serial,
+            // whose caller records the serial entry.
+            lock_inner(inner)
+                .metrics
+                .record_lane_entry(job.surface, LANE_CONTINUOUS);
         }
     }
     if dec.lane == LANE_STATIC {
@@ -2514,6 +2523,11 @@ mod owner_tests {
     }
 
     #[test]
+    // C lane-entry contract (ds4_server.c ~10794 + live 2026-08-26
+    // surfaces evidence): cont_admit success ticks continuous before the
+    // engine funding verdict; the stranded fallback's generate_job entry
+    // ticks serial too — C /v1/stats shows openai_chat.serial:1 AND
+    // openai_chat.continuous:1 for one stranded request.
     fn fallback_records_actual_serial_lane() {
         let cfg = test_cfg();
         let inner = Mutex::new(ServerInner::from_cfg(&cfg));
@@ -2546,7 +2560,7 @@ mod owner_tests {
         assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
         let g = inner.lock().unwrap();
         assert_eq!(g.metrics.route_requests[0][0], 1);
-        assert_eq!(g.metrics.route_requests[0][1], 0);
+        assert_eq!(g.metrics.route_requests[0][1], 1);
     }
 
     #[test]

@@ -58,6 +58,15 @@ impl RouteMetrics {
         }
     }
 
+    /// C `route_metrics_record`: one lane ENTRY tick alone (no decision or
+    /// think tick). Lane-entry counters fire where a lane takes the job and
+    /// can fire more than once per request — C's `cont_admit` success ticks
+    /// continuous before the engine's funding verdict, and the stranded
+    /// fallback's `generate_job` entry then ticks serial as well.
+    pub fn record_lane_entry(&mut self, surf: WireSurface, lane: u8) {
+        self.route_requests[surface_index(surf)][lane_index(lane)] += 1;
+    }
+
     pub fn record_shed(&mut self, reason: u8) {
         if (reason as usize) < SHED_REASONS {
             self.shed[reason as usize] += 1;
