@@ -902,6 +902,20 @@ static ds4_think_mode g_default_reasoning_effort = DS4_THINK_LOW;
  * that level. */
 static bool g_native_reasoning_effort = false;
 
+/* Issue #18 residual: agent scaffolds that echo assistant messages verbatim
+ * re-send reasoning_content, and the tool-context render re-emits it inside
+ * <think>...</think> -- the conversation then runs 16-28% deeper per turn
+ * than the same transcript on llama.cpp (default drops it) or DeepSeek's
+ * reference API (rejects it), entering the depth band where the quant's
+ * tool-protocol adherence slips (measured 50% no-tool-call turns at 70-80K).
+ * --reasoning-replay drop renders history assistant turns lean; the cont
+ * bank's partial-prefix admission absorbs the divergence at a measured cost
+ * of a one-turn tail re-prefill (~270 tokens / ~0.6s per turn).  Default
+ * keeps the replay (warm in-place reuse for echoing clients); assistant
+ * turns being CONTINUED (after the last user message) always keep their
+ * reasoning regardless. */
+static bool g_reasoning_replay_drop = false;
+
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
     if (!s) return false;
     /* The three levels the 0731 checkpoint defines, plus the OpenAI-style
@@ -2575,7 +2589,8 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
             if (pending_assistant) {
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
-                    if (tool_context || i > last_user_idx) {
+                    if ((tool_context && !g_reasoning_replay_drop) ||
+                        i > last_user_idx) {
                         buf_puts(&out, "<think>");
                         buf_puts(&out, m->reasoning ? m->reasoning : "");
                         buf_puts(&out, "</think>");
@@ -3053,6 +3068,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
+        !g_reasoning_replay_drop &&
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
@@ -3283,6 +3299,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     request_acquire_cont_pin(s, r);   /* Inc 5b: pin the LIVE record */
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
+        !g_reasoning_replay_drop &&
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
                                              &r->tool_orders, r->think_mode);
@@ -4241,6 +4258,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_preserves_reasoning =
+        !g_reasoning_replay_drop &&
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
     request_acquire_cont_pin(s, r);   /* Inc 5b: pin the LIVE record */
@@ -8714,6 +8732,13 @@ struct server {
     const char *tool_slip_dir;
     pthread_mutex_t tool_slip_mu;
     uint64_t tool_slip_seq;
+    /* issue #18 option C: when a cont-served non-streaming tools-armed chat
+     * turn settles at finish=stop with no tool calls (the measured 50%
+     * failure shape at 70-80K depth), requeue it once at the FIFO head for
+     * a fresh draw instead of writing the prose -- the retired bank warm-
+     * admits the full prompt, so the retry costs one generation, not a
+     * prefill.  Opt-in; disclosed in release notes (it is our sampler). */
+    bool tool_slip_resample;
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -8756,6 +8781,11 @@ struct job {
     /* Inc 2e: this request's HTTP body size, charged against the server's
      * inflight_body_bytes bound from enqueue until settle. */
     size_t body_bytes;
+    /* issue #18 option C: number of tool-slip resamples already spent on this
+     * job (cap 1).  Worker-owned; also exempts the retry from the queue-age
+     * shed (t_arrive is the ORIGINAL arrival, deliberately not refreshed --
+     * timings stay honest about total latency). */
+    int slip_attempts;
 };
 
 /* Inc 2c: CANCELED = the CLIENT ended the request (disconnected while
@@ -13712,6 +13742,22 @@ static enq_verdict enqueue(server *s, job *j) {
     return ENQ_OK;
 }
 
+/* issue #18 option C: put a slip-resample retry back at the FIFO HEAD.  Head,
+ * not tail: the job's just-retired bank still holds its full prompt, so an
+ * immediate re-admit warm-matches everything and the retry costs only the
+ * generation.  Deliberately NOT the client enqueue path: no shed bounds (the
+ * job was already admitted once) and no body-bytes re-charge (still charged
+ * -- Inc 2e charges from enqueue until settle, and this job has not settled). */
+static void requeue_job_head(server *s, job *j) {
+    pthread_mutex_lock(&s->mu);
+    j->next = s->head;
+    s->head = j;
+    if (!s->tail) s->tail = j;
+    s->queued++;
+    pthread_cond_signal(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+}
+
 /* Unlink the FIFO head.  Callers hold s->mu; head must be non-NULL.  The
  * single decrement site for the queue-depth accounting, shared by all three
  * pull paths (dequeue, coalesce_gather, cont_admit) so they cannot drift. */
@@ -13752,6 +13798,10 @@ static bool client_disconnected(int fd) {
  * outwaited it.  Callers decide the shed site; the check is just arithmetic
  * so it can run under s->mu. */
 static bool job_queue_aged(const server *s, const job *j) {
+    /* A slip-resample retry keeps its original t_arrive (honest latency), so
+     * a long first generation must not read as queue age -- it was served,
+     * not stuck. */
+    if (j->slip_attempts > 0) return false;
     return s->max_queue_age > 0 && now_sec() - j->t_arrive > s->max_queue_age;
 }
 
@@ -16116,8 +16166,14 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
 /* A1: format a NON-streaming continuous row's response from its host-side
  * accumulated text (stop-truncated / tool-scanned) -- write_batch_completion's
  * shape, but from st->acc.text instead of a re-detok, with scan-verdict finish
- * semantics and real tool parsing.  Frees the cont_stream state. */
-static void write_cont_completion(server *s, job *j, int engine_finish) {
+ * semantics and real tool parsing.  Frees the cont_stream state.
+ *
+ * Returns true when the response was written (the normal settle).  Returns
+ * false ONLY on the issue-#18 slip-resample path: a tools-armed chat turn
+ * settled at finish=stop with no tool calls and --tool-slip-resample is
+ * armed -- nothing was written, the stream state is freed, and the caller
+ * must requeue the job instead of finishing it. */
+static bool write_cont_completion(server *s, job *j, int engine_finish) {
     cont_stream *st = j->cstream;
     char id[96];
     snprintf(id, sizeof(id), "%s-%llu",
@@ -16132,6 +16188,22 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
         char *content = NULL, *reasoning = NULL;
         if (j->req.has_tools) {
             cont_resolve_chat(s, j, st, &fin, &content, &reasoning, &calls);
+            if (s->tool_slip_resample && !calls.len && !j->req.stream &&
+                j->slip_attempts == 0 && !strcmp(fin, "stop")) {
+                j->slip_attempts = 1;
+                /* A pinned seed would redraw the identical slip; perturb it
+                 * for the retry only.  Unpinned requests draw fresh entropy
+                 * anyway. */
+                if (j->req.seed) j->req.seed++;
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: cont chat ctx=%d gen=%d tools-armed turn settled with no tool calls; resampling once",
+                           prompt_tokens, st->acc.completion);
+                free(content);
+                free(reasoning);
+                tool_calls_free(&calls);
+                cont_stream_discard(j);
+                return false;
+            }
         } else {
             char perr[160] = {0};
             bool recovered = false;
@@ -16182,6 +16254,7 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
     }
     log_cont_completion(j, st, prompt_tokens, fin);
     cont_stream_discard(j);
+    return true;
 }
 
 /* Inc 7c: one sample of the projection-cost counters (ns spent + one token
@@ -16382,7 +16455,17 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
     if (j->req.stream) {                       /* W6: close the live SSE stream. */
         cont_stream_finalize(cs->s, j, finish ? "stop" : "length");
     } else if (j->cstream) {                   /* A1: stop/tool row -> host-side text. */
-        write_cont_completion(cs->s, j, finish);
+        if (!write_cont_completion(cs->s, j, finish)) {
+            /* issue #18 option C: slip resample.  Nothing was written; the
+             * job goes back to the FIFO head for one fresh draw (its retired
+             * bank warm-admits the full prompt).  The client thread is still
+             * parked on j->done, so job_finish is deliberately NOT called,
+             * and this settle never counted as served. */
+            cs->served--;
+            t_emit_job = NULL;
+            requeue_job_head(cs->s, j);
+            return;
+        }
     } else {                                   /* W5: write the whole response now. */
         ds4_batch_gen_result r = { .tokens = (int *)tokens, .n_tokens = n, .finish = finish };
         write_batch_completion(cs->s, j, &r);
@@ -18690,6 +18773,7 @@ typedef struct {
     const char *chdir_path;
     const char *trace_path;
     const char *tool_slip_dump_dir;
+    bool tool_slip_resample;
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
@@ -18839,6 +18923,21 @@ static void usage(FILE *fp) {
         "      Dump one JSON file per tools-armed chat completion that settles without\n"
         "      tool calls (raw request body + generated text + parse verdict), both\n"
         "      lanes -- the issue #18 forensic instrument. Env twin: DS4_TOOL_SLIP_DUMP_DIR.\n"
+        "  --tool-slip-resample\n"
+        "      When a continuously-batched non-streaming tools-armed chat turn settles\n"
+        "      at finish=stop with no tool calls, requeue it once for a fresh draw\n"
+        "      before answering (the retry warm-admits its own bank, so the cost is one\n"
+        "      generation). Serial-lane and streaming turns are not resampled. Off by\n"
+        "      default. Env twin: DS4_TOOL_SLIP_RESAMPLE=1.\n"
+        "  --reasoning-replay MODE\n"
+        "      keep (default): reasoning_content echoed by the client in tool-context\n"
+        "      history renders back into <think> blocks (keeps the rendered prefix\n"
+        "      aligned with live KV for warm in-place reuse). drop: render history\n"
+        "      assistant turns lean, like llama.cpp's default and DeepSeek's API --\n"
+        "      the conversation runs 16-28%% shallower per turn on echoing agent\n"
+        "      scaffolds, at the cost of a one-turn-tail re-prefill per turn.\n"
+        "      Assistant turns being continued (after the last user message) always\n"
+        "      keep their reasoning. Env twin: DS4_REASONING_REPLAY=drop.\n"
         "  --reasoning-effort LEVEL\n"
         "      Default reasoning effort for requests that do not send one: low (default),\n"
         "      high, max, or off. Explicit request values always win.\n"
@@ -19411,6 +19510,17 @@ static server_config parse_options(int argc, char **argv) {
             c.tool_slip_dump_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--reasoning-effort-native")) {
             g_native_reasoning_effort = true;
+        } else if (!strcmp(arg, "--reasoning-replay")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "drop")) g_reasoning_replay_drop = true;
+            else if (!strcmp(v, "keep")) g_reasoning_replay_drop = false;
+            else {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: unknown --reasoning-replay '%s' (keep, drop)", v);
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--tool-slip-resample")) {
+            c.tool_slip_resample = true;
         } else if (!strcmp(arg, "--reasoning-effort")) {
             const char *v = need_arg(&i, argc, argv, arg);
             if (!parse_reasoning_effort_name(v, &g_default_reasoning_effort)) {
@@ -19526,6 +19636,14 @@ static server_config parse_options(int argc, char **argv) {
     if (!g_native_reasoning_effort) {   /* env twin of --reasoning-effort-native */
         const char *ne = getenv("DS4_REASONING_EFFORT_NATIVE");
         g_native_reasoning_effort = ne && ne[0] == '1' && ne[1] == '\0';
+    }
+    if (!g_reasoning_replay_drop) {   /* env twin of --reasoning-replay drop */
+        const char *rr = getenv("DS4_REASONING_REPLAY");
+        if (rr && !strcmp(rr, "drop")) g_reasoning_replay_drop = true;
+    }
+    if (!c.tool_slip_resample) {   /* env twin of --tool-slip-resample */
+        const char *rs = getenv("DS4_TOOL_SLIP_RESAMPLE");
+        c.tool_slip_resample = rs && rs[0] == '1' && rs[1] == '\0';
     }
     return c;
 }
@@ -19805,6 +19923,13 @@ int main(int argc, char **argv) {
                    "ds4-server: dumping tools-armed no-tool-call turns to %s",
                    s.tool_slip_dir);
     }
+    s.tool_slip_resample = cfg.tool_slip_resample;
+    if (s.tool_slip_resample)
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: tool-slip resample armed (cont non-streaming chat, one retry)");
+    if (g_reasoning_replay_drop)
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: reasoning-replay=drop (history assistant turns render lean)");
 
     /* W4: build the persistent batched-generation context, sized to the same
      * coalescing bounds the worker enforces (so every coalesced group fits).  On
@@ -21669,6 +21794,147 @@ static void test_tool_slip_dump(void) {
     rmdir(dir);
     request_free(&r);
     pthread_mutex_destroy(&s.tool_slip_mu);
+}
+
+static void test_reasoning_replay_drop_render(void) {
+    /* issue #18 A1: --reasoning-replay drop renders HISTORY assistant turns
+     * lean (the bare </think> replay form the lean path already uses), while
+     * an assistant turn being CONTINUED (after the last user-like message)
+     * keeps its reasoning in both modes. */
+    const bool saved = g_reasoning_replay_drop;
+    chat_msgs msgs = {0};
+    chat_msg m0 = {0};
+    m0.role = xstrdup("user");
+    m0.content = xstrdup("do the task");
+    chat_msgs_push(&msgs, m0);
+    chat_msg m1 = {0};
+    m1.role = xstrdup("assistant");
+    m1.content = xstrdup("");
+    m1.reasoning = xstrdup("REPLAYED-THOUGHTS");
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\": \"ls\"}");
+    tool_calls_push(&m1.calls, tc);
+    chat_msgs_push(&msgs, m1);
+    chat_msg m2 = {0};
+    m2.role = xstrdup("tool");
+    m2.content = xstrdup("ok");
+    chat_msgs_push(&msgs, m2);
+    chat_msg m3 = {0};
+    m3.role = xstrdup("assistant");
+    m3.content = xstrdup("partial answer");
+    m3.reasoning = xstrdup("CONT-THOUGHTS");
+    chat_msgs_push(&msgs, m3);
+    const char *schemas = "## bash\ndescription";
+
+    g_reasoning_replay_drop = false;
+    char *keep = render_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(strstr(keep, "REPLAYED-THOUGHTS") != NULL);
+    TEST_ASSERT(strstr(keep, "CONT-THOUGHTS") != NULL);
+
+    g_reasoning_replay_drop = true;
+    char *drop = render_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(strstr(drop, "REPLAYED-THOUGHTS") == NULL);
+    /* The history turn takes the lean replay form (no <think> opener)... */
+    TEST_ASSERT(strstr(drop, "<｜Assistant｜></think>") != NULL);
+    /* ...its visible content and calls survive... */
+    TEST_ASSERT(strstr(drop, "<｜DSML｜invoke name=\"bash\">") != NULL);
+    /* ...and the continuation turn (after the tool result) keeps thinking. */
+    TEST_ASSERT(strstr(drop, "CONT-THOUGHTS") != NULL);
+
+    g_reasoning_replay_drop = saved;
+    free(keep);
+    free(drop);
+    chat_msgs_free(&msgs);
+}
+
+static void test_cont_slip_resample_contract(void) {
+    /* issue #18 option C: the FIRST tools-armed no-tool-call stop settle on a
+     * non-streaming cont chat row returns false (nothing written, stream
+     * state freed, one attempt recorded); the SECOND settles normally. */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0) return;
+    server s;
+    memset(&s, 0, sizeof(s));
+    s.tool_slip_resample = true;
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.fd = sv[0];
+    pthread_mutex_init(&j.mu, NULL);
+    pthread_cond_init(&j.cv, NULL);
+    request_init(&j.req, REQ_CHAT, 128);
+    j.req.api = API_OPENAI;
+    j.req.stream = false;
+    j.req.has_tools = true;
+    j.req.think_mode = DS4_THINK_NONE;
+    j.req.prompt.len = 10;
+    j.req.seed = 7;
+
+    cont_stream *st = cont_stream_ensure(&j);
+    buf_puts(&st->acc.text, "I believe the task is complete.");
+    TEST_ASSERT(!write_cont_completion(&s, &j, 1));
+    TEST_ASSERT(j.slip_attempts == 1);
+    TEST_ASSERT(j.cstream == NULL);
+    TEST_ASSERT(j.req.seed == 8);          /* pinned seed perturbed for the redraw */
+    char probe;
+    TEST_ASSERT(recv(sv[1], &probe, 1, MSG_PEEK | MSG_DONTWAIT) < 0);  /* nothing written */
+
+    st = cont_stream_ensure(&j);
+    buf_puts(&st->acc.text, "Still prose on the retry.");
+    TEST_ASSERT(write_cont_completion(&s, &j, 1));
+    TEST_ASSERT(j.slip_attempts == 1);     /* one retry only */
+    char out[2048] = {0};
+    ssize_t got = recv(sv[1], out, sizeof(out) - 1, MSG_DONTWAIT);
+    TEST_ASSERT(got > 0);
+    TEST_ASSERT(strstr(out, "Still prose on the retry.") != NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"stop\"") != NULL);
+
+    /* Length settles never resample (fresh job, same prose, engine_finish=0). */
+    job j2;
+    memset(&j2, 0, sizeof(j2));
+    j2.fd = sv[0];
+    pthread_mutex_init(&j2.mu, NULL);
+    pthread_cond_init(&j2.cv, NULL);
+    request_init(&j2.req, REQ_CHAT, 128);
+    j2.req.api = API_OPENAI;
+    j2.req.has_tools = true;
+    j2.req.think_mode = DS4_THINK_NONE;
+    j2.req.prompt.len = 10;
+    st = cont_stream_ensure(&j2);
+    buf_puts(&st->acc.text, "cut off mid");
+    TEST_ASSERT(write_cont_completion(&s, &j2, 0));
+    TEST_ASSERT(j2.slip_attempts == 0);
+    while (recv(sv[1], out, sizeof(out) - 1, MSG_DONTWAIT) > 0) {}
+
+    request_free(&j.req);
+    request_free(&j2.req);
+    buf_free(&j.out);
+    buf_free(&j2.out);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_slip_requeue_and_age_exemption(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    job j, j2;
+    memset(&j, 0, sizeof(j));
+    memset(&j2, 0, sizeof(j2));
+    requeue_job_head(&s, &j);
+    TEST_ASSERT(s.head == &j && s.tail == &j && s.queued == 1);
+    requeue_job_head(&s, &j2);
+    TEST_ASSERT(s.head == &j2 && s.head->next == &j && s.tail == &j);
+    TEST_ASSERT(s.queued == 2);
+    /* Age shed: a retry (slip_attempts>0) is exempt -- its t_arrive is the
+     * original arrival, not queue wait. */
+    s.max_queue_age = 1.0;
+    j.t_arrive = now_sec() - 100.0;
+    TEST_ASSERT(job_queue_aged(&s, &j));
+    j.slip_attempts = 1;
+    TEST_ASSERT(!job_queue_aged(&s, &j));
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -29608,6 +29874,9 @@ static void ds4_server_unit_tests_run(void) {
     test_reasoning_effort_mapping();
     test_client_reasoning_effort_compat();
     test_tool_slip_dump();
+    test_reasoning_replay_drop_render();
+    test_cont_slip_resample_contract();
+    test_slip_requeue_and_age_exemption();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_think_effort_prefix_tiers();
