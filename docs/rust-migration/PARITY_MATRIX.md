@@ -1,5 +1,10 @@
 # Parity matrix
 
+> **Freshness (2026-08-26):** the cell states below predate the rust-host
+> campaign waves and are **stale**. The live authority is the newest
+> `RUST_HOST_CAMPAIGN_STATUS-*.md` + `HANDOFF-*-KST.md` in this directory;
+> this matrix is redrawn only from a fresh §10 re-run at promotion time.
+
 “Rust works” is not `cargo build`. A host change is accepted only
 when all five axes that it can affect are green. CUDA optimization
 commits already require a correctness proof **and** a speed proof

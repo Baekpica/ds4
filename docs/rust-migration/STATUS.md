@@ -1,5 +1,13 @@
 # Migration status
 
+> **Freshness (2026-08-26):** this matrix predates the rust-host campaign
+> waves and is **stale below this banner**. The live authority for what is
+> done, blocked, and KEEP is the newest
+> `RUST_HOST_CAMPAIGN_STATUS-*.md` + `HANDOFF-*-KST.md` in this directory.
+> Per the campaign contract this matrix is redrawn only from a fresh §10
+> re-run at promotion time — cells here must not be upgraded piecemeal.
+> Phase 9 is NOT_GREEN; production binaries are still C.
+
 Update this table in the same commit that changes a subsystem’s
 state. Colors: `green` = gate passed, `yellow` = partial / in
 progress, `—` = not started or not applicable, `n/a` = axis does

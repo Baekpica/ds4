@@ -8,13 +8,13 @@
 | 항목 | 값 |
 |---|---|
 | Branch | `rust-host` (ahead of `origin/rust-host`) |
-| HEAD | `40a321c` `Rust(server): Collapse static n=1 gather to serial` |
+| HEAD | `fba963e` `Rust(server): Host C serial_session_ensure_fit rightsize` |
 | C golden | `v0.6.3-dfm` (`516456fe35510e4fb8350396c9d88807ac1f760b`) |
 | 기본 바이너리 | 여전히 C (`ds4` / `ds4-server` / `ds4-bench` / `ds4-agent`) |
 | Rust shadow | `ds4-rs` / `ds4-server-rs` / `ds4-bench-rs` / `ds4-agent-rs` |
 | Phase 9 | **NOT_GREEN** — 이름 승격·SPLIT 문서·`dfm-rs` 생성 없음 |
 | 플랜 | `.omo/plans/rust-host-remaining-to-phase-9.md` (todos 1–61 `[x]`, F1–F4는 최종 감사) |
-| 작업트리 재검증 | 2026-08-26 14:55 KST. serial n=1 붕괴 커밋. Solar/EXAONE owner+worker + DeepSeek standalone 서빙 |
+| 작업트리 재검증 | 2026-08-26 16:30 KST. serial rightsize 호스트 이식 커밋(`fba963e`) + Motif rust serial 4-surface 재스탬프 + cheap/parity 재스탬프 (§3.11) |
 
 증거는 `.omo/evidence/task-*-rust-host-remaining-to-phase-9.txt`에 있다
 (untracked, `git add` 금지 목록).
@@ -223,6 +223,73 @@ standalone Solar는 여전히 boot_prewarm `cudaFreeAsync` IMA (CUDA KEEP).
 긴 owner sock 경로는 `AF_UNIX` 한도에 걸림 — `/tmp/ds4-*-rs/` 사용.
 EXAONE standalone serial 생성은 C `serial_session_ensure_fit` rightsize가
 아직 호스트에 없다. 뱅크 옆 full `-c` lazy graph가 실패한다.
+(→ §3.11에서 rightsize는 호스트로 이식됐다. 단 이 EXAONE standalone
+FAIL의 근본 원인 재판독: `server.log`상 boot prewarm 중 CUDA IMA
+(`CUDA tensor read failed: an illegal memory access`, exaone prefill
+logits readback)가 먼저 발생했고, 이후 모든 CUDA alloc이 IMA로 실패해
+`lazy session graph alloc failed`가 하류 증상으로 나타났다. 당시
+avail ~35 GiB, ctx=512에서도 동일 — 용량 문제가 아니다.)
+
+### 3.11 2026-08-26 오후 — serial rightsize 호스트 이식 (HEAD `fba963e`)
+
+- `fba963e` `Rust(server): Host C serial_session_ensure_fit rightsize`
+  - C `serial_session_fit_plan`/`serial_session_reuse_ok`를 C 테스트
+    벡터와 함께 이식 (`crates/ds4-server/src/serve_serial_fit.rs`)
+  - `run_serial`이 `generate_terminal_at`을 prepare(render+tokenize) /
+    generate 2단계로 갈라 sync에 실제로 들어갈 토큰 수로 fit을 판정
+  - Resize: free-before-probe → C settle window(20×100ms) →
+    필요시 C trim 1회(`trim_idle_banks`, deficit+headroom 또는
+    numberless면 whole-commons) → [need_min, need_full+32768] 이진
+    탐색(1024 granularity) → `Model::session(target)` 재생성
+  - RefusePreserve: ResolvedLive 프레임은 frontier 보존 + C 문구 503.
+    Capacity refuse는 C 문구 503 + `requests_refused_deep_serial` +
+    `rejected[serial][live_headroom]`
+  - `DS4_SERVER_SERIAL_RIGHTSIZE=0`(정확히 "0"만 off)과 batch-ctx 없는
+    부트는 v0.5.1 full--c 계약 유지
+  - 새 bridge seam: `ds4_bridge_session_graph_pending` (freeze 카테고리
+    session; null stub 추가로 `make test-server-parity` 링크 유지)
+- cheap-gate 재스탬프 (HEAD `fba963e`): `cargo fmt --check`,
+  `git diff --check`, `cargo test --workspace`(50 suite),
+  `--no-default-features`, `cargo check --workspace --all-targets`,
+  `make test-{server,kv,web,dist,catalog,tokenizer,session,agent}-parity`
+  모두 PASS. `ds4-server` lib 단위 215.
+- **Motif rust serial 4-surface 재스탬프 PASS** (P0-2 닫힘):
+  `scratch/rust-host-live/task53/motif-serial-rust-20260826-154104/`
+  — `CONTINUOUS=0` width=1, chat/completion/anthropic/responses 각
+  `*_serial=1`, finish stop/length/end_turn/완료. Rust SHA
+  `8d794e727fc5af3c61e8747e1170111a9a7e7a1203b6fe349c215c0e7e96c177`,
+  C 셀은 `motif-surfaces-20260826-120759`의 기존 PASS 유지
+  (C 바이너리 SHA `9dd45c7a…` 불변).
+- 주의: 라이브 스크립트의 `rg`는 이 호스트 비대화형 셸에 없다 —
+  `grep -Eq`로 치환했다 (`motif-serial-rust.sh`, `motif-surfaces.sh`,
+  `exaone-serial-rightsize.sh`).
+
+### 3.12 2026-08-26 오후 — EXAONE standalone IMA 분류 (C 대조 실험)
+
+증거: `scratch/rust-host-live/task53/exaone-serial-rightsize-20260826-154403/`
+(HEAD `fba963e`, C `9dd45c7a…`, Rust `8d794e72…`, owner `7eb5c9d2…`).
+한 모델씩, `guarded-run -m 112`, phase 사이 SIGTERM → compute PID 없음 →
+`clear_cache`.
+
+| Phase | 셀 | 결과 |
+|---|---|---|
+| A | standalone `ds4-server-rs` `CONTINUOUS=0` `-c 2048` n=1 | 진입 serial ✓ (`openai_chat_serial=1`, `static_no_cont=1`). boot prewarm **IMA** (`CUDA tensor read failed: an illegal memory access`, exaone prefill logits readback) → 이후 CUDA alloc 전부 IMA → HTTP 500 `lazy session graph alloc failed`. rightsize의 fit quote는 순수 산술이라 오염된 컨텍스트를 볼 수 없고 REUSE로 통과 — C도 같은 지점에서 같은 결말 |
+| B | standalone **C** `ds4-server` 동일 플래그 (대조군) | **같은 boot prewarm IMA, 같은 500** (`lazy session graph alloc failed (ctx=2048 prefill_cap=512)`). |
+| C | VMM owner (`ds4_weight_server` ranges=529, `/tmp/ds4-exaone-rs/`) + `ds4-server-rs` worker `CONTINUOUS=0` `COALESCE_MAX=1` `-c 2048` n=1 | **PASS**: HTTP 200, content `"ok"`, finish=`stop`, prompt 20 → completion 1, TTFT 480.2 ms, prefill 57.0 tok/s. `openai_chat_serial=1`, `static_no_cont=1`. worker boot prewarm 2.0s 정상 — IMA는 in-process artifacts standalone 경로 한정임을 재확인. ensure-fit는 REUSE 레그로 통과 (resize 불필요) |
+
+**판정: EXAONE standalone small-ctx 부트의 boot prewarm IMA는 C/Rust
+공통의 엔진 측 갭이다 (Solar standalone `cudaFreeAsync` IMA와 같은
+클래스, CUDA KEEP).** 호스트 rightsize 미이식이 원인이라던 이전 기록은
+정정한다. rightsize 이식(`fba963e`)은 별개의 유효한 호스트 슬라이스로
+남는다 (bank-holding 부트의 full-`-c` graph 500 클래스). **EXAONE rust
+serial 생성(200 + 실제 decode + `serial=1`)은 정본 owner+worker 경로에서
+PASS다.**
+
+운영 메모: 이 스크립트의 worker teardown이 owner가 아직 살아 있는 상태에서
+`clear_cache`를 한 번 호출했다 (`TEARDOWN_COMPUTE_STILL_ALIVE` 후).
+페이지 캐시 드랍이라 결과에는 영향이 없지만 규율 위반이므로 다음 하니스는
+owner 생존 중 clear_cache를 건너뛰도록 고칠 것. 최종 owner teardown 후의
+clear_cache와 host 확인(compute 앱 0, avail 117Gi)은 정상.
 
 ---
 
@@ -269,7 +336,7 @@ BLOCKED는 대부분 `DS4_PROOF_BASE` / `DS4_*_MODEL` 미설정.
 | (3.tool-map) Motif/DeepSeek | FAIL | **PASS (DeepSeek + Motif)** — 아래 2026-08-26 라이브 |
 | (3.ordinary/continued) | BLOCKED | **PASS (DeepSeek)** — 기존 serial cold/continued 4-way |
 | (3.periodic/evict/partial) | BLOCKED | **PASS (DeepSeek + Motif evict/periodic)**; Motif partial HTTP **BLOCKED** |
-| (10) serial 4 surface | PASS | **PASS (DeepSeek; Motif C)**. Rust n=1 400 닫힘 (`40a321c`). Motif rust serial 4-surface 미재스탬프 |
+| (10) serial 4 surface | PASS | **PASS (DeepSeek; Motif C+Rust)**. Rust n=1 400 닫힘 (`40a321c`); Motif rust serial 4-surface `fba963e` 바이너리로 재스탬프 PASS (§3.11) |
 | (10) continuous chat/completion | PASS | **PASS (DeepSeek + Motif)** |
 | (10) continuous anthropic/responses | FAIL (Rust serial) | **PASS (DeepSeek + Motif)** |
 | (10) static 4 surface | FAIL | **PASS (DeepSeek + Motif, continuous off)** |
@@ -593,14 +660,18 @@ TickOp / Motif partial HTTP / EXAONE standalone serial rightsize는
 
 완료: Wave A–B 호스트 슬라이스, cheap+parity 재스탬프,
 DeepSeek KV/static, Motif ABBA/tool-map/evict/periodic,
-Motif continuous+static 4 surface, family Makefile 셀.
+Motif continuous+static 4 surface, family Makefile 셀,
+serial rightsize 호스트 이식(`fba963e`) + Motif rust serial 4-surface
+재스탬프 (§3.11).
 
 남아 있는 BLOCKED (GREEN 금지):
 
 1. TickOp 소비 — C continuous 루프 KEEP. 새 CUDA 스케줄러를 만들지 말 것
 2. Motif partial HTTP `cached=0` — C Motif `last_done` stats 갭
-3. EXAONE standalone serial graph — C `serial_session_ensure_fit` rightsize
-   미이식. owner+worker 생성은 PASS
+3. EXAONE standalone (C·Rust 공통) — boot prewarm CUDA IMA (exaone prefill
+   logits readback; §3.12 C 대조로 엔진 측 확정, CUDA KEEP). rightsize는
+   `fba963e`로 이식됐고, EXAONE rust serial 생성은 owner+worker에서
+   200+decode+`serial=1` PASS (§3.12 phase C)
 4. sibling mmap — KEEP
 5. Solar standalone rust — boot_prewarm IMA (CUDA KEEP). owner+worker는 PASS
 
