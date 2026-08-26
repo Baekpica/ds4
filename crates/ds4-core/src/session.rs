@@ -68,6 +68,7 @@ pub struct SessionLedger {
     pub generation: u64,
     pub solar_state_valid: bool,
     pub mtp_draft_valid: bool,
+    pub n_swa: u32,
 }
 
 impl SessionLedger {
@@ -82,7 +83,12 @@ impl SessionLedger {
             generation: 1,
             solar_state_valid: family != ModelFamily::SolarOpen2,
             mtp_draft_valid: false,
+            n_swa: 0,
         }
+    }
+
+    pub fn set_n_swa(&mut self, n_swa: u32) {
+        self.n_swa = n_swa;
     }
 
     pub fn pos(&self) -> i32 {
@@ -160,6 +166,43 @@ impl SessionLedger {
             return RewriteKind::Rebuild;
         }
         RewriteKind::Error
+    }
+
+    /// C `ds4_session_exaone_rewind_span` arithmetic. `sliding_caps` are the
+    /// SWA layer KV capacities that have a live tensor. GPU graph alloc
+    /// stays native; this is the host policy once those caps are known.
+    pub fn exaone_rewind_span(
+        family: ModelFamily,
+        graph_ready: bool,
+        ctx_size: u32,
+        live: i32,
+        n_swa: u32,
+        sliding_caps: &[u32],
+    ) -> i32 {
+        if family != ModelFamily::ExaoneMoe || !graph_ready {
+            return 0;
+        }
+        let mut narrowest = 0u32;
+        let mut bounded = false;
+        for &cap in sliding_caps {
+            if !bounded || cap < narrowest {
+                narrowest = cap;
+                bounded = true;
+            }
+        }
+        if !bounded {
+            return ctx_size as i32;
+        }
+        if live <= 0 {
+            return 0;
+        }
+        if (live as u32) <= narrowest {
+            return live;
+        }
+        if narrowest <= n_swa {
+            return 0;
+        }
+        (narrowest - n_swa + 1) as i32
     }
 
     pub fn exaone_sync_start(live: i32, prompt_len: i32, common: i32, span: i32) -> (i32, bool) {
@@ -467,4 +510,82 @@ fn split_pair(s: &str) -> (Vec<i32>, Vec<i32>) {
     let a = parts.next().unwrap_or("");
     let b = parts.next().unwrap_or("");
     (parse_ids(a), parse_ids(b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exaone_rewind_span_matches_c_kernel_fixture() {
+        let short = SessionLedger::exaone_rewind_span(
+            ModelFamily::ExaoneMoe,
+            true,
+            262144,
+            500,
+            128,
+            &[640],
+        );
+        let wrapped = SessionLedger::exaone_rewind_span(
+            ModelFamily::ExaoneMoe,
+            true,
+            262144,
+            1000,
+            128,
+            &[640],
+        );
+        assert_eq!((short, wrapped), (500, 513));
+        assert_eq!(
+            SessionLedger::exaone_rewind_span(
+                ModelFamily::DeepSeek4,
+                true,
+                262144,
+                500,
+                128,
+                &[640]
+            ),
+            0
+        );
+        assert_eq!(
+            SessionLedger::exaone_rewind_span(
+                ModelFamily::ExaoneMoe,
+                false,
+                262144,
+                500,
+                128,
+                &[640]
+            ),
+            0
+        );
+        assert_eq!(
+            SessionLedger::exaone_rewind_span(ModelFamily::ExaoneMoe, true, 262144, 1000, 128, &[]),
+            262144
+        );
+        assert_eq!(
+            SessionLedger::exaone_rewind_span(ModelFamily::ExaoneMoe, true, 262144, 0, 128, &[640]),
+            0
+        );
+        assert_eq!(
+            SessionLedger::exaone_rewind_span(
+                ModelFamily::ExaoneMoe,
+                true,
+                262144,
+                1000,
+                128,
+                &[128]
+            ),
+            0
+        );
+        assert_eq!(
+            SessionLedger::exaone_rewind_span(
+                ModelFamily::ExaoneMoe,
+                true,
+                262144,
+                1000,
+                128,
+                &[900, 640, 800]
+            ),
+            513
+        );
+    }
 }
