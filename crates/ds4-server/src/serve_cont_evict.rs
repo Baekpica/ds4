@@ -3,6 +3,10 @@
 //! C `kv_cache_store_bank(..., "bank-evict", warm_pin_min)` then
 //! `warm_rec_invalidate`. A continuation-protected (pinned) bank is never
 //! a victim.
+//!
+//! The save path is the same `save_bank_record` ContLane::persist_bank uses;
+//! only the reason is `BankEvict`. Live place_* call ContLane::evict_bank,
+//! which is persist_bank(BankEvict) plus this pin-skip / drop contract.
 
 use std::path::Path;
 

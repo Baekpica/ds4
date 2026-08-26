@@ -1537,6 +1537,21 @@ mod native {
                 retired_record(self.warm[bank].record.as_ref(), key, snapshot.generation);
         }
 
+        /// Live evict: same `save_bank_record` path as `persist_bank`,
+        /// then drop the warm record. Pinned banks are left untouched.
+        fn evict_bank(&mut self, store: Option<&mut KvStore>, bank: usize, pinned: bool) -> bool {
+            if pinned {
+                return false;
+            }
+            if let Some(store) = store {
+                self.persist_bank(store, bank, KvReason::BankEvict, self.warm_pin_min, false);
+            }
+            if let Some(warm) = self.warm.get_mut(bank) {
+                warm.record = None;
+            }
+            true
+        }
+
         fn persist_bank(
             &mut self,
             store: &mut KvStore,
@@ -1626,50 +1641,34 @@ mod native {
             }
             self.note_use(placement.source);
             if placement.fork {
-                if let Some(store) = store.as_deref_mut() {
-                    self.persist_bank(
-                        store,
-                        placement.target,
-                        KvReason::BankEvict,
-                        self.warm_pin_min,
-                        false,
-                    );
-                }
+                let _ = self.evict_bank(store.as_deref_mut(), placement.target, false);
                 let stored = if plan.partial {
                     self.warm[placement.source].stored_tokens.min(plan.cached)
                 } else {
                     self.warm[placement.source].stored_tokens
                 };
-                self.warm[placement.target].record = None;
                 self.warm[placement.target].stored_tokens = stored;
             } else {
                 if plan.partial {
-                    if let Some(store) = store.as_deref_mut() {
-                        self.persist_bank(
-                            store,
-                            placement.source,
-                            KvReason::BankEvict,
-                            self.warm_pin_min,
-                            false,
-                        );
-                    }
+                    let _ = self.evict_bank(store.as_deref_mut(), placement.source, false);
                     self.warm[placement.source].stored_tokens =
                         self.warm[placement.source].stored_tokens.min(plan.cached);
+                } else {
+                    self.warm[placement.source].record = None;
                 }
-                self.warm[placement.source].record = None;
             }
             Some(placement)
         }
 
         fn place_cold(&mut self, protected: &[bool], store: Option<&mut KvStore>) -> Option<usize> {
             let target = warm_victim_pick(&self.warm, protected, None, self.warm_pin_min, true)?;
-            if protected.get(target).copied().unwrap_or(false) {
+            if !self.evict_bank(
+                store,
+                target,
+                protected.get(target).copied().unwrap_or(false),
+            ) {
                 return None;
             }
-            if let Some(store) = store {
-                self.persist_bank(store, target, KvReason::BankEvict, self.warm_pin_min, false);
-            }
-            self.warm[target].record = None;
             self.warm[target].committed_tokens = 0;
             self.warm[target].stored_tokens = 0;
             Some(target)
