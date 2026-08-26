@@ -81,7 +81,8 @@ endif
         test-motif3-cuda test-motif3-resident \
         test-dots3-loader test-dots3-tokenizer test-dots3-reference \
         test-dots3-resident test-dots3-batch \
-        test-qwen4exp-loader test-qwen4exp-ple test-qwen4exp-ple-reference \
+        test-qwen4exp-loader test-qwen4exp-tokenizer \
+        test-qwen4exp-ple test-qwen4exp-ple-reference \
         test-qwen4exp-ple-cuda test-qwen4exp-primitives \
         test-qwen4exp-ple-compute test-qwen4exp-ple-forward \
         test-qwen4exp-moe test-qwen4exp-moe-forward test-qwen4exp-gdn \
@@ -629,6 +630,15 @@ test-qwen4exp-loader: tests/test_qwen4exp_loader
 	@test -n "$(DS4_QWEN4EXP_MODEL)" || \
 		{ echo "set DS4_QWEN4EXP_MODEL to the first Qwen4Exp GGUF shard" >&2; exit 2; }
 	./tests/test_qwen4exp_loader "$(DS4_QWEN4EXP_MODEL)"
+
+tests/test_qwen4exp_tokenizer: tests/test_qwen4exp_tokenizer.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-qwen4exp-tokenizer: tests/test_qwen4exp_tokenizer
+	@test -n "$(DS4_QWEN4EXP_MODEL)" || \
+		{ echo "set DS4_QWEN4EXP_MODEL to the structural or completed Qwen4Exp GGUF" >&2; exit 2; }
+	./tests/test_qwen4exp_tokenizer "$(DS4_QWEN4EXP_MODEL)"
 
 tests/test_qwen4exp_ple: tests/test_qwen4exp_ple.c ds4_ple.c ds4_ple.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_qwen4exp_ple.c ds4_ple.c $(LDLIBS)

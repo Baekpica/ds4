@@ -30744,6 +30744,10 @@ static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_ve
         bpe_tokenize_text_dots3(vocab, text, out);
         return;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        bpe_tokenize_text_dots3(vocab, text, out);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
         bpe_tokenize_text_exaone(vocab, text, out);
         return;
@@ -30982,6 +30986,24 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         vocab->dsml_id = -1;
         return;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id))
+            vocab->bos_id = vocab_lookup(vocab, "<|endoftext|>");
+        if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id))
+            vocab->eos_id = vocab_lookup(vocab, "<|im_end|>");
+        vocab->eot_id = vocab_lookup(vocab, "<|endoftext|>");
+        vocab->im_start_id = vocab_lookup(vocab, "<|im_start|>");
+        vocab->im_end_id = vocab_lookup(vocab, "<|im_end|>");
+        vocab->think_start_id = vocab_lookup(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup(vocab, "</think>");
+        vocab->tool_call_start_id = vocab_lookup(vocab, "<tool_call>");
+        vocab->tool_call_end_id = vocab_lookup(vocab, "</tool_call>");
+        vocab->tool_response_start_id = vocab_lookup(vocab, "<tool_response>");
+        vocab->tool_response_end_id = vocab_lookup(vocab, "</tool_response>");
+        vocab->system_id = vocab->user_id = vocab->assistant_id = -1;
+        vocab->dsml_id = -1;
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
         if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
             vocab->bos_id = vocab_lookup_optional(vocab, "<|startoftext|>");
@@ -31197,6 +31219,58 @@ static void encode_chat_prompt_exaone(
     }
 }
 
+static const char DS4_QWEN_XHIGH_PROMPT[] =
+    "Reasoning effort is set to xhigh. Please think carefully through the task, "
+    "validate key assumptions, consider plausible alternatives, and prioritize "
+    "correctness, consistency, and clarity in the final answer.";
+
+static void qwen_chat_open_role(const ds4_vocab *vocab, const char *role,
+                                token_vec *out) {
+    token_vec_push(out, vocab->im_start_id);
+    bpe_tokenize_text(vocab, role, out);
+    bpe_tokenize_text(vocab, "\n", out);
+}
+
+static void qwen_chat_close_role(const ds4_vocab *vocab, token_vec *out) {
+    token_vec_push(out, vocab->im_end_id);
+    bpe_tokenize_text(vocab, "\n", out);
+}
+
+static void encode_chat_prompt_qwen(
+        const ds4_vocab *vocab,
+        const char      *system,
+        const char      *prompt,
+        ds4_think_mode   think_mode,
+        token_vec       *out) {
+    if (vocab->im_start_id < 0 || vocab->im_end_id < 0 ||
+        vocab->think_start_id < 0 || vocab->think_end_id < 0) {
+        ds4_die("this tokenizer does not provide the Qwen chat markers");
+    }
+    const bool xhigh =
+        think_mode == DS4_THINK_HIGH || think_mode == DS4_THINK_MAX;
+    if (xhigh || (system && system[0])) {
+        qwen_chat_open_role(vocab, "system", out);
+        if (xhigh) {
+            bpe_tokenize_text(vocab, DS4_QWEN_XHIGH_PROMPT, out);
+            if (system && system[0]) bpe_tokenize_text(vocab, "\n\n", out);
+        }
+        if (system && system[0]) bpe_tokenize_text(vocab, system, out);
+        qwen_chat_close_role(vocab, out);
+    }
+    qwen_chat_open_role(vocab, "user", out);
+    bpe_tokenize_text(vocab, prompt, out);
+    qwen_chat_close_role(vocab, out);
+    qwen_chat_open_role(vocab, "assistant", out);
+    token_vec_push(out, vocab->think_start_id);
+    if (ds4_think_mode_enabled(think_mode)) {
+        bpe_tokenize_text(vocab, "\n", out);
+    } else {
+        bpe_tokenize_text(vocab, "\n\n", out);
+        token_vec_push(out, vocab->think_end_id);
+        bpe_tokenize_text(vocab, "\n\n", out);
+    }
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
@@ -31205,6 +31279,10 @@ static void encode_chat_prompt(
         token_vec       *out) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE) {
         encode_chat_prompt_exaone(vocab, system, prompt, think_mode, out);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        encode_chat_prompt_qwen(vocab, system, prompt, think_mode, out);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
@@ -31311,6 +31389,12 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
         {"<|system|>",              vocab->dots3_endofsystem_id >= 0 ? vocab->system_id : -1},
         {"<|user|>",                vocab->dots3_endofuser_id >= 0 ? vocab->user_id : -1},
         {"<|assistant|>",           vocab->dots3_endofuser_id >= 0 ? vocab->assistant_id : -1},
+        {"<|endoftext|>",           DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP
+                                      ? vocab->eot_id : -1},
+        {"<|im_start|>",            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP
+                                      ? vocab->im_start_id : -1},
+        {"<|im_end|>",              DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP
+                                      ? vocab->im_end_id : -1},
         {"<|endoftext|>",           vocab->eos_id},
         {"<|beginoftext|>",         vocab->bos_id},
         {"<|startofturn|>",         vocab->start_of_turn_id},
@@ -31429,7 +31513,8 @@ void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens) {
     /* Solar and dots3-note templates emit no BOS. */
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) return;
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) return;
     token_vec_push(tokens, e->vocab.bos_id);
 }
 
@@ -31445,7 +31530,8 @@ void ds4_encode_chat_prompt(
 void ds4_chat_append_effort_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3 ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) return;
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE ||
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) return;
     const char *effort = ds4_think_effort_prefix(mode);
     if (effort[0]) bpe_tokenize_text(&e->vocab, effort, tokens);
 }
@@ -31540,6 +31626,34 @@ void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role
         }
         return;
     }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        if (!strcmp(role, "system") || !strcmp(role, "developer")) {
+            qwen_chat_open_role(vocab, "system", tokens);
+            bpe_tokenize_text(vocab, content, tokens);
+        } else if (!strcmp(role, "assistant")) {
+            qwen_chat_open_role(vocab, "assistant", tokens);
+            if (strncmp(content, "<think>", 7) != 0) {
+                token_vec_push(tokens, vocab->think_start_id);
+                bpe_tokenize_text(vocab, "\n\n", tokens);
+                token_vec_push(tokens, vocab->think_end_id);
+                bpe_tokenize_text(vocab, "\n\n", tokens);
+            }
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+        } else if (!strcmp(role, "tool") || !strcmp(role, "function")) {
+            qwen_chat_open_role(vocab, "user", tokens);
+            token_vec_push(tokens, vocab->tool_response_start_id);
+            bpe_tokenize_text(vocab, "\n", tokens);
+            bpe_tokenize_wrapped_payload_text(
+                vocab, content, "</tool_response>", tokens);
+            bpe_tokenize_text(vocab, "\n", tokens);
+            token_vec_push(tokens, vocab->tool_response_end_id);
+        } else {
+            qwen_chat_open_role(vocab, "user", tokens);
+            tokenize_rendered_chat_vocab(vocab, content, tokens);
+        }
+        qwen_chat_close_role(vocab, tokens);
+        return;
+    }
     if (!strcmp(role, "system") || !strcmp(role, "developer")) {
         bpe_tokenize_text(vocab, content, tokens);
     } else if (!strcmp(role, "assistant")) {
@@ -31584,6 +31698,18 @@ void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_thi
         token_vec_push(tokens, e->vocab.think_start_id);
         if (!ds4_think_mode_enabled(think_mode)) {
             token_vec_push(tokens, e->vocab.think_end_id);
+        }
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        qwen_chat_open_role(&e->vocab, "assistant", tokens);
+        token_vec_push(tokens, e->vocab.think_start_id);
+        if (ds4_think_mode_enabled(think_mode)) {
+            bpe_tokenize_text(&e->vocab, "\n", tokens);
+        } else {
+            bpe_tokenize_text(&e->vocab, "\n\n", tokens);
+            token_vec_push(tokens, e->vocab.think_end_id);
+            bpe_tokenize_text(&e->vocab, "\n\n", tokens);
         }
         return;
     }
@@ -31719,6 +31845,8 @@ static bool vocab_token_is_generation_stop(const ds4_vocab *vocab, int token) {
     if (!vocab || token < 0) return false;
     if (token == vocab->eos_id) return true;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2 &&
+        vocab->eot_id >= 0 && token == vocab->eot_id) return true;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP &&
         vocab->eot_id >= 0 && token == vocab->eot_id) return true;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
         /* The official final generation_config pins eos_token_id to
