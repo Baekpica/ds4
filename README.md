@@ -266,6 +266,40 @@ values, including file contents and edit text, use the request's normal sampling
 settings. That separation is important: deterministic decoding is helpful for
 syntax, but can create repeated text when applied to long code or file bodies.
 
+### Replayed reasoning and agent-loop robustness
+
+Two v0.6.4 knobs target long agent loops (measured on SWE-rebench-class
+workloads; see the changelog for the receipts):
+
+**`--reasoning-replay keep|drop`** (env `DS4_REASONING_REPLAY=drop`).
+Most OpenAI-style agent scaffolds echo each assistant message back
+verbatim, including `reasoning_content`. Under the default `keep`, the
+tool-context render re-emits that reasoning inside `<think>` blocks, which
+keeps the rendered prefix byte-aligned with the live KV (warm in-place
+reuse, no re-prefill). The cost is depth: llama-server drops replayed
+reasoning by default and DeepSeek's API rejects it, so on the identical
+conversation this server runs 16-28% deeper per turn, and depth is where
+low-bit quants start missing the tool-call protocol. `drop` renders
+history assistant turns in the lean `</think>` replay form instead;
+the bank's partial-prefix admission absorbs the divergence at the cost of
+a one-turn-tail re-prefill (~270 tokens measured). An assistant turn being
+continued (after the last user-like message) always keeps its reasoning.
+For agent workloads on quantized weights, `drop` is the recommended
+setting and is expected to become the default.
+
+**`--tool-slip-resample`** (env `DS4_TOOL_SLIP_RESAMPLE=1`, off by
+default). At depth a quantized model occasionally answers a tools-armed
+turn with a prose completion report instead of a tool call; agent
+harnesses reject the turn, and their retry rules can convert a few such
+slips into a dead task. With this knob, a continuously-batched
+non-streaming chat turn that settles at `finish=stop` with no tool calls
+is requeued once for a fresh draw before anything reaches the client; the
+just-retired bank warm-admits the full prompt, so the retry costs one
+generation. `length`/`error` finishes, streaming turns, and the serial
+lane are never resampled. Note the obvious disclosure: this retries the
+server's own sampler before the harness sees the turn, so benchmark
+results should say whether it was on.
+
 ### Continuation registry and trust domain
 
 For the Anthropic and Responses endpoints — whose protocols let a client send
@@ -325,6 +359,14 @@ higher than the `--ctx` value you started the server with:
 ```sh
 ./ds4-server --ctx 524288 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
+
+For long agent loops on quantized weights, also consider
+`--reasoning-replay drop --tool-slip-resample` (v0.6.4+): the first keeps
+scaffold-echoed reasoning out of the prompt so conversations run 16-28%
+shallower, the second retries a turn once when a tools-armed request
+settles as prose instead of a tool call. See
+[Replayed reasoning and agent-loop robustness](#replayed-reasoning-and-agent-loop-robustness)
+for the mechanics and measurements.
 
 You can use larger context and larger cache if you wish. Full context of
 1M tokens is going to use more or less 26GB of memory (compressed indexer
@@ -589,13 +631,28 @@ on a stripped headless Spark.
 ## Thinking Modes
 
 DeepSeek V4 Flash has distinct non-thinking, thinking, and Think Max modes.
-The server defaults to thinking mode. `reasoning_effort=max` requests Think
-Max, but it is only applied when the context size is large enough for the model
-card recommendation; smaller contexts fall back to normal thinking. OpenAI
-`reasoning_effort=xhigh` still maps to normal thinking, not Think Max.
+The server defaults to thinking mode. The checkpoint's high and max tiers
+are not just decode budgets: they inject DeepSeek's effort preamble
+(verbatim reference-encoder text) at position 0, ahead of the system
+prompt.
 
-For direct replies, use `thinking: {"type":"disabled"}`, `think:false`, or a
-non-thinking model alias such as `deepseek-chat`.
+Since v0.6.3.1, a client-sent `reasoning_effort` field cannot reach those
+prefixed tiers by default: client `high`/`xhigh`/`max` compat-map to the
+prefix-free level. Agent frameworks send the field meaning the OpenAI
+"think more" knob, and a controlled needle matrix showed the injected
+preamble measurably degrades deep-context tool calling (6/50
+completion-protocol failures at 96K+ tokens with the prefix vs 0/100
+without — the field issue #18 regression). llama.cpp and pre-v0.5.3
+engines silently ignore the field for this GGUF, which is the behavior the
+default restores. Operators opt back into the native tiers with
+`--reasoning-effort-native` (env `DS4_REASONING_EFFORT_NATIVE=1`), and the
+operator's own `--reasoning-effort low|high|max|off` server default is
+always honored as written: setting it is the opt-in for that level.
+Disabling thinking stays client-reachable either way.
+
+For direct replies, use `thinking: {"type":"disabled"}`, `think:false`,
+`reasoning_effort:"off"`, or a non-thinking model alias such as
+`deepseek-chat`.
 
 ## Disk KV Cache
 
@@ -1267,6 +1324,7 @@ first answer:
 ./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
 ./ds4 --dump-logits /tmp/logits.json --metal --nothink --prompt-file prompt.txt
 ./ds4-server --trace /tmp/ds4-trace.txt ...
+./ds4-server --tool-slip-dump /tmp/ds4-slips ...
 ```
 
 - `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
@@ -1277,7 +1335,15 @@ first answer:
   alternatives at each step, which helps separate sampling choices from
   logit/model issues.
 - `ds4-server --trace` writes the rendered prompts, cache decisions, generated
-  text, and tool-parser events for a whole agent session.
+  text, and tool-parser events for a whole agent session. Serial lane only:
+  continuously-batched rows (the default serving lane) do not trace yet.
+- `ds4-server --tool-slip-dump DIR` covers the batched lane's blind spot for
+  tool-protocol failures: every tools-armed chat completion that settles
+  without tool calls dumps one JSON file with the raw request body, the full
+  generated text, and the parse verdict. Agent harnesses discard rejected
+  responses, so this is usually the only byte-exact record of what the model
+  actually said; each dump replays directly against a server as a regression
+  fixture.
 
 ## About this fork
 

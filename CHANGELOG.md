@@ -5,6 +5,53 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.6.4 — 2026-08-26
+
+The issue-#18 residual-gap release: with `--reasoning-replay drop
+--tool-slip-resample`, a SWE-rebench agent instance that llama.cpp
+resolves and that this engine previously failed three ways
+(harness-graded, identical scaffold and request shape) is now submitted
+and resolved identically to llama.cpp.
+
+- **`--reasoning-replay keep|drop`** (env `DS4_REASONING_REPLAY=drop`) —
+  agent scaffolds that echo assistant messages verbatim re-send
+  `reasoning_content`, and the tool-context chat render re-emitted it
+  inside `<think>` blocks. llama-server drops it by default and
+  DeepSeek's reference API rejects it, so on the identical conversation
+  this engine ran 16-28% deeper per turn, entering the depth band where
+  the 2.4-bpw quant's tool-protocol adherence slips (measured: 50% of
+  turns settle as prose completion reports instead of tool calls at
+  70-80K prompt tokens). `drop` renders history assistant turns in the
+  lean `</think>` replay form; assistant turns being continued (after
+  the last user-like message) always keep their reasoning. Measured
+  steady-state cost: a one-turn-tail re-prefill (~270 tokens / ~0.6 s)
+  absorbed by the cont bank's partial-prefix admission. Default stays
+  `keep` (byte-identical prior behavior, warm in-place reuse for
+  echoing clients); the default is expected to flip to `drop` in a
+  future release.
+- **`--tool-slip-resample`** (env `DS4_TOOL_SLIP_RESAMPLE=1`, off by
+  default) — when a continuously-batched non-streaming tools-armed chat
+  turn settles at `finish=stop` with no tool calls, the request is
+  requeued once at the FIFO head for a fresh draw before anything is
+  written to the client; the just-retired bank warm-admits the full
+  prompt, so the retry costs one generation. Pinned seeds are perturbed
+  (+1) for the redraw; `length`/`error` settles, streaming turns, and
+  the serial lane are never resampled; retries are exempt from the
+  queue-age shed while keeping the original arrival stamp for honest
+  latency. Disclosure: this knob changes benchmark behavior by
+  construction (it retries the engine's own sampler before the harness
+  sees the turn) — in the validating run, 6 slips across 142 turns were
+  all rescued invisibly and the task went from three dead runs to
+  submitted-and-resolved. Runs that report benchmark numbers should say
+  whether it was on.
+- **`--tool-slip-dump DIR`** (env `DS4_TOOL_SLIP_DUMP_DIR`) — forensic
+  instrument: every tools-armed chat completion that settles without
+  tool calls dumps one self-contained JSON file (raw request body,
+  full generated text, parse verdict, lane), on both the
+  continuous-batching and serial lanes. Each dump is a byte-exact
+  replay fixture. `--trace` usage text now documents that session
+  tracing covers the serial lane only.
+
 ## v0.6.3.1 — 2026-08-25
 
 - **Client reasoning_effort compat-mapping (field issue #18)** — the

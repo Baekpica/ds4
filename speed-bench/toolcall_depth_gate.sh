@@ -20,12 +20,15 @@
 #
 # Env: TG_HOST (sync-192_168_88_33)  BINDIR (/home/ent/code/ds4-phase0)
 #      GGUF (/home/ent/gguf)  SEEDS (1,2,3)  PORT (8078)
+#      TG_EXTRA_ENV — extra server env (e.g. "DS4_REASONING_REPLAY=drop
+#      DS4_TOOL_SLIP_RESAMPLE=1" for the v0.6.4 knob-armed arm)
 set -u
 R=${TG_HOST:-sync-192_168_88_33}
 BINDIR=${BINDIR:-/home/ent/code/ds4-phase0}
 GGUF=${GGUF:-/home/ent/gguf}
 SEEDS=${SEEDS:-1,2,3}
 PORT=${PORT:-8078}
+EXTRA_ENV=${TG_EXTRA_ENV:-}
 WORK=/tmp/toolcall_depth_gate.$$
 MODEL="$GGUF/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DRAFTER="$GGUF/DSpark-drafter-Q2K-Q8-0731.gguf"
@@ -41,7 +44,7 @@ scp -q "$HERE/needle_toolcall_harness.py" "$R:$WORK/" || fail "scp harness"
 
 ssh "$R" "setsid --fork sh -c 'env DS4_SESSION_LAZY_GRAPH=0 DS4_SERVER_FORK=0 \
   DS4_SERVER_COALESCE_MAX=2 DS4_CONT_MTP_MODE=2 DS4_CONT_DSPARK=1 \
-  DS4_DSPARK_MODEL=$DRAFTER DS4_BATCH_VMM_BUDGET_MB=4096 \
+  DS4_DSPARK_MODEL=$DRAFTER DS4_BATCH_VMM_BUDGET_MB=4096 $EXTRA_ENV \
   $BINDIR/ds4-server --cuda -m $MODEL --dspark $DRAFTER --no-mtp -c 131072 \
   --kv-disk-dir $WORK/kv --kv-disk-space-mb 16384 --port $PORT \
   > $WORK/srv.log 2>&1 & echo \$! > $WORK/srv.pid' </dev/null >/dev/null 2>&1"
