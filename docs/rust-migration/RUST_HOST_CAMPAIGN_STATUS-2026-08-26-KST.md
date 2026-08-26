@@ -7,15 +7,14 @@
 
 | 항목 | 값 |
 |---|---|
-| Branch | `rust-host` = `origin/rust-host` |
-| HEAD | `4abaec3125854df07479700eb1d918f43c31c216` |
-| 최신 커밋 | `Rust(server): Call C idle-bank trim from the gate` |
+| Branch | `rust-host` (ahead of `origin/rust-host`) |
+| HEAD | `40a321c` `Rust(server): Collapse static n=1 gather to serial` |
 | C golden | `v0.6.3-dfm` (`516456fe35510e4fb8350396c9d88807ac1f760b`) |
 | 기본 바이너리 | 여전히 C (`ds4` / `ds4-server` / `ds4-bench` / `ds4-agent`) |
 | Rust shadow | `ds4-rs` / `ds4-server-rs` / `ds4-bench-rs` / `ds4-agent-rs` |
 | Phase 9 | **NOT_GREEN** — 이름 승격·SPLIT 문서·`dfm-rs` 생성 없음 |
 | 플랜 | `.omo/plans/rust-host-remaining-to-phase-9.md` (todos 1–61 `[x]`, F1–F4는 최종 감사) |
-| 작업트리 재검증 | 2026-08-26 12:15 KST. Wave A–B 커밋됨. Wave C TickOp은 BLOCKED. cheap+Motif live 재스탬프 |
+| 작업트리 재검증 | 2026-08-26 14:55 KST. serial n=1 붕괴 커밋. Solar/EXAONE owner+worker + DeepSeek standalone 서빙 |
 
 증거는 `.omo/evidence/task-*-rust-host-remaining-to-phase-9.txt`에 있다
 (untracked, `git add` 금지 목록).
@@ -26,8 +25,10 @@
 
 호스트 잔여 **코드 슬라이스(Wave A–B)와 cheap-gate는 닫혔다.**
 DeepSeek KV/static과 Motif ABBA/tool-map/evict/periodic도 **PASS**다.
-Wave C TickOp 소비, Motif partial HTTP `cached=0`, Rust serial n=1
-static-width 400이 남아 계약상 **GREEN이 아니고**, production 이름은 C다.
+Rust HTTP `CONTINUOUS=0` n=1은 C `worker_main`처럼 serial로 접힌다
+(`40a321c`). Wave C TickOp 소비, Motif partial HTTP `cached=0`,
+EXAONE standalone serial graph rightsize가 남아 계약상 **GREEN이 아니고**,
+production 이름은 C다.
 
 대략:
 
@@ -200,6 +201,29 @@ Wave C (TickOp) — **BLOCKED, 커밋 없음:**
 - `generate_pair`는 `ds4_bridge_continuous_generate` 원샷을 유지
 - `owner_tick_pair`는 호스트 스케줄 모델일 뿐 `_ops`는 계속 버려진다
 
+### 3.10 2026-08-26 14:55 KST — serial n=1 + family serve
+
+커밋 `40a321c`: HTTP static gather n==1 → serial (`ds4_server.c`
+`worker_main`). `generate_static` n>=2 / n>=2 실패는 serial로 안 접힘.
+`cargo test -p ds4-server --lib` 206 PASS.
+
+라이브 (한 모델 → guarded-run -m 112 → SIGTERM → clear_cache):
+
+| Family | 경로 | 결과 |
+|---|---|---|
+| Solar-Open2 | VMM owner + `ds4-server-rs` `-c 2048` | **PASS** `/v1/models` + chat `ok` stop, `continuous=1` |
+| K-EXAONE | standalone `CONTINUOUS=0` n=1 | serial **entry** PASS (`serial=1`, 400 없음). 생성은 lazy graph FAIL |
+| K-EXAONE | VMM owner + rust worker `-c 2048` | **PASS** chat `ok` stop, `continuous=1` |
+| DeepSeek Flash | standalone `-c 2048` 81G GGUF | **PASS** chat `ok` stop. decision `continuous=1`, entry `serial=1` |
+
+증거 (untracked):
+`scratch/rust-host-live/family-serve-20260826-retry/`
+
+standalone Solar는 여전히 boot_prewarm `cudaFreeAsync` IMA (CUDA KEEP).
+긴 owner sock 경로는 `AF_UNIX` 한도에 걸림 — `/tmp/ds4-*-rs/` 사용.
+EXAONE standalone serial 생성은 C `serial_session_ensure_fit` rightsize가
+아직 호스트에 없다. 뱅크 옆 full `-c` lazy graph가 실패한다.
+
 ---
 
 ## 4. §10 비교 결과 (GREEN 아님)
@@ -245,7 +269,7 @@ BLOCKED는 대부분 `DS4_PROOF_BASE` / `DS4_*_MODEL` 미설정.
 | (3.tool-map) Motif/DeepSeek | FAIL | **PASS (DeepSeek + Motif)** — 아래 2026-08-26 라이브 |
 | (3.ordinary/continued) | BLOCKED | **PASS (DeepSeek)** — 기존 serial cold/continued 4-way |
 | (3.periodic/evict/partial) | BLOCKED | **PASS (DeepSeek + Motif evict/periodic)**; Motif partial HTTP **BLOCKED** |
-| (10) serial 4 surface | PASS | **PASS (DeepSeek; Motif C)**. Motif Rust serial **BLOCKED** |
+| (10) serial 4 surface | PASS | **PASS (DeepSeek; Motif C)**. Rust n=1 400 닫힘 (`40a321c`). Motif rust serial 4-surface 미재스탬프 |
 | (10) continuous chat/completion | PASS | **PASS (DeepSeek + Motif)** |
 | (10) continuous anthropic/responses | FAIL (Rust serial) | **PASS (DeepSeek + Motif)** |
 | (10) static 4 surface | FAIL | **PASS (DeepSeek + Motif, continuous off)** |
@@ -380,8 +404,10 @@ Motif remaining surfaces (2026-08-26 오후, `-c 2048`, thinking disabled,
 - C/Rust continuous 4 surface: 각 `*.continuous=1` **PASS**
 - C/Rust static 4 surface (`CONTINUOUS=0`, n=2): 각 `*.static=2` **PASS**
 - C serial 4 surface (`CONTINUOUS=0`, width=1): 각 `*.serial=1` **PASS**
-- Rust serial **BLOCKED**: `CONTINUOUS=0` n=1이 static lane으로 가며
-  C `n>=2` width 규칙에 걸려 HTTP 400. C는 같은 픽스처를 serial로 접는다.
+- Rust serial n=1 width-400 **닫힘** (`40a321c`): C `worker_main`처럼
+  gather n==1은 `run_job_single`. `generate_static`는 n>=2 유지.
+  EXAONE `CONTINUOUS=0` n=1: `static_no_cont=1`, `openai_chat.serial=1`,
+  400 없음. Motif 4-surface rust serial은 이 HEAD에서 재스탬프하지 않음.
 
 Family Makefile (서빙 없음, 2026-08-26 12:00 KST):
 
@@ -389,8 +415,7 @@ Family Makefile (서빙 없음, 2026-08-26 12:00 KST):
 - `test-solar-kda{,-prefill,-chunk}` **PASS**
 - `test-exaone-kernels` **PASS** (모델 경로 없이)
 - `test-mmq-parity` / `test-model-family-kernels` **PASS**
-- Solar 250B / EXAONE 236B 서빙 프로세스 없음
-- resident/batch는 한 모델 규칙을 위해 이 턴에서 안 돌림
+- Solar 250B / EXAONE 236B / DeepSeek 서빙: 아래 3.10 (2026-08-26 14:55 KST)
 
 ### 4.3 메모리 운영 (다음에 라이브 돌릴 때 필수)
 
@@ -411,7 +436,9 @@ DeepSeek Flash IQ2XXS imatrix:
   /home/sunghoon/workspace/ds4-exaone/DeepSeek-GGUF/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
 ```
 
-Solar 250B / EXAONE 236B는 이 캠페인에서 **올리지 않았다** (OOM 위험).
+Solar 250B / EXAONE 236B standalone rust는 이 호스트에서 IMA/lazy-graph로
+실패한 적이 있다. 2026-08-26 재시도는 **VMM owner + rust worker**로
+둘 다 생성까지 PASS (3.10). DeepSeek 81G standalone도 PASS.
 
 ---
 
@@ -507,12 +534,13 @@ Solar 250B / EXAONE 236B는 이 캠페인에서 **올리지 않았다** (OOM 위
     - 4셀 모두 `VmSwap=0`, GPU 102597 MiB
     - 기본 32뱅크 C가 아니라 `DS4_SERVER_COALESCE_MAX=2`다. 기록에 명시
 
-15. **4 surface × 3 lane을 C와 나란히 재스탬프 — Motif 부분 DONE + 1 BLOCKED**
+15. **4 surface × 3 lane을 C와 나란히 재스탬프 — Motif 부분 DONE; serial n=1 닫힘**
     - DeepSeek continuous + static 4 surface: 기존 PASS
     - Motif continuous 4 surface: C/Rust **PASS**
     - Motif static 4 surface (`CONTINUOUS=0`, n=2): C/Rust **PASS**
-    - Motif serial: C **PASS**, Rust n=1 static-width 400 **BLOCKED**
-    - Solar/EXAONE/dots3 서빙 surface는 이 턴에서 안 돌림
+    - Motif serial: C **PASS**. Rust n=1 width-400는 `40a321c`로 닫힘
+      (crate + EXAONE metrics). Motif rust serial 4-surface는 미재스탬프
+    - Solar/EXAONE owner+worker + DeepSeek standalone 생성: **PASS** (3.10)
     - 스키마/이벤트 순서/ID/finish는
       `docs/ds4-api-surface-matrix.md` (live body는 byte oracle 아님)
 
@@ -556,7 +584,8 @@ Solar 250B / EXAONE 236B는 이 캠페인에서 **올리지 않았다** (OOM 위
 | F4 scope fidelity | APPROVE | rename/SPLIT/dfm-rs/CUDA rewrite/Tokio/merge 없음 |
 
 F2를 HEAD `4abaec3`에서 다시 돌리면 세 required 항목은 코드상 닫혀 있다.
-TickOp / Motif partial HTTP / Rust serial n=1은 이 감사 표 밖의 BLOCKED다.
+TickOp / Motif partial HTTP / EXAONE standalone serial rightsize는
+이 감사 표 밖의 BLOCKED다. serial n=1 HTTP 400은 `40a321c`로 닫혔다.
 
 ---
 
@@ -570,9 +599,10 @@ Motif continuous+static 4 surface, family Makefile 셀.
 
 1. TickOp 소비 — C continuous 루프 KEEP. 새 CUDA 스케줄러를 만들지 말 것
 2. Motif partial HTTP `cached=0` — C Motif `last_done` stats 갭
-3. Rust serial n=1 — `CONTINUOUS=0`이 static으로 가며 width-1이 400
+3. EXAONE standalone serial graph — C `serial_session_ensure_fit` rightsize
+   미이식. owner+worker 생성은 PASS
 4. sibling mmap — KEEP
-5. Solar/EXAONE 서빙 surface — 이 호스트에서 기본 서빙과 같이 올리지 말 것
+5. Solar standalone rust — boot_prewarm IMA (CUDA KEEP). owner+worker는 PASS
 
 §10 전체를 FAIL=0 / BLOCKED=0으로 다시 채운 뒤에만 GREEN/Phase 9를 논한다.
 production 이름 변경, `SPLIT_READINESS.md`, `dfm-rs`,
