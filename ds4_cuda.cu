@@ -8853,8 +8853,8 @@ __global__ static void qwen4exp_gdn_recurrent_kernel(
     }
 }
 
-/* Reference order: RMS-normalize each 128-value head, multiply the learned
- * (non-zero-centered) weight, then apply SiLU(z). */
+/* Qwen3.8 pins output_gate_type="sigmoid": RMS-normalize each 128-value
+ * head, multiply the learned (non-zero-centered) weight, then sigmoid(z). */
 __global__ static void qwen4exp_gdn_gated_rms_norm_kernel(
         float *out, const float *core, const float *z, const float *weight,
         uint32_t head_dim, float eps, uint64_t head_rows) {
@@ -8872,8 +8872,8 @@ __global__ static void qwen4exp_gdn_gated_rms_norm_kernel(
     }
     const float scale = rsqrtf(sum[0] / (float)head_dim + eps);
     const float gate = z[base + d];
-    const float silu = gate / (1.0f + expf(-gate));
-    out[base + d] = x * scale * weight[d] * silu;
+    const float sigmoid = 1.0f / (1.0f + expf(-gate));
+    out[base + d] = x * scale * weight[d] * sigmoid;
 }
 
 /* QSA index projection layout is [four query heads, one raw key]. Store the

@@ -205,7 +205,7 @@ static void gdn_norm_reference(float *out, const float *core,
         for (uint32_t d = 0; d < TEST_HEAD_DIM; d++) {
             const float gate = z[base + d];
             out[base + d] = core[base + d] * scale * weight[d] *
-                            (gate * gdn_sigmoid(gate));
+                            gdn_sigmoid(gate);
         }
     }
 }

@@ -170,7 +170,7 @@ static void gated_norm_reference(float *out, const float *core,
         for (uint32_t d = 0; d < HEAD_DIM; d++) {
             const float gate = z[base + d];
             out[base + d] = core[base + d] * scale * weight[d] *
-                            (gate * sigmoid_ref(gate));
+                            sigmoid_ref(gate);
         }
     }
 }
@@ -461,7 +461,7 @@ int main(void) {
                 ROWS, VALUE_HEADS, HEAD_DIM, 1.0e-6f),
             "GDN gated RMSNorm launch");
     download_f32(dnorm, norm_got, core_count, "GDN norm download");
-    compare_f32("GDN per-head RMSNorm then SiLU(z)", norm_got, norm_want,
+    compare_f32("GDN per-head RMSNorm then sigmoid(z)", norm_got, norm_want,
                 core_count, 8.0e-6f, 8.0e-6);
 
     REQUIRE(!ds4_gpu_qwen4exp_gdn_conv_tensor(
