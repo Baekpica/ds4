@@ -2,7 +2,8 @@
  * DS4 quantization facade.
  *
  * These are the small GGUF quantization pieces needed by our DeepSeek V4
- * Flash recipes: float conversion, q8_0, q2_K, q4_K, and iq2_xxs.  The code is
+ * Flash recipes: float conversion, q8_0, q2_K, q4_K, q5_K, q6_K, and
+ * iq2_xxs.  The code is
  * local C and deliberately narrow; other GGUF type IDs are named for metadata
  * compatibility, but cannot be emitted by this tool.
  *
@@ -48,8 +49,8 @@ static const ds4q_traits ds4q_type_traits[DS4Q_TYPE_COUNT] = {
     [DS4Q_TYPE_Q2_K]    = { "q2_K",  QK_K,  84, true,  false },
     [DS4Q_TYPE_Q3_K]    = { "q3_K",  QK_K, 110, false, false },
     [DS4Q_TYPE_Q4_K]    = { "q4_K",  QK_K, 144, true,  false },
-    [DS4Q_TYPE_Q5_K]    = { "q5_K",  QK_K, 176, false, false },
-    [DS4Q_TYPE_Q6_K]    = { "q6_K",  QK_K, 210, false, false },
+    [DS4Q_TYPE_Q5_K]    = { "q5_K",  QK_K, 176, true,  false },
+    [DS4Q_TYPE_Q6_K]    = { "q6_K",  QK_K, 210, true,  false },
     [DS4Q_TYPE_Q8_K]    = { "q8_K",  QK_K, 292, false, false },
     [DS4Q_TYPE_IQ2_XXS] = { "iq2_xxs", QK_K,  66, true,  true  },
     [DS4Q_TYPE_IQ2_XS]  = { "iq2_xs",  QK_K,  74, false, true  },
@@ -338,6 +339,82 @@ static void ds4q_get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *
     }
 }
 
+static float ds4q_make_qx_quants(int n, int nmax, const float *x, int8_t *L,
+                                 int rmse_type, const float *quant_weights) {
+    float max = 0.0f;
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++) {
+        const float ax = fabsf(x[i]);
+        if (ax > amax) {
+            amax = ax;
+            max = x[i];
+        }
+    }
+    if (amax < DS4Q_GROUP_MAX_EPS) {
+        memset(L, 0, (size_t)n);
+        return 0.0f;
+    }
+
+    float iscale = -nmax / max;
+    if (rmse_type == 0) {
+        for (int i = 0; i < n; i++) {
+            int l = ds4q_nearest_int(iscale * x[i]);
+            L[i] = nmax + DS4Q_MAX(-nmax, DS4Q_MIN(nmax - 1, l));
+        }
+        return 1.0f / iscale;
+    }
+
+    bool return_early = false;
+    if (rmse_type < 0) {
+        rmse_type = -rmse_type;
+        return_early = true;
+    }
+    float sumlx = 0.0f;
+    float suml2 = 0.0f;
+    for (int i = 0; i < n; i++) {
+        int l = ds4q_nearest_int(iscale * x[i]);
+        l = DS4Q_MAX(-nmax, DS4Q_MIN(nmax - 1, l));
+        L[i] = l + nmax;
+        const float w = quant_weights ? quant_weights[i] :
+            rmse_type == 1 ? x[i] * x[i] :
+            rmse_type == 2 ? 1.0f :
+            rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
+        sumlx += w * x[i] * l;
+        suml2 += w * l * l;
+    }
+    float scale = suml2 ? sumlx / suml2 : 0.0f;
+    if (return_early) {
+        return suml2 > 0 ? 0.5f * (scale + 1.0f / iscale) : 1.0f / iscale;
+    }
+
+    float best = scale * sumlx;
+    for (int is = -9; is <= 9; is++) {
+        if (is == 0) continue;
+        iscale = -(nmax + 0.1f * is) / max;
+        sumlx = 0.0f;
+        suml2 = 0.0f;
+        for (int i = 0; i < n; i++) {
+            int l = ds4q_nearest_int(iscale * x[i]);
+            l = DS4Q_MAX(-nmax, DS4Q_MIN(nmax - 1, l));
+            const float w = quant_weights ? quant_weights[i] :
+                rmse_type == 1 ? x[i] * x[i] :
+                rmse_type == 2 ? 1.0f :
+                rmse_type == 3 ? fabsf(x[i]) : sqrtf(fabsf(x[i]));
+            sumlx += w * x[i] * l;
+            suml2 += w * l * l;
+        }
+        if (suml2 > 0 && sumlx * sumlx > best * suml2) {
+            for (int i = 0; i < n; i++) {
+                int l = ds4q_nearest_int(iscale * x[i]);
+                L[i] = nmax + DS4Q_MAX(-nmax, DS4Q_MIN(nmax - 1, l));
+            }
+            scale = sumlx / suml2;
+            best = scale * sumlx;
+        }
+    }
+    return scale;
+}
+
 static size_t ds4q_quantize_q8_0(const float *src, void *dst, int64_t start,
                                  int64_t nrows, int64_t ncols) {
     const int64_t qk = 32;
@@ -520,6 +597,177 @@ static size_t ds4q_quantize_q4_k(const float *src, void *dst, int64_t start,
             } else {
                 ds4q_write_q4_k_block_ref(x, block);
             }
+        }
+    }
+    return (size_t)nrows * row_size;
+}
+
+static void ds4q_write_q5_k_block_ref(const float *x, uint8_t *y) {
+    enum { d_off = 0, dmin_off = 2, scales_off = 4, qh_off = 16, qs_off = 48 };
+    uint8_t L[QK_K];
+    uint8_t Laux[32];
+    float weights[32];
+    float mins[QK_K / 32];
+    float scales[QK_K / 32];
+    uint8_t *scales_out = y + scales_off;
+    uint8_t *qh = y + qh_off;
+    uint8_t *ql = y + qs_off;
+
+    float max_scale = 0.0f;
+    float max_min = 0.0f;
+    for (int j = 0; j < QK_K / 32; j++) {
+        float sum_x2 = 0.0f;
+        for (int l = 0; l < 32; l++) sum_x2 += x[32 * j + l] * x[32 * j + l];
+        const float av_x = sqrtf(sum_x2 / 32);
+        for (int l = 0; l < 32; l++) weights[l] = av_x + fabsf(x[32 * j + l]);
+        scales[j] = ds4q_make_qkx2_quants(
+            32, 31, x + 32 * j, weights, L + 32 * j, &mins[j], Laux,
+            -0.5f, 0.1f, 15, false);
+        if (scales[j] > max_scale) max_scale = scales[j];
+        if (mins[j] > max_min) max_min = mins[j];
+    }
+
+    const float inv_scale = max_scale > 0 ? 63.0f / max_scale : 0.0f;
+    const float inv_min = max_min > 0 ? 63.0f / max_min : 0.0f;
+    for (int j = 0; j < QK_K / 32; j++) {
+        uint8_t ls = DS4Q_MIN(63, ds4q_nearest_int(inv_scale * scales[j]));
+        uint8_t lm = DS4Q_MIN(63, ds4q_nearest_int(inv_min * mins[j]));
+        if (j < 4) {
+            scales_out[j] = ls;
+            scales_out[j + 4] = lm;
+        } else {
+            scales_out[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+            scales_out[j - 4] |= (ls >> 4) << 6;
+            scales_out[j] |= (lm >> 4) << 6;
+        }
+    }
+
+    const uint16_t d = ds4q_f32_to_f16(max_scale / 63.0f);
+    const uint16_t dmin = ds4q_f32_to_f16(max_min / 63.0f);
+    memcpy(y + d_off, &d, sizeof(d));
+    memcpy(y + dmin_off, &dmin, sizeof(dmin));
+
+    uint8_t sc, m;
+    for (int j = 0; j < QK_K / 32; j++) {
+        ds4q_get_scale_min_k4(j, scales_out, &sc, &m);
+        const float dd = ds4q_f16_to_f32(d) * sc;
+        if (!dd) continue;
+        const float dm = ds4q_f16_to_f32(dmin) * m;
+        for (int ii = 0; ii < 32; ii++) {
+            int l = ds4q_nearest_int((x[32 * j + ii] + dm) / dd);
+            L[32 * j + ii] = DS4Q_MAX(0, DS4Q_MIN(31, l));
+        }
+    }
+
+    memset(qh, 0, QK_K / 8);
+    uint8_t m1 = 1;
+    uint8_t m2 = 2;
+    for (int n = 0; n < QK_K; n += 64) {
+        for (int j = 0; j < 32; j++) {
+            int l1 = L[n + j];
+            if (l1 > 15) {
+                l1 -= 16;
+                qh[j] |= m1;
+            }
+            int l2 = L[n + j + 32];
+            if (l2 > 15) {
+                l2 -= 16;
+                qh[j] |= m2;
+            }
+            ql[j] = l1 | (l2 << 4);
+        }
+        m1 <<= 2;
+        m2 <<= 2;
+        ql += 32;
+    }
+}
+
+static size_t ds4q_quantize_q5_k(const float *src, void *dst, int64_t start,
+                                 int64_t nrows, int64_t ncols) {
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q5_K, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t blocks_per_row = ncols / QK_K;
+    for (int64_t row = 0; row < nrows; row++) {
+        const float *xrow = src + start + (size_t)row * (size_t)ncols;
+        for (int64_t b = 0; b < blocks_per_row; b++) {
+            uint8_t *block = out + (size_t)row * row_size +
+                (size_t)b * ds4q_type_traits[DS4Q_TYPE_Q5_K].type_size;
+            ds4q_write_q5_k_block_ref(xrow + (size_t)b * QK_K, block);
+        }
+    }
+    return (size_t)nrows * row_size;
+}
+
+static void ds4q_write_q6_k_block_ref(const float *x, uint8_t *y) {
+    enum { ql_off = 0, qh_off = 128, scales_off = 192, d_off = 208 };
+    int8_t L[QK_K];
+    float scales[QK_K / 16];
+    uint8_t *ql = y + ql_off;
+    uint8_t *qh = y + qh_off;
+    int8_t *scales_out = (int8_t *)(y + scales_off);
+
+    float max_scale = 0.0f;
+    float max_abs_scale = 0.0f;
+    for (int ib = 0; ib < QK_K / 16; ib++) {
+        const float scale = ds4q_make_qx_quants(16, 32, x + 16 * ib, L + 16 * ib, 1, NULL);
+        scales[ib] = scale;
+        const float abs_scale = fabsf(scale);
+        if (abs_scale > max_abs_scale) {
+            max_abs_scale = abs_scale;
+            max_scale = scale;
+        }
+    }
+    if (max_abs_scale < DS4Q_GROUP_MAX_EPS) {
+        memset(y, 0, ds4q_type_traits[DS4Q_TYPE_Q6_K].type_size);
+        return;
+    }
+
+    const float iscale = -128.0f / max_scale;
+    const uint16_t d = ds4q_f32_to_f16(1.0f / iscale);
+    memcpy(y + d_off, &d, sizeof(d));
+    for (int ib = 0; ib < QK_K / 16; ib++) {
+        scales_out[ib] = DS4Q_MIN(127, ds4q_nearest_int(iscale * scales[ib]));
+    }
+    for (int j = 0; j < QK_K / 16; j++) {
+        const float dd = ds4q_f16_to_f32(d) * scales_out[j];
+        if (!dd) continue;
+        for (int ii = 0; ii < 16; ii++) {
+            int l = ds4q_nearest_int(x[16 * j + ii] / dd);
+            l = DS4Q_MAX(-32, DS4Q_MIN(31, l));
+            L[16 * j + ii] = l + 32;
+        }
+    }
+    for (int j = 0; j < QK_K; j += 128) {
+        for (int l = 0; l < 32; l++) {
+            const uint8_t q1 = L[j + l] & 0xF;
+            const uint8_t q2 = L[j + l + 32] & 0xF;
+            const uint8_t q3 = L[j + l + 64] & 0xF;
+            const uint8_t q4 = L[j + l + 96] & 0xF;
+            ql[l] = q1 | (q3 << 4);
+            ql[l + 32] = q2 | (q4 << 4);
+            qh[l] = (L[j + l] >> 4) |
+                    ((L[j + l + 32] >> 4) << 2) |
+                    ((L[j + l + 64] >> 4) << 4) |
+                    ((L[j + l + 96] >> 4) << 6);
+        }
+        ql += 64;
+        qh += 32;
+    }
+}
+
+static size_t ds4q_quantize_q6_k(const float *src, void *dst, int64_t start,
+                                 int64_t nrows, int64_t ncols) {
+    const size_t row_size = ds4q_row_size(DS4Q_TYPE_Q6_K, ncols);
+    const int64_t start_row = start / ncols;
+    uint8_t *out = (uint8_t *)dst + (size_t)start_row * row_size;
+    const int64_t blocks_per_row = ncols / QK_K;
+    for (int64_t row = 0; row < nrows; row++) {
+        const float *xrow = src + start + (size_t)row * (size_t)ncols;
+        for (int64_t b = 0; b < blocks_per_row; b++) {
+            uint8_t *block = out + (size_t)row * row_size +
+                (size_t)b * ds4q_type_traits[DS4Q_TYPE_Q6_K].type_size;
+            ds4q_write_q6_k_block_ref(xrow + (size_t)b * QK_K, block);
         }
     }
     return (size_t)nrows * row_size;
@@ -1059,6 +1307,14 @@ size_t ds4q_quantize_chunk(ds4q_type type, const float *src, void *dst,
     }
     if (type == DS4Q_TYPE_Q4_K) {
         return ds4q_quantize_q4_k(src, dst, start, nrows, ncols, imatrix);
+    }
+    if (type == DS4Q_TYPE_Q5_K) {
+        (void)imatrix;
+        return ds4q_quantize_q5_k(src, dst, start, nrows, ncols);
+    }
+    if (type == DS4Q_TYPE_Q6_K) {
+        (void)imatrix;
+        return ds4q_quantize_q6_k(src, dst, start, nrows, ncols);
     }
     if (type == DS4Q_TYPE_IQ2_XXS) {
         return ds4q_quantize_iq2_xxs(src, dst, start, nrows, ncols, imatrix);

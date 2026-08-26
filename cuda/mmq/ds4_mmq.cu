@@ -1283,8 +1283,13 @@ int ds4_mmq_moe_impl(
                 tag, M, K, n_tokens, n_experts, n_expert_used);
         return -1;
     }
-    if (K % 256 != 0) {
-        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
+    /* K-quants use 256-value super-blocks. Qwen's expert-down tail is a
+     * deliberately separate Q5_0 tensor with K=128, so its legacy 32-value
+     * block is the one legal exception to the 256-wide routed contract. */
+    constexpr int k_alignment = type == GGML_TYPE_Q5_0 ? QK5_0 : 256;
+    if (K % k_alignment != 0) {
+        fprintf(stderr, "%s: K=%d must be a multiple of %d\n",
+                tag, K, k_alignment);
         return -1;
     }
     if (n_expert_used > n_experts) {
@@ -2589,6 +2594,30 @@ extern "C" int ds4_mmq_q4_K_moe(
                                             n_tokens, n_experts, n_expert_used, stream);
 }
 
+extern "C" int ds4_mmq_q5_K_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_Q5_K>("ds4_mmq_q5_K_moe", W, X, ids, out, M, K,
+                                            n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q6_K_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_Q6_K>("ds4_mmq_q6_K_moe", W, X, ids, out, M, K,
+                                            n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q5_0_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_impl<GGML_TYPE_Q5_0>("ds4_mmq_q5_0_moe", W, X, ids, out, M, K,
+                                            n_tokens, n_experts, n_expert_used, stream);
+}
+
 extern "C" int ds4_mmq_q4_K_moe_bounded(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
@@ -2926,8 +2955,10 @@ int ds4_mmq_moe_vec_impl(
                 tag, M, K, n_tokens, n_experts, n_expert_used);
         return -1;
     }
-    if (K % 256 != 0) {
-        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
+    constexpr int k_alignment = type == GGML_TYPE_Q5_0 ? QK5_0 : 256;
+    if (K % k_alignment != 0) {
+        fprintf(stderr, "%s: K=%d must be a multiple of %d\n",
+                tag, K, k_alignment);
         return -1;
     }
     if (n_expert_used > n_experts) {
@@ -4440,6 +4471,33 @@ extern "C" int ds4_mmq_q4_K_moe_vec(
         n_tokens, n_experts, n_expert_used, stream);
 }
 
+extern "C" int ds4_mmq_q5_K_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q5_K>(
+        "ds4_mmq_q5_K_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q6_K_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q6_K>(
+        "ds4_mmq_q6_K_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q5_0_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q5_0>(
+        "ds4_mmq_q5_0_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
 // M1-Inc2b: exact inverse of the weight-server repack
 // (repack_iq2_xxs_aligned_kernel, tools/ds4_weight_server.cu): aligned-SoA
 // artifact -> raw block_iq2_xxs byte stream (66B = [half d][8 x uint2
@@ -5315,4 +5373,10 @@ template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
 template void mul_mat_q_case<GGML_TYPE_Q3_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q5_K>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q6_K>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q5_0>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
