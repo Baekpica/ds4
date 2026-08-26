@@ -1,7 +1,8 @@
 //! Safe Model / Session wrappers around `ds4-sys`, plus the host-owned
 //! GGUF shape catalog, tensor inventory, bind plan, validate, vocab,
 //! bind lookup, layout, tokenizer, session ledger, DSV4 payload prefix,
-//! and live memgov census snapshot (Phase 8).
+//! live memgov census snapshot, and the host-owned memgov D0b evaluator
+//! (Phase 8).
 //!
 //! `unsafe` is confined to the FFI calls and the mmap adapter in this
 //! crate. Application crates (`ds4-cli`, `ds4-server`, …) must not call
@@ -14,6 +15,7 @@ mod identify;
 mod layout;
 mod mapped;
 mod mem;
+mod mem_gov;
 mod payload;
 mod progress;
 mod session;
@@ -47,6 +49,12 @@ pub use layout::{
 };
 pub use mem::{
     snapshot_mem, MemCell as HostMemCell, MemCensus, MemObserve, MemSnap, MEMC_COUNT, MEMD_COUNT,
+};
+pub use mem_gov::{
+    gov_compare, gov_epoch_read_begin, gov_epoch_read_verify, gov_epoch_write_begin,
+    gov_epoch_write_end, gov_evaluate, gov_lease_publish, gov_mode_name, gov_mode_parse, GovClaim,
+    GovCmp, GovConsumer, GovLease, GovLedger, GovMode, GovQuote, GovStatus, MemObsSource,
+    MemObsStatus, MemObservation, GOVC_COUNT,
 };
 pub use payload::{
     dump_cmd as payload_dump_cmd, dump_script as payload_dump_script, encode_fields, parse_prefix,
