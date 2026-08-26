@@ -13,6 +13,36 @@
 이 문서는 `SPLIT_READINESS.md`가 작성되기 **전**에는 실행하지 않는 후속 지시서다.
 `SPLIT_READINESS.md` 자체는 §26(마이그레이션 게이트)이 증거 기반 green일 때만 작성한다.
 
+## 실행 전제 변경 기록 (2026-08-26 통합)
+
+이 절은 두 초안(`ds4_dfm_c_to_rust_migration_plan.md`,
+`dfm_rs_repository_split_followup_plan.md` — 이제 SUPERSEDED 배너를 달고
+tracked)과 이 문서를 **의도적으로 통합**한 결과이며, 이 문서가 단일
+권위다. 초안의 "두 문서 통합 전 remote add/push 금지" 조건은 이 통합으로
+해소됐다.
+
+1. **레포 선생성 사실:** `Baekpica/dfm-rs`는 2026-08-26 16:24 KST에
+   GitHub 웹 UI로 이미 생성됐다 (initial commit `a293973`, README +
+   stock Rust `.gitignore`만; PUBLIC, non-fork, default `main`,
+   **branch protection 없음** — 2026-08-26 확인). §0의 "생성하지 않는다"
+   전제는 이 사실로 대체된다. **시딩 시점은 불변**: genesis 확정 전에는
+   어떤 코드도 push하지 않는다.
+2. **시딩 방식 보정:** genesis push는 `a293973` 위에 **force-push**
+   (`git push dfm-rs +<GENESIS_SHA>:refs/heads/main`)가 된다. §2.1의
+   fast-forward push 표기는 이 형태로 읽는다. baseline 태그도 함께
+   push한다 (`git push dfm-rs v0.6.3-dfm`).
+3. **원격 URL:** 로컬 클론의 origin은 HTTPS
+   (`https://github.com/Baekpica/dfm-rs.git`)다. §2.1의 SSH 표기는
+   예시이며 HTTPS를 허용한다.
+4. **로컬 클론 위치:** `/home/sunghoon/workspace/ds4-exaone/dfm-rs`
+   (workspace 루트; 2026-08-26에 ds4-dfm 내부 중첩 위치에서 이동).
+5. **GREEN 판정 스코프 (사용자 결정 2026-08-26):** §26 게이트는
+   호스트-패리티 계약이다. 어떤 셀의 실패 모드가 **같은 명령의 C 대조
+   실행**으로 동일 재현되고 그 대조가 증거로 기록되면
+   `PASS*(engine-gap E-n)`으로 표기하고 GREEN 판정에서 PASS로 계수한다.
+   C는 통과하는데 Rust만 실패하면 FAIL 유지. 셀 삭제·완화 금지.
+   엔진 갭 레지스트리는 `docs/rust-migration/ENGINE_GAPS.md`.
+
 ---
 
 # 0. 시작 조건
@@ -175,11 +205,16 @@ dfm-rs/
 
 한 번에 전부 바꾸지 않는다.
 
-- **Phase A** (user-facing binary 먼저): `ds4-server-rs`→`dfm-server`, `ds4-bench-rs`→`dfm-bench`, `ds4-rs`→`dfm`
+- **Phase A** (user-facing binary 먼저): `ds4-server-rs`→`dfm-server`, `ds4-bench-rs`→`dfm-bench`, `ds4-rs`→`dfm`, `ds4-agent-rs`→`dfm-agent`
 - **Phase B** (crate): `ds4-core`→`dfm-core`, `ds4-server`→`dfm-server`, `ds4-kv`→`dfm-kv`
 - **Phase C** (native symbol은 마지막): `ds4_cuda_*` / `ds4_bridge_*`는 무리하게 즉시 rename하지
   않는다. 이유: native/backend regression 위험, debug symbol continuity, git blame 가독성,
   upstream vendor diff 추적. 초기에는 old symbol naming을 compatibility detail로 허용한다.
+
+**`ds4-eval` carve-out:** `ds4-eval`은 naming cleanup 대상이 아니다.
+`make test`의 extractor oracle이며 Rust candidate가 없으므로 genesis와
+`v0.1` 동안 이름과 C 구현을 그대로 유지하고, Rust로 승격했다고 주장하지
+않는다.
 
 ---
 
@@ -215,6 +250,22 @@ different host-language architecture
 각 RC는 최소: build / unit / parity / CUDA proof / server surface tests / long-context /
 GB10 benchmark / soak 를 통과해야 한다. 최종 `v0.1.0`은 RC와 source-identical 또는
 documentation-only delta.
+
+**추가 게이트 (2026-08-26 통합으로 흡수; 승격·genesis·RC에 공통):**
+
+- native tracked-golden OPP-C: 고정 `v0.6.3-dfm` golden 대비 OPP-C가
+  현 candidate에서 green일 것.
+- C→Rust host OPP-C를 **명시적 binary 경로**로 실행 (oracle과 candidate
+  경로를 커맨드에 적고 로그에 남긴다; 기본 이름 추론 금지).
+- default/oracle binary **SHA-256 매핑 표**: 승격 전후로
+  `ds4`/`ds4-server`/`ds4-bench`/`ds4-agent` ↔ `*-c` 의 해시를 기록하고
+  pre-Rust SHA == post-default SHA, pre-C SHA == post-`*-c` SHA를
+  검증한다. proof 하니스는 candidate와 oracle이 같은 inode 또는 같은
+  binary hash면 실패해야 한다.
+- `ds4-eval --self-test-extractors` PASS.
+- Phase 9 pre/post family manifest replay: §18.3 매니페스트(고정 순서
+  model-family smoke → API/KV fixtures → CUDA smoke → CUDA long →
+  OPP-C → ABBA/perf → soak)를 pre/post 동일 입력으로 재현.
 
 ---
 
