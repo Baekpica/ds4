@@ -300,6 +300,45 @@ impl Store {
         self.prefix_candidate(prompt, model_id, quant_bits, ctx_size, true)
     }
 
+    pub fn bank_text_lcp_candidate(
+        &mut self,
+        prompt: &[u8],
+        model_id: u8,
+        quant_bits: u8,
+        ctx_size: u32,
+        min_lcp: usize,
+    ) -> io::Result<Option<(PathBuf, Envelope, usize)>> {
+        let Some((index, _)) = self.find_text_lcp(prompt, model_id, quant_bits, ctx_size, min_lcp)
+        else {
+            return Ok(None);
+        };
+        let entry = self.entries[index].clone();
+        let envelope = read_envelope(&entry.path).map_err(format_io_error)?;
+        let header = &envelope.header;
+        let unchanged = header.model_id == entry.header.model_id
+            && header.quant_bits == entry.header.quant_bits
+            && header.ctx_size == entry.header.ctx_size
+            && header.tokens == entry.header.tokens
+            && header.text_bytes == entry.header.text_bytes;
+        let lcp = prompt
+            .iter()
+            .zip(&envelope.text)
+            .take_while(|(left, right)| left == right)
+            .count();
+        if !is_automatic_exact_replay(header.reason, header.ext_flags)
+            || !unchanged
+            || header.model_id != model_id
+            || (self.reject_different_quant && header.quant_bits != quant_bits)
+            || header.ctx_size > ctx_size
+            || lcp < min_lcp
+            || 8 * (lcp as u64) < u64::from(header.text_bytes)
+            || text_sha_hex(&envelope.text) != entry.sha
+        {
+            return Ok(None);
+        }
+        Ok(Some((entry.path, envelope, lcp)))
+    }
+
     fn prefix_candidate(
         &mut self,
         prompt: &[u8],
@@ -843,6 +882,40 @@ mod tests {
         store.write(r).unwrap();
         assert!(store.find_bank_text_prefix(b"hello", 0, 2, 2048).is_none());
         assert!(store.find_bank_text_prefix(b"hello!", 0, 2, 2048).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lcp_candidate_reopens_and_revalidates_the_selected_record() {
+        let dir = std::env::temp_dir().join(format!("ds4-kv-lcp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let mut record = rec(b"shared alpha", 512);
+        record.header.reason = Reason::BankCheckpoint;
+        record.header.ext_flags = crate::format::EXT_BANK_REPLAY_V1;
+        let path = store.write(record).unwrap();
+
+        let (candidate, envelope, lcp) = store
+            .bank_text_lcp_candidate(b"shared beta", 0, 2, 2048, 6)
+            .unwrap()
+            .unwrap();
+        assert_eq!(candidate, path);
+        assert_eq!(envelope.text, b"shared alpha");
+        assert_eq!(lcp, b"shared ".len());
+
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start((FIXED_HEADER + 4) as u64))
+            .unwrap();
+        file.write_all(b"X").unwrap();
+        file.flush().unwrap();
+        assert!(store
+            .bank_text_lcp_candidate(b"shared beta", 0, 2, 2048, 6)
+            .unwrap()
+            .is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 
