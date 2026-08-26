@@ -99,13 +99,13 @@ use ds4_sys::{
     ds4_bridge_model_run_distributed_worker, ds4_bridge_session, ds4_bridge_session_argmax,
     ds4_bridge_session_argmax_excluding, ds4_bridge_session_copy_logits, ds4_bridge_session_create,
     ds4_bridge_session_ctx, ds4_bridge_session_distributed_route_ready,
-    ds4_bridge_session_eval_layer_slice, ds4_bridge_session_exaone_rewind_span,
-    ds4_bridge_session_free, ds4_bridge_session_generation, ds4_bridge_session_graph_fit_quote,
-    ds4_bridge_session_invalidate, ds4_bridge_session_layer_slice_reset,
-    ds4_bridge_session_load_layer_payload, ds4_bridge_session_load_payload,
-    ds4_bridge_session_load_payload_range, ds4_bridge_session_load_snapshot,
-    ds4_bridge_session_output_head_bench, ds4_bridge_session_power, ds4_bridge_session_prefill_cap,
-    ds4_bridge_session_rewind, ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
+    ds4_bridge_session_eval_layer_slice, ds4_bridge_session_free, ds4_bridge_session_generation,
+    ds4_bridge_session_graph_fit_quote, ds4_bridge_session_invalidate,
+    ds4_bridge_session_layer_slice_reset, ds4_bridge_session_load_layer_payload,
+    ds4_bridge_session_load_payload, ds4_bridge_session_load_payload_range,
+    ds4_bridge_session_load_snapshot, ds4_bridge_session_output_head_bench,
+    ds4_bridge_session_power, ds4_bridge_session_prefill_cap, ds4_bridge_session_rewind,
+    ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
     ds4_bridge_session_save_payload, ds4_bridge_session_save_snapshot,
     ds4_bridge_session_set_power, ds4_bridge_session_sync, ds4_bridge_session_top_logprobs,
     ds4_bridge_shard, ds4_bridge_snapshot, ds4_bridge_snapshot_create, ds4_bridge_snapshot_free,
@@ -1217,7 +1217,7 @@ impl Model {
             ledger_ctx(ctx_size, native_ctx),
             prefill.max(0) as u32,
         );
-        host.set_n_swa(self.bind_plan.shape.n_swa);
+        host.apply_shape(&self.bind_plan.shape);
         Ok(Session {
             raw,
             host,
@@ -1381,12 +1381,8 @@ impl Session<'_> {
     }
 
     pub fn last_plan(&self, tokens: &[i32]) -> SyncPlan {
-        let span = if self.host.family == ModelFamily::ExaoneMoe {
-            unsafe { ds4_bridge_session_exaone_rewind_span(self.raw.as_ptr()) }
-        } else {
-            0
-        };
-        self.host.plan_sync(tokens, span)
+        self.host
+            .plan_sync(tokens, self.host.planned_exaone_rewind_span())
     }
 
     fn check_sync(&self, tokens: &TokenBuffer) -> Result<SyncPlan> {

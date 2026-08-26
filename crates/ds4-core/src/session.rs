@@ -4,7 +4,7 @@
 //! at v0.6.3-dfm. Native CUDA still executes prefill/decode; this module
 //! decides reuse vs rebuild and is the authoritative pos/generation/ctx.
 
-use crate::shape::ModelFamily;
+use crate::shape::{ModelFamily, Shape};
 
 pub const PREFILL_FENCE_ROWS: u32 = 8192;
 
@@ -69,6 +69,9 @@ pub struct SessionLedger {
     pub solar_state_valid: bool,
     pub mtp_draft_valid: bool,
     pub n_swa: u32,
+    pub n_swa_period: u32,
+    pub n_layer: u32,
+    pub n_nextn_predict: u32,
 }
 
 impl SessionLedger {
@@ -84,11 +87,21 @@ impl SessionLedger {
             solar_state_valid: family != ModelFamily::SolarOpen2,
             mtp_draft_valid: false,
             n_swa: 0,
+            n_swa_period: 0,
+            n_layer: 0,
+            n_nextn_predict: 0,
         }
     }
 
     pub fn set_n_swa(&mut self, n_swa: u32) {
         self.n_swa = n_swa;
+    }
+
+    pub fn apply_shape(&mut self, shape: &Shape) {
+        self.n_swa = shape.n_swa;
+        self.n_swa_period = shape.n_swa_period;
+        self.n_layer = shape.n_layer;
+        self.n_nextn_predict = shape.n_nextn_predict;
     }
 
     pub fn pos(&self) -> i32 {
@@ -166,6 +179,54 @@ impl SessionLedger {
             return RewriteKind::Rebuild;
         }
         RewriteKind::Error
+    }
+
+    /// C `exaone_layer_is_sliding`: LLLG full attention on every
+    /// `n_swa_period`-th layer, sliding otherwise.
+    pub fn exaone_layer_is_sliding(il: u32, n_swa_period: u32) -> bool {
+        n_swa_period != 0 && (il % n_swa_period) != n_swa_period - 1
+    }
+
+    /// C `exaone_graph_prefill_cap_for_context`.
+    pub fn exaone_graph_prefill_cap_for_context(ctx_size: u32, requested: u32) -> u32 {
+        let cap = if requested == 0 { 512 } else { requested };
+        cap.min(ctx_size)
+    }
+
+    /// C `exaone_graph_layer_kv_cap`. Sliding rings keep the SWA window
+    /// plus one prefill chunk. GPU alloc stays native; the number is host.
+    pub fn exaone_graph_layer_kv_cap(
+        il: u32,
+        ctx_size: u32,
+        prefill_cap: u32,
+        n_swa: u32,
+        n_swa_period: u32,
+    ) -> u32 {
+        if !Self::exaone_layer_is_sliding(il, n_swa_period) {
+            return ctx_size;
+        }
+        (u64::from(n_swa) + u64::from(prefill_cap)).min(u64::from(ctx_size)) as u32
+    }
+
+    /// Planned sliding caps after a successful CUDA session create.
+    /// `DS4_NO_GPU` / CPU backend stay 0, matching C.
+    pub fn planned_exaone_rewind_span(&self) -> i32 {
+        if self.family != ModelFamily::ExaoneMoe || self.backend != SessionBackend::Cuda {
+            return 0;
+        }
+        if self.n_swa_period == 0 || self.n_layer == 0 {
+            return 0;
+        }
+        let ctx = self.ctx.max(0) as u32;
+        let prefill = Self::exaone_graph_prefill_cap_for_context(ctx, self.prefill_cap);
+        let n_exec = self.n_layer.saturating_sub(self.n_nextn_predict);
+        let caps: Vec<u32> = (0..n_exec)
+            .filter(|&il| Self::exaone_layer_is_sliding(il, self.n_swa_period))
+            .map(|il| {
+                Self::exaone_graph_layer_kv_cap(il, ctx, prefill, self.n_swa, self.n_swa_period)
+            })
+            .collect();
+        Self::exaone_rewind_span(self.family, true, ctx, self.live_len(), self.n_swa, &caps)
     }
 
     /// C `ds4_session_exaone_rewind_span` arithmetic. `sliding_caps` are the
@@ -587,5 +648,41 @@ mod tests {
             ),
             513
         );
+    }
+
+    #[test]
+    fn exaone_layer_kv_cap_matches_c_kernel_fixture() {
+        use crate::shape::SHAPE_KEXAONE_236B;
+        let n_swa = SHAPE_KEXAONE_236B.n_swa;
+        let period = SHAPE_KEXAONE_236B.n_swa_period;
+        assert_eq!(
+            SessionLedger::exaone_graph_layer_kv_cap(0, 262144, 512, n_swa, period),
+            640
+        );
+        assert_eq!(
+            SessionLedger::exaone_graph_layer_kv_cap(3, 262144, 512, n_swa, period),
+            262144
+        );
+        assert!(SessionLedger::exaone_layer_is_sliding(0, period));
+        assert!(!SessionLedger::exaone_layer_is_sliding(3, period));
+        assert_eq!(
+            SessionLedger::exaone_graph_prefill_cap_for_context(262144, 0),
+            512
+        );
+    }
+
+    #[test]
+    fn planned_exaone_rewind_span_uses_host_caps() {
+        use crate::shape::SHAPE_KEXAONE_236B;
+        let mut host =
+            SessionLedger::new(ModelFamily::ExaoneMoe, SessionBackend::Cuda, 262144, 512);
+        host.apply_shape(&SHAPE_KEXAONE_236B);
+        host.tokens = (0..500).collect();
+        host.valid = true;
+        assert_eq!(host.planned_exaone_rewind_span(), 500);
+        host.tokens = (0..1000).collect();
+        assert_eq!(host.planned_exaone_rewind_span(), 513);
+        host.backend = SessionBackend::Cpu;
+        assert_eq!(host.planned_exaone_rewind_span(), 0);
     }
 }
