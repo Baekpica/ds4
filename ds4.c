@@ -48979,12 +48979,19 @@ int ds4_gov_governed_check_margin(const char *site, const ds4_gov_claim *cl,
     return gov_governed_dispatch(site, cl, legacy_status, &margin_bytes, NULL);
 }
 
+static uint32_t qwen4exp_graph_prefill_cap_for_context(uint32_t ctx_size);
+
 /* Absolute session-graph intent at a ctx: the serial-reserve estimator
  * (v0.5.6 governance) exported for SERIAL_SESSION / STATIC_BATCH shadow
  * claims.  Estimate, not measurement -- the scoping table marks these
  * rows BOUNDED. */
 uint64_t ds4_engine_session_graph_bytes_estimate(ds4_engine *e, int ctx) {
     if (!e || ctx <= 0) return 0;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        const uint32_t prefill_cap =
+            qwen4exp_graph_prefill_cap_for_context((uint32_t)ctx);
+        return qwen4exp_graph_bytes_estimate((uint32_t)ctx, prefill_cap);
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2)
         return solar_graph_context_memory_estimate(
             e->backend, (uint32_t)ctx).total_bytes;
@@ -58706,21 +58713,37 @@ static uint32_t qwen4exp_graph_prefill_cap_for_context(uint32_t ctx_size) {
 static bool qwen4exp_graph_session_fit_check(ds4_backend backend,
                                               uint32_t ctx_size,
                                               uint32_t prefill_cap,
-                                              bool loud) {
+                                              bool loud,
+                                              ds4_session_graph_fit_quote *q) {
+    if (q) memset(q, 0, sizeof(*q));
     const char *fit = getenv("DS4_SESSION_GRAPH_FIT");
-    if (fit && fit[0] == '0' && fit[1] == '\0') return true;
+    if (fit && fit[0] == '0' && fit[1] == '\0') {
+        if (q) { q->fits = 1; q->fail_open = 1; }
+        return true;
+    }
     if (backend != DS4_BACKEND_CUDA || ctx_size > DS4_ROPE_ORIG_CTX) return false;
     const uint64_t plan =
         qwen4exp_graph_bytes_estimate(ctx_size, prefill_cap);
     if (plan == 0u) return false;
     uint64_t free_bytes = 0u, total_bytes = 0u;
-    if (ds4_gpu_mem_info(&free_bytes, &total_bytes) != 0) return true;
+    if (ds4_gpu_mem_info(&free_bytes, &total_bytes) != 0) {
+        if (q) { q->fits = 1; q->fail_open = 1; }
+        return true;
+    }
     const uint64_t substrate = ds4_gpu_substrate_outstanding();
     free_bytes = free_bytes > substrate ? free_bytes - substrate : 0u;
-    const uint64_t headroom = (uint64_t)qwen4exp_env_u32(
-        "DS4_SESSION_GRAPH_HEADROOM_MB", 1024u, 0u, 65536u) << 20;
+    const uint64_t headroom = ds4_session_graph_headroom_bytes();
     const bool fits = plan <= UINT64_MAX - headroom &&
                       free_bytes >= plan + headroom;
+    if (q) {
+        const uint64_t ask = plan <= UINT64_MAX - headroom
+            ? plan + headroom : UINT64_MAX;
+        q->fits = fits ? 1 : 0;
+        q->need_bytes = plan;
+        q->headroom_bytes = headroom;
+        q->avail_bytes = free_bytes;
+        q->deficit_bytes = fits ? 0u : ask - free_bytes;
+    }
     if (!fits && loud) {
         ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1);
         fprintf(stderr,
@@ -58768,17 +58791,36 @@ static uint64_t session_tensors_census_live(void) {
 static int ds4_session_alloc_graph(ds4_session *s) {
     ds4_engine *e = s->engine;
     if (ds4_session_is_qwen4exp(s)) {
-        if (!qwen4exp_graph_session_fit_check(
-                e->backend, (uint32_t)s->ctx_size, s->prefill_cap, true) ||
-            !qwen4exp_graph_alloc(
+        const uint64_t est = qwen4exp_graph_bytes_estimate(
+            (uint32_t)s->ctx_size, s->prefill_cap);
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, est, 0);
+        s->graph_alloc_bytes = 0;
+        const uint64_t census_before = session_tensors_census_live();
+        ds4_gpu_mem_scope_begin(DS4_MEMC_SESSION_TENSORS);
+        const bool ok = qwen4exp_graph_session_fit_check(
+                e->backend, (uint32_t)s->ctx_size, s->prefill_cap,
+                true, NULL) &&
+            qwen4exp_graph_alloc(
                 &s->qwen_graph, &e->weights, e->qwen_ple_store,
-                (uint32_t)s->ctx_size, s->prefill_cap)) {
+                (uint32_t)s->ctx_size, s->prefill_cap);
+        ds4_gpu_mem_scope_end();
+        if (!ok) {
             s->qwen_graph_ready = false;
+            ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
             return 1;
         }
         s->qwen_graph_ready = true;
-        s->graph_alloc_bytes = qwen4exp_graph_bytes_estimate(
-            (uint32_t)s->ctx_size, s->prefill_cap);
+        const uint64_t census_after = session_tensors_census_live();
+        const uint64_t measured = census_after > census_before
+            ? census_after - census_before : 0u;
+        s->graph_alloc_bytes = measured ? measured : est;
+        ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION,
+                            s->graph_alloc_bytes, s->graph_alloc_bytes);
+        fprintf(stderr,
+                "ds4: Qwen graph memory committed: est=%.1f MiB "
+                "measured=%.1f MiB\n",
+                (double)est / 1048576.0,
+                (double)s->graph_alloc_bytes / 1048576.0);
         return 0;
     }
     if (ds4_session_is_motif3(s)) {
@@ -58987,7 +59029,7 @@ int ds4_engine_session_graph_fit_quote(ds4_engine *e, int ctx_size,
         const uint32_t prefill_cap =
             qwen4exp_graph_prefill_cap_for_context((uint32_t)ctx_size);
         q->fits = qwen4exp_graph_session_fit_check(
-            e->backend, (uint32_t)ctx_size, prefill_cap, false) ? 1 : 0;
+            e->backend, (uint32_t)ctx_size, prefill_cap, false, q) ? 1 : 0;
         return q->fits;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
@@ -59228,6 +59270,7 @@ void ds4_session_free(ds4_session *s) {
         if (ds4_session_is_qwen4exp(s)) {
             qwen4exp_graph_free(&s->qwen_graph);
             s->qwen_graph_ready = false;
+            ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
         } else if (ds4_session_is_exaone(s)) {
             exaone_graph_free(&s->exaone_graph);
             s->exaone_graph_ready = false;
@@ -59248,10 +59291,8 @@ void ds4_session_free(ds4_session *s) {
              * a freed session leaves a PHANTOM lease other lanes' quotes
              * charge forever (live-caught: the boot prewarm session's ctx-528
              * graph left 746 MiB of stuck intent after its free).  Absolute
-             * publish: after free the session lane holds nothing.  The DFM
-             * family graphs above never publish this lease (their alloc
-             * branches return before the serial-session publish), so the
-             * release stays with the metal graph it balances. */
+             * publish: after free the session lane holds nothing.  Specialized
+             * graphs that publish a lease release it in their own branch. */
             ds4_gov_publish_use(DS4_GOVC_SERIAL_SESSION, 0, 0);
             /* MT-6 (audit V9/V11): the serial per-layer exec pool bakes this
              * graph's tensor pointers by value -- after the free every entry
