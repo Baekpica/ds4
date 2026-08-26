@@ -9,7 +9,9 @@ use std::path::Path;
 use ds4_kv::{Reason as KvReason, Store as KvStore};
 
 use crate::generate::GenerateError;
-use crate::serve_cont::{save_bank_record, WarmBank, WarmRecord};
+#[cfg(test)]
+use crate::serve_cont::WarmRecord;
+use crate::serve_cont::{save_bank_record, WarmBank};
 
 /// Persist a pin-tier bank with `BankEvict`, then drop its warm record.
 ///
@@ -66,6 +68,7 @@ mod tests {
                 text: text.as_bytes().to_vec(),
                 generation: 3,
                 ext_flags: 0,
+                trailer: Vec::new(),
             }),
             committed_tokens: 70_000,
             stored_tokens: 0,

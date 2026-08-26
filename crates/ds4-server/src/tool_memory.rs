@@ -4,7 +4,7 @@ use std::sync::Arc;
 use ds4_kv::{read_trailer, Store as KvStore, EXT_TOOL_MAP};
 
 use crate::parse::{ChatMsg, ToolCall};
-use crate::render::{SOLAR_TOOL_CALLS, SOLAR_TOOL_CALL_END};
+use crate::render::{MOTIF_TOOL_CALLS, SOLAR_TOOL_CALLS, SOLAR_TOOL_CALL_END};
 use crate::tools::{
     release_tool_id, reserve_tool_id, DSML_TOOL_CALLS_END, DSML_TOOL_CALLS_END_SHORT,
     DSML_TOOL_CALLS_START, DSML_TOOL_CALLS_START_SHORT,
@@ -252,7 +252,10 @@ impl ToolMemory {
     pub(crate) fn attach(&mut self, messages: &mut [ChatMsg]) -> usize {
         let mut attached = 0;
         for message in messages {
-            if message.calls.is_empty() || !message.raw_dsml.is_empty() {
+            if message.calls.is_empty()
+                || !message.raw_dsml.is_empty()
+                || !message.raw_tool_text.is_empty()
+            {
                 continue;
             }
             let mut matched: Option<Arc<str>> = None;
@@ -273,6 +276,7 @@ impl ToolMemory {
             if exact {
                 if let Some(block) = matched {
                     message.raw_dsml = block.to_string();
+                    message.raw_tool_text = block.to_string();
                     attached += 1;
                 }
             }
@@ -295,6 +299,33 @@ impl ToolMemory {
                 }
             }
             pos = end;
+        }
+        // A continuous bank deliberately omits its last sampled token, which
+        // can cut the current tool block inside the closing marker. Complete
+        // blocks use the hash lookup above; only this bounded LRU tail needs a
+        // scan, and equal-prefix ambiguity fails closed.
+        let mut tail = None;
+        let mut tail_len = 0;
+        let mut ambiguous = false;
+        for (block, ids) in &self.blocks {
+            if seen.contains(block) {
+                continue;
+            }
+            let matched = tool_block_tail_prefix_len(text, block.as_bytes());
+            if matched > tail_len {
+                tail = Some((block, ids));
+                tail_len = matched;
+                ambiguous = false;
+            } else if matched != 0 && matched == tail_len {
+                ambiguous = true;
+            }
+        }
+        if !ambiguous {
+            if let Some((block, ids)) = tail {
+                for id in ids {
+                    entries.push((id.as_bytes(), block.as_bytes()));
+                }
+            }
         }
         encode_ktm_bounded(&entries, self.max_bytes)
     }
@@ -418,46 +449,88 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn next_tool_block(text: &[u8], from: usize) -> Option<(usize, usize)> {
-    let forms = [
+fn tool_block_forms() -> [(&'static [u8], &'static [u8], Option<&'static [u8]>); 9] {
+    [
         (
-            b"\n\n<\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls>".as_slice(),
+            b"\n\n<\xef\xbd\x9cDSML\xef\xbd\x9ctool_calls>",
             DSML_TOOL_CALLS_END.as_bytes(),
-            false,
+            None,
         ),
         (
             DSML_TOOL_CALLS_START.as_bytes(),
             DSML_TOOL_CALLS_END.as_bytes(),
-            false,
+            None,
         ),
         (
-            b"\n\n<DSML\xef\xbd\x9ctool_calls>".as_slice(),
+            b"\n\n<DSML\xef\xbd\x9ctool_calls>",
             DSML_TOOL_CALLS_END_SHORT.as_bytes(),
-            false,
+            None,
         ),
         (
             DSML_TOOL_CALLS_START_SHORT.as_bytes(),
             DSML_TOOL_CALLS_END_SHORT.as_bytes(),
-            false,
+            None,
         ),
-        (
-            b"\n\n<tool_calls>".as_slice(),
-            b"</tool_calls>".as_slice(),
-            false,
-        ),
-        (
-            b"<tool_calls>".as_slice(),
-            b"</tool_calls>".as_slice(),
-            false,
-        ),
+        (b"\n\n<tool_calls>", b"</tool_calls>", None),
+        (b"<tool_calls>", b"</tool_calls>", None),
         (
             SOLAR_TOOL_CALLS.as_bytes(),
             SOLAR_TOOL_CALL_END.as_bytes(),
-            true,
+            Some(SOLAR_TOOL_CALLS.as_bytes()),
         ),
-    ];
-    let mut best: Option<(usize, usize, bool)> = None;
-    for (start_marker, end_marker, solar) in forms {
+        (
+            b"\n<tool_call>",
+            b"</tool_call>",
+            Some(MOTIF_TOOL_CALLS.as_bytes()),
+        ),
+        (
+            MOTIF_TOOL_CALLS.as_bytes(),
+            b"</tool_call>",
+            Some(MOTIF_TOOL_CALLS.as_bytes()),
+        ),
+    ]
+}
+
+fn tool_block_tail_prefix_len(text: &[u8], block: &[u8]) -> usize {
+    if text.is_empty() || block.is_empty() {
+        return 0;
+    }
+    let mut best = 0;
+    for (start_marker, _, _) in tool_block_forms() {
+        let mut block_from = 0;
+        while block_from < block.len() {
+            let Some(block_rel) = find_bytes(&block[block_from..], start_marker) else {
+                break;
+            };
+            let block_marker = block_from + block_rel;
+            let min_candidate = text.len().saturating_sub(block.len());
+            let mut text_from = min_candidate.saturating_add(block_marker).min(text.len());
+            while text_from < text.len() {
+                let Some(text_rel) = find_bytes(&text[text_from..], start_marker) else {
+                    break;
+                };
+                let text_marker = text_from + text_rel;
+                if text_marker >= block_marker {
+                    let candidate = text_marker - block_marker;
+                    let suffix = &text[candidate..];
+                    if suffix.len() <= block.len()
+                        && suffix.len() >= block_marker + start_marker.len()
+                        && block.starts_with(suffix)
+                    {
+                        best = best.max(suffix.len());
+                    }
+                }
+                text_from = text_marker + 1;
+            }
+            block_from = block_marker + 1;
+        }
+    }
+    best
+}
+
+fn next_tool_block(text: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize, Option<&[u8]>, &[u8])> = None;
+    for (start_marker, end_marker, repeat_start) in tool_block_forms() {
         let Some(start_rel) = find_bytes(&text[from..], start_marker) else {
             continue;
         };
@@ -468,25 +541,25 @@ fn next_tool_block(text: &[u8], from: usize) -> Option<(usize, usize)> {
         };
         let end = body + end_rel + end_marker.len();
         if best.map(|current| start < current.0).unwrap_or(true) {
-            best = Some((start, end, solar));
+            best = Some((start, end, repeat_start, end_marker));
         }
     }
-    let (start, mut end, solar) = best?;
-    if solar {
+    let (start, mut end, repeat_start, repeat_end) = best?;
+    if let Some(repeat_start) = repeat_start {
         loop {
             let next = text[end..]
                 .iter()
                 .position(|byte| !byte.is_ascii_whitespace())
                 .map(|offset| end + offset)
                 .unwrap_or(text.len());
-            if !text[next..].starts_with(SOLAR_TOOL_CALLS.as_bytes()) {
+            if !text[next..].starts_with(repeat_start) {
                 break;
             }
-            let body = next + SOLAR_TOOL_CALLS.len();
-            let Some(end_rel) = find_bytes(&text[body..], SOLAR_TOOL_CALL_END.as_bytes()) else {
+            let body = next + repeat_start.len();
+            let Some(end_rel) = find_bytes(&text[body..], repeat_end) else {
                 break;
             };
-            end = body + end_rel + SOLAR_TOOL_CALL_END.len();
+            end = body + end_rel + repeat_end.len();
         }
     }
     Some((start, end))
@@ -753,6 +826,48 @@ mod tests {
         );
         assert_eq!(got[0], (b"call_exact".to_vec(), exact.into_bytes()));
         assert_eq!(got[1], (b"call_solar".to_vec(), solar.into_bytes()));
+    }
+
+    #[test]
+    fn checkpoint_keeps_a_tool_turn_cut_inside_its_close_marker() {
+        let raw = dsml("bank-cut");
+        let mut memory = ToolMemory::new(10, 4096);
+        memory.put("call_cut", &raw, Source::Ram);
+        let cut = raw.len() - 5;
+        let text = format!("prompt{}", &raw[..cut]);
+
+        let trailer = memory.checkpoint(text.as_bytes()).unwrap();
+        let mut got = Vec::new();
+        assert_eq!(
+            decode_ktm(&trailer, 10, |id, dsml| {
+                got.push((id.to_vec(), dsml.to_vec()));
+                true
+            }),
+            1
+        );
+        assert_eq!(got, vec![(b"call_cut".to_vec(), raw.into_bytes())]);
+    }
+
+    #[test]
+    fn checkpoint_restores_motif_exact_tool_text_from_a_partial_bank_key() {
+        let raw =
+            "\n<tool_call>{\"name\":\"pair_values\",\"arguments\":{\"a\":1,\"b\":2}}</tool_call>";
+        let mut source = ToolMemory::new(10, 4096);
+        source.put("call_motif", raw, Source::Ram);
+        let mut text = b"prompt".to_vec();
+        text.extend_from_slice(&raw.as_bytes()[..raw.len() - 5]);
+        let trailer = source.checkpoint(&text).unwrap();
+
+        let mut restored = ToolMemory::new(10, 4096);
+        let wanted = HashSet::from(["call_motif".to_string()]);
+        assert_eq!(restored.load_trailer(&trailer, &wanted), 1);
+        let mut messages = vec![ChatMsg {
+            role: "assistant".into(),
+            calls: calls(&["call_motif"]),
+            ..Default::default()
+        }];
+        assert_eq!(restored.attach(&mut messages), 1);
+        assert_eq!(messages[0].raw_tool_text, raw);
     }
 
     #[test]

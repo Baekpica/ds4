@@ -10824,14 +10824,15 @@ static void route_metrics_record(const request *r, int lane) {
  * Tool Call Text Memory.
  * =========================================================================
  *
- * The model speaks DSML, while OpenAI and Anthropic clients round-trip tool
- * calls as JSON.  Re-rendering that JSON is not always the same byte sequence:
+ * The model speaks family-native tool syntax, while OpenAI and Anthropic
+ * clients round-trip tool calls as JSON. Re-rendering that JSON is not always
+ * the same byte sequence:
  * clients may preserve, sort, or rebuild object keys differently.  Tool call
  * ids are the bridge between both worlds.  For every generated tool call we
- * remember the exact DSML block sampled by the model under a random id.  When
+ * remember the exact sampled tool block under a random id. When
  * the client later sends the same id back in conversation history, we replay
- * the sampled DSML verbatim and keep the KV cache aligned with the live model
- * state.
+ * the sampled native text verbatim and keep the KV cache aligned with the
+ * live model state.
  */
 
 #define DS4_TOOL_MEMORY_DEFAULT_MAX_IDS 100000
@@ -11774,12 +11775,19 @@ static const char *tool_memory_lookup_locked(tool_memory *m, const char *id,
     return e->block->dsml;
 }
 
+static const char *tool_calls_exact_text(const tool_calls *calls) {
+    if (!calls) return NULL;
+    if (calls->raw_dsml && calls->raw_dsml[0]) return calls->raw_dsml;
+    if (calls->raw_tool_text && calls->raw_tool_text[0]) return calls->raw_tool_text;
+    return NULL;
+}
+
 static void tool_memory_remember(server *s, const tool_calls *calls) {
-    if (!s || s->disable_exact_dsml_tool_replay ||
-        !calls || !calls->raw_dsml || !calls->raw_dsml[0]) return;
+    const char *exact = tool_calls_exact_text(calls);
+    if (!s || s->disable_exact_dsml_tool_replay || !exact) return;
     pthread_mutex_lock(&s->tool_mu);
     for (int i = 0; i < calls->len; i++) {
-        tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_dsml,
+        tool_memory_put_locked(&s->tool_mem, calls->v[i].id, exact,
                                TOOL_MEMORY_RAM);
     }
     pthread_mutex_unlock(&s->tool_mu);
@@ -11807,7 +11815,7 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
         if (stats) {
             for (int i = 0; i < msgs->len; i++) {
                 tool_calls *calls = &msgs->v[i].calls;
-                if (calls->len == 0 || calls->raw_dsml) continue;
+                if (calls->len == 0 || tool_calls_exact_text(calls)) continue;
                 stats->canonical++;
                 stats->missing_ids += calls->len;
             }
@@ -11817,7 +11825,7 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
     pthread_mutex_lock(&s->tool_mu);
     for (int i = 0; i < msgs->len; i++) {
         tool_calls *calls = &msgs->v[i].calls;
-        if (calls->len == 0 || calls->raw_dsml) continue;
+        if (calls->len == 0 || tool_calls_exact_text(calls)) continue;
         tool_memory_block *matched = NULL;
         tool_memory_source matched_source = TOOL_MEMORY_DISK;
         bool exact = true;
@@ -11843,6 +11851,7 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
         }
         if (exact && matched) {
             calls->raw_dsml = xstrdup(matched->dsml);
+            calls->raw_tool_text = xstrdup(matched->dsml);
             if (stats) {
                 if (matched_source == TOOL_MEMORY_RAM) stats->mem++;
                 else stats->disk++;
@@ -12409,45 +12418,55 @@ static char *path_join(const char *dir, const char *name) {
 
 
 
+struct kv_tool_block_form {
+    const char *start;
+    const char *end;
+    const char *repeat_start;
+};
+
+static const struct kv_tool_block_form kv_tool_block_forms[] = {
+    {"\n\n" DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END, NULL},
+    {DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END, NULL},
+    {"\n\n" DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT, NULL},
+    {DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT, NULL},
+    {"\n\n<tool_calls>", "</tool_calls>", NULL},
+    {"<tool_calls>", "</tool_calls>", NULL},
+    {DS4_SOLAR_TOOL_CALL_START, DS4_SOLAR_TOOL_CALL_END,
+     DS4_SOLAR_TOOL_CALL_START},
+    {"\n<tool_call>", "</tool_call>", "<tool_call>"},
+    {"<tool_call>", "</tool_call>", "<tool_call>"},
+};
+
 static const char *find_next_dsml_tool_block(const char *p, const char **end_out) {
-    struct block_form {
-        const char *start;
-        const char *end;
-    } forms[] = {
-        {"\n\n" DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
-        {DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END},
-        {"\n\n" DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
-        {DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT},
-        {"\n\n<tool_calls>", "</tool_calls>"},
-        {"<tool_calls>", "</tool_calls>"},
-        {DS4_SOLAR_TOOL_CALL_START, DS4_SOLAR_TOOL_CALL_END},
-    };
 
     const char *best = NULL;
     const char *best_end = NULL;
-    bool best_is_solar = false;
-    for (size_t i = 0; i < sizeof(forms) / sizeof(forms[0]); i++) {
-        const char *s = strstr(p, forms[i].start);
+    const char *best_repeat_start = NULL;
+    const char *best_repeat_end = NULL;
+    for (size_t i = 0;
+         i < sizeof(kv_tool_block_forms) / sizeof(kv_tool_block_forms[0]);
+         i++) {
+        const char *s = strstr(p, kv_tool_block_forms[i].start);
         if (!s || (best && s >= best)) continue;
-        const char *e = strstr(s, forms[i].end);
+        const char *e = strstr(s, kv_tool_block_forms[i].end);
         if (!e) continue;
         best = s;
-        best_end = e + strlen(forms[i].end);
-        best_is_solar = !strcmp(forms[i].start, DS4_SOLAR_TOOL_CALL_START);
+        best_end = e + strlen(kv_tool_block_forms[i].end);
+        best_repeat_start = kv_tool_block_forms[i].repeat_start;
+        best_repeat_end = kv_tool_block_forms[i].end;
     }
-    if (best_is_solar) {
-        /* A Solar assistant turn may contain several adjacent native calls.
-         * tool_memory stores the full sampled span for every call id, so the KV
-         * extension scanner must select that same whole span rather than the
-         * first call only. */
-        const size_t start_len = strlen(DS4_SOLAR_TOOL_CALL_START);
-        const size_t end_len = strlen(DS4_SOLAR_TOOL_CALL_END);
+    if (best_repeat_start) {
+        /* A Solar or Motif assistant turn may contain several adjacent native
+         * calls. tool_memory stores the full sampled span for every call id, so
+         * the KV extension scanner must select that same whole span rather than
+         * the first call only. */
+        const size_t start_len = strlen(best_repeat_start);
+        const size_t end_len = strlen(best_repeat_end);
         const char *next = best_end;
         for (;;) {
             while (*next && isspace((unsigned char)*next)) next++;
-            if (strncmp(next, DS4_SOLAR_TOOL_CALL_START, start_len)) break;
-            const char *e = strstr(next + start_len,
-                                   DS4_SOLAR_TOOL_CALL_END);
+            if (strncmp(next, best_repeat_start, start_len)) break;
+            const char *e = strstr(next + start_len, best_repeat_end);
             if (!e) break;
             best_end = e + end_len;
             next = best_end;
@@ -12455,6 +12474,71 @@ static const char *find_next_dsml_tool_block(const char *p, const char **end_out
     }
     if (end_out) *end_out = best_end;
     return best;
+}
+
+static size_t kv_tool_map_tail_prefix_len(const char *text, size_t text_len,
+                                          const tool_memory_block *block) {
+    if (!text || !text_len || !block || !block->dsml || !block->len) return 0;
+    size_t best = 0;
+    for (size_t i = 0;
+         i < sizeof(kv_tool_block_forms) / sizeof(kv_tool_block_forms[0]);
+         i++) {
+        const char *marker = kv_tool_block_forms[i].start;
+        const size_t marker_len = strlen(marker);
+        const char *bm = block->dsml;
+        while ((bm = strstr(bm, marker)) != NULL) {
+            const size_t block_marker = (size_t)(bm - block->dsml);
+            const size_t min_candidate =
+                text_len > block->len ? text_len - block->len : 0;
+            if (block_marker <= text_len - min_candidate) {
+                size_t min_marker = min_candidate + block_marker;
+                if (min_marker <= text_len) {
+                    const char *tm = text + min_marker;
+                    while ((tm = strstr(tm, marker)) != NULL) {
+                        const size_t text_marker = (size_t)(tm - text);
+                        if (text_marker >= block_marker) {
+                            const size_t candidate = text_marker - block_marker;
+                            const size_t suffix_len = text_len - candidate;
+                            if (suffix_len <= block->len &&
+                                suffix_len >= block_marker + marker_len &&
+                                !memcmp(text + candidate, block->dsml, suffix_len) &&
+                                suffix_len > best)
+                                best = suffix_len;
+                        }
+                        tm++;
+                    }
+                }
+            }
+            bm++;
+        }
+    }
+    return best;
+}
+
+static tool_memory_block *kv_tool_map_tail_block_locked(server *s,
+                                                         const char *text,
+                                                         uint64_t scan) {
+    /* cont_warm_retire drops the final sampled token, so the current tool
+     * block may end inside its close marker and cannot use the exact block
+     * lookup above. Scan the bounded LRU only for that tail; an equal-prefix
+     * collision fails closed. */
+    const size_t text_len = strlen(text);
+    tool_memory_block *best = NULL;
+    size_t best_len = 0;
+    bool ambiguous = false;
+    for (tool_memory_entry *e = s->tool_mem.head; e; e = e->next) {
+        tool_memory_block *b = e->block;
+        if (!b || b->seen == scan || b == best) continue;
+        const size_t matched = kv_tool_map_tail_prefix_len(text, text_len, b);
+        if (matched > best_len) {
+            best = b;
+            best_len = matched;
+            ambiguous = false;
+        } else if (matched != 0 && matched == best_len) {
+            ambiguous = true;
+        }
+    }
+    return ambiguous ? NULL : best;
 }
 
 
@@ -12487,6 +12571,22 @@ static bool kv_tool_map_measure_locked(server *s, const char *text,
             }
         }
         p = end;
+    }
+    tool_memory_block *tail = kv_tool_map_tail_block_locked(s, text, scan);
+    if (tail) {
+        tail->seen = scan;
+        for (tool_memory_entry *e = tail->entries; e; e = e->block_next) {
+            size_t id_len = strlen(e->id);
+            size_t dsml_len = tail->len;
+            if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
+            if (count == UINT32_MAX) return false;
+            if (UINT64_MAX - bytes < 8u ||
+                UINT64_MAX - bytes - 8u < (uint64_t)id_len ||
+                UINT64_MAX - bytes - 8u - (uint64_t)id_len < (uint64_t)dsml_len)
+                return false;
+            count++;
+            bytes += 8u + (uint64_t)id_len + (uint64_t)dsml_len;
+        }
     }
     if (count == 0) bytes = 0;
     if (count_out) *count_out = count;
@@ -12554,6 +12654,23 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
             }
         }
         p = end;
+    }
+    tool_memory_block *tail = ok
+        ? kv_tool_map_tail_block_locked(s, text, scan)
+        : NULL;
+    if (tail) {
+        tail->seen = scan;
+        for (tool_memory_entry *e = tail->entries; ok && e; e = e->block_next) {
+            size_t id_len = strlen(e->id);
+            size_t dsml_len = tail->len;
+            if (id_len > UINT32_MAX || dsml_len > UINT32_MAX) continue;
+            uint8_t lens[8];
+            le_put32(lens, (uint32_t)id_len);
+            le_put32(lens + 4, (uint32_t)dsml_len);
+            ok = fwrite(lens, 1, sizeof(lens), fp) == sizeof(lens) &&
+                 fwrite(e->id, 1, id_len, fp) == id_len &&
+                 fwrite(tail->dsml, 1, dsml_len, fp) == dsml_len;
+        }
     }
     pthread_mutex_unlock(&s->tool_mu);
 
@@ -14395,9 +14512,30 @@ static char *build_toolless_thinking_visible_prefix(const request *r,
  * Do not include <|endofturn|> here: the generation stop token is not evaluated
  * into the session, so that delimiter belongs to the newly tokenized suffix on
  * the continuation request. */
+/* Motif none-think generation ends with <think></think>; official history
+ * replay omits that pair. Continuous bank keys and serial checkpoints both
+ * store the history form so a tool-result follow-up still byte-prefixes. */
+static size_t motif3_no_think_retire_prompt_len(const request *r) {
+    static const char empty_think[] = "<think></think>";
+    const size_t empty_think_len = sizeof(empty_think) - 1;
+    if (!r || !r->prompt_text ||
+        r->model_syntax != SERVER_MODEL_SYNTAX_MOTIF3 ||
+        ds4_think_mode_enabled(r->think_mode))
+    {
+        return r && r->prompt_text ? strlen(r->prompt_text) : 0;
+    }
+    const size_t prompt_len = strlen(r->prompt_text);
+    if (prompt_len < empty_think_len ||
+        memcmp(r->prompt_text + prompt_len - empty_think_len,
+               empty_think, empty_think_len) != 0)
+    {
+        return prompt_len;
+    }
+    return prompt_len - empty_think_len;
+}
+
 static char *build_motif3_no_think_visible_text(
         const request *r, const char *content, const tool_calls *calls) {
-    static const char empty_think[] = "<think></think>";
     if (!r || r->model_syntax != SERVER_MODEL_SYNTAX_MOTIF3 ||
         ds4_think_mode_enabled(r->think_mode) || !r->prompt_text || !calls)
     {
@@ -14405,16 +14543,13 @@ static char *build_motif3_no_think_visible_text(
     }
 
     const size_t prompt_len = strlen(r->prompt_text);
-    const size_t empty_think_len = sizeof(empty_think) - 1;
-    if (prompt_len < empty_think_len ||
-        memcmp(r->prompt_text + prompt_len - empty_think_len,
-               empty_think, empty_think_len) != 0)
-    {
+    const size_t visible_prefix = motif3_no_think_retire_prompt_len(r);
+    if (visible_prefix == prompt_len) {
         return NULL;
     }
 
     buf visible = {0};
-    buf_append(&visible, r->prompt_text, prompt_len - empty_think_len);
+    buf_append(&visible, r->prompt_text, visible_prefix);
     motif3_buf_put_trimmed(&visible, content);
     if (calls->len > 0) {
         append_motif3_tool_calls_text(&visible, calls, true);
@@ -17510,7 +17645,16 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
     if (!ds4_think_mode_enabled(j->req.think_mode) ||
         j->req.prompt_preserves_reasoning)
     {
-        buf_puts(&tb, j->req.prompt_text);
+        /* Motif none-think generation ends with <think></think>; official
+         * history replay omits that pair. Store the history form so a
+         * tool-result follow-up still byte-prefixes the bank. */
+        const char *pt = j->req.prompt_text;
+        const size_t plen = motif3_no_think_retire_prompt_len(&j->req);
+        if (plen < strlen(pt)) {
+            buf_append(&tb, pt, plen);
+        } else {
+            buf_puts(&tb, pt);
+        }
         cont_append_committed_text(s, &tb, tokens, n);
     } else if (!finish) {
         /* v0.5.4 (378855/41): an ABORTED thinking row (dead client, budget)
@@ -25473,6 +25617,15 @@ static void test_motif3_no_think_visible_checkpoint(void) {
     TEST_ASSERT(!strncmp(next_prompt + strlen(plain),
                          "<|endofturn|>", strlen("<|endofturn|>")));
 
+    TEST_ASSERT(motif3_no_think_retire_prompt_len(&r) ==
+                strlen(r.prompt_text) - strlen("<think></think>"));
+    r.think_mode = DS4_THINK_HIGH;
+    TEST_ASSERT(motif3_no_think_retire_prompt_len(&r) == strlen(r.prompt_text));
+    r.think_mode = DS4_THINK_NONE;
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
+    TEST_ASSERT(motif3_no_think_retire_prompt_len(&r) == strlen(r.prompt_text));
+    r.model_syntax = SERVER_MODEL_SYNTAX_MOTIF3;
+
     free(visible);
     free(plain);
     tool_calls_free(&calls);
@@ -28321,6 +28474,62 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
     TEST_ASSERT(strstr(msgs.v[0].calls.raw_dsml, "zzzz") == NULL);
 
     chat_msgs_free(&msgs);
+    if (fp) fclose(fp);
+    tool_memory_free(&src.tool_mem);
+    tool_memory_free(&dst.tool_mem);
+    pthread_mutex_destroy(&src.tool_mu);
+    pthread_mutex_destroy(&dst.tool_mu);
+}
+
+static void test_kv_tool_map_keeps_a_partial_trailing_block(void) {
+    const char *exact =
+        "\n<tool_call>{\"name\":\"pair_values\",\"arguments\":{\"a\":1,\"b\":2}}</tool_call>";
+
+    server src = {0}, dst = {0};
+    pthread_mutex_init(&src.tool_mu, NULL);
+    pthread_mutex_init(&dst.tool_mu, NULL);
+    tool_calls generated = {0};
+    tool_call call = {
+        .id = xstrdup("call_cut"),
+        .name = xstrdup("pair_values"),
+        .arguments = xstrdup("{\"a\":1,\"b\":2}"),
+    };
+    tool_calls_push(&generated, call);
+    generated.raw_tool_text = xstrdup(exact);
+    tool_memory_remember(&src, &generated);
+
+    buf text = {0};
+    buf_puts(&text, "prompt");
+    buf_append(&text, exact, strlen(exact) - 5);
+
+    uint64_t estimated_bytes = 0;
+    TEST_ASSERT(kv_tool_map_serialized_size(&src, text.ptr, &estimated_bytes));
+    TEST_ASSERT(estimated_bytes > 0);
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    uint64_t bytes = 0;
+    TEST_ASSERT(kv_tool_map_write(&src, fp, text.ptr, &bytes));
+    TEST_ASSERT(bytes == estimated_bytes);
+    rewind(fp);
+    TEST_ASSERT(kv_tool_map_load_from_pos(&dst, fp, NULL) == 1);
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {.role = xstrdup("assistant")};
+    tool_call replay = {
+        .id = xstrdup("call_cut"),
+        .name = xstrdup("pair_values"),
+        .arguments = xstrdup("{\"b\":2,\"a\":1}"),
+    };
+    tool_calls_push(&assistant.calls, replay);
+    chat_msgs_push(&msgs, assistant);
+    tool_memory_attach_to_messages(&dst, &msgs, NULL);
+    TEST_ASSERT(msgs.v[0].calls.raw_tool_text != NULL);
+    if (msgs.v[0].calls.raw_tool_text)
+        TEST_ASSERT(!strcmp(msgs.v[0].calls.raw_tool_text, exact));
+
+    chat_msgs_free(&msgs);
+    tool_calls_free(&generated);
+    buf_free(&text);
     if (fp) fclose(fp);
     tool_memory_free(&src.tool_mem);
     tool_memory_free(&dst.tool_mem);
@@ -33906,6 +34115,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
+    test_kv_tool_map_keeps_a_partial_trailing_block();
     test_kv_tool_map_persists_solar_multi_call();
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();

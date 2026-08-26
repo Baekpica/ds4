@@ -21,7 +21,7 @@ use crate::dsml::{SampleOverride, SamplePolicy};
 use crate::generate::{
     render_prompt, responses_ids, stream_req_from_parsed, GenerateError, GenerateOutcome,
 };
-use crate::parse::{ParsedRequest, ToolChoice};
+use crate::parse::{ParsedRequest, ToolCall, ToolChoice};
 use crate::parse::{DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_TOP_P};
 use crate::render::syntax_for_model_id;
 use crate::retry::{terminal_finish, truncation_outcome, TruncationOutcome};
@@ -60,6 +60,7 @@ pub struct ContStepper {
     parsed_max_tokens: i32,
     required_tool_prefix: Vec<i32>,
     required_think_end_prefix: Vec<i32>,
+    tool_replay: Option<(Vec<ToolCall>, String)>,
     started: bool,
 }
 
@@ -146,6 +147,7 @@ impl ContStepper {
                 parsed_max_tokens: parsed.max_tokens,
                 required_tool_prefix: parsed.required_tool_prefix.clone(),
                 required_think_end_prefix: parsed.required_think_end_prefix.clone(),
+                tool_replay: None,
                 started: true,
             },
             head,
@@ -306,6 +308,14 @@ impl ContStepper {
                     "call_"
                 },
             );
+            let exact = if parsed_gen.raw_dsml.is_empty() {
+                &parsed_gen.raw_tool_text
+            } else {
+                &parsed_gen.raw_dsml
+            };
+            if !exact.is_empty() {
+                self.tool_replay = Some((parsed_gen.calls.clone(), exact.clone()));
+            }
             self.finish = "tool_calls";
         }
         /* cont_usage_apply_engine_split, ordinary-request frame: whatever
@@ -443,6 +453,16 @@ impl ContStepper {
         };
         (std::mem::take(&mut self.w.out), outcome)
     }
+
+    #[cfg(any(feature = "native", test))]
+    fn take_tool_replay(&mut self) -> Option<(Vec<ToolCall>, String)> {
+        self.tool_replay.take()
+    }
+
+    #[cfg(feature = "native")]
+    fn has_complete_tool_turn(&self) -> bool {
+        self.acc.saw_tool_end
+    }
 }
 
 fn last_delta(raw: &[u8], emit_limit: usize, piece_len: usize) -> Option<&[u8]> {
@@ -458,11 +478,7 @@ fn last_delta(raw: &[u8], emit_limit: usize, piece_len: usize) -> Option<&[u8]> 
 
 #[cfg(any(feature = "native", test))]
 fn bank_scope(parsed: &ParsedRequest) -> bool {
-    parsed.kind == ReqKind::Chat
-        && !think_mode_enabled(parsed.think_mode)
-        && !parsed.has_tools
-        && !parsed.has_tool_results
-        && parsed.live_call_ids.is_empty()
+    parsed.kind == ReqKind::Chat && !think_mode_enabled(parsed.think_mode)
 }
 
 #[cfg(any(feature = "native", test))]
@@ -482,6 +498,7 @@ pub(crate) struct WarmRecord {
     pub(crate) text: Vec<u8>,
     pub(crate) generation: u64,
     pub(crate) ext_flags: u8,
+    pub(crate) trailer: Vec<u8>,
 }
 
 #[cfg(any(feature = "native", test))]
@@ -502,6 +519,48 @@ fn warm_match_pick(banks: &[WarmBank], prompt: &[u8]) -> Option<usize> {
         }
     }
     best
+}
+
+#[cfg(any(feature = "native", test))]
+fn warm_partial_match_pick(
+    banks: &[WarmBank],
+    prompt: &[u8],
+    min_prefix: usize,
+) -> Option<(usize, usize)> {
+    if min_prefix == 0 || prompt.len() < min_prefix {
+        return None;
+    }
+    let mut best = None;
+    let mut best_len = 0;
+    for (bank, state) in banks.iter().enumerate() {
+        let Some(record) = state.record.as_ref() else {
+            continue;
+        };
+        let prefix = prompt
+            .iter()
+            .zip(&record.text)
+            .take_while(|(left, right)| left == right)
+            .count();
+        if prefix >= min_prefix && prefix > best_len {
+            best = Some((bank, prefix));
+            best_len = prefix;
+        }
+    }
+    best
+}
+
+#[cfg(any(feature = "native", test))]
+fn warm_partial_token_cut(source: &[i32], prompt: &[i32], min_tokens: i32) -> Option<i32> {
+    let cap = source.len().min(prompt.len().saturating_sub(1));
+    let cut = source
+        .iter()
+        .zip(prompt)
+        .take(cap)
+        .take_while(|(left, right)| left == right)
+        .count();
+    i32::try_from(cut)
+        .ok()
+        .filter(|cut| *cut >= min_tokens.max(1))
 }
 
 #[cfg(any(feature = "native", test))]
@@ -599,17 +658,44 @@ fn warm_placement(
     })
 }
 
-#[cfg(any(feature = "native", test))]
+fn motif3_history_retire_prompt(prompt: &[u8]) -> &[u8] {
+    // Motif none-think generation ends with an empty think pair; official
+    // history replay omits it. Bank keys must use the history form or the
+    // next tool-result turn diverges at <|assistant|>.
+    prompt.strip_suffix(b"<think></think>").unwrap_or(prompt)
+}
+
 fn committed_key(
     prompt: &[u8],
     tokens: &[i32],
     mut token_text: impl FnMut(i32) -> Vec<u8>,
 ) -> Vec<u8> {
-    let mut key = prompt.to_vec();
+    let mut key = motif3_history_retire_prompt(prompt).to_vec();
     for &token in tokens.iter().take(tokens.len().saturating_sub(1)) {
         key.extend(token_text(token));
     }
     key
+}
+
+#[cfg(any(feature = "native", test))]
+fn bank_retire_key(
+    prompt: &[u8],
+    snapshot_tokens: &[i32],
+    done_tokens: &[i32],
+    allow_generated_snapshot: bool,
+    mut token_text: impl FnMut(i32) -> Vec<u8>,
+) -> Option<(Vec<u8>, bool)> {
+    if !done_tokens.is_empty() {
+        return Some((committed_key(prompt, done_tokens, token_text), false));
+    }
+    let retained = committed_key(&[], snapshot_tokens, &mut token_text);
+    if retained.is_empty() {
+        return None;
+    }
+    if prompt.starts_with(&retained) {
+        return Some((retained, true));
+    }
+    (allow_generated_snapshot && retained.starts_with(prompt)).then_some((retained, false))
 }
 
 #[cfg(any(feature = "native", test))]
@@ -643,6 +729,28 @@ fn warm_admit_tokens(
         return None;
     }
     Some((tokens, cached))
+}
+
+#[cfg(any(feature = "native", test))]
+fn warm_partial_admit_tokens(
+    warm: &WarmBank,
+    prompt_tokens: &[i32],
+    snapshot_tokens: &[i32],
+    generation: u64,
+    min_tokens: i32,
+    seq_cap: i32,
+) -> Option<(Vec<i32>, i32)> {
+    let record = warm.record.as_ref()?;
+    if record.generation != generation
+        || i32::try_from(prompt_tokens.len())
+            .ok()
+            .filter(|tokens| *tokens <= seq_cap)
+            .is_none()
+    {
+        return None;
+    }
+    let cached = warm_partial_token_cut(snapshot_tokens, prompt_tokens, min_tokens)?;
+    Some((prompt_tokens.to_vec(), cached))
 }
 
 #[cfg(any(feature = "native", test))]
@@ -719,33 +827,28 @@ pub(crate) fn save_bank_record(
     if committed <= 0 {
         return Ok(false);
     }
-    let Some(text) = warm
+    let Some(record) = warm
         .record
         .as_ref()
-        .filter(|record| record.generation == generation)
-        .map(|record| &record.text)
-        .filter(|text| !text.is_empty())
-        .cloned()
+        .filter(|record| record.generation == generation && !record.text.is_empty())
     else {
         return Ok(false);
     };
+    let text = &record.text;
     let tokens = u32::try_from(committed)
         .map_err(|_| GenerateError::Engine("bank token count exceeds u32".into()))?;
-    let keep_ext = warm
-        .record
-        .as_ref()
-        .map(|record| record.ext_flags)
-        .unwrap_or(0);
+    let keep_ext = record.ext_flags;
+    let trailer = &record.trailer;
     let (model_id, quant_bits, ctx) = identity;
     let mut header = crate::generate::kv_header(model_id, quant_bits, ctx, tokens);
     header.reason = reason;
-    header.ext_flags = bank_persist_ext_flags(keep_ext, false, false);
+    header.ext_flags = bank_persist_ext_flags(keep_ext, false, !trailer.is_empty());
     let payload = store
         .payload_temp()
         .map_err(|error| GenerateError::Engine(error.to_string()))?;
     save_payload(payload.path())?;
     store
-        .write_payload_file(header, &text, payload.path(), &[])
+        .write_payload_file(header, text, payload.path(), trailer)
         .map_err(|error| GenerateError::Engine(error.to_string()))?;
     warm.stored_tokens = committed;
     Ok(true)
@@ -866,6 +969,7 @@ mod native {
     use ds4_core::{BatchCtx, ContAdmit, ContDriver, Vocab, CONT_SAMPLE_GREEDY, CONT_SAMPLE_NONE};
 
     use crate::serve_static::{BatchStatic, CoalesceLimits, StaticExec, StaticJob, StaticRow};
+    use crate::tool_memory::ToolMemory;
 
     /// Native continuous lane: a rolling `ContDriver` over every bank
     /// exposed by the persistent native batch context.
@@ -881,9 +985,13 @@ mod native {
         warm: Vec<WarmBank>,
         warm_clock: u64,
         warm_fork: bool,
+        warm_fork_partial: bool,
+        warm_disk_partial: bool,
+        warm_partial_min: i32,
         warm_pin_min: i32,
         warm_checkpoint: bool,
         last_bank: Option<i32>,
+        tool_memory: ToolMemory,
         memgov: Box<dyn crate::serve_cont_roll::ContMemGov>,
     }
 
@@ -891,6 +999,7 @@ mod native {
         source: usize,
         tokens: Vec<i32>,
         cached: i32,
+        partial: bool,
     }
 
     struct PreparedSlot {
@@ -1110,8 +1219,18 @@ mod native {
             let max_seq = usize::try_from(batch.max_seq().max(0)).unwrap_or(0);
             let warm_pin_min = crate::serve::env_i32_bound("DS4_SERVER_PIN_MIN_TOKENS", 65536);
             let warm_fork = std::env::var_os("DS4_SERVER_FORK").is_none_or(|value| value != "0");
+            let partial_requested =
+                std::env::var_os("DS4_SERVER_FORK_PARTIAL").is_none_or(|value| value != "0");
+            let warm_fork_partial = partial_requested && batch.supports_partial_reuse();
+            let warm_disk_partial = warm_fork_partial
+                && std::env::var_os("DS4_SERVER_DISK_PARTIAL").is_none_or(|value| value != "0");
+            let warm_partial_min =
+                crate::serve::env_i32_bound("DS4_SERVER_FORK_PARTIAL_MIN", 192).max(136);
             let warm_checkpoint =
                 std::env::var_os("DS4_SERVER_BANK_CHECKPOINT").is_none_or(|value| value != "0");
+            if partial_requested && !warm_fork_partial {
+                eprintln!("ds4-server-rs: partial bank reuse disabled by model runtime");
+            }
             Self {
                 batch,
                 vocab,
@@ -1122,9 +1241,13 @@ mod native {
                 warm: (0..max_seq).map(|_| WarmBank::default()).collect(),
                 warm_clock: 0,
                 warm_fork,
+                warm_fork_partial,
+                warm_disk_partial,
+                warm_partial_min,
                 warm_pin_min,
                 warm_checkpoint,
                 last_bank: None,
+                tool_memory: ToolMemory::default(),
                 memgov: Box::new(crate::serve_cont_roll::AdmitAlways),
             }
         }
@@ -1140,7 +1263,7 @@ mod native {
             }
         }
 
-        fn warm_plan(&mut self, prompt: &[u8]) -> Option<WarmAdmitPlan> {
+        fn warm_full_plan(&mut self, prompt: &[u8]) -> Option<WarmAdmitPlan> {
             let source = warm_match_pick(&self.warm, prompt)?;
             let snapshot = self.batch.bank_snapshot(i32::try_from(source).ok()?).ok()?;
             let (tokens, cached) = warm_admit_tokens(
@@ -1156,7 +1279,46 @@ mod native {
                 source,
                 tokens,
                 cached,
+                partial: false,
             })
+        }
+
+        fn warm_partial_plan(
+            &mut self,
+            prompt: &[u8],
+            prompt_tokens: &[i32],
+        ) -> Option<WarmAdmitPlan> {
+            if !self.warm_fork_partial {
+                return None;
+            }
+            let min_prefix = usize::try_from(self.warm_partial_min).ok()?;
+            let (source, _) = warm_partial_match_pick(&self.warm, prompt, min_prefix)?;
+            let snapshot = self.batch.bank_snapshot(i32::try_from(source).ok()?).ok()?;
+            let (tokens, cached) = warm_partial_admit_tokens(
+                self.warm.get(source)?,
+                prompt_tokens,
+                &snapshot.tokens,
+                snapshot.generation,
+                self.warm_partial_min,
+                self.batch.seq_cap(),
+            )?;
+            self.warm[source].committed_tokens = i32::try_from(snapshot.tokens.len()).ok()?;
+            Some(WarmAdmitPlan {
+                source,
+                tokens,
+                cached,
+                partial: true,
+            })
+        }
+
+        fn warm_plan(&mut self, prompt: &[u8], prompt_tokens: &[i32]) -> Option<WarmAdmitPlan> {
+            let full = self.warm_full_plan(prompt);
+            let partial = self.warm_partial_plan(prompt, prompt_tokens);
+            match (full, partial) {
+                (Some(full), Some(partial)) if partial.cached > full.cached => Some(partial),
+                (Some(full), _) => Some(full),
+                (None, partial) => partial,
+            }
         }
 
         fn protected_banks(
@@ -1232,6 +1394,7 @@ mod native {
                 text: envelope.text,
                 generation: snapshot.generation,
                 ext_flags: envelope.header.ext_flags,
+                trailer: Vec::new(),
             });
             self.warm[target].committed_tokens = committed;
             self.warm[target].stored_tokens = committed;
@@ -1249,10 +1412,84 @@ mod native {
                 source: target,
                 tokens,
                 cached,
+                partial: false,
             })
         }
 
-        fn retire(&mut self, bank: i32, prompt: &[u8], done_tokens: &[i32]) {
+        fn disk_partial_plan(
+            &mut self,
+            store: &mut KvStore,
+            prompt: &[u8],
+            prompt_tokens: &[i32],
+            protected: &[bool],
+        ) -> Option<WarmAdmitPlan> {
+            if !self.warm_disk_partial {
+                return None;
+            }
+            let identity = self.identity()?;
+            let min_prefix = usize::try_from(self.warm_partial_min).ok()?;
+            let (path, envelope, _) = store
+                .bank_text_lcp_candidate(prompt, identity.0, identity.1, identity.2, min_prefix)
+                .ok()??;
+            let target = self.disk_victim(protected, envelope.header.tokens)?;
+            if !disk_restore_target_allowed(
+                &self.warm,
+                target,
+                envelope.header.tokens,
+                self.warm_pin_min,
+            ) {
+                return None;
+            }
+            let snapshot = match self.batch.load_bank_payload_range(
+                i32::try_from(target).ok()?,
+                &path,
+                envelope.payload_offset,
+                envelope.header.payload_bytes,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    eprintln!("ds4-server-rs: partial bank restore skipped: {error}");
+                    return None;
+                }
+            };
+            if usize::try_from(envelope.header.tokens).ok() != Some(snapshot.tokens.len()) {
+                let _ = store.discard_bank(&path);
+                return None;
+            }
+            let committed = i32::try_from(snapshot.tokens.len()).ok()?;
+            self.warm[target].record = Some(WarmRecord {
+                text: envelope.text,
+                generation: snapshot.generation,
+                ext_flags: envelope.header.ext_flags,
+                trailer: Vec::new(),
+            });
+            self.warm[target].committed_tokens = committed;
+            self.warm[target].stored_tokens = committed;
+            self.note_use(target);
+            let _ = store.touch_hit(&path);
+            let (tokens, cached) = warm_partial_admit_tokens(
+                &self.warm[target],
+                prompt_tokens,
+                &snapshot.tokens,
+                snapshot.generation,
+                self.warm_partial_min,
+                self.batch.seq_cap(),
+            )?;
+            Some(WarmAdmitPlan {
+                source: target,
+                tokens,
+                cached,
+                partial: true,
+            })
+        }
+
+        fn retire(
+            &mut self,
+            bank: i32,
+            prompt: &[u8],
+            done_tokens: &[i32],
+            allow_generated_snapshot: bool,
+        ) {
             let Ok(bank) = usize::try_from(bank) else {
                 return;
             };
@@ -1269,24 +1506,26 @@ mod native {
                 self.warm[bank].record = None;
                 return;
             }
-            let key = if done_tokens.is_empty() {
-                let retained =
-                    committed_key(&[], &snapshot.tokens, |token| self.vocab.token_text(token));
-                if retained.is_empty() || !prompt.starts_with(&retained) {
-                    self.warm[bank].record = None;
-                    return;
-                }
+            let Some((key, retained_existing)) = bank_retire_key(
+                prompt,
+                &snapshot.tokens,
+                done_tokens,
+                allow_generated_snapshot,
+                |token| self.vocab.token_text(token),
+            ) else {
+                self.warm[bank].record = None;
+                return;
+            };
+            if retained_existing {
                 self.warm[bank].stored_tokens = self.warm[bank]
                     .stored_tokens
                     .min(snapshot.tokens.len() as i32);
-                retained
-            } else {
-                committed_key(prompt, done_tokens, |token| self.vocab.token_text(token))
-            };
+            }
             self.warm[bank].record = (!key.is_empty()).then_some(WarmRecord {
                 text: key,
                 generation: snapshot.generation,
                 ext_flags: 0,
+                trailer: Vec::new(),
             });
         }
 
@@ -1326,6 +1565,19 @@ mod native {
             {
                 return;
             }
+            let Some(trailer) = self.warm[bank]
+                .record
+                .as_ref()
+                .and_then(|record| self.tool_memory.checkpoint(&record.text))
+            else {
+                eprintln!(
+                    "ds4-server-rs: bank checkpoint skipped bank={bank}: tool-map exceeds bound"
+                );
+                return;
+            };
+            if let Some(record) = self.warm[bank].record.as_mut() {
+                record.trailer = trailer;
+            }
             let (batch, states) = (&mut self.batch, &mut self.warm);
             let state = &mut states[bank];
             if let Err(error) = save_bank_record(
@@ -1351,7 +1603,7 @@ mod native {
             &mut self,
             plan: &WarmAdmitPlan,
             protected: &[bool],
-            store: Option<&mut KvStore>,
+            mut store: Option<&mut KvStore>,
         ) -> Option<WarmPlacement> {
             let placement = warm_placement(
                 &self.warm,
@@ -1366,7 +1618,7 @@ mod native {
             }
             self.note_use(placement.source);
             if placement.fork {
-                if let Some(store) = store {
+                if let Some(store) = store.as_deref_mut() {
                     self.persist_bank(
                         store,
                         placement.target,
@@ -1375,10 +1627,27 @@ mod native {
                         false,
                     );
                 }
-                let stored = self.warm[placement.source].stored_tokens;
+                let stored = if plan.partial {
+                    self.warm[placement.source].stored_tokens.min(plan.cached)
+                } else {
+                    self.warm[placement.source].stored_tokens
+                };
                 self.warm[placement.target].record = None;
                 self.warm[placement.target].stored_tokens = stored;
             } else {
+                if plan.partial {
+                    if let Some(store) = store.as_deref_mut() {
+                        self.persist_bank(
+                            store,
+                            placement.source,
+                            KvReason::BankEvict,
+                            self.warm_pin_min,
+                            false,
+                        );
+                    }
+                    self.warm[placement.source].stored_tokens =
+                        self.warm[placement.source].stored_tokens.min(plan.cached);
+                }
                 self.warm[placement.source].record = None;
             }
             Some(placement)
@@ -1411,7 +1680,17 @@ mod native {
             mut store: Option<&mut KvStore>,
             reserve: &crate::serve_cont_roll::RollReserve,
         ) -> Result<PreparedSlot, GenerateError> {
-            let parsed = work.parsed;
+            let mut parsed = work.parsed.clone();
+            if parsed.kind == ReqKind::Chat {
+                if let Ok(model_id) = u8::try_from(self.model_id) {
+                    if let Some(store) = store.as_deref() {
+                        self.tool_memory
+                            .restore_store(store, model_id, &parsed.messages);
+                    }
+                }
+                self.tool_memory.attach(&mut parsed.messages);
+            }
+            let parsed = &parsed;
             let prompt = render_prompt(parsed, self.model_id)?;
             let tokens = match parsed.kind {
                 ReqKind::Completion => self
@@ -1450,11 +1729,17 @@ mod native {
                 let (hold, hold_retry) = self.protected_banks(bank_hold_retry);
                 let protected = reserve.protect(&hold);
                 let warm = if capture_done {
-                    self.warm_plan(&stepper.prompt).or_else(|| {
-                        store
-                            .as_deref_mut()
-                            .and_then(|store| self.disk_plan(store, &stepper.prompt, &protected))
-                    })
+                    self.warm_plan(&stepper.prompt, &tokens)
+                        .or_else(|| {
+                            store.as_deref_mut().and_then(|store| {
+                                self.disk_plan(store, &stepper.prompt, &protected)
+                            })
+                        })
+                        .or_else(|| {
+                            store.as_deref_mut().and_then(|store| {
+                                self.disk_partial_plan(store, &stepper.prompt, &tokens, &protected)
+                            })
+                        })
                 } else {
                     None
                 };
@@ -1465,7 +1750,7 @@ mod native {
                     let mut admit = ContAdmit::cold(1, plan.tokens, stepper.max_tokens.max(1));
                     admit.place_bank = i32::try_from(placement.target + 1).unwrap_or(0);
                     admit.n_cached = plan.cached;
-                    if placement.fork {
+                    if placement.fork || plan.partial {
                         admit.fork_bank = i32::try_from(placement.source + 1).unwrap_or(0);
                     }
                     admit
@@ -1499,7 +1784,7 @@ mod native {
             &mut self,
             mut job: JobSlot<'_>,
             native_err: Option<String>,
-            store: Option<&mut KvStore>,
+            mut store: Option<&mut KvStore>,
             cors: bool,
         ) -> Result<GenerateOutcome, GenerateError> {
             let timings = {
@@ -1531,16 +1816,24 @@ mod native {
             let actual_bank = job.bank;
             self.last_bank = actual_bank;
             let capture_done = job.capture_done;
-            if let Some(bank) = retired_bank(
+            let allow_generated_snapshot =
+                native_err.is_none() && io_ok && job.stepper.has_complete_tool_turn();
+            let retired = retired_bank(
                 capture_done,
                 admitted,
                 done_called,
                 actual_bank,
                 self.batch.max_seq(),
-            ) {
-                self.retire(bank, &job.stepper.prompt, &done_tokens);
+            );
+            if let Some(bank) = retired {
+                self.retire(
+                    bank,
+                    &job.stepper.prompt,
+                    &done_tokens,
+                    allow_generated_snapshot,
+                );
                 if self.warm_checkpoint {
-                    if let Some(store) = store {
+                    if let Some(store) = store.as_deref_mut() {
                         self.persist_bank(
                             store,
                             bank as usize,
@@ -1565,6 +1858,24 @@ mod native {
             let (tail, outcome) = job
                 .stepper
                 .finalize(engine_eos, n_cached, n_computed, timings, cors);
+            let mut tool_remembered = false;
+            if let Some((calls, exact)) = job.stepper.take_tool_replay() {
+                tool_remembered = self.tool_memory.remember(&calls, &exact) > 0;
+            }
+            if tool_remembered && self.warm_checkpoint {
+                if let (Some(store), Some(bank)) = (
+                    store.as_deref_mut(),
+                    retired.and_then(|bank| usize::try_from(bank).ok()),
+                ) {
+                    self.persist_bank(
+                        store,
+                        bank,
+                        KvReason::BankCheckpoint,
+                        self.warm_pin_min,
+                        false,
+                    );
+                }
+            }
             if !tail.is_empty() {
                 job.out.write_all(&tail).map_err(|_| GenerateError::Io)?;
                 let _ = job.out.flush();
@@ -1783,7 +2094,7 @@ mod bank_tests {
     use super::*;
     use crate::parse::{parse_chat_request, ParseEnv};
     use crate::route::{Api, ReqKind, ThinkMode};
-    use ds4_kv::{Options, Reason, Store, EXT_BANK_REPLAY_V1};
+    use ds4_kv::{Options, Reason, Store, EXT_BANK_REPLAY_V1, EXT_TOOL_MAP};
     use std::fs;
 
     fn temp_store(tag: &str) -> (std::path::PathBuf, Store) {
@@ -1800,6 +2111,7 @@ mod bank_tests {
                 text: text.as_bytes().to_vec(),
                 generation: 1,
                 ext_flags: 0,
+                trailer: Vec::new(),
             }),
             committed_tokens: 10,
             stored_tokens: 0,
@@ -1808,7 +2120,7 @@ mod bank_tests {
     }
 
     #[test]
-    fn bank_scope_is_chat_without_thinking_or_tools() {
+    fn bank_scope_accepts_no_think_tool_turns() {
         let mut env = ParseEnv::default();
         env.default_effort = ThinkMode::None;
         let mut parsed = parse_chat_request(
@@ -1830,13 +2142,43 @@ mod bank_tests {
         assert!(!bank_scope(&parsed));
         parsed.think_mode = ThinkMode::None;
         parsed.has_tools = true;
-        assert!(!bank_scope(&parsed));
+        assert!(bank_scope(&parsed));
         parsed.has_tools = false;
         parsed.has_tool_results = true;
-        assert!(!bank_scope(&parsed));
+        assert!(bank_scope(&parsed));
         parsed.has_tool_results = false;
         parsed.live_call_ids.push("call_1".into());
-        assert!(!bank_scope(&parsed));
+        assert!(bank_scope(&parsed));
+    }
+
+    #[test]
+    fn cont_stepper_retains_exact_tool_text_for_bank_checkpoint() {
+        let mut env = ParseEnv::default();
+        env.default_effort = ThinkMode::None;
+        let parsed = parse_chat_request(
+            &env,
+            r#"{"messages":[{"role":"user","content":"call f"}],"tools":[{"type":"function","function":{"name":"f","parameters":{"type":"object"}}}],"thinking":{"type":"disabled"}}"#,
+        )
+        .unwrap();
+        let (mut stepper, _) = ContStepper::new(
+            &parsed,
+            0,
+            "tool-bank",
+            1,
+            false,
+            16,
+            b"prompt".to_vec(),
+            1,
+            32,
+        );
+        let exact =
+            "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+        assert!(stepper.feed(exact.as_bytes()).done);
+        let (_, outcome) = stepper.finalize(false, 0, 1, ReqTimings::default(), false);
+        assert_eq!(outcome.tool_ids.len(), 1);
+        let (calls, remembered) = stepper.take_tool_replay().unwrap();
+        assert_eq!(calls[0].id, outcome.tool_ids[0]);
+        assert_eq!(remembered, exact);
     }
 
     #[test]
@@ -1852,12 +2194,48 @@ mod bank_tests {
     }
 
     #[test]
+    fn bank_retire_key_accepts_a_complete_tool_turn_from_the_snapshot() {
+        let token_text = |token| vec![b'0' + token as u8];
+        assert_eq!(
+            bank_retire_key(b"12", &[1, 2, 3, 4], &[], false, token_text),
+            None
+        );
+        assert_eq!(
+            bank_retire_key(b"12", &[1, 2, 3, 4], &[], true, token_text),
+            Some((b"123".to_vec(), false))
+        );
+        assert_eq!(
+            bank_retire_key(b"1234", &[1, 2, 3, 4], &[], false, token_text),
+            Some((b"123".to_vec(), true))
+        );
+        assert_eq!(
+            bank_retire_key(b"12", &[], &[3, 4], false, token_text),
+            Some((b"123".to_vec(), false))
+        );
+        assert_eq!(
+            bank_retire_key(
+                b"<|assistant|><think></think>",
+                &[],
+                &[1, 2],
+                false,
+                |token| match token {
+                    1 => b"I need".to_vec(),
+                    2 => b" it".to_vec(),
+                    _ => Vec::new(),
+                }
+            ),
+            Some((b"<|assistant|>I need".to_vec(), false))
+        );
+    }
+
+    #[test]
     fn warm_match_requires_a_strict_suffix_and_exact_snapshot_tokens() {
         let warm = WarmBank {
             record: Some(WarmRecord {
                 text: b"shared".to_vec(),
                 generation: 7,
                 ext_flags: 0,
+                trailer: Vec::new(),
             }),
             committed_tokens: 2,
             stored_tokens: 0,
@@ -1887,6 +2265,57 @@ mod bank_tests {
         assert_eq!(warm_match_pick(&banks, b"shared turn suffix"), Some(1));
         assert_eq!(warm_match_pick(&banks, b"shared turn"), Some(0));
         assert_eq!(warm_match_pick(&banks, b"unrelated"), None);
+    }
+
+    #[test]
+    fn partial_match_uses_the_longest_divergent_record() {
+        let banks = vec![
+            warm("shared system alpha", 3),
+            warm("shared beta", 2),
+            warm("other", 1),
+        ];
+        assert_eq!(
+            warm_partial_match_pick(&banks, b"shared system gamma", 5),
+            Some((0, b"shared system ".len()))
+        );
+        assert_eq!(
+            warm_partial_match_pick(&banks, b"shared system gamma", 15),
+            None
+        );
+    }
+
+    #[test]
+    fn partial_cut_is_a_canonical_token_prefix_with_a_suffix_left_to_prefill() {
+        assert_eq!(
+            warm_partial_token_cut(&[10, 11, 12, 13], &[10, 11, 12, 20], 3),
+            Some(3)
+        );
+        assert_eq!(
+            warm_partial_token_cut(&[10, 11, 12, 13], &[10, 11, 12, 20], 4),
+            None
+        );
+        assert_eq!(
+            warm_partial_token_cut(&[10, 11, 12], &[10, 11, 12], 2),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn partial_admit_uses_canonical_prompt_tokens_and_validates_generation() {
+        let warm = warm("shared system alpha", 7);
+        let (tokens, cached) =
+            warm_partial_admit_tokens(&warm, &[10, 11, 12, 20, 21], &[10, 11, 12, 13], 1, 3, 8)
+                .unwrap();
+        assert_eq!(tokens, [10, 11, 12, 20, 21]);
+        assert_eq!(cached, 3);
+        assert!(
+            warm_partial_admit_tokens(&warm, &[10, 11, 12, 20], &[10, 11, 12, 13], 2, 3, 8)
+                .is_none()
+        );
+        assert!(
+            warm_partial_admit_tokens(&warm, &[10, 11, 12, 20], &[10, 11, 12, 13], 1, 3, 3)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2067,6 +2496,7 @@ mod bank_tests {
                 text: b"live".to_vec(),
                 generation: 7,
                 ext_flags: 0,
+                trailer: Vec::new(),
             }),
             committed_tokens: 70_000,
             stored_tokens: 0,
@@ -2120,11 +2550,14 @@ mod bank_tests {
     #[test]
     fn bank_save_stages_before_reuse_and_advances_marker_only_on_success() {
         let (dir, mut store) = temp_store("save-order");
+        let trailer =
+            crate::tool_memory::encode_ktm(&[(b"call_1", b"<tool_call>x</tool_call>")]).unwrap();
         let mut warm = WarmBank {
             record: Some(WarmRecord {
                 text: b"shared prefix".to_vec(),
                 generation: 7,
                 ext_flags: 0,
+                trailer: trailer.clone(),
             }),
             committed_tokens: 3,
             stored_tokens: 1,
@@ -2156,11 +2589,12 @@ mod bank_tests {
         let path = store.entries()[0].path.clone();
         let record = store.read(&path).unwrap();
         assert_eq!(record.header.reason, Reason::BankShutdown);
-        assert_eq!(record.header.ext_flags, EXT_BANK_REPLAY_V1);
+        assert_eq!(record.header.ext_flags, EXT_BANK_REPLAY_V1 | EXT_TOOL_MAP);
         assert_eq!(record.header.tokens, 3);
         assert_eq!(record.header.ctx_size, 8192);
         assert_eq!(record.text, b"shared prefix");
         assert_eq!(record.payload, b"opaque");
+        assert_eq!(record.trailer, trailer);
 
         warm.stored_tokens = 1;
         let error = save_bank_record(
