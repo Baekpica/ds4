@@ -1,0 +1,581 @@
+# rust-host 캠페인 현황 (2026-08-26 KST)
+
+이 문서는 `rust-host`에서 Phase 2–8 잔여 슬라이스를 닫고 §10 비교까지 돌린
+뒤의 **작업 기록 + 남은 일**이다. `STATUS.md` / `PARITY_MATRIX.md`는
+승격 전 재실행 없이 다시 그리지 않는다. Phase 9와 `SPLIT_READINESS.md`는
+아직 열리지 않았다.
+
+| 항목 | 값 |
+|---|---|
+| Branch | `rust-host` = `origin/rust-host` |
+| HEAD | `4abaec3125854df07479700eb1d918f43c31c216` |
+| 최신 커밋 | `Rust(server): Call C idle-bank trim from the gate` |
+| C golden | `v0.6.3-dfm` (`516456fe35510e4fb8350396c9d88807ac1f760b`) |
+| 기본 바이너리 | 여전히 C (`ds4` / `ds4-server` / `ds4-bench` / `ds4-agent`) |
+| Rust shadow | `ds4-rs` / `ds4-server-rs` / `ds4-bench-rs` / `ds4-agent-rs` |
+| Phase 9 | **NOT_GREEN** — 이름 승격·SPLIT 문서·`dfm-rs` 생성 없음 |
+| 플랜 | `.omo/plans/rust-host-remaining-to-phase-9.md` (todos 1–61 `[x]`, F1–F4는 최종 감사) |
+| 작업트리 재검증 | 2026-08-26 12:15 KST. Wave A–B 커밋됨. Wave C TickOp은 BLOCKED. cheap+Motif live 재스탬프 |
+
+증거는 `.omo/evidence/task-*-rust-host-remaining-to-phase-9.txt`에 있다
+(untracked, `git add` 금지 목록).
+
+---
+
+## 1. 한 줄 결론
+
+호스트 잔여 **코드 슬라이스(Wave A–B)와 cheap-gate는 닫혔다.**
+DeepSeek KV/static과 Motif ABBA/tool-map/evict/periodic도 **PASS**다.
+Wave C TickOp 소비, Motif partial HTTP `cached=0`, Rust serial n=1
+static-width 400이 남아 계약상 **GREEN이 아니고**, production 이름은 C다.
+
+대략:
+
+```text
+문서/프로세스/금지 항목 준수     ~95%
+Phase 0–3 골격 + shadow         ~80%
+Phase 4–8 호스트 코드           ~80%  (quote FFI + trim wrap + HostKvView; TickOp KEEP)
+§10 integrated gate             ~70%  (Motif evict/periodic/surfaces 추가, 전체 NOT_GREEN)
+Phase 9 + dfm-rs DoD            ~10%
+```
+
+---
+
+## 2. 하지 않은 것 (올바름)
+
+- CUDA/MMQ 커널 rewrite, tokenizer/MTP/checkpoint format 변경 없음
+- Tokio / Axum / async scheduler 없음
+- `git merge dfm` 없음
+- production 바이너리 rename 없음 (`ds4` 등은 여전히 C ELF)
+- `docs/rust-migration/SPLIT_READINESS.md` 없음
+- `Baekpica/dfm-rs` / `gh repo create` 없음
+- `STATUS.md`를 “코드가 있으니 green”으로 다시 쓰지 않음
+- `.omo/`, 로컬 rust-migration 초안, `ds4-agent-rs`, `tests/test_*` 바이너리를
+  커밋하지 않음
+
+---
+
+## 3. 이번에 닫힌 구현 (crate / cheap-gate)
+
+플랜 todos **1–52, 59–61**은 `[x]`. 의미만 묶으면:
+
+### 3.1 Distributed worker (8.4)
+
+- 데이터 리슨 accept, hop `serve_once`, `reconnect_local` (`!Send`)
+- `ds4-rs` / `ds4-server-rs` `--role worker`가 `assemble_worker`를 탐
+  (`run_distributed_worker` 제거). `ds4-server`는 `ds4-cli`에 의존하지 않음
+- `serve_prefetch` + `Session` 금지. `!Send` receive prefetch
+  (`DS4_DIST_DISABLE_WORKER_PREFETCH` unset=on)
+- hop relay / telemetry 배선
+- C `ds4_bridge_model_run_distributed_worker`는 oracle용으로 유지
+
+### 3.2 Static lane (8.5)
+
+- `LANE_STATIC` → `BatchCtx::generate_static` (serial 우회 아님)
+- C `n>=2`, ragged, overflow `"out of memory"`
+- owner FIFO coalesce (`try_recv`, no Tokio)
+- 터미널 `finish_reason` / queue timing
+
+**라이브 주의:** 짧은 프롬프트 + `have_cont`이면 C도 continuous를 고른다.
+static 셀을 “짧은 greedy POST”로 치면 C/Rust 둘 다 static이 아니다.
+이건 라우터 버그가 아니라 픽스처 설계 문제다. static을 다시 치려면
+`prompt_len > seq_cap` 이거나 `have_cont=false`인 요청이 필요하다.
+
+### 3.3 Rolling continuous (8.5)
+
+- `OneJob` 제거, `RollDriver` / `ContRoll` / `generate_pair`
+- fork / pin / `BankEvict` hold
+- memgov charge (`AdmitAlways` + C reason map; live quote는 아직 C)
+- prefill interleave: `tick_roll_prefill`가 `serve_pair`에서 호출됨.
+  실제 청크 루프는 여전히 C `continuous_generate`
+- OpenAI chat no-think no-tools bank 테스트 green
+- **라이브:** barrier 2클라이언트 200/stop, 503 없음 (C·Rust)
+
+### 3.4 Tools / KV / reclaim / stream (8.5)
+
+- `cont_tools_anthropic` / `_responses` C default ON, env=`0`만 off
+- streaming Anthropic tool-turn → bank-owned continuation, mismatch 409
+- KVC thinking bit + `KTM\x01` persist/restore (crate + C oracle)
+- rolling periodic 10000 → 10240 (`bank_checkpoint_due`)
+- live bank-evict persist (`KvReason::BankEvict`, pin skip)
+- serial emergency reclaim 게이트가 `run_serial` 앞에 붙음
+  (3.9: quote FFI + C `trim_free` wrap. 호스트 두 번째 trimmer 없음)
+- Anthropic/Responses stream disconnect / backpressure (panic 없음)
+
+### 3.5 Agent / CLI (8.2 / 8.3)
+
+- TUI, `/save` `/list` `/switch` `/del` `/strip`
+- interactive write/edit `Ask`
+- `--non-interactive` 없이도 parse Ok
+- bash/compact, worker reject, dir-steering 회귀 green
+- TTY thinking grey (`\x1b[90m`), pipe는 ESC 없음
+- `--dump-logits` / `--dump-tokens`
+- C help/CSV 커버 (C에 없는 새 public 플래그 추가 안 함)
+
+### 3.6 Ownership / ABI (8.6)
+
+- `ds4_bridge_model_*` keep vs move inventory
+- Drop: session → model → C `ds4_engine_close` (MTP, DSpark, base)
+- `SiblingAttach`가 MTP/DSpark bind-map lifecycle 소유
+  (mmap open은 여전히 C)
+- host ledger가 `Session::ctx()` public truth
+- CLI `unsafe {` 27곳 SAFETY 분류. server 0
+- bridge freeze: 새 `ds4_bridge_*`는 create/load/session/prefill/decode/KV/destroy만
+- Metal: Linux라 SKIP
+
+### 3.7 게이트 직후 핫픽스 (라이브 FAIL / F2)
+
+| 커밋 | 내용 |
+|---|---|
+| `401cc98` | `ServerConfig::test_cfg()`, integration `--tests` E0451 해소. `serial_fit`은 `pub(crate)` |
+| `9fa5d98` | `--cont-width`를 `--help`에서 숨김. `DS4_SERVER_COALESCE_MAX`가 C knob. 스크립트용 숨은 alias는 유지 |
+| `1d1fe03` | Anthropic/Responses streaming이 `Unsupported` serial fallback 하지 않음 |
+| `4417906` | public 503을 C `"server shutting down"`에 맞춤. invent된 세 문자열 삭제 |
+
+**Motif 라이브 재확인 (HEAD `4417906`):**
+
+- `POST /v1/messages` stream → HTTP 200, finish=`end_turn`,
+  `/metrics` anthropic **continuous 0→1**, serial 0
+- `POST /v1/responses` stream → HTTP 200, finish=`completed`,
+  `/metrics` responses **continuous 0→1**, serial 0
+- 한 모델만, `guarded-run -m 112`, 내린 뒤에만 `clear_cache`
+
+증거: `.omo/evidence/task-live-anthropic-cont-recheck-rust-host-remaining-to-phase-9.txt`
+
+### 3.8 2026-08-26 작업트리 follow-up (커밋됨, `5ae1f82`…`661f5af`)
+
+- `bridge_null_oracle`에 현재 bridge ABI의 최소 session stub을 추가했다.
+- C와 Rust 모두 continuous bank가 마지막 미커밋 토큰 때문에 tool close marker
+  중간에서 잘린 경우에도 bounded tool-memory에서 exact sampled block을 찾는다.
+- Motif/Solar의 family-native multi-call form과 `raw_tool_text`를 exact replay
+  소스로 처리한다. dots3 형식을 DSML scanner로 오인하지 않는다.
+- Rust continuous lane이 tool turn을 bank 대상으로 받아들이고, producer replay를
+  `WarmRecord.trailer`에 `KTM\x01`로 저장하며 restore-before-render를 수행한다.
+- `Makefile`의 Rust release copy는 실제 `CARGO_TARGET_DIR`를 따른다.
+- 4-way harness는 producer/loader의 tool schema JSON을 같은 compact form으로
+  만든다. 공백이 다르면 KTM이 정상이어도 schema에서 먼저 갈라져 256-token
+  partial hit만 보이는 false failure가 된다.
+- workspace 재검증 중 발견한 `ds4-cli` list oracle 병렬 race는 child process의
+  cwd를 전용 fixture로 고정해 제거했다.
+- Rust `ContLane`에 C와 같은 live/disk partial-prefix reuse를 넣었다.
+  (`warm_fork_partial`, `warm_disk_partial`, `bank_text_lcp_candidate`,
+  `BatchCtx::supports_partial_reuse`)
+- Rust가 C의 `DS4_SERVER_CONTINUOUS=0` kill switch를 읽도록
+  `ServerConfig.continuous`를 연결했다. owner FIFO는 batch ctx를 유지한 채
+  short prompt를 `LANE_STATIC`으로 보낸다.
+  회귀: `continuous_zero_keeps_the_batch_ctx_for_two_short_static_jobs`
+- Rust static gather가 C와 같이 `DS4_SERVER_COALESCE_WAIT_MS`를 읽는다.
+  회귀: `late_sibling_joins_when_coalesce_wait_is_set`
+- Motif none-think continuous bank retire는 official history와 같이
+  생성 prefix의 빈 `<think></think>`를 키에서 뺀다.
+  (`motif3_no_think_retire_prompt_len` / `motif3_history_retire_prompt`)
+  히스토리 렌더 자체는 바꾸지 않는다.
+- Motif/reasoning family 감사는 producer가 툴 앞에 낸 visible text를
+  loader가 그대로 복사하고, `usage.cached_tokens`는 빈 think 2토큰만큼
+  짧아도 된다. 엔진 복원(`timings.prefill_cached_tokens`)과
+  `RESTORED_OK`는 그대로 필수다. `cached_tokens=0`은 FAIL.
+
+증거: `.omo/evidence/task-p0-followup-rust-host-remaining-to-phase-9.txt`
+
+### 3.9 2026-08-26 오후 Wave A–C (HEAD `4abaec3`)
+
+Wave A (호스트만):
+
+- `ce21e79` Stopping 503에서 Retry-After 제거 (C `wire_http_error`)
+- `904efd6` `retire()`가 warm `ext_flags` 유지
+- `f74850d` evict가 live `persist_bank` / `save_bank_record`를 탐
+- `4693db0` continued target / bank-due가 `HostKvView`만 읽음
+
+Wave B (quote + trim wrap):
+
+- `c04ddf3` `ds4_bridge_session_graph_fit_quote` + null stub
+- `663f155` `fail_open`이면 unquoted fallback. graph-fit은 margin이지 floor가 아님
+- `4abaec3` idle-bank trim은 C `ds4_batch_ctx_trim_free` 한 번. 호스트 두 번째 trimmer 없음
+
+Wave C (TickOp) — **BLOCKED, 커밋 없음:**
+
+- `ContDriver::admit` / `on_token`은 R4 청크/디코드 순서를 강제할 수 없다
+- C에 prefill-chunk / decode-step 공개 API가 없다
+- step FFI를 새로 빼면 KEEP인 CUDA continuous 루프가 된다
+- `generate_pair`는 `ds4_bridge_continuous_generate` 원샷을 유지
+- `owner_tick_pair`는 호스트 스케줄 모델일 뿐 `_ops`는 계속 버려진다
+
+---
+
+## 4. §10 비교 결과 (GREEN 아님)
+
+계약: **모든 열거 셀이 PASS**여야 GREEN. FAIL 또는 BLOCKED가 하나라도 있으면
+NOT_GREEN. crate 컴파일은 GREEN이 아니다.
+
+### 4.1 첫 비교 (모델 env 없이, `4a02e24`)
+
+증거: `.omo/evidence/task-53-rust-host-remaining-to-phase-9.txt`
+
+**PASS=18 FAIL=3 BLOCKED=39** (60셀)
+
+당시 FAIL:
+
+1. `cargo test --workspace --no-default-features` — `serial_fit` E0451
+2. `cargo check --workspace --all-targets` — 동일
+3. `make test-server-parity` — `bridge_null_oracle` 링크 실패
+   (`ds4_session_eval_layer_slice` 등 stub 없음)
+
+2026-08-26 12:15 KST cheap 재스탬프 (HEAD `4abaec3`):
+
+- `cargo fmt --all -- --check` / `git diff --check` — **PASS**
+- `cargo test --workspace --no-default-features` — **PASS**
+- `cargo test --workspace` — **PASS**
+- `cargo check --workspace --all-targets` — **PASS** (기존 unused 경고만)
+- `make test-{server,kv,web,dist,catalog,tokenizer,session,agent}-parity`
+  — **PASS** (`ds4-server` 202 unit 포함)
+
+BLOCKED는 대부분 `DS4_PROOF_BASE` / `DS4_*_MODEL` 미설정.
+
+### 4.2 라이브 재실행 (Motif 88G → DeepSeek 81G, 한 번에 하나)
+
+증거: `.omo/evidence/task-53-live-rust-host-remaining-to-phase-9.txt`
+
+**PASS=13 FAIL=7 BLOCKED=5** (당시 남은 25 라이브 셀)
+
+그 뒤 Anthropic/Responses 2셀은 핫픽스 후 **PASS로 뒤집힘**.
+
+| 셀 | 당시 | 지금 |
+|---|---|---|
+| (3.shutdown) Motif bank 4-way | PASS | PASS (`RESTORED_OK` cached=6896, 4방향) |
+| (3.tool-map) Motif/DeepSeek | FAIL | **PASS (DeepSeek + Motif)** — 아래 2026-08-26 라이브 |
+| (3.ordinary/continued) | BLOCKED | **PASS (DeepSeek)** — 기존 serial cold/continued 4-way |
+| (3.periodic/evict/partial) | BLOCKED | **PASS (DeepSeek + Motif evict/periodic)**; Motif partial HTTP **BLOCKED** |
+| (10) serial 4 surface | PASS | **PASS (DeepSeek; Motif C)**. Motif Rust serial **BLOCKED** |
+| (10) continuous chat/completion | PASS | **PASS (DeepSeek + Motif)** |
+| (10) continuous anthropic/responses | FAIL (Rust serial) | **PASS (DeepSeek + Motif)** |
+| (10) static 4 surface | FAIL | **PASS (DeepSeek + Motif, continuous off)** |
+| (11) barrier width 2 | PASS | PASS |
+| (12.1–12.4) proof smoke/long/opp-c/rust-opp-c | PASS | PASS (DeepSeek) |
+| (13) Motif ABBA | PASS (throughput only) | **PASS + host RSS** — 아래 2026-08-26 재측정 |
+
+DeepSeek tool-map 재검증:
+
+- 결과:
+  `scratch/rust-host-live/task53/tool-fourway-deepseek-v4-fixed-20260826-013629/`
+- 모델: `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`
+  (86,720,111,488 bytes)
+- C/Rust producer KVC가 모두 `reason=8`, `ext=17`
+  (`EXT_BANK_REPLAY_V1 | EXT_TOOL_MAP`), `tokens=423`, trailer=297,
+  magic=`4b544d01` (`KTM\x01`)
+- C→C, C→Rust, Rust→C, Rust→Rust 모두
+  `RESTORED_OK`, finish=`stop`, prompt=452, cached=423, computed=29
+- 바이너리 SHA256:
+  C `469ea278e1a30e4fd36b01fa4a28aea19cf5462b3eaee233f65e7c19c27812b0`,
+  Rust `4eedbfebeea9aef988260d2e73608c4f5dbf872b3b7f495cb5c0757b54a1951c`
+- Motif full-model tool-map은 아래 2026-08-26 10:13 런에서 PASS.
+
+ABBA 숫자 (Motif ctx 8192, prompt 6782, completion 114):
+
+| | prefill tok/s | decode tok/s | TTFT ms | GPU MiB |
+|---|---:|---:|---:|---:|
+| C1 | 633.5 | 14.9 | 10781 | 114535 |
+| R1 | 632.0 | 14.8 | 10817 | 102597 |
+| R2 | 631.3 | 14.8 | 10829 | 102597 |
+| C2 | 585.8 | 14.8 | 11649 | 114523 |
+
+C2는 32뱅크 + memgov가 boot prewarm을 거절했다. 이 표의 RSS는 미측정.
+2026-08-26 RSS 재측정은 `DS4_SERVER_COALESCE_MAX=2`로 아래를 쓴다.
+
+DeepSeek KV/static 재검증 (2026-08-26, 한 모델씩, `guarded-run -m 112`):
+
+- partial:
+  `scratch/rust-host-live/task53/bank-partial-fourway-20260826-085417/`
+  (`ctx=8192`, reason=`BankPartial=8`, ext=16, tokens=6786).
+  4방향 loader 모두 `PARTIAL_RESTORED`, cached=6656, computed=128.
+  C/Rust producer payload SHA는 달랐고, 호환은 cross-load로 판정했다.
+- evict:
+  `scratch/rust-host-live/task53/bank-evict-fourway-20260826-090152/`
+  (`ctx=8192`, reason=`BankEvict=7`, tokens=6786).
+  4방향 loader 모두 `EVICT_RESTORED`, cached=6786, computed=12.
+- periodic:
+  `scratch/rust-host-live/task53/bank-periodic-fourway-20260826-091902/`
+  (`ctx=10400`, reason=`BankCheckpoint=9`, tokens=10298).
+  producer는 기본 6 GiB derived headroom에서 continuous lane을 열었다.
+  loader 4셀은 boot-fit 재현을 위해 `DS4_BATCH_FIT_HEADROOM_MB=5120`을 pin했다
+  (`c-to-c-5g` … `rust-to-rust-5g`). 모두 `RESTORED_AGAIN`, cached=10298,
+  computed=12. 12K 기본 headroom에서는 Rust memgov가 serial-only로 강등했다.
+- static:
+  `scratch/rust-host-live/task53/static-live-deepseek-20260826-093703/`
+  (`ctx=1024`, `DS4_SERVER_CONTINUOUS=0`, width=4).
+  C/Rust 모두 `openai_chat.serial=1`, `continuous=0`, `static=2`.
+  blocker prompt=506 (stop-scan → serial), static pair prompt=773, n=2
+  (`batch_eval n=1546 pos0=773`). Rust SHA
+  `ba1b68f17b6911ebb45ee617329ba0b96dbce066758e0ecd2738501978405d80`.
+
+Motif ABBA RSS 재측정 (2026-08-26):
+
+- 결과: `scratch/rust-host-live/task53/motif-abba-rss-20260826-094218/`
+- 모델: `Motif-3-MQ87-88-FIT.gguf` (`MQ87-88-FIT-SHA256SUMS`)
+- 설정: `-c 8192`, `--tokens 128`, `DS4_SERVER_COALESCE_MAX=2`
+- 4셀 모두 prompt=6782, completion=114, finish=`stop`, cached=0,
+  content SHA `faf7c0214ae53aaf72ba9e8fd9404b62c6ac8a03ba97d18193c17835075332d3`
+- swap 0, GPU resident 102597 MiB (C/R 동일)
+
+| | prefill tok/s | decode tok/s | TTFT ms | VmHWM KiB | VmRSS KiB |
+|---|---:|---:|---:|---:|---:|
+| C1 | 631.3 | 14.8 | 10828.2 | 7739436 | 893280 |
+| R1 | 629.3 | 14.7 | 10944.0 | 7819076 | 949708 |
+| R2 | 633.8 | 15.0 | 10866.6 | 7819468 | 949680 |
+| C2 | 632.9 | 14.8 | 10776.2 | 7740088 | 893308 |
+
+비율 (Rust 평균 / C 평균): prefill 99.9%, decode 100.3%, TTFT +1.0%,
+host HWM +1.0%. 임계값 prefill ≥97% / decode ≥98% / TTFT ≤+5% /
+host RSS ≤+5%를 통과한다.
+
+Motif tool-map 4-way (2026-08-26, 새 persist 키, resume 금지 후 재생산):
+
+- 결과:
+  `scratch/rust-host-live/task53/tool-fourway-Motif-3-MQ87-88-FIT-20260826-101314/`
+- 모델: `Motif-3-MQ87-88-FIT.gguf` (94,162,541,472 bytes)
+- C/Rust producer 모두 reason=8, ext=17, tokens=190, text=868,
+  trailer=131, magic=`4b544d01`. 툴 앞 visible text:
+  `I need to call the pair_values function with a=1 and b=2 before answering. Let me do that now.`
+- 4방향 loader 모두 `RESTORED_OK`, finish=`stop`,
+  `timings.prefill_cached_tokens=190`.
+  `usage.cached_tokens=188` (249−61 또는 250−62). 빈 think 2토큰
+  slack이며 엔진 복원 190과 모순되지 않는다.
+- 바이너리 SHA256:
+  C `9dd45c7a683fe14dd38ab0a54a43c5ff07b182424ac9ff4be2d1190fea378a46`,
+  Rust `59ce472dd89945a17979a58e11508573d9a59a6a59766cc8b04f93c043751965`
+
+DeepSeek 나머지 static surface (2026-08-26, `DS4_SERVER_CONTINUOUS=0`,
+`DS4_SERVER_COALESCE_WAIT_MS=250`, thinking disabled, max_tokens=64):
+
+- 결과: `scratch/rust-host-live/task53/static-surfaces-deepseek-20260826-103043/`
+- C/Rust 모두 completion/anthropic/responses `static=2`, serial=0, continuous=0
+- 짧은 reasoning 기본값(think=low)과 wait=0 single-gather collapse는
+  픽스처 문제였다. 엔진 라우터를 “짧게 치면 static”으로 바꾸지 않았다.
+- Rust SHA
+  `01e943eeb7b81faae2a0c585a922afbcaca492d2cf52b95682807e96419e535c`
+
+Motif periodic/evict/partial (2026-08-26 오후, HEAD `4abaec3`,
+`COALESCE_MAX=2`, port 8765, thinking disabled):
+
+- 바이너리 SHA256: C `9dd45c7a683fe14dd38ab0a54a43c5ff07b182424ac9ff4be2d1190fea378a46`,
+  Rust `79eaa7738e982d6771551c54f2643408fa3ce0a8b4ba4c95cd397a00217a67b0`
+- evict **PASS**:
+  `scratch/rust-host-live/task53/bank-evict-fourway-motif-20260826-113523/`
+  (`ctx=8192`, reason=`BankEvict=7`, ext=16, model=3, tokens=6418).
+  4방향 모두 `timings.prefill_cached_tokens=6418`,
+  `usage.cached_tokens=6416` (think 2토큰 slack).
+- periodic **PASS**:
+  `scratch/rust-host-live/task53/bank-periodic-fourway-motif-20260826-115513/`
+  (`ctx=11264`, `HEADROOM_MB=5120`, reason=`BankCheckpoint=9`, tokens=10540).
+  4방향 모두 cached=10540, usage=10538.
+- partial **BLOCKED**:
+  `scratch/rust-host-live/task53/bank-partial-fourway-motif-20260826-114317/`
+  C 엔진은 `partial fork cut=6393 suffix=11` / `lcp=22904`를 찍었으나
+  HTTP `timings.prefill_cached_tokens=0`. 계획 감사는 `cached=0`을 FAIL로
+  본다. Motif family `last_done` stats가 C에서도 0이다. 호스트 하니스 실수가 아님.
+
+Motif remaining surfaces (2026-08-26 오후, `-c 2048`, thinking disabled,
+`COALESCE_WAIT_MS=250`, live body는 byte oracle 아님):
+
+- 결과: `scratch/rust-host-live/task53/motif-surfaces-20260826-120759/`
+- C/Rust continuous 4 surface: 각 `*.continuous=1` **PASS**
+- C/Rust static 4 surface (`CONTINUOUS=0`, n=2): 각 `*.static=2` **PASS**
+- C serial 4 surface (`CONTINUOUS=0`, width=1): 각 `*.serial=1` **PASS**
+- Rust serial **BLOCKED**: `CONTINUOUS=0` n=1이 static lane으로 가며
+  C `n>=2` width 규칙에 걸려 HTTP 400. C는 같은 픽스처를 serial로 접는다.
+
+Family Makefile (서빙 없음, 2026-08-26 12:00 KST):
+
+- `test-motif3-{reference,cuda}` **PASS**
+- `test-solar-kda{,-prefill,-chunk}` **PASS**
+- `test-exaone-kernels` **PASS** (모델 경로 없이)
+- `test-mmq-parity` / `test-model-family-kernels` **PASS**
+- Solar 250B / EXAONE 236B 서빙 프로세스 없음
+- resident/batch는 한 모델 규칙을 위해 이 턴에서 안 돌림
+
+### 4.3 메모리 운영 (다음에 라이브 돌릴 때 필수)
+
+- 모델은 **한 개만**. Motif 88G와 DeepSeek 81G를 동시에 올리지 말 것
+- 기동: `../scripts/guarded-run.sh -m 112`
+- 내리기: SIGTERM → pid/CUDA app 없음 확인 → **그다음** `/usr/local/bin/clear_cache`
+- 서버가 살아있는 동안 `clear_cache` 금지
+- Motif `-c 8192` 기본 C 32뱅크는 avail이 3–8 GiB까지 떨어짐.
+  surface/4-way는 `DS4_SERVER_COALESCE_MAX=2`
+- 포트 8765. 기존 스크립트: `scratch/rust-host-live/{abba,bank-fourway,run}.sh`
+
+모델 경로:
+
+```text
+Motif-3:
+  /home/sunghoon/workspace/ds4-exaone/models/Motif-3-Mixed-Quant-GGUF/Motif-3-MQ87-88-FIT.gguf
+DeepSeek Flash IQ2XXS imatrix:
+  /home/sunghoon/workspace/ds4-exaone/DeepSeek-GGUF/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
+```
+
+Solar 250B / EXAONE 236B는 이 캠페인에서 **올리지 않았다** (OOM 위험).
+
+---
+
+## 5. 지금 해야 할 일 (우선순위)
+
+### P0 — GREEN을 가로막는 제품/게이트
+
+1. **`make test-server-parity` 링크 — DONE (작업트리)**
+   - 현재 bridge ABI의 최소 null stub을 추가했다.
+   - server parity, no-default workspace test, all-target check를 재기록했다.
+
+2. **Motif (또는 DeepSeek) tool-map 4-way — DONE (DeepSeek + Motif)**
+   - C/Rust producer 모두 `EXT_TOOL_MAP` + `KTM\x01` bank-shutdown KVC를 썼다.
+   - DeepSeek 4방향은 423 cached token과 `RESTORED_OK`.
+   - Motif 4방향은 persist 키에서 빈 think를 뺀 뒤
+     `timings.prefill_cached_tokens=190`과 `RESTORED_OK`.
+     `usage.cached_tokens=188`은 감사 slack (think 2토큰).
+
+3. **4-way 나머지 픽스처 — DONE (DeepSeek; Motif evict/periodic)**
+   - ordinary/continued는 기존 serial 4-way.
+   - DeepSeek periodic/evict/partial는
+     `scratch/rust-host-live/intermediate-prefill-fourway-40gDCF/producer.request.json`
+     을 compact JSON으로 재사용했다.
+   - Motif evict/periodic은 같은 픽스처 + Motif history 텍스트 키 (3.9).
+   - Motif partial은 엔진이 cut=6393을 찍었으나 HTTP cached=0 → **BLOCKED**.
+   - 16K/width-2 standalone DeepSeek는 112 GiB 가드에서 OOM이 났고,
+     이후 셀은 8K–11.2K와 `COALESCE_MAX=2`로만 올렸다.
+
+4. **static 라이브 셀 — DONE (DeepSeek 4 surface, continuous off)**
+   - 라우터를 “짧게 치면 static”으로 바꾸지 않았다.
+   - chat는 기존 런. completion/anthropic/responses는 thinking off +
+     coalesce wait 250ms로 n=2 static을 찍었다.
+   - `prompt_len > seq_cap` 16K×3-copy 픽스처는 쓰지 않았다.
+
+### P1 — 호스트가 아직 C에 맡긴 것
+
+5. **native graph-fit quote / idle-bank trim — DONE (`c04ddf3`/`663f155`/`4abaec3`)**
+   - quote FFI: `ds4_bridge_session_graph_fit_quote`. 산술은 C `ds4.c`.
+   - `fail_open`이면 unquoted fallback (`need=0`, `avail=MAX`).
+   - C는 floor가 아니라 **margin**이다. 그 의미를 유지했다.
+   - idle-bank trim: 호스트는 C `ds4_batch_ctx_trim_free`를 한 번 부른다.
+     두 번째 trimmer를 만들지 않았다.
+
+6. **prefill interleave 실행권 — BLOCKED (커밋 없음)**
+   - `owner_tick_pair` 결과는 `_ops`로 버려짐
+   - `ContDriver` admit/on_token은 R4 청크/디코드 순서를 강제할 수 없다
+   - C에 prefill-chunk / decode-step 공개 API가 없다
+   - step FFI를 새로 빼면 KEEP인 CUDA continuous 루프가 된다
+   - `generate_pair`는 `ds4_bridge_continuous_generate` 원샷을 유지한다
+
+7. **`HostKvView`를 serve 경로에 연결 — DONE (`4693db0`)**
+   - continued target / bank-due는 `{live_tokens, stored_tokens}`만 읽는다
+   - 10240 aligned 의미는 그대로다
+
+8. **`persist_bank_evict`와 live `persist_bank` 단일화 — DONE (`f74850d`/`904efd6`)**
+   - evict는 `persist_bank(..., BankEvict)` + pin skip
+   - `retire()`는 이전 warm `ext_flags`를 유지한다
+
+9. **sibling mmap — KEEP**
+   - Rust는 bind-map만 소유
+   - `ds4_engine_open`이 여전히 `e->mtp_model` / `e->dspark_model`을 mmap
+   - 이 캠페인에서 옮기지 않는다
+
+10. **Stopping envelope — DONE (`ce21e79`)**
+    - Stopping 503은 Retry-After 없음 (C `wire_http_error`)
+    - queue-full 429는 5, preparse max-clients 503은 10 유지
+
+### P2 — 라이브 게이트를 다시 채우기
+
+11. **workspace cheap 재스탬프 — DONE (HEAD `4abaec3`, 12:15 KST)**
+    - `cargo test --workspace --no-default-features`
+    - `cargo test --workspace`
+    - `cargo check --workspace --all-targets`
+    - `cargo fmt --all -- --check`, `git diff --check`
+    - `make test-{server,kv,web,dist,catalog,tokenizer,session,agent}-parity`
+
+12. **Motif/DeepSeek 외 family — Makefile 셀 DONE, 서빙 안 함**
+    - `test-motif3-{reference,cuda}`, `test-solar-kda{,-prefill,-chunk}`,
+      `test-exaone-kernels`, `test-mmq-parity`, `test-model-family-kernels`
+    - Solar 250B / EXAONE 236B 서빙 프로세스 없음
+    - resident/batch는 한 모델 규칙을 위해 이 턴에서 안 돌림
+
+13. **tokenizer vectors — DONE (DeepSeek)**
+    - 제공된 DeepSeek GGUF를 `DS4_TEST_MODEL`로 사용했다.
+    - `short_italian_fact`, `short_code_completion`,
+      `short_reasoning_plain`, `long_memory_archive`, `long_code_audit`
+      모두 PASS (`logprob-vectors: OK`, exit 0).
+    - 증거:
+      `scratch/rust-host-live/task53/deepseek-logprob-vectors-20260826.out`
+
+14. **ABBA RSS — DONE (Motif, width=2)**
+    - prefill 99.9%, decode 100.3%, TTFT +1.0%, host HWM +1.0%
+    - 4셀 모두 `VmSwap=0`, GPU 102597 MiB
+    - 기본 32뱅크 C가 아니라 `DS4_SERVER_COALESCE_MAX=2`다. 기록에 명시
+
+15. **4 surface × 3 lane을 C와 나란히 재스탬프 — Motif 부분 DONE + 1 BLOCKED**
+    - DeepSeek continuous + static 4 surface: 기존 PASS
+    - Motif continuous 4 surface: C/Rust **PASS**
+    - Motif static 4 surface (`CONTINUOUS=0`, n=2): C/Rust **PASS**
+    - Motif serial: C **PASS**, Rust n=1 static-width 400 **BLOCKED**
+    - Solar/EXAONE/dots3 서빙 surface는 이 턴에서 안 돌림
+    - 스키마/이벤트 순서/ID/finish는
+      `docs/ds4-api-surface-matrix.md` (live body는 byte oracle 아님)
+
+### P3 — Phase 9 (지금은 금지)
+
+16. todo 53 표를 **FAIL=0, BLOCKED=0**으로 다시 채운다
+17. todo 54가 GREEN일 때만:
+    - production 이름을 Rust로, C는 oracle
+    - 같은 §10을 **승격 후** 한 번 더
+    - 그다음 `STATUS.md` / `PARITY_MATRIX.md`에 HEAD를 적는다
+    - 그다음 `SPLIT_READINESS.md`
+18. `Baekpica/dfm-rs`는 이 플랜이 GREEN이어도 **만들지 않는다**
+
+---
+
+## 6. 알려진 잔여 C 의존 (호스트)
+
+| 영역 | 아직 C |
+|---|---|
+| Model open / CUDA·VMM alloc / weight upload | `ds4_bridge_model_open*` |
+| Session eval / prefill / decode hot path | native session + CUDA |
+| Continuous 청크 interleave 실행 | `ds4_bridge_continuous_generate` (TickOp KEEP) |
+| Serial graph-fit quote 산술 | C `ds4.c` (호스트는 FFI wrap) |
+| Idle-bank trim 본체 | C `ds4_batch_ctx_trim_free` (호스트는 한 번 호출) |
+| Sibling mmap pointer | `ds4_engine_open` (KEEP) |
+| Prefetch eval 외 파이프라인 일부 | dist는 receive queue만 호스트 |
+| `ds4-eval` | 계속 C |
+| CPU reference / Metal | cut-over blocker 아님 |
+
+`ds4-sys` / `ds4-core`의 `unsafe`는 지정 FFI. CLI 27곳은 분류됨.
+
+---
+
+## 7. 최종 감사 (F1–F4)
+
+| | 결과 | 메모 |
+|---|---|---|
+| F1 plan compliance | APPROVE | 1–61 체크 + 증거. 55–57 SKIP/CANCEL |
+| F2 code quality | 당시 REJECT | `serial_fit` / `--cont-width` / invent 503 → **이후 커밋으로 해소**. F2 재감사는 안 함 |
+| F3 runnable QA | APPROVE | 작업트리에서 fmt, workspace 2종, all-target check, server parity, DeepSeek vector/4-way PASS |
+| F4 scope fidelity | APPROVE | rename/SPLIT/dfm-rs/CUDA rewrite/Tokio/merge 없음 |
+
+F2를 HEAD `4abaec3`에서 다시 돌리면 세 required 항목은 코드상 닫혀 있다.
+TickOp / Motif partial HTTP / Rust serial n=1은 이 감사 표 밖의 BLOCKED다.
+
+---
+
+## 8. 다음에 손대는 순서 (추천)
+
+완료: Wave A–B 호스트 슬라이스, cheap+parity 재스탬프,
+DeepSeek KV/static, Motif ABBA/tool-map/evict/periodic,
+Motif continuous+static 4 surface, family Makefile 셀.
+
+남아 있는 BLOCKED (GREEN 금지):
+
+1. TickOp 소비 — C continuous 루프 KEEP. 새 CUDA 스케줄러를 만들지 말 것
+2. Motif partial HTTP `cached=0` — C Motif `last_done` stats 갭
+3. Rust serial n=1 — `CONTINUOUS=0`이 static으로 가며 width-1이 400
+4. sibling mmap — KEEP
+5. Solar/EXAONE 서빙 surface — 이 호스트에서 기본 서빙과 같이 올리지 말 것
+
+§10 전체를 FAIL=0 / BLOCKED=0으로 다시 채운 뒤에만 GREEN/Phase 9를 논한다.
+production 이름 변경, `SPLIT_READINESS.md`, `dfm-rs`,
+`STATUS.md` / `PARITY_MATRIX.md` 재작성은 하지 않는다.
+
+라이브는 항상: **한 모델 → guarded-run → 측정 → 프로세스 종료 → clear_cache → 다음.**
