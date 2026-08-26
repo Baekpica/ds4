@@ -1232,6 +1232,18 @@ fn run_engine<W: TerminalSink>(
             },
             None => run_static_routed(&mut detached, current),
         };
+        // C worker_main: after coalesce_gather, n==1 collapses to
+        // run_job_single. generate_static is never called with n<2 on
+        // the HTTP path. The decision stays STATIC (already recorded);
+        // the entry lane is SERIAL — decisions and entries are different
+        // metric families. n>=2 generate_static failures stay here and
+        // never fall through to serial.
+        if matches!(&result, Err(GenerateError::Engine(msg)) if msg == STATIC_WIDTH_ERR) {
+            return (
+                crate::route::LANE_SERIAL,
+                run_serial(cfg, inner, job, id, engine, cont, out, arrived_at),
+            );
+        }
         return (
             LANE_STATIC,
             settle_static_lane(

@@ -7,7 +7,7 @@ use super::super::*;
 use super::run_owner_maybe_coalesce;
 use crate::generate::{GenerateError, GenerateOutcome, ScriptedDecode};
 use crate::parse::ParseEnv;
-use crate::route::{ThinkMode, WireSurface, LANE_STATIC};
+use crate::route::{ThinkMode, WireSurface, LANE_SERIAL, LANE_STATIC};
 use crate::serve_cont::ContExec;
 use crate::serve_static::{
     static_fallback_error, CoalesceLimits, StaticExec, StaticFinish, StaticJob, StaticRow,
@@ -200,6 +200,50 @@ fn continuous_zero_keeps_the_batch_ctx_for_two_short_static_jobs() {
     assert_eq!(
         g.metrics.route_requests[WireSurface::OpenaiChat as usize][LANE_STATIC as usize],
         2
+    );
+}
+
+#[test]
+fn continuous_zero_n1_collapses_static_gather_to_serial() {
+    // Given: CONTINUOUS=0 so route_decide picks STATIC; owner FIFO has one job
+    let cfg = ServerConfig {
+        continuous: false,
+        have_engine: true,
+        default_tokens: 8,
+        ..ServerConfig::default()
+    };
+    let inner = Arc::new(Mutex::new(ServerInner::from_cfg(&cfg)));
+    let (job_a, drain_a) = static_chat_job(&inner, "a");
+    let (_tx, rx) = mpsc::channel();
+    let mut spy = OwnerSpy {
+        seq_cap: 8,
+        ..OwnerSpy::default()
+    };
+    let mut engine = ScriptedDecode::from_pieces(&[b"serial-fallback"]);
+
+    // When: coalesce_gather width is 1
+    let leftover = run_owner_maybe_coalesce(&cfg, &inner, &mut engine, &mut spy, job_a, &rx);
+
+    // Then: C worker_main n==1 → run_job_single. generate_static stays cold.
+    assert!(leftover.is_none());
+    assert_eq!(spy.calls, 0);
+    let text = String::from_utf8(drain_a.state.take()).unwrap();
+    let _ = drain_a.done.recv();
+    assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
+    assert!(
+        !text.contains(crate::serve_static::STATIC_WIDTH_ERR),
+        "HTTP n=1 must not refuse width: {text}"
+    );
+    assert!(text.contains("serial-fallback"), "{text}");
+    let g = lock_inner(&inner);
+    assert_eq!(g.runtime.requests_serial, 1);
+    assert_eq!(
+        g.metrics.route_requests[WireSurface::OpenaiChat as usize][LANE_SERIAL as usize],
+        1
+    );
+    assert_eq!(
+        g.metrics.route_requests[WireSurface::OpenaiChat as usize][LANE_STATIC as usize],
+        0
     );
 }
 

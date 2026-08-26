@@ -1,7 +1,7 @@
 use super::harness::{drive_static_chat, drive_static_chat_with, pair_jobs, SpyStatic};
 use super::*;
 use crate::generate::GenerateError;
-use crate::route::{WireSurface, LANE_STATIC, NEED_STREAMING};
+use crate::route::{WireSurface, LANE_SERIAL, LANE_STATIC, NEED_STREAMING};
 
 fn peer(footprint: i64, peer_ok: bool) -> CoalescePeer {
     CoalescePeer { footprint, peer_ok }
@@ -72,29 +72,31 @@ fn run_static_invokes_generate_static_when_n_eq_2() {
 }
 
 #[test]
-fn static_routed_request_returns_c_width_error_not_serial() {
+fn static_routed_n1_collapses_to_serial() {
     // Given: route_decide picked LANE_STATIC (seq_cap=0, needs=0)
-    // When: a single static-routed request is served (n=1, no coalesce yet)
+    // When: a single static-routed request is served (n=1, no coalesce)
     let (response, inner) = drive_static_chat();
     let text = String::from_utf8_lossy(&response);
 
-    // Then: C width string, never the serial session path
-    assert!(text.starts_with("HTTP/1.1 400 Bad Request"), "{text}");
+    // Then: C worker_main n==1 → run_job_single. generate_static stays
+    // n>=2 (see run_static_returns_c_error_string_when_n_eq_1). Decision
+    // reason stays static; the entry lane is serial.
+    assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
     assert!(
-        text.contains(STATIC_WIDTH_ERR),
-        "missing C width string: {text}"
+        !text.contains(STATIC_WIDTH_ERR),
+        "HTTP n=1 must not refuse width: {text}"
     );
     assert!(
-        !text.contains("serial-fallback"),
-        "serial decode must not run: {text}"
+        text.contains("serial-fallback"),
+        "serial decode must run: {text}"
     );
-    assert_eq!(inner.runtime.requests_serial, 0);
+    assert_eq!(inner.runtime.requests_serial, 1);
     assert_eq!(
-        inner.metrics.route_requests[WireSurface::OpenaiChat as usize][LANE_STATIC as usize],
+        inner.metrics.route_requests[WireSurface::OpenaiChat as usize][LANE_SERIAL as usize],
         1
     );
     assert_eq!(
-        inner.metrics.route_requests[WireSurface::OpenaiChat as usize][0],
+        inner.metrics.route_requests[WireSurface::OpenaiChat as usize][LANE_STATIC as usize],
         0
     );
 }
