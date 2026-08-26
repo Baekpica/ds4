@@ -85,19 +85,20 @@ use std::ptr::{self, NonNull};
 use ds4_sys::{
     ds4_bridge_bind_plan, ds4_bridge_bind_plan_check, ds4_bridge_bind_slot,
     ds4_bridge_distributed_options, ds4_bridge_encode_chat_prompt, ds4_bridge_eval,
-    ds4_bridge_eval_speculative_argmax, ds4_bridge_model, ds4_bridge_model_boot_prewarm,
-    ds4_bridge_model_free, ds4_bridge_model_id, ds4_bridge_model_open,
-    ds4_bridge_model_open_distributed, ds4_bridge_model_open_options,
+    ds4_bridge_eval_speculative_argmax, ds4_bridge_graph_fit_quote, ds4_bridge_model,
+    ds4_bridge_model_boot_prewarm, ds4_bridge_model_free, ds4_bridge_model_id,
+    ds4_bridge_model_open, ds4_bridge_model_open_distributed, ds4_bridge_model_open_options,
     ds4_bridge_model_routed_quant_bits, ds4_bridge_model_run_distributed_worker,
     ds4_bridge_session, ds4_bridge_session_argmax, ds4_bridge_session_argmax_excluding,
     ds4_bridge_session_copy_logits, ds4_bridge_session_create, ds4_bridge_session_ctx,
     ds4_bridge_session_distributed_route_ready, ds4_bridge_session_eval_layer_slice,
     ds4_bridge_session_exaone_rewind_span, ds4_bridge_session_free, ds4_bridge_session_generation,
-    ds4_bridge_session_invalidate, ds4_bridge_session_layer_slice_reset,
-    ds4_bridge_session_load_layer_payload, ds4_bridge_session_load_payload,
-    ds4_bridge_session_load_payload_range, ds4_bridge_session_load_snapshot,
-    ds4_bridge_session_output_head_bench, ds4_bridge_session_power, ds4_bridge_session_prefill_cap,
-    ds4_bridge_session_rewind, ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
+    ds4_bridge_session_graph_fit_quote, ds4_bridge_session_invalidate,
+    ds4_bridge_session_layer_slice_reset, ds4_bridge_session_load_layer_payload,
+    ds4_bridge_session_load_payload, ds4_bridge_session_load_payload_range,
+    ds4_bridge_session_load_snapshot, ds4_bridge_session_output_head_bench,
+    ds4_bridge_session_power, ds4_bridge_session_prefill_cap, ds4_bridge_session_rewind,
+    ds4_bridge_session_sample, ds4_bridge_session_save_layer_payload,
     ds4_bridge_session_save_payload, ds4_bridge_session_save_snapshot,
     ds4_bridge_session_set_power, ds4_bridge_session_sync, ds4_bridge_session_top_logprobs,
     ds4_bridge_shard, ds4_bridge_snapshot, ds4_bridge_snapshot_create, ds4_bridge_snapshot_free,
@@ -359,6 +360,30 @@ pub struct TokenScore {
     pub id: i32,
     pub logit: f32,
     pub logprob: f32,
+}
+
+/// Host copy of `ds4_session_graph_fit_quote`. Margin, not a refuse floor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphFitQuote {
+    pub fits: bool,
+    pub fail_open: bool,
+    pub need_bytes: u64,
+    pub headroom_bytes: u64,
+    pub avail_bytes: u64,
+    pub deficit_bytes: u64,
+}
+
+impl GraphFitQuote {
+    pub fn from_bridge(raw: ds4_bridge_graph_fit_quote) -> Self {
+        Self {
+            fits: raw.fits != 0,
+            fail_open: raw.fail_open != 0,
+            need_bytes: raw.need_bytes,
+            headroom_bytes: raw.headroom_bytes,
+            avail_bytes: raw.avail_bytes,
+            deficit_bytes: raw.deficit_bytes,
+        }
+    }
 }
 
 pub struct Model {
@@ -1204,6 +1229,16 @@ impl Model {
         unsafe { ds4_bridge_model_routed_quant_bits(self.raw.as_ptr()) }
     }
 
+    pub fn session_graph_fit_quote(&self, ctx_size: i32) -> Option<GraphFitQuote> {
+        if ctx_size <= 0 {
+            return None;
+        }
+        let mut raw = ds4_bridge_graph_fit_quote::default();
+        let _fits =
+            unsafe { ds4_bridge_session_graph_fit_quote(self.raw.as_ptr(), ctx_size, &mut raw) };
+        Some(GraphFitQuote::from_bridge(raw))
+    }
+
     pub fn run_distributed_worker(&self, ctx_size: i32) -> Result<i32> {
         let mut err = [0u8; 512];
         let rc = unsafe {
@@ -1906,6 +1941,25 @@ impl Drop for Session<'_> {
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn graph_fit_quote_copies_c_fields() {
+        let raw = ds4_bridge_graph_fit_quote {
+            fits: 1,
+            fail_open: 0,
+            need_bytes: 7_090_000_000,
+            headroom_bytes: 256,
+            avail_bytes: 5_460_000_000,
+            deficit_bytes: 1_630_000_256,
+        };
+        let quote = GraphFitQuote::from_bridge(raw);
+        assert!(quote.fits);
+        assert!(!quote.fail_open);
+        assert_eq!(quote.need_bytes, 7_090_000_000);
+        assert_eq!(quote.headroom_bytes, 256);
+        assert_eq!(quote.avail_bytes, 5_460_000_000);
+        assert_eq!(quote.deficit_bytes, 1_630_000_256);
+    }
 
     #[test]
     fn backend_codes_match_bridge_header() {

@@ -241,6 +241,20 @@ int ds4_bridge_token_is_stop(ds4_bridge_model *m, int32_t token);
 int ds4_bridge_model_id(ds4_bridge_model *m);
 int ds4_bridge_model_routed_quant_bits(ds4_bridge_model *m);
 
+/* Thin wrap of ds4_engine_session_graph_fit_quote. Fields match the
+ * native quote; this ABI is copied, not the ds4.h layout. */
+typedef struct ds4_bridge_graph_fit_quote {
+    int32_t fits;
+    int32_t fail_open;
+    uint64_t need_bytes;
+    uint64_t headroom_bytes;
+    uint64_t avail_bytes;
+    uint64_t deficit_bytes;
+} ds4_bridge_graph_fit_quote;
+
+int ds4_bridge_session_graph_fit_quote(ds4_bridge_model *m, int ctx_size,
+                                       ds4_bridge_graph_fit_quote *q);
+
 /* CLI chat-template encode (ds4_encode_chat_prompt): system may be NULL,
  * think_mode is ds4_think_mode 0..3.  Same buffer contract as tokenize. */
 int ds4_bridge_encode_chat_prompt(ds4_bridge_model *m, const char *system,

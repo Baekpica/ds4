@@ -89,6 +89,11 @@ int ds4_engine_routed_quant_bits(ds4_engine *e) {
     if (!e) STUB("ds4_engine_routed_quant_bits");
     return bridge_routed_quant_bits;
 }
+int ds4_engine_session_graph_fit_quote(ds4_engine *e, int ctx_size,
+                                       ds4_session_graph_fit_quote *q) {
+    (void)e; (void)ctx_size; (void)q;
+    STUB("ds4_engine_session_graph_fit_quote");
+}
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     (void)out; (void)e; (void)ctx_size; STUB("ds4_session_create");
 }

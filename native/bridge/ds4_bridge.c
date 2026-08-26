@@ -1000,6 +1000,25 @@ int ds4_bridge_model_routed_quant_bits(ds4_bridge_model *m)
     return ds4_engine_routed_quant_bits(m->engine);
 }
 
+int ds4_bridge_session_graph_fit_quote(ds4_bridge_model *m, int ctx_size,
+                                       ds4_bridge_graph_fit_quote *q)
+{
+    ds4_session_graph_fit_quote native;
+    int fits;
+
+    if (!q) return 0;
+    memset(q, 0, sizeof(*q));
+    if (!m || !m->engine || ctx_size <= 0) return 0;
+    fits = ds4_engine_session_graph_fit_quote(m->engine, ctx_size, &native);
+    q->fits = native.fits;
+    q->fail_open = native.fail_open;
+    q->need_bytes = native.need_bytes;
+    q->headroom_bytes = native.headroom_bytes;
+    q->avail_bytes = native.avail_bytes;
+    q->deficit_bytes = native.deficit_bytes;
+    return fits;
+}
+
 int ds4_bridge_encode_chat_prompt(ds4_bridge_model *m, const char *system,
                                   const char *prompt, int think_mode,
                                   int32_t *out, int cap, int *n_out,

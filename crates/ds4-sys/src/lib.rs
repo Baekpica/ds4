@@ -164,6 +164,17 @@ pub struct ds4_bridge_mem_observe {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ds4_bridge_graph_fit_quote {
+    pub fits: i32,
+    pub fail_open: i32,
+    pub need_bytes: u64,
+    pub headroom_bytes: u64,
+    pub avail_bytes: u64,
+    pub deficit_bytes: u64,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ds4_bridge_bind_slot {
     pub name: *const c_char,
@@ -577,6 +588,12 @@ extern "C" {
     pub fn ds4_bridge_model_id(m: *mut ds4_bridge_model) -> c_int;
 
     pub fn ds4_bridge_model_routed_quant_bits(m: *mut ds4_bridge_model) -> c_int;
+
+    pub fn ds4_bridge_session_graph_fit_quote(
+        m: *mut ds4_bridge_model,
+        ctx_size: c_int,
+        q: *mut ds4_bridge_graph_fit_quote,
+    ) -> c_int;
 
     pub fn ds4_bridge_encode_chat_prompt(
         m: *mut ds4_bridge_model,
