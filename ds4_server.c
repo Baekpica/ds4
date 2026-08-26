@@ -531,6 +531,13 @@ typedef enum {
 #define DS4_SOLAR_TOOL_RESPONSE_START "<|tool_response:start|>"
 #define DS4_SOLAR_TOOL_RESPONSE_END   "<|tool_response:end|>"
 
+#define DS4_QWEN_IM_START             "<|im_start|>"
+#define DS4_QWEN_IM_END               "<|im_end|>"
+#define DS4_QWEN_TOOL_CALL_START      "<tool_call>"
+#define DS4_QWEN_TOOL_CALL_END        "</tool_call>"
+#define DS4_QWEN_TOOL_RESPONSE_START  "<tool_response>"
+#define DS4_QWEN_TOOL_RESPONSE_END    "</tool_response>"
+
 static const char *chat_think_start(ds4_chat_format format) {
     return format == DS4_CHAT_FORMAT_SOLAR_OPEN2
         ? DS4_SOLAR_THINK_START : "<think>";
@@ -1244,6 +1251,7 @@ static const char *server_model_id_from_variant(int variant) {
     if (variant == 3) return "motif-3";
     if (variant == 4) return "k-exaone-236b-a23b";
     if (variant == 5) return "dots3-note-prev";
+    if (variant == 6) return "qwen3.8-flash-next";
     return "deepseek-v4-flash";
 }
 
@@ -1265,7 +1273,10 @@ static bool server_model_alias_known(const char *id) {
             !strcmp(id, "LGAI-EXAONE/K-EXAONE-236B-A23B") ||
             !strcmp(id, "dots3-note-prev") ||
             !strcmp(id, "dots-studio/dots3-note-prev") ||
-            !strcmp(id, "dots3-note-prev-Mixed-Quant-GGUF"));
+            !strcmp(id, "dots3-note-prev-Mixed-Quant-GGUF") ||
+            !strcmp(id, "qwen3.8-flash-next") ||
+            !strcmp(id, "Qwen/Qwen3.8-Flash-Next") ||
+            !strcmp(id, "Baekpica/Qwen3.8-Flash-Next-Mixed-Quant-SSD-PLE-GGUF"));
 }
 
 /* A server knob may request partial warm reuse, but the model runtime is the
@@ -2784,11 +2795,64 @@ static void append_solar_tool_calls_text(buf *b, const tool_calls *calls,
     }
 }
 
+static void append_qwen_arg(buf *b, const json_arg *arg) {
+    buf_puts(b, "<parameter=");
+    buf_puts(b, arg->key ? arg->key : "");
+    buf_puts(b, ">\n");
+    buf_puts(b, arg->value ? arg->value : "");
+    buf_puts(b, "\n</parameter>\n");
+}
+
+static bool append_qwen_arguments_from_json(buf *b, const char *json,
+                                            const tool_schema_order *order) {
+    json_args args = {0};
+    if (!json_args_parse(json, &args)) return false;
+    if (order) {
+        for (int i = 0; i < order->len; i++) {
+            int idx = json_args_find_unused(&args, order->prop[i]);
+            if (idx < 0) continue;
+            append_qwen_arg(b, &args.v[idx]);
+            args.v[idx].used = true;
+        }
+    }
+    for (int i = 0; i < args.len; i++) {
+        if (!args.v[i].used) append_qwen_arg(b, &args.v[i]);
+    }
+    json_args_free(&args);
+    return true;
+}
+
+static void append_qwen_tool_calls_text(buf *b, const tool_calls *calls,
+                                        const tool_schema_orders *orders) {
+    if (!calls || calls->len == 0) return;
+    if (calls->raw_dsml && calls->raw_dsml[0]) {
+        buf_puts(b, calls->raw_dsml);
+        return;
+    }
+    for (int i = 0; i < calls->len; i++) {
+        const tool_call *tc = &calls->v[i];
+        if (i) buf_putc(b, '\n');
+        buf_puts(b, DS4_QWEN_TOOL_CALL_START "\n<function=");
+        buf_puts(b, tc->name ? tc->name : "");
+        buf_puts(b, ">\n");
+        const tool_schema_order *order =
+            tool_schema_orders_find(orders, tc->name);
+        if (!append_qwen_arguments_from_json(b, tc->arguments, order)) {
+            buf_puts(b, "<parameter=arguments>\n");
+            buf_puts(b, tc->arguments ? tc->arguments : "{}");
+            buf_puts(b, "\n</parameter>\n");
+        }
+        buf_puts(b, "</function>\n" DS4_QWEN_TOOL_CALL_END);
+    }
+}
+
 static void append_model_tool_calls_text(buf *b, const tool_calls *calls,
                                          const tool_schema_orders *orders,
                                          ds4_chat_format format) {
     if (format == DS4_CHAT_FORMAT_SOLAR_OPEN2)
         append_solar_tool_calls_text(b, calls, orders);
+    else if (format == DS4_CHAT_FORMAT_QWEN4EXP)
+        append_qwen_tool_calls_text(b, calls, orders);
     else
         append_dsml_tool_calls_text(b, calls);
 }
@@ -3654,15 +3718,184 @@ static char *render_solar_chat_prompt_text_choice(
     return buf_take(&out);
 }
 
+static const char *qwen_reasoning_instruction(ds4_think_mode mode) {
+    if (mode == DS4_THINK_LOW) {
+        return "Reasoning effort is set to low. Keep your thinking brief and "
+               "focused, moving directly to the conclusion without unnecessary "
+               "elaboration.";
+    }
+    if (mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX) {
+        return "Reasoning effort is set to xhigh. Please think carefully through "
+               "the task, validate key assumptions, consider plausible alternatives, "
+               "and prioritize correctness, consistency, and clarity in the final answer.";
+    }
+    return "";
+}
+
+static void append_qwen_tool_schemas(buf *out, const char *tool_schemas) {
+    const char *p = tool_schemas ? tool_schemas : "";
+    while (*p) {
+        json_ws(&p);
+        if (!*p) break;
+        char *schema = NULL;
+        if (!json_raw_value(&p, &schema)) break;
+        buf_puts(out, "\n{\"type\": \"function\", \"function\": ");
+        dots3_pyspace_json(out, schema);
+        buf_putc(out, '}');
+        free(schema);
+    }
+}
+
+static void append_qwen_tools_prompt_text(buf *out,
+                                          const char *tool_schemas) {
+    buf_puts(out,
+        "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+    append_qwen_tool_schemas(out, tool_schemas);
+    buf_puts(out,
+        "\n</tools>"
+        "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:"
+        "\n\n<tool_call>\n<function=example_function_name>"
+        "\n<parameter=example_parameter_1>\nvalue_1\n</parameter>"
+        "\n<parameter=example_parameter_2>\nThis is the value for the second parameter"
+        "\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>"
+        "\n\n<IMPORTANT>\nReminder:"
+        "\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags"
+        "\n- Required parameters MUST be specified"
+        "\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after"
+        "\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls"
+        "\n</IMPORTANT>");
+}
+
+static void append_qwen_tool_response_span(buf *out, const char *text,
+                                           size_t len) {
+    const size_t marker_len = strlen(DS4_QWEN_TOOL_RESPONSE_END);
+    const char *p = text ? text : "";
+    const char *end = p + len;
+    while (p < end) {
+        if ((size_t)(end - p) >= marker_len &&
+            !strncmp(p, DS4_QWEN_TOOL_RESPONSE_END, marker_len)) {
+            buf_puts(out, "&lt;");
+            p++;
+        } else {
+            buf_putc(out, *p++);
+        }
+    }
+}
+
+static int render_qwen_tool_result_block(buf *out, const chat_msgs *msgs,
+                                         int start) {
+    int end = start;
+    bool first = true;
+    while (msgs && end < msgs->len &&
+           chat_msg_is_model_tool_result(&msgs->v[end])) {
+        solar_tool_result_views views = {0};
+        solar_collect_tool_result_message(&msgs->v[end], &views);
+        for (int i = 0; i < views.len; i++) {
+            if (first) buf_puts(out, DS4_QWEN_IM_START "user");
+            buf_puts(out, "\n" DS4_QWEN_TOOL_RESPONSE_START "\n");
+            append_qwen_tool_response_span(out, views.v[i].text,
+                                           views.v[i].len);
+            buf_puts(out, "\n" DS4_QWEN_TOOL_RESPONSE_END);
+            first = false;
+        }
+        free(views.v);
+        end++;
+    }
+    if (!first) buf_puts(out, DS4_QWEN_IM_END "\n");
+    return end;
+}
+
+static char *render_qwen_chat_prompt_text_choice_impl(
+        const chat_msgs *msgs, const char *tool_schemas,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        bool include_preamble) {
+    const bool have_tools = tool_schemas && tool_schemas[0];
+    buf system = {0};
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!role_is_system(m->role)) continue;
+        if (system.len) buf_puts(&system, "\n\n");
+        motif3_buf_put_trimmed(&system, m->content);
+    }
+
+    buf out = {0};
+    if (include_preamble) {
+        const char *instruction = qwen_reasoning_instruction(think_mode);
+        if (have_tools) {
+            buf_puts(&out, DS4_QWEN_IM_START "system\n");
+            if (instruction[0]) {
+                buf_puts(&out, instruction);
+                buf_puts(&out, "\n\n");
+            }
+            append_qwen_tools_prompt_text(&out, tool_schemas);
+            if (system.len) {
+                buf_puts(&out, "\n\n");
+                buf_append(&out, system.ptr, system.len);
+            }
+            buf_puts(&out, DS4_QWEN_IM_END "\n");
+        } else if (system.len || instruction[0]) {
+            buf_puts(&out, DS4_QWEN_IM_START "system\n");
+            if (instruction[0]) {
+                buf_puts(&out, instruction);
+                if (system.len) buf_puts(&out, "\n\n");
+            }
+            if (system.len) buf_append(&out, system.ptr, system.len);
+            buf_puts(&out, DS4_QWEN_IM_END "\n");
+        }
+    }
+
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (role_is_system(m->role)) {
+            continue;
+        } else if (!strcmp(m->role, "user") &&
+                   !chat_msg_is_model_tool_result(m)) {
+            buf_puts(&out, DS4_QWEN_IM_START "user\n");
+            motif3_buf_put_trimmed(&out, m->content);
+            buf_puts(&out, DS4_QWEN_IM_END "\n");
+        } else if (chat_msg_is_model_tool_result(m)) {
+            i = render_qwen_tool_result_block(&out, msgs, i) - 1;
+        } else if (!strcmp(m->role, "assistant")) {
+            buf_puts(&out, DS4_QWEN_IM_START "assistant\n<think>\n");
+            motif3_buf_put_trimmed(&out, m->reasoning);
+            buf_puts(&out, "\n</think>\n\n");
+            const size_t content_start = out.len;
+            motif3_buf_put_trimmed(&out, m->content);
+            if (m->calls.len > 0 && out.len > content_start)
+                buf_puts(&out, "\n\n");
+            append_qwen_tool_calls_text(&out, &m->calls, tool_orders);
+            buf_puts(&out, DS4_QWEN_IM_END "\n");
+        }
+    }
+
+    buf_puts(&out, DS4_QWEN_IM_START "assistant\n<think>\n");
+    if (!ds4_think_mode_enabled(think_mode))
+        buf_puts(&out, "\n</think>\n\n");
+    buf_free(&system);
+    return buf_take(&out);
+}
+
+static char *render_qwen_chat_prompt_text_choice(
+        const chat_msgs *msgs, const char *tool_schemas,
+        const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
+        tool_choice_mode tool_choice) {
+    (void)tool_choice;
+    return render_qwen_chat_prompt_text_choice_impl(
+        msgs, tool_schemas, tool_orders, think_mode, true);
+}
+
 static char *render_chat_prompt_text_choice_format(
         const chat_msgs *msgs, const char *tool_schemas,
         const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
         tool_choice_mode tool_choice, ds4_chat_format format) {
-    return format == DS4_CHAT_FORMAT_SOLAR_OPEN2
-        ? render_solar_chat_prompt_text_choice(msgs, tool_schemas, tool_orders,
-                                               think_mode, tool_choice)
-        : render_dsml_chat_prompt_text_choice(msgs, tool_schemas, tool_orders,
-                                              think_mode, tool_choice);
+    if (format == DS4_CHAT_FORMAT_SOLAR_OPEN2)
+        return render_solar_chat_prompt_text_choice(
+            msgs, tool_schemas, tool_orders, think_mode, tool_choice);
+    if (format == DS4_CHAT_FORMAT_QWEN4EXP)
+        return render_qwen_chat_prompt_text_choice(
+            msgs, tool_schemas, tool_orders, think_mode, tool_choice);
+    return render_dsml_chat_prompt_text_choice(
+        msgs, tool_schemas, tool_orders, think_mode, tool_choice);
 }
 
 #ifdef DS4_SERVER_TEST
@@ -3755,7 +3988,8 @@ static char *render_dsml_live_tool_tail(const chat_msgs *msgs, int start,
 static char *render_live_tool_tail_format(const chat_msgs *msgs, int start,
                                           ds4_think_mode think_mode,
                                           ds4_chat_format format) {
-    if (format != DS4_CHAT_FORMAT_SOLAR_OPEN2)
+    if (format != DS4_CHAT_FORMAT_SOLAR_OPEN2 &&
+        format != DS4_CHAT_FORMAT_QWEN4EXP)
         return render_dsml_live_tool_tail(msgs, start, think_mode);
 
     chat_msgs tail = {0};
@@ -3764,12 +3998,17 @@ static char *render_live_tool_tail_format(const chat_msgs *msgs, int start,
         tail.len = msgs->len - start;
         tail.cap = tail.len;
     }
-    char *rendered = render_solar_chat_prompt_text_choice(
-        &tail, NULL, NULL, think_mode, TOOL_CHOICE_AUTO);
+    char *rendered = format == DS4_CHAT_FORMAT_QWEN4EXP
+        ? render_qwen_chat_prompt_text_choice_impl(
+              &tail, NULL, NULL, think_mode, false)
+        : render_solar_chat_prompt_text_choice(
+              &tail, NULL, NULL, think_mode, TOOL_CHOICE_AUTO);
     buf out = {0};
     /* The sampled <|im:end|> is the engine EOS and is therefore not evaluated
      * into KV.  Append it before the new tool-role suffix. */
-    buf_puts(&out, DS4_SOLAR_IM_END "\n");
+    buf_puts(&out, format == DS4_CHAT_FORMAT_QWEN4EXP
+                       ? DS4_QWEN_IM_END "\n"
+                       : DS4_SOLAR_IM_END "\n");
     buf_puts(&out, rendered ? rendered : "");
     free(rendered);
     return buf_take(&out);
@@ -4247,7 +4486,8 @@ static bool request_prepare_tool_choice(ds4_engine *e, request *r,
     ds4_tokenize_rendered_chat(e,
                                r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2
                                    ? DS4_SOLAR_TOOL_CALL_START
-                                   : r->chat_format == DS4_CHAT_FORMAT_EXAONE
+                               : (r->chat_format == DS4_CHAT_FORMAT_EXAONE ||
+                                  r->chat_format == DS4_CHAT_FORMAT_QWEN4EXP)
                                        ? "<tool_call>"
                                        : "<｜DSML｜tool_calls>",
                                &r->required_tool_prefix);
@@ -5790,7 +6030,8 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     if (r->model_syntax == SERVER_MODEL_SYNTAX_MOTIF3 ||
         r->model_syntax == SERVER_MODEL_SYNTAX_EXAONE ||
         r->model_syntax == SERVER_MODEL_SYNTAX_DOTS3 ||
-        r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2) {
+        r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2 ||
+        r->chat_format == DS4_CHAT_FORMAT_QWEN4EXP) {
         /* Raw completion uses the loaded family's official chat protocol. */
         chat_msgs msgs = {0};
         chat_msg system = {.role = xstrdup("system"),
@@ -5963,7 +6204,8 @@ static const char *find_tool_start_format(const char *s,
                                           ds4_chat_format format) {
     if (format == DS4_CHAT_FORMAT_SOLAR_OPEN2)
         return s ? strstr(s, DS4_SOLAR_TOOL_CALL_START) : NULL;
-    if (format == DS4_CHAT_FORMAT_EXAONE)
+    if (format == DS4_CHAT_FORMAT_EXAONE ||
+        format == DS4_CHAT_FORMAT_QWEN4EXP)
         return s ? strstr(s, "<tool_call>") : NULL;
     return find_any_tool_start(s ? s : "");
 }
@@ -5987,7 +6229,8 @@ static const char *find_tool_end_format(const char *s,
                                         ds4_chat_format format) {
     if (format == DS4_CHAT_FORMAT_SOLAR_OPEN2)
         return s ? strstr(s, DS4_SOLAR_TOOL_CALL_END) : NULL;
-    if (format == DS4_CHAT_FORMAT_EXAONE)
+    if (format == DS4_CHAT_FORMAT_EXAONE ||
+        format == DS4_CHAT_FORMAT_QWEN4EXP)
         return s ? strstr(s, "</tool_call>") : NULL;
     return find_any_tool_end(s ? s : "");
 }
@@ -6416,6 +6659,134 @@ static bool parse_solar_generated_message(const char *text,
     return calls->len > 0;
 }
 
+static bool parse_qwen_generated_message(const char *text,
+                                         bool require_thinking_closed,
+                                         const tool_schema_orders *orders,
+                                         char **content_out,
+                                         char **reasoning_out,
+                                         tool_calls *calls) {
+    text = text ? text : "";
+    const char *tool_search = text;
+    if (require_thinking_closed) {
+        const char *think_end = find_last_substr(text, "</think>");
+        if (!think_end) {
+            const char *body = !strncmp(text, "<think>", 7) ? text + 7 : text;
+            *reasoning_out = xstrdup(body);
+            *content_out = xstrdup("");
+            return true;
+        }
+        tool_search = think_end + strlen("</think>");
+    }
+
+    const char *start = strstr(tool_search, DS4_QWEN_TOOL_CALL_START);
+    if (!start) {
+        split_reasoning_content_format(text, strlen(text),
+                                       DS4_CHAT_FORMAT_QWEN4EXP,
+                                       content_out, reasoning_out);
+        return true;
+    }
+
+    const size_t content_len =
+        trim_tool_separator_ws(text, 0, (size_t)(start - text));
+    const char *p = start;
+    const char *raw_end = NULL;
+    while (!strncmp(p, DS4_QWEN_TOOL_CALL_START,
+                    strlen(DS4_QWEN_TOOL_CALL_START))) {
+        p += strlen(DS4_QWEN_TOOL_CALL_START);
+        p = skip_ascii_ws(p);
+        static const char function_start[] = "<function=";
+        if (strncmp(p, function_start, sizeof(function_start) - 1)) return false;
+        p += sizeof(function_start) - 1;
+        const char *name_end = strchr(p, '>');
+        if (!name_end) return false;
+        char *name = trim_ascii_span_dup(p, name_end);
+        if (!name[0]) {
+            free(name);
+            return false;
+        }
+        const tool_schema_order *order = tool_schema_orders_find(orders, name);
+        p = name_end + 1;
+
+        buf args = {0};
+        bool function_closed = false;
+        while (*p) {
+            p = skip_ascii_ws(p);
+            if (!strncmp(p, "</function>", strlen("</function>"))) {
+                p += strlen("</function>");
+                function_closed = true;
+                break;
+            }
+            static const char parameter_start[] = "<parameter=";
+            if (strncmp(p, parameter_start, sizeof(parameter_start) - 1)) {
+                free(name);
+                buf_free(&args);
+                return false;
+            }
+            p += sizeof(parameter_start) - 1;
+            const char *arg_name_end = strchr(p, '>');
+            if (!arg_name_end) {
+                free(name);
+                buf_free(&args);
+                return false;
+            }
+            char *arg_name = trim_ascii_span_dup(p, arg_name_end);
+            p = arg_name_end + 1;
+            if (*p == '\r') p++;
+            if (*p == '\n') p++;
+            const char *arg_end = strstr(p, "</parameter>");
+            if (!arg_end || !arg_name[0]) {
+                free(arg_name);
+                free(name);
+                buf_free(&args);
+                return false;
+            }
+            const char *value_end = arg_end;
+            if (value_end > p && value_end[-1] == '\n') value_end--;
+            if (value_end > p && value_end[-1] == '\r') value_end--;
+            solar_tool_arg_json_add(
+                &args, arg_name, p, (size_t)(value_end - p),
+                tool_schema_order_prop_type(order, arg_name));
+            free(arg_name);
+            p = arg_end + strlen("</parameter>");
+        }
+        if (!function_closed) {
+            free(name);
+            buf_free(&args);
+            return false;
+        }
+        p = skip_ascii_ws(p);
+        if (strncmp(p, DS4_QWEN_TOOL_CALL_END,
+                    strlen(DS4_QWEN_TOOL_CALL_END))) {
+            free(name);
+            buf_free(&args);
+            return false;
+        }
+        p += strlen(DS4_QWEN_TOOL_CALL_END);
+        raw_end = p;
+
+        tool_call tc = {.name = name};
+        buf wrapped = {0};
+        buf_putc(&wrapped, '{');
+        buf_puts(&wrapped, args.ptr ? args.ptr : "");
+        buf_putc(&wrapped, '}');
+        tc.arguments = buf_take(&wrapped);
+        tool_calls_push(calls, tc);
+        buf_free(&args);
+
+        const char *next = skip_ascii_ws(p);
+        if (strncmp(next, DS4_QWEN_TOOL_CALL_START,
+                    strlen(DS4_QWEN_TOOL_CALL_START))) break;
+        p = next;
+    }
+
+    free(calls->raw_dsml);
+    calls->raw_dsml = xstrndup(start, (size_t)(raw_end - start));
+    split_reasoning_content_format(text, content_len,
+                                   DS4_CHAT_FORMAT_QWEN4EXP,
+                                   content_out, reasoning_out);
+    return calls->len > 0;
+}
+
 static bool parse_generated_message_ex_format(
         const char *text, bool require_thinking_closed,
         ds4_chat_format format, const tool_schema_orders *orders,
@@ -6425,6 +6796,11 @@ static bool parse_generated_message_ex_format(
         return parse_solar_generated_message(text, require_thinking_closed,
                                              orders,
                                              content_out, reasoning_out, calls);
+    }
+    if (format == DS4_CHAT_FORMAT_QWEN4EXP) {
+        return parse_qwen_generated_message(text, require_thinking_closed,
+                                            orders,
+                                            content_out, reasoning_out, calls);
     }
     text = text ? text : "";
     const char *tool_search = text;
@@ -7027,7 +7403,8 @@ static bool try_repair_tool_call_format(const char *s, size_t len,
                                         ds4_chat_format format, buf *out) {
     if (format == DS4_CHAT_FORMAT_SOLAR_OPEN2)
         return try_repair_solar_tool_call(s, len, out);
-    if (format == DS4_CHAT_FORMAT_EXAONE) return false;
+    if (format == DS4_CHAT_FORMAT_EXAONE ||
+        format == DS4_CHAT_FORMAT_QWEN4EXP) return false;
     return try_repair_dsml(s, len, out);
 }
 
@@ -13794,7 +14171,8 @@ static size_t tool_marker_stream_safe_len(const char *text, size_t len,
     if (format == DS4_CHAT_FORMAT_SOLAR_OPEN2) {
         marks = solar_marks;
         nmarks = 1;
-    } else if (format == DS4_CHAT_FORMAT_EXAONE) {
+    } else if (format == DS4_CHAT_FORMAT_EXAONE ||
+               format == DS4_CHAT_FORMAT_QWEN4EXP) {
         marks = exaone_marks;
         nmarks = 1;
     }
@@ -13966,20 +14344,36 @@ static char *rendered_solar_system_region(const char *prompt_text) {
     return xstrndup(p, (size_t)(end - p));
 }
 
+static char *rendered_qwen_system_region(const char *prompt_text) {
+    if (!prompt_text) return xstrdup("");
+    const char *prefix = DS4_QWEN_IM_START "system\n";
+    const size_t prefix_len = strlen(prefix);
+    if (strncmp(prompt_text, prefix, prefix_len)) return xstrdup("");
+    const char *p = prompt_text + prefix_len;
+    const char *end = strstr(p, DS4_QWEN_IM_END);
+    if (!end) end = p + strlen(p);
+    while (end > p && isspace((unsigned char)end[-1])) end--;
+    return xstrndup(p, (size_t)(end - p));
+}
+
 static char *rendered_chat_system_region(const request *r) {
-    return r && r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2
-        ? rendered_solar_system_region(r->prompt_text)
-        : rendered_dsml_system_region(r ? r->prompt_text : NULL);
+    if (r && r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2)
+        return rendered_solar_system_region(r->prompt_text);
+    if (r && r->chat_format == DS4_CHAT_FORMAT_QWEN4EXP)
+        return rendered_qwen_system_region(r->prompt_text);
+    return rendered_dsml_system_region(r ? r->prompt_text : NULL);
 }
 
 static char *build_invalid_tool_error_suffix(const request *r,
                                              const thinking_state *thinking,
                                              const char *detail) {
     const bool solar = r && r->chat_format == DS4_CHAT_FORMAT_SOLAR_OPEN2;
+    const bool qwen = r && r->chat_format == DS4_CHAT_FORMAT_QWEN4EXP;
     char *system = rendered_chat_system_region(r);
     buf tool_error = {0};
     buf_puts(&tool_error, solar ? "Tool error: invalid Solar tool call"
-                                : "Tool error: invalid DSML tool call");
+                                : qwen ? "Tool error: invalid Qwen tool call"
+                                       : "Tool error: invalid DSML tool call");
     if (detail && detail[0]) {
         buf_puts(&tool_error, ": ");
         buf_puts(&tool_error, detail);
@@ -13988,6 +14382,10 @@ static char *build_invalid_tool_error_suffix(const request *r,
         buf_puts(&tool_error,
                  "\nThe previous assistant output was not executed because the Solar tool syntax was malformed. "
                  "Emit a new valid native Solar tool call, or answer normally if no tool is needed.");
+    } else if (qwen) {
+        buf_puts(&tool_error,
+                 "\nThe previous assistant output was not executed because the Qwen tool syntax was malformed. "
+                 "Emit a new valid native Qwen tool call, or answer normally if no tool is needed.");
     } else {
         buf_puts(&tool_error,
                  "\nThe previous assistant output was not executed because the DSML syntax was malformed. "
@@ -14014,6 +14412,18 @@ static char *build_invalid_tool_error_suffix(const request *r,
         buf_puts(&suffix, DS4_SOLAR_THINK_START);
         if (!r || !ds4_think_mode_enabled(r->think_mode))
             buf_puts(&suffix, DS4_SOLAR_THINK_END);
+    } else if (qwen) {
+        buf_puts(&suffix, DS4_QWEN_IM_END "\n"
+                          DS4_QWEN_IM_START "user\n"
+                          DS4_QWEN_TOOL_RESPONSE_START "\n");
+        append_qwen_tool_response_span(&suffix,
+                                       tool_error.ptr ? tool_error.ptr : "",
+                                       tool_error.len);
+        buf_puts(&suffix, "\n" DS4_QWEN_TOOL_RESPONSE_END
+                          DS4_QWEN_IM_END "\n"
+                          DS4_QWEN_IM_START "assistant\n<think>\n");
+        if (!r || !ds4_think_mode_enabled(r->think_mode))
+            buf_puts(&suffix, "\n</think>\n\n");
     } else {
         buf_puts(&suffix, "<｜end▁of▁sentence｜><｜User｜><tool_result>");
         append_tool_result_text(&suffix, tool_error.ptr ? tool_error.ptr : "");
@@ -14232,6 +14642,19 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
         buf_puts(&suffix, "<|endofassistant|>");
         return buf_take(&suffix);
     }
+    if (r->chat_format == DS4_CHAT_FORMAT_QWEN4EXP) {
+        if (ds4_think_mode_enabled(r->think_mode)) {
+            motif3_buf_put_trimmed(&suffix, reasoning);
+            buf_puts(&suffix, "\n</think>\n\n");
+        }
+        const size_t content_start = suffix.len;
+        motif3_buf_put_trimmed(&suffix, content);
+        if (calls && calls->len > 0 && suffix.len > content_start)
+            buf_puts(&suffix, "\n\n");
+        append_qwen_tool_calls_text(&suffix, calls, &r->tool_orders);
+        buf_puts(&suffix, DS4_QWEN_IM_END "\n");
+        return buf_take(&suffix);
+    }
     if (ds4_think_mode_enabled(r->think_mode)) {
         buf_puts(&suffix, reasoning ? reasoning : "");
         buf_puts(&suffix, chat_think_end(r->chat_format));
@@ -14291,6 +14714,20 @@ static char *build_responses_visible_assistant_suffix(const request *r,
         buf_puts(&suffix, "<|endofassistant|>");
         return buf_take(&suffix);
     }
+    if (r->chat_format == DS4_CHAT_FORMAT_QWEN4EXP) {
+        if (ds4_think_mode_enabled(r->think_mode)) {
+            if (r->reasoning_summary_emit && calls && calls->len > 0)
+                motif3_buf_put_trimmed(&suffix, reasoning);
+            buf_puts(&suffix, "\n</think>\n\n");
+        }
+        const size_t content_start = suffix.len;
+        motif3_buf_put_trimmed(&suffix, content);
+        if (calls && calls->len > 0 && suffix.len > content_start)
+            buf_puts(&suffix, "\n\n");
+        append_qwen_tool_calls_text(&suffix, calls, &r->tool_orders);
+        buf_puts(&suffix, DS4_QWEN_IM_END "\n");
+        return buf_take(&suffix);
+    }
     if (ds4_think_mode_enabled(r->think_mode)) {
         if (r->reasoning_summary_emit && calls && calls->len > 0) {
             buf_puts(&suffix, reasoning ? reasoning : "");
@@ -14336,6 +14773,21 @@ static char *build_toolless_thinking_visible_prefix(const request *r,
     if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
 
     size_t pt_len = strlen(r->prompt_text);
+    if (r->chat_format == DS4_CHAT_FORMAT_QWEN4EXP) {
+        static const char generation_prefix[] = "<think>\n";
+        const size_t prefix_len = sizeof(generation_prefix) - 1;
+        if (pt_len < prefix_len ||
+            memcmp(r->prompt_text + pt_len - prefix_len,
+                   generation_prefix, prefix_len) != 0)
+            return NULL;
+
+        buf visible = {0};
+        buf_puts(&visible, r->prompt_text);
+        buf_puts(&visible, "\n</think>\n\n");
+        motif3_buf_put_trimmed(&visible, content);
+        if (terminal) buf_puts(&visible, DS4_QWEN_IM_END "\n");
+        return buf_take(&visible);
+    }
     if (r->model_syntax == SERVER_MODEL_SYNTAX_EXAONE) {
         static const char generation_prefix[] = "<think>\n";
         const size_t prefix_len = sizeof(generation_prefix) - 1;
@@ -24733,6 +25185,115 @@ static void test_solar_native_anthropic_tool_result_rendering(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_qwen4exp_native_chat_protocol(void) {
+    static const char xhigh[] =
+        "Reasoning effort is set to xhigh. Please think carefully through the "
+        "task, validate key assumptions, consider plausible alternatives, and "
+        "prioritize correctness, consistency, and clarity in the final answer.";
+    chat_msgs msgs = {0};
+    chat_msg system = {.role = xstrdup("system"),
+                       .content = xstrdup("Be precise.")};
+    chat_msg user = {.role = xstrdup("user"),
+                     .content = xstrdup("Weather?")};
+    chat_msgs_push(&msgs, system);
+    chat_msgs_push(&msgs, user);
+
+    char *prompt = render_chat_prompt_text_choice_format(
+        &msgs, NULL, NULL, DS4_THINK_HIGH, TOOL_CHOICE_AUTO,
+        DS4_CHAT_FORMAT_QWEN4EXP);
+    buf expected = {0};
+    buf_puts(&expected, "<|im_start|>system\n");
+    buf_puts(&expected, xhigh);
+    buf_puts(&expected,
+             "\n\nBe precise.<|im_end|>\n"
+             "<|im_start|>user\nWeather?<|im_end|>\n"
+             "<|im_start|>assistant\n<think>\n");
+    TEST_ASSERT(prompt && !strcmp(prompt, expected.ptr));
+    free(prompt);
+    buf_free(&expected);
+
+    prompt = render_chat_prompt_text_choice_format(
+        &msgs, NULL, NULL, DS4_THINK_NONE, TOOL_CHOICE_AUTO,
+        DS4_CHAT_FORMAT_QWEN4EXP);
+    TEST_ASSERT(prompt && !strcmp(prompt,
+        "<|im_start|>system\nBe precise.<|im_end|>\n"
+        "<|im_start|>user\nWeather?<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+    free(prompt);
+    chat_msgs_free(&msgs);
+
+    const char *schemas =
+        "{\"name\":\"weather\",\"parameters\":{\"type\":\"object\","
+        "\"properties\":{\"city\":{\"type\":\"string\"},"
+        "\"days\":{\"type\":\"integer\"}}}}";
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders, schemas);
+    const char *generated =
+        "<think>\nNeed weather.\n</think>\n\n"
+        "<tool_call>\n<function=weather>\n"
+        "<parameter=city>\nSeoul\n</parameter>\n"
+        "<parameter=days>\n2\n</parameter>\n"
+        "</function>\n</tool_call>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex_format(
+        generated, true, DS4_CHAT_FORMAT_QWEN4EXP, &orders,
+        &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.len == 1 && !strcmp(calls.v[0].name, "weather"));
+    TEST_ASSERT(calls.len == 1 && strstr(calls.v[0].arguments,
+                                         "\"city\": \"Seoul\"") != NULL);
+    TEST_ASSERT(calls.len == 1 && strstr(calls.v[0].arguments,
+                                         "\"days\": 2") != NULL);
+    TEST_ASSERT(content && !content[0]);
+    TEST_ASSERT(reasoning && strstr(reasoning, "Need weather.") != NULL);
+    TEST_ASSERT(calls.raw_dsml && strstr(calls.raw_dsml, "<function=weather>"));
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.chat_format = DS4_CHAT_FORMAT_QWEN4EXP;
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
+    r.think_mode = DS4_THINK_HIGH;
+    char *suffix = build_tool_checkpoint_suffix(
+        &r, content, reasoning, &calls);
+    TEST_ASSERT(suffix && strstr(suffix,
+        "Need weather.\n</think>\n\n<tool_call>\n<function=weather>") == suffix);
+    TEST_ASSERT(suffix && strstr(suffix, "</tool_call><|im_end|>\n") != NULL);
+    free(suffix);
+
+    chat_msgs tail_msgs = {0};
+    chat_msg tool = {.role = xstrdup("tool"), .content = xstrdup("sunny")};
+    chat_msgs_push(&tail_msgs, tool);
+    char *tail = render_live_tool_tail_format(
+        &tail_msgs, 0, DS4_THINK_HIGH, DS4_CHAT_FORMAT_QWEN4EXP);
+    TEST_ASSERT(tail && !strcmp(tail,
+        "<|im_end|>\n<|im_start|>user\n<tool_response>\n"
+        "sunny\n</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n"));
+    free(tail);
+    chat_msgs_free(&tail_msgs);
+
+    r.has_tools = true;
+    r.think_mode = DS4_THINK_NONE;
+    sem_accum acc;
+    sem_accum_init(&acc, &r);
+    sem_feed feed = sem_accum_feed(
+        &acc, &r, "<tool_call>\n<function=weather>\n</function>\n",
+        strlen("<tool_call>\n<function=weather>\n</function>\n"));
+    TEST_ASSERT(feed.entered_tool_block && acc.saw_tool_start);
+    feed = sem_accum_feed(&acc, &r, "</tool_call>", 12);
+    TEST_ASSERT(feed.tool_block_closed && acc.saw_tool_end);
+    TEST_ASSERT(acc.verdict == NULL);
+    sem_accum_free(&acc);
+    request_free(&r);
+
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    tool_schema_orders_free(&orders);
+}
+
 static void test_reasoning_effort_mapping(void) {
     ds4_think_mode mode = DS4_THINK_NONE;
     /* The three levels are distinct now; aliases round DOWN to the nearest. */
@@ -25807,6 +26368,7 @@ static void test_no_tools_unclosed_thinking_uses_reasoning_channel(void) {
         { DS4_CHAT_FORMAT_DSML, "unfinished DSML reasoning" },
         { DS4_CHAT_FORMAT_SOLAR_OPEN2, "unfinished Solar reasoning" },
         { DS4_CHAT_FORMAT_EXAONE, "unfinished EXAONE reasoning" },
+        { DS4_CHAT_FORMAT_QWEN4EXP, "unfinished Qwen reasoning" },
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -27578,10 +28140,14 @@ static void test_server_model_ids_cover_loaded_variants(void) {
     TEST_ASSERT(!strcmp(server_model_id_from_variant(3), "motif-3"));
     TEST_ASSERT(!strcmp(server_model_id_from_variant(4),
                         "k-exaone-236b-a23b"));
+    TEST_ASSERT(!strcmp(server_model_id_from_variant(5), "dots3-note-prev"));
+    TEST_ASSERT(!strcmp(server_model_id_from_variant(6),
+                        "qwen3.8-flash-next"));
     TEST_ASSERT(server_model_alias_known("solar-open2-250b"));
     TEST_ASSERT(server_model_alias_known("motif-3"));
     TEST_ASSERT(server_model_alias_known("Motif-3-Mixed-Quant-GGUF"));
     TEST_ASSERT(server_model_alias_known("K-EXAONE-236B-A23B"));
+    TEST_ASSERT(server_model_alias_known("Qwen/Qwen3.8-Flash-Next"));
 }
 
 static void test_model_id_from_gguf_path(void) {
@@ -33787,6 +34353,7 @@ static void ds4_server_unit_tests_run(void) {
     test_solar_tool_choice_prompt_is_cache_stable();
     test_solar_native_tool_recovery();
     test_solar_native_anthropic_tool_result_rendering();
+    test_qwen4exp_native_chat_protocol();
     test_reasoning_effort_mapping();
     test_model_family_aliases();
     test_api_thinking_controls_parse();

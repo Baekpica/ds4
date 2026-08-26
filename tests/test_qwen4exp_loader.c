@@ -58,6 +58,16 @@ int main(int argc, char **argv) {
         model_close(&model);
         return 1;
     }
+    if (!qwen4exp_ple_cache_mb_valid(512u) ||
+        !qwen4exp_ple_cache_mb_valid(1024u) ||
+        !qwen4exp_ple_cache_mb_valid(2048u) ||
+        qwen4exp_ple_cache_mb_valid(511u) ||
+        qwen4exp_ple_cache_mb_valid(513u) ||
+        qwen4exp_ple_cache_mb_valid(4096u)) {
+        fprintf(stderr, "Qwen4Exp PLE cache-size contract is invalid\n");
+        model_close(&model);
+        return 1;
+    }
 
     ds4_str quantization = {0};
     const bool external_ple =

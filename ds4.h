@@ -51,6 +51,7 @@ typedef enum {
     DS4_CHAT_FORMAT_DSML = 0,
     DS4_CHAT_FORMAT_SOLAR_OPEN2 = 1,
     DS4_CHAT_FORMAT_EXAONE = 2,
+    DS4_CHAT_FORMAT_QWEN4EXP = 3,
 } ds4_chat_format;
 
 typedef enum {

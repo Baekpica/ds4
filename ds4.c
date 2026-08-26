@@ -21007,6 +21007,8 @@ static bool qwen4exp_graph_forward_chunk(
         pos0 > graph->context_cap || rows > graph->context_cap - pos0)
         return false;
     char ple_error[256] = {0};
+    /* Submit SSD reads before token embedding and decoder layer 0; the PLE
+     * rows are first consumed at layer 1, so those GPU stages hide I/O. */
     if (!qwen4exp_ple_prepare(
             &graph->ple, ple_store, tokens, rows,
             ple_error, sizeof(ple_error))) {
@@ -30061,6 +30063,10 @@ struct ds4_engine {
     uint64_t mtp_guard_hits;
 };
 
+static bool qwen4exp_ple_cache_mb_valid(uint32_t cache_mb) {
+    return cache_mb == 512u || cache_mb == 1024u || cache_mb == 2048u;
+}
+
 #ifndef DS4_NO_GPU
 static uint32_t qwen4exp_env_u32(const char *name, uint32_t fallback,
                                  uint32_t minimum, uint32_t maximum) {
@@ -30099,8 +30105,15 @@ static bool qwen4exp_engine_open_ple(ds4_engine *engine,
     } else {
         strcpy(root, ".");
     }
-    const uint32_t cache_mb = qwen4exp_env_u32(
-        "DS4_QWEN_PLE_CACHE_MB", 512u, 16u, 16384u);
+    uint32_t cache_mb = qwen4exp_env_u32(
+        "DS4_QWEN_PLE_CACHE_MB", 512u, 512u, 2048u);
+    if (!qwen4exp_ple_cache_mb_valid(cache_mb)) {
+        fprintf(stderr,
+                "ds4: ignoring DS4_QWEN_PLE_CACHE_MB=%u "
+                "(supported: 512, 1024, 2048); using 512\n",
+                cache_mb);
+        cache_mb = 512u;
+    }
     const uint32_t workers = qwen4exp_env_u32(
         "DS4_QWEN_PLE_WORKERS", 4u, 1u, 64u);
     char error[512] = {0};
@@ -58465,6 +58478,8 @@ ds4_chat_format ds4_engine_chat_format(ds4_engine *e) {
         return DS4_CHAT_FORMAT_SOLAR_OPEN2;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_EXAONE_MOE)
         return DS4_CHAT_FORMAT_EXAONE;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP)
+        return DS4_CHAT_FORMAT_QWEN4EXP;
     return DS4_CHAT_FORMAT_DSML;
 }
 
