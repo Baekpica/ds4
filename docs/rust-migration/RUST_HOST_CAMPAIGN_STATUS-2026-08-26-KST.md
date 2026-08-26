@@ -7,14 +7,15 @@
 
 | 항목 | 값 |
 |---|---|
-| Branch | `rust-host` (`origin/rust-host`와 동기화; 이 스탬프가 다음 CAND) |
-| HEAD | `05a9357` `Rust(server): Tick cont lane entry on the stranded fallback` (마지막 코드). 이 문서 스탬프가 그 위. |
+| Branch | `rust-host` (`origin/rust-host`와 동기화) |
+| HEAD | `05a9357` 마지막 코드. 공식 표 CAND는 `11c59e4` (그 위 docs). |
 | C golden | `v0.6.3-dfm` (`516456fe35510e4fb8350396c9d88807ac1f760b`) |
 | 기본 바이너리 | 여전히 C (`ds4` / `ds4-server` / `ds4-bench` / `ds4-agent`) |
 | Rust shadow | `ds4-rs` / `ds4-server-rs` / `ds4-bench-rs` / `ds4-agent-rs` |
-| Phase 9 | **NOT_GREEN** — 이름 승격·`SPLIT_READINESS.md` 없음. `Baekpica/dfm-rs`는 스캐폴드만 (`a293973`, 시딩 전). |
+| §10 todo-54 | **GREEN** (호스트-패리티; PASS* 포함). 증거 `task-54-rerun-11c59e4.txt` |
+| Phase 9 | **미실행** — 이름 승격(T1.5) 전. `SPLIT_READINESS.md` 없음. `dfm-rs`는 스캐폴드만. |
 | 플랜 | `.omo/plans/rust-host-remaining-to-phase-9.md` (todos 1–61 `[x]`, F1–F4는 최종 감사) |
-| 작업트리 재검증 | 2026-08-26 19:00 KST. §10 셰이크아웃 drain + ENGINE_GAPS E-2..E-5 C-control 확정 (§3.14). |
+| 작업트리 재검증 | 2026-08-26 20:30 KST. 공식 60셀 GREEN (§3.15). |
 
 증거는 `.omo/evidence/task-*-rust-host-remaining-to-phase-9.txt`에 있다
 (untracked, `git add` 금지 목록).
@@ -23,14 +24,11 @@
 
 ## 1. 한 줄 결론
 
-호스트 잔여 **코드 슬라이스(Wave A–B)와 cheap-gate는 닫혔다.**
-DeepSeek KV/static과 Motif ABBA/tool-map/evict/periodic도 **PASS**다.
-Rust HTTP `CONTINUOUS=0` n=1은 C `worker_main`처럼 serial로 접힌다
-(`40a321c`). §10 셰이크아웃(CAND `f368131`)은 drain됐다. 남은
-BLOCKED는 TickOp KEEP와 ENGINE_GAPS E-1..E-5(전부 C-control
-reproduced → 공식 런에서 `PASS*` 가능). 계약상 **GREEN이 아니고**,
-production 이름은 C다. 공식 60셀은 `05a9357`+이 스탬프 CAND에서 다시
-돈다.
+호스트-패리티 **§10 GREEN** (CAND `11c59e4`, todo-54). 60셀
+FAIL=0 BLOCKED=0. PASS* 5셀은 E-2..E-6 (C-control reproduced).
+production 이름은 아직 C. Phase 9 승격(T1.5)은 다음 일이다.
+`STATUS.md` / `PARITY_MATRIX.md` / `SPLIT_READINESS.md` / dfm-rs
+시딩은 승격 후 재실행(T1.6) 전 금지.
 
 대략:
 
@@ -298,10 +296,9 @@ PASS다.**
    `PASS*(engine-gap E-n)`으로 표기하고 todo-54 판정에서 PASS로
    계수한다. C는 통과하는데 Rust만 실패하면 FAIL 유지. 셀 삭제·완화
    금지. 레지스트리는 [ENGINE_GAPS.md](ENGINE_GAPS.md)
-   (E-1 Motif partial cached=0 / E-2 EXAONE prewarm IMA / **E-3
-   Solar IMA** / E-4 Motif batch 디코드 / E-5 Motif resident RSS —
-   전부 C-control reproduced. E-3는 셰이크아웃 G3 C standalone 부트
-   + golden `test_solar_session`으로 확정).
+   (E-1 Motif partial cached=0 / E-2 EXAONE IMA / E-3 Solar IMA /
+   E-4 Motif batch / E-5 Motif resident RSS / **E-6 dots3 chunk/ring
+   logit parity** — 전부 C-control reproduced).
 2. **dfm-rs 시딩은 문서대로**: SPLIT_READINESS green 후 genesis SHA를
    `a293973` 위에 ancestry force-push. 그 전에는 코드 push 금지.
 3. **로컬 클론은 workspace 루트** `../dfm-rs` (이동 완료; main
@@ -314,16 +311,11 @@ web_tools.rs cwd flake proper fix(`0f8b1cb` — dirty 해소, tracked
 클린), split 문서 통합(`de372e9` — 두 초안 SUPERSEDED로 tracked화),
 ENGINE_GAPS.md(`054109c`), workspace CLAUDE.md에 dfm-rs 행 추가.
 
-**남은 로드맵 (승인된 플랜 §Track 1–2):** T1.2 하니스(CTX=8192,
-owner-resident, 새 CAND 증거 경로) → T1.3 후보 HEAD 동결(`05a9357`+이
-스탬프) → todo-53 60셀 §10 **공식** 재실행(G0 no-model / G1 DeepSeek
-/ G2 Motif+ABBA / G3 Solar / G4 EXAONE / G5 dots3) → todo-54 판정 →
-GREEN이면 §18.2 원자 승격(Rust가 기본 이름, C→`*-c`, proof oracle
-`./ds4-c` 재배선 + 동일-inode/해시 가드) → 승격 후 §10 전량 재실행 +
-§18.3 pre/post SHA 동일성 → STATUS/PARITY 재도색(todo 55) →
-soak(§18.1 hard blocker; DeepSeek 2h 혼합 트래픽) →
-SPLIT_READINESS.md + genesis 태그(todo 57) → dfm-rs ancestry
-force-push → naming Phase A/B(§6) → v0.1.0-rc.N → v0.1.0.
+**남은 로드맵:** T1.3 공식 60셀 + T1.4 GREEN 완료 (§3.15). 다음
+T1.5 §18.2 원자 승격(Rust가 기본 이름, C→`*-c`, proof oracle
+`./ds4-c` + 동일-inode/해시 가드) → T1.6 승격 후 §10 전량 재실행 +
+§18.3 pre/post SHA → T1.7 STATUS/PARITY 재도색 → T1.8 soak →
+T1.9 SPLIT_READINESS + genesis → T1.10 push → T2.2 dfm-rs 시딩.
 
 운영 메모: 이 스크립트의 worker teardown이 owner가 아직 살아 있는 상태에서
 `clear_cache`를 한 번 호출했다 (`TEARDOWN_COMPUTE_STILL_ALIVE` 후).
@@ -369,9 +361,34 @@ clear_cache와 host 확인(compute 앱 0, avail 117Gi)은 정상.
 
 ENGINE_GAPS.md는 E-2/E-3 확장 + E-4/E-5 신설. 엔진 수리 커밋 없음.
 
+### 3.15 2026-08-26 밤 — 공식 §10 GREEN (CAND `11c59e4`)
+
+증거: `.omo/evidence/task-53-rerun-11c59e4.txt`,
+`.omo/evidence/task-54-rerun-11c59e4.txt`,
+`scratch/rust-host-live/gate-11c59e4/`.
+
+60셀: PASS 55 + PASS* 5 (E-2..E-6) + FAIL 0 + BLOCKED 0 → **GREEN**.
+
+| 그룹 | 결과 |
+|---|---|
+| G0 | 14 PASS |
+| G1a DeepSeek KV+vectors | 7 PASS (`CTX=8192`) |
+| G1b surfaces+proofs | 16 PASS — (10.*) 12셀 전부 PASS (`05a9357`) |
+| G2 Motif | (5.1–5.4) PASS; (5.5) PASS*(E-5); (5.6) PASS*(E-4); (3.shutdown) PASS; (11) PASS; (13) ABBA PASS (prefill 100.09%, decode 101.0%, TTFT +0.9%, HWM +1.0%) |
+| G3 Solar | (6.1–6.3, 6.5–6.9) PASS; (6.4) PASS*(E-3); E-3 C-control reproduced |
+| G4 EXAONE | (7.1–7.2) PASS; (7.3) PASS*(E-2) |
+| G5 dots3 | (8.1–8.2) PASS; (8.3) PASS*(E-6) |
+
+G2 첫 패스는 `barrier_pair` `set -u`로 (11)에서 죽음. (11)/(13)은
+`run-g2-rem2.sh`로 재스탬프. (8.3) golden `516456f`가 candidate와
+같은 chunk/ring 수치로 실패 → E-6.
+
+호스트 FAIL은 없다. 엔진 갭은 ENGINE_GAPS에만 남는다. **이름 승격은
+아직 없다.**
+
 ---
 
-## 4. §10 비교 결과 (GREEN 아님)
+## 4. §10 비교 결과 (CAND `11c59e4` = GREEN)
 
 계약: **모든 열거 셀이 PASS**여야 GREEN. FAIL 또는 BLOCKED가 하나라도 있으면
 NOT_GREEN. crate 컴파일은 GREEN이 아니다.
@@ -742,20 +759,17 @@ Motif continuous+static 4 surface, family Makefile 셀,
 serial rightsize 호스트 이식(`fba963e`) + Motif rust serial 4-surface
 재스탬프 (§3.11).
 
-남아 있는 BLOCKED (GREEN 금지; 공식 런에서 `PASS*` 가능한 것은 표기):
+§10 호스트-패리티는 GREEN. 엔진 갭은 백로그 (승격과 혼합 금지):
 
-1. TickOp 소비 — C continuous 루프 KEEP. 새 CUDA 스케줄러를 만들지 말 것
-2. Motif partial HTTP `cached=0` — E-1, C-control reproduced → `PASS*`
-3. EXAONE standalone / `test-exaone-batch` IMA — E-2 → `PASS*`
-   (정본은 owner+worker serial, §3.12 phase C)
+1. TickOp 소비 — C continuous 루프 KEEP
+2. E-1 Motif partial HTTP `cached=0` (이 60셀의 셀-오브-레코드 아님)
+3. E-2 EXAONE IMA — 정본 owner+worker
 4. sibling mmap — KEEP
-5. Solar standalone / `test-solar-session` IMA — E-3 → `PASS*`
-   (정본은 owner+worker)
-6. Motif batch 디코드 divergence — E-4 → `PASS*`
-7. Motif resident RSS 한계 — E-5 → `PASS*`
+5. E-3 Solar IMA — 정본 owner+worker
+6. E-4 Motif batch / E-5 Motif RSS / E-6 dots3 chunk/ring
 
-다음 손: T1.2 하니스 → T1.3 CAND 동결 → 공식 §10 60셀.
-§10 전체를 FAIL=0 / BLOCKED=0으로 다시 채운 뒤에만 GREEN/Phase 9를 논한다.
+다음 손: **T1.5 원자 승격**. `STATUS.md` / `PARITY_MATRIX.md` /
+`SPLIT_READINESS.md` / dfm-rs 시딩은 T1.6 전 금지.
 production 이름 변경, `SPLIT_READINESS.md`, `dfm-rs`,
 `STATUS.md` / `PARITY_MATRIX.md` 재작성은 하지 않는다.
 

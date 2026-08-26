@@ -97,3 +97,21 @@ C `v0.6.3-dfm`과 Rust 호스트가 **동일하게** 보이는 엔진 측 결함
   `gate-20260826/golden-logs/motif-resident.log` (golden).
 - **스코프:** 엔진/테스트 한계 (residency 스모크 한계 재산정 필요).
 - **상태:** Open.
+
+## E-6 — dots3 residency smoke chunk/ring logit parity
+
+- **증상:** VMM owner 하에 `test-dots3-resident`가 chunk/ring 세션에서
+  `logit parity mismatch`로 실패. 수치
+  `first=63594/63594 batch_cos=0.98607464 batch_nrmse=0.201895
+  cache_cos=1 cache_nrmse=0 decode=0 tok/s`. residency gate는
+  `chunk=0` (나머지 metadata/forward/session/dsa/cache256/release=1).
+- **C-control:** **reproduced** — v0.6.3-dfm golden
+  `test_dots3_resident`가 **동일 수치·동일 gate**로 실패
+  (`gate-11c59e4/golden-logs/dots3-resident.log`; 토큰속도만
+  264 vs 216 tok/s). rust-host 무관.
+- **Canonical 경로:** loader/tokenizer PASS. 서빙 스모크는 별도
+  (`family-serve` dots3 standalone는 이전에 PASS).
+- **증거:** `gate-11c59e4/g5-logs/dots3-resident-owner.log` (candidate),
+  `gate-11c59e4/golden-logs/dots3-resident.log` (golden).
+- **스코프:** 엔진/픽스처 (dots3 chunk/ring logit 게이트).
+- **상태:** Open.
