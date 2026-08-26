@@ -11,9 +11,9 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
-#[cfg(feature = "native")]
-use ds4_kv::bank_checkpoint_due;
 use ds4_kv::Store as KvStore;
+#[cfg(feature = "native")]
+use ds4_kv::{bank_checkpoint_due_from_host, HostKvView};
 #[cfg(any(feature = "native", test))]
 use ds4_kv::{bank_persist_ext_flags, Reason as KvReason};
 
@@ -1584,7 +1584,13 @@ mod native {
                 .is_none_or(|record| record.generation != snapshot.generation)
                 || committed < min_committed
                 || (due_only
-                    && !bank_checkpoint_due(&store.opt, committed, self.warm[bank].stored_tokens))
+                    && !bank_checkpoint_due_from_host(
+                        &store.opt,
+                        HostKvView {
+                            live_tokens: committed,
+                            stored_tokens: self.warm[bank].stored_tokens,
+                        },
+                    ))
             {
                 return;
             }

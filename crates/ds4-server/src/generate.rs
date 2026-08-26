@@ -17,9 +17,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ds4_kv::Store as KvStore;
 #[cfg(any(feature = "native", test))]
 use ds4_kv::{
-    chat_anchor_pos as kv_chat_anchor_pos, continued_store_target as kv_continued_store_target,
-    store_len as kv_store_len, Header as KvHeader, Reason as KvReason, EXT_THINKING_VISIBLE,
-    EXT_TOOL_MAP,
+    chat_anchor_pos as kv_chat_anchor_pos, continued_store_target_from_host,
+    store_len as kv_store_len, Header as KvHeader, HostKvView, Reason as KvReason,
+    EXT_THINKING_VISIBLE, EXT_TOOL_MAP,
 };
 
 use crate::dsml::{SampleOverride, SamplePolicy};
@@ -296,13 +296,23 @@ fn try_store_live(
 }
 
 #[cfg(any(feature = "native", test))]
+fn continued_target(store: &KvStore, live_tokens: i32) -> i32 {
+    continued_store_target_from_host(
+        &store.opt,
+        HostKvView {
+            live_tokens,
+            stored_tokens: store.continued_last_store_tokens,
+        },
+    )
+}
+
+#[cfg(any(feature = "native", test))]
 fn try_store_continued(
     io: &mut impl SerialKvIo,
     store: &mut KvStore,
     identity: (u8, u8, u32),
 ) -> Result<bool, GenerateError> {
-    let target =
-        kv_continued_store_target(&store.opt, store.continued_last_store_tokens, io.live_len());
+    let target = continued_target(store, io.live_len());
     if target == 0 {
         return Ok(false);
     }
@@ -351,7 +361,7 @@ fn sync_maybe_checkpoint(
 
 #[cfg(any(feature = "native", test))]
 fn suppress_continued(store: &mut KvStore, target: i32) -> Option<i32> {
-    if kv_continued_store_target(&store.opt, store.continued_last_store_tokens, target) != target {
+    if continued_target(store, target) != target {
         return None;
     }
     let old = store.continued_last_store_tokens;
@@ -1727,11 +1737,7 @@ impl SerialKvIo for NativeSerialKvIo<'_, '_, '_, '_> {
                 if current <= cached_floor {
                     return;
                 }
-                let target = kv_continued_store_target(
-                    &store.opt,
-                    store.continued_last_store_tokens,
-                    current,
-                );
+                let target = continued_target(store, current);
                 if target == 0 {
                     return;
                 }
