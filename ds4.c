@@ -58778,7 +58778,7 @@ static bool exaone_graph_session_fit_check(ds4_backend backend,
 
 static uint32_t qwen4exp_graph_prefill_cap_for_context(uint32_t ctx_size) {
     uint32_t capacity = qwen4exp_env_u32(
-        "DS4_QWEN_PREFILL_CHUNK", 256u, 1u, 512u);
+        "DS4_QWEN_PREFILL_CHUNK", 256u, 1u, 8192u);
     if (capacity > ctx_size) capacity = ctx_size;
     return capacity;
 }

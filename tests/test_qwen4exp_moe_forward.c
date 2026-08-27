@@ -1,9 +1,9 @@
-/* Real-artifact H200 parity for the complete Qwen4Exp text MoE body.
+/* Real-artifact CUDA parity for the complete Qwen4Exp text MoE body.
  *
  * The public layer-2 router first chooses the real top-10 experts. Only those
  * expert slices plus the always-active shared matrices are copied into a
- * compact fixture, keeping the 90.96 GiB backbone mmap non-resident while
- * preserving the exact published Q5_K/Q6_K/Q5_0 bytes used by the forward. */
+ * compact fixture, keeping the published backbone mmap non-resident while
+ * preserving the exact published variant-selected bytes used by the forward. */
 #include "../ds4.c"
 
 #include <math.h>
@@ -243,11 +243,17 @@ int main(int argc, char **argv) {
     ds4_weights weights;
     weights_bind(&weights, &model, false, 0, DS4_N_LAYER - 1u, true, false);
     const ds4_layer_weights *layer = &weights.layer[TEST_LAYER];
+    ds4_str quantization = {0};
+    uint32_t gate_type = 0u, down_type = 0u, tail_type = 0u;
+    REQUIRE(model_get_string(&model, "general.quantization", &quantization) &&
+            qwen4exp_ssd_precision_types(
+                quantization, NULL, &gate_type, &down_type, &tail_type),
+            "published SSD-PLE precision map");
     REQUIRE(layer->ffn_gate_inp->type == DS4_TENSOR_F32 &&
-            layer->ffn_gate_exps->type == DS4_TENSOR_Q5_K &&
-            layer->ffn_up_exps->type == DS4_TENSOR_Q5_K &&
-            layer->ffn_down_exps->type == DS4_TENSOR_Q6_K &&
-            layer->ffn_down_exps_tail->type == DS4_TENSOR_Q5_0 &&
+            layer->ffn_gate_exps->type == gate_type &&
+            layer->ffn_up_exps->type == gate_type &&
+            layer->ffn_down_exps->type == down_type &&
+            layer->ffn_down_exps_tail->type == tail_type &&
             layer->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
             layer->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
             layer->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
@@ -463,11 +469,11 @@ int main(int argc, char **argv) {
     }
     printf("%-48s pass (10 ids and weights)\n",
            "real F32 router -> normalized top-10");
-    compare_metrics("real Q5_K gate/up -> weighted SwiGLU",
+    compare_metrics("real routed gate/up -> weighted SwiGLU",
                     gpu_mid, cpu_mid,
                     (uint64_t)TEST_USED * TEST_EXPERT_FF,
                     2.0e-2, 2.0e-3);
-    compare_metrics("real Q6_K main + Q5_0 tail per expert",
+    compare_metrics("real routed main + Q5_0 tail per expert",
                     gpu_down, cpu_down,
                     (uint64_t)TEST_USED * TEST_HIDDEN,
                     3.0e-2, 3.0e-3);
