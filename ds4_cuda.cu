@@ -8217,6 +8217,7 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
         const float *xscale,
         uint64_t in_dim,
         uint64_t out_dim,
+        uint64_t out_stride,
         uint64_t n_tok,
         uint64_t blocks,
         int use_dp4a) {
@@ -8239,7 +8240,7 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
         acc += __half2float(*scale_h) * xsr[b] * (float)dot;
     }
     acc = warp_sum_f32(acc);
-    if (lane == 0) out[tok * out_dim + row] = acc;
+    if (lane == 0) out[tok * out_stride + row] = acc;
 }
 
 __global__ static void matmul_q8_0_preq_n2_warp8_kernel(
@@ -23623,6 +23624,7 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
                 xscale,
                 in_dim,
                 out_dim,
+                out_dim,
                 n_tok,
                 blocks,
                 use_dp4a);
@@ -24204,19 +24206,50 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                         "ds4: q8 pair prefill using aligned Q8_0 artifacts\n");
             }
         } else {
-            matmul_q8_0_pair_preq_batch_warp8_kernel<<<grid, 256, 0, ds4_current_stream()>>>(
-                    (float *)out0->ptr,
-                    (float *)out1->ptr,
-                    reinterpret_cast<const unsigned char *>(w0),
-                    reinterpret_cast<const unsigned char *>(w1),
-                    xq,
-                    xscale,
-                    in_dim,
-                    out0_dim,
-                    out1_dim,
-                    n_tok,
-                    blocks,
-                    use_dp4a);
+            /* PLE key is four times wider than value: keep the paired prefix,
+             * then run the key-only tail without a dead second accumulator. */
+            const bool qwen_ple_asymmetric =
+                in_dim == 2560u && out0_dim == 10240u && out1_dim == 2560u &&
+                n_tok >= 64u &&
+                getenv("DS4_CUDA_NO_Q8_PAIR_ASYM_SPLIT") == NULL;
+            if (qwen_ple_asymmetric) {
+                dim3 pair_grid(((unsigned)out1_dim + 7u) / 8u,
+                               (unsigned)n_tok, 1);
+                matmul_q8_0_pair_preq_batch_warp8_kernel<<<
+                    pair_grid, 256, 0, ds4_current_stream()>>>(
+                        (float *)out0->ptr,
+                        (float *)out1->ptr,
+                        reinterpret_cast<const unsigned char *>(w0),
+                        reinterpret_cast<const unsigned char *>(w1),
+                        xq, xscale, in_dim, out0_dim, out1_dim, n_tok,
+                        blocks, use_dp4a);
+
+                const uint64_t tail_dim = out0_dim - out1_dim;
+                dim3 tail_grid(((unsigned)tail_dim + 7u) / 8u,
+                               (unsigned)n_tok, 1);
+                matmul_q8_0_preq_batch_warp8_kernel<<<
+                    tail_grid, 256, 0, ds4_current_stream()>>>(
+                        (float *)out0->ptr + out1_dim,
+                        reinterpret_cast<const unsigned char *>(w0) +
+                            out1_dim * blocks * 34u,
+                        xq, xscale, in_dim, tail_dim, out0_dim, n_tok,
+                        blocks, use_dp4a);
+            } else {
+                matmul_q8_0_pair_preq_batch_warp8_kernel<<<
+                    grid, 256, 0, ds4_current_stream()>>>(
+                        (float *)out0->ptr,
+                        (float *)out1->ptr,
+                        reinterpret_cast<const unsigned char *>(w0),
+                        reinterpret_cast<const unsigned char *>(w1),
+                        xq,
+                        xscale,
+                        in_dim,
+                        out0_dim,
+                        out1_dim,
+                        n_tok,
+                        blocks,
+                        use_dp4a);
+            }
         }
     }
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");

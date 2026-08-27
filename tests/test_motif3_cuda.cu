@@ -1101,6 +1101,13 @@ static void test_q8_pair_profile(const char *mode) {
         out1_dim = 13824u;
         name0 = "blk.0.ffn_gate.weight";
         name1 = "blk.0.ffn_up.weight";
+    } else if (!std::strcmp(mode, "qwen-ple")) {
+        in_dim = 2560u;
+        n_tok = 256u;
+        out0_dim = 10240u;
+        out1_dim = 2560u;
+        name0 = "blk.1.ple.key.weight";
+        name1 = "blk.1.ple.value.weight";
     } else {
         fprintf(stderr, "invalid DS4_MOTIF3_PROFILE_PAIR=%s\n", mode);
         std::exit(2);
@@ -1143,12 +1150,13 @@ static void test_q8_pair_profile(const char *mode) {
     records[1].dims[1] = out1_dim;
     records[1].offset = bytes0;
     records[1].bytes = bytes1;
-    if (ds4_gpu_build_derived_artifacts_from_records(
+    const bool qwen_ple_mode = !std::strcmp(mode, "qwen-ple");
+    if (!qwen_ple_mode && ds4_gpu_build_derived_artifacts_from_records(
             model.data(), model.size(), records, 2u) != 2) {
         fprintf(stderr, "could not build Motif Q8 pair artifacts\n");
         std::exit(1);
     }
-    if (!std::strncmp(mode, "dots-", 5u))
+    if (!std::strncmp(mode, "dots-", 5u) || qwen_ple_mode)
         setenv("DS4_CUDA_NO_DERIVED_WEIGHTS", "1", 1);
     setenv("DS4_CUDA_COPY_MODEL", "1", 1);
     if (!ds4_gpu_set_model_map(model.data(), model.size())) {
@@ -1173,6 +1181,9 @@ static void test_q8_pair_profile(const char *mode) {
      * every lane's block order and therefore produce byte-identical floats. */
     setenv("DS4_CUDA_NO_Q8_PAIR_MMQ_SPLIT", "1", 1);
     setenv("DS4_CUDA_NO_Q8_PAIR_COALESCED", "1", 1);
+    const bool asym_profile = qwen_ple_mode;
+    if (asym_profile)
+        setenv("DS4_CUDA_NO_Q8_PAIR_ASYM_SPLIT", "1", 1);
     if (!ds4_gpu_matmul_q8_0_pair_tensor(
             out0.p, out1.p, model.data(), model.size(), 0u, bytes0,
             in_dim, out0_dim, out1_dim, x.p, n_tok)) {
@@ -1182,6 +1193,8 @@ static void test_q8_pair_profile(const char *mode) {
     auto oracle0 = download_f32(out0, (size_t)(n_tok * out0_dim));
     auto oracle1 = download_f32(out1, (size_t)(n_tok * out1_dim));
     unsetenv("DS4_CUDA_NO_Q8_PAIR_COALESCED");
+    if (asym_profile)
+        unsetenv("DS4_CUDA_NO_Q8_PAIR_ASYM_SPLIT");
     const bool split_profile = !std::strcmp(mode, "dense") ||
         !std::strcmp(mode, "dots-shared") ||
         !std::strcmp(mode, "dots-dense");
@@ -1198,7 +1211,7 @@ static void test_q8_pair_profile(const char *mode) {
     auto got1 = download_f32(out1, oracle1.size());
     if (std::memcmp(got0.data(), oracle0.data(), got0.size() * sizeof(float)) ||
         std::memcmp(got1.data(), oracle1.data(), got1.size() * sizeof(float))) {
-        fprintf(stderr, "Motif Q8 pair coalesced output is not bit-identical\n");
+        fprintf(stderr, "Q8 pair profile output is not bit-identical\n");
         std::exit(1);
     }
     unsetenv("DS4_CUDA_FORCE_Q8_PAIR_COALESCED");
