@@ -41,16 +41,17 @@ memory. The implementation remains a narrow C/CUDA engine: every accepted
 architecture has an explicit metadata validator, tensor binder, prompt
 protocol, state lifecycle, and device kernel path.
 
-`v0.6.2-dfm` is based on Entrpi `v0.6.2` and currently integrates these
-deployed families:
+`v0.6.3-dfm` is based on Entrpi `v0.6.3`. The current `dfm` branch accepts
+only the explicitly validated model families below:
 
-| Model family | GGUF architecture | Serving runtime |
+| Model family | GGUF architecture | Serving and state support |
 |---|---|---|
-| DeepSeek V4 Flash | `deepseek4` | Entrpi continuous-batch core; optional DSpark drafter |
-| Solar Open2 250B | `solar-open2` | Native recurrent/GQA persistent banks |
-| K-EXAONE 236B A23B | `exaone-moe` | Native LLLG persistent banks with shared prefill scratch |
-| Motif-3 | `motif3` | Native latent-KV persistent banks |
-| dots3-note Preview | `dots3-note` | Native dual-geometry latent serial sessions |
+| DeepSeek V4 Flash / PRO | `deepseek4` | Serial or continuous; disk KV and live partial-prefix forks; optional external MTP/DSpark |
+| Solar Open2 250B | `solar-open2` | Recurrent/GQA persistent banks; disk KV and live partial-prefix forks; plain decode |
+| K-EXAONE 236B A23B | `exaone-moe` | LLLG persistent banks with shared prefill scratch; disk KV and exact-frontier reuse; plain decode |
+| Motif-3 | `motif3` | Latent-KV persistent banks; disk KV and live partial-prefix forks; plain decode |
+| dots3-note Preview | `dots3-note` | Dual-geometry latent serial sessions and disk KV; embedded MTP is validation-only |
+| Qwen3.8-Flash-Next SSD-PLE | `qwen4exp` | CUDA serial or opt-in two-bank serving; bounded SSD-PLE, recurrent disk KV, live partial-prefix forks, and scalar target-verified embedded MTP |
 
 The serving command and HTTP contract do not change with the family; only the
 GGUF path and the matching weight-owner manifest change:
@@ -67,22 +68,35 @@ The server exposes OpenAI Chat Completions, OpenAI Completions, OpenAI
 Responses, and Anthropic Messages at `/v1/chat/completions`,
 `/v1/completions`, `/v1/responses`, and `/v1/messages`. Model-specific
 tokenization, chat rendering, tool syntax, stop tokens, and recurrent/KV state
-stay behind this common surface. DeepSeek-only MTP and DSpark support models
-are rejected for the other families instead of entering an incompatible graph.
-Serial checkpoints and idle continuous banks from every listed family can be
-saved to the same disk-KV service and restored after an inference-worker
-restart. Disk persistence avoids repeated prefill; it does not reduce the
-resident memory required by each active bank.
+stay behind this common surface. External MTP and DSpark support GGUFs remain
+DeepSeek-only and are rejected for every other family. Qwen instead uses the
+MTP block embedded in its main GGUF when `--mtp-draft 2` is selected; that
+target-verified path currently applies to greedy scalar/session decode, while
+the opt-in two-bank lane still uses plain decode. Serial checkpoints, and idle
+continuous banks for families that have them, can be saved to the same disk-KV
+service and restored after an inference-worker restart. Disk persistence avoids
+repeated prefill; it does not reduce the resident memory required by each active
+bank.
 
-All five families above have been loaded from their production mixed-quant
-GGUFs and exercised through the same server binary on the reference DGX Spark.
+All six family ports above have production-artifact server evidence in this
+repository's history on the reference DGX Spark; adding the Qwen features did
+not require rerunning the other five models. Qwen's `MQ-Q5-SSD-PLE-BF16`
+artifact most recently passed a real-weight recurrent-state/disk-KV round trip,
+exact and divergent partial forks between two banks, and target-stream-identical
+embedded-MTP checks. A guarded 196,608-context API run completed 7/7 requests
+with no failures, including a three-request continuous epoch with
+`served=3 fallback=0`; this was a configured-context serving check, not a
+196,608-token prompt run. Qwen batching remains opt-in with
+`DS4_QWEN_BATCH=1` and is capped at two banks.
+
 Motif-3 also completed a strict OpenAI Chat gate at the 262,144-token context
 limit: 262,080 prompt tokens at 175.61 tok/s followed by 43 decoded tokens at
 2.52 tok/s, with all three retrieval sentinels exact. Solar Open2 serves 8K
 prompts at 1,050.7 tok/s prefill with 19.05 tok/s decode on the same host. See
 [the DFM model-family guide](docs/ds4-dfm-model-families.md) for the pinned
-implementation, measurement conditions, Nsight evidence, weight-owner
-lifecycle, integration matrix, and current limits.
+pre-Qwen family evidence, measurement conditions, Nsight evidence, weight-owner
+lifecycle, integration matrix, and current limits; the Qwen artifact card holds
+its SSD-PLE-specific verification and performance record.
 
 ## Quick start
 
@@ -665,7 +679,10 @@ than refusing). The knobs:
 | `DS4_MEMGOV` | unset (the governor's verdicts are binding) | Set to `observe` to fall back to the pre-v0.6 memory formulas: the governor keeps evaluating and reporting on `/metrics`, but stops deciding. The one-word escape hatch if a memory decision ever looks wrong. |
 | `DS4_MEM_RECONCILE_TOL_MB` | `256` | When idle, the server reconciles the box's available-memory drop since boot against what its own allocation ledger explains and logs the residual (`mem reconcile:` line, also on `/v1/stats` and `/metrics`); a residual beyond this many MiB is marked `FLAGGED`. `DS4_MEM_RECONCILE_STRICT=1` adds a distinct `mem reconcile STRICT` line for gate scripts to assert on; `DS4_MEM_RECONCILE_WARMUP_MB` pins the named one-time warmup charge instead of letting the first idle pass self-calibrate it. Pure reporting — no admission decision reads it. |
 | `DS4_CONT_PREFILL_CHUNK` / `DS4_CONT_PREFILL_CHUNK_LIVE` | `4096` / `512` | Long prompts are ingested this many tokens at a time so a big admission never blocks the server. The `_LIVE` value applies while other requests are actively decoding: smaller keeps live decode smoother, larger ingests faster. |
-| `DS4_SERVER_FORK_PARTIAL` | `1` | Reuse the longest safe prefix when a prompt diverges inside a retained conversation. Set to `0` for a true cold-control path: Solar then reserves and captures no KDA checkpoints, and Motif-3 no SWA-window checkpoints. `DS4_SERVER_FORK_PARTIAL_MIN` (default 192 tokens, floor 136) skips tiny partial matches. |
+| `DS4_SERVER_FORK_PARTIAL` | `1` | Reuse the longest safe prefix when a prompt diverges inside a retained conversation. Set to `0` for a true cold-control path: Solar then reserves no KDA checkpoints, Motif-3 no SWA-window checkpoints, and Qwen no recurrent-state checkpoints. `DS4_SERVER_FORK_PARTIAL_MIN` (default 192 tokens, floor 136) skips tiny partial matches. |
+| `DS4_QWEN_BATCH` | unset (off) | Set to `1` to enable Qwen's persistent two-bank lane. It supports exact-frontier and partial-prefix forks plus bank disk-KV persistence; its decode loop is still non-MTP and does not claim row-batched kernel throughput. |
+| `DS4_QWEN_PREFILL_CHUNK` | `256` (range 1..16384) | Qwen serial and bank prefill width. `8192` is the production serving setting used for the published Spark results; larger values need enough graph memory. |
+| `DS4_QWEN_PLE_CACHE_MB` | `2048` (allowed: 512, 1024, 2048) | Bound for Qwen's pinned SSD-PLE page cache. The full 95.37 GiB sidecar remains outside the unified-memory resident set. |
 | `DS4_SERVER_CONTINUOUS` | `1` (continuous batching on) | Set to `0` to serve one request at a time on the old serial path. Only worth considering for single-user, latency-critical setups. |
 | `DS4_BATCH_VMM_BUDGET_MB` | unset: sized automatically (the bank plan's allowance, capped to measured capacity at boot, floored at two full-depth **packed** working sets — what two full banks actually commit at the admission-charged rate, not their virtual extents; `DS4_BATCH_VMM_FLOOR_PACKED=0` restores the old virtual-extent floor) | Hard cap on the KV pool, in MiB. Set it to pin the pool to a known size; either way the boot ledger prints `budget=[chosen] [plan X, capacity Y]` plus the work floor that applied, and a separate line whenever the floor is what ruled. |
 | `DS4_BATCH_VMM_TRIM` | `1` (reclaim allowed) | When an admission does not fit, the engine may release idle banks' memory to fund it; the reclaimed conversation then needs a disk restore or re-prefill when it returns. Set to `0` to forbid that: resident context is never sacrificed, and the admission is refused instead. Victims are chosen like warm-record eviction — invalid content first, then the longest-idle bank (shortest history breaks ties) — and the log names each victim with its bytes, history length, and recency; `DS4_BATCH_TRIM_VICTIM=hist` restores the old shortest-history-only order. When one victim's release would cover the whole remaining deficit, the engine now picks the smallest such victim in the same validity class instead of the first in recency order — so a deep trunk no longer dies for a deficit a small idle bank could fund (the `best-fit victim` log line discloses the substitution, and the trim summary reports released vs wanted); `DS4_BATCH_TRIM_BESTFIT=0` restores the pure recency order. |
