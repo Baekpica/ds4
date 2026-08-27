@@ -38268,6 +38268,53 @@ static bool exaone_graph_decode(ds4_exaone_gpu_graph *g,
     return exaone_graph_output_head(g, m, w, g->cur, 0);
 }
 
+/* Shared partial-prefix checkpoint bookkeeping.  A slot is an immutable
+ * snapshot of one bank's non-rewindable state at a committed position;
+ * banks inherit reference bits instead of duplicating snapshots. */
+enum {
+    DS4_PARTIAL_CHECKPOINT_SLOTS = 32,
+    DS4_PARTIAL_PERIODIC_TARGET = 24,
+};
+
+typedef struct {
+    uint64_t bank_refs[2];
+    uint64_t last_use;
+    uint32_t pos;
+    uint8_t logits_valid;
+} ds4_partial_checkpoint;
+
+static bool partial_checkpoint_ref(const ds4_partial_checkpoint *cp,
+                                   uint32_t bank) {
+    return cp && bank < DS4_MULTISEQ_MAX_SEQ &&
+           (cp->bank_refs[bank >> 6u] & (1ull << (bank & 63u))) != 0u;
+}
+
+static void partial_checkpoint_set_ref(ds4_partial_checkpoint *cp,
+                                       uint32_t bank) {
+    cp->bank_refs[bank >> 6u] |= 1ull << (bank & 63u);
+}
+
+static void partial_checkpoint_clear_ref(ds4_partial_checkpoint *cp,
+                                         uint32_t bank) {
+    cp->bank_refs[bank >> 6u] &= ~(1ull << (bank & 63u));
+    if (cp->bank_refs[0] == 0u && cp->bank_refs[1] == 0u) {
+        cp->pos = 0u;
+        cp->logits_valid = 0u;
+    }
+}
+
+static uint64_t ds4_mem_usable_beyond(uint64_t reserve);
+
+/* Unmapped remainder of a demand-mapped span: what a capture would still
+ * have to page in.  Zero means the span is already resident. */
+static uint64_t batch_span_need(const ds4_gpu_tensor *tensor,
+                                uint64_t offset, uint64_t bytes) {
+    if (!tensor || bytes == 0u) return 0u;
+    const uint64_t resident =
+        ds4_gpu_tensor_resident(tensor, offset, bytes);
+    return resident < bytes ? bytes - resident : 0u;
+}
+
 /* Qwen's kernels are still single-row/single-sequence, but the server can
  * keep two independent graphs alive and interleave them through the existing
  * continuous scheduler.  ponytail: cap this first banked runtime at two;
@@ -38281,11 +38328,39 @@ typedef struct ds4_qwen_batch_runtime {
     ds4_qwen_gpu_graph *graph;
     float *bank_logits;
     uint8_t *bank_logits_valid;
+
+    /* QSA history is append-only and copies from the source bank.  Only PLE
+     * convolution plus GDN conv/recurrent state needs a checkpoint. */
+    ds4_gpu_tensor *checkpoint_slab;
+    ds4_partial_checkpoint checkpoint[DS4_PARTIAL_CHECKPOINT_SLOTS];
+    float *checkpoint_logits;
+    uint64_t checkpoint_clock;
+    uint64_t checkpoint_slot_bytes;
+    uint32_t checkpoint_stride;
 } ds4_qwen_batch_runtime;
 
 static bool qwen4exp_graph_session_fit_check(
     ds4_backend backend, uint32_t ctx_size, uint32_t prefill_cap,
     bool loud, ds4_session_graph_fit_quote *q);
+
+static uint64_t qwen4exp_recurrent_checkpoint_bytes(
+        const ds4_qwen_gpu_graph *g) {
+    if (!g || !g->ple.conv_state) return 0u;
+    uint64_t bytes = ds4_gpu_tensor_bytes(g->ple.conv_state);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_qwen4exp_layer_is_full_attention(il)) continue;
+        const ds4_qwen_gdn_state *s = &g->gdn_state[il];
+        const uint64_t conv = ds4_gpu_tensor_bytes(s->conv);
+        const uint64_t recurrent = ds4_gpu_tensor_bytes(s->recurrent);
+        if (conv == 0u || recurrent == 0u ||
+            bytes > UINT64_MAX - conv ||
+            bytes + conv > UINT64_MAX - recurrent) {
+            return 0u;
+        }
+        bytes += conv + recurrent;
+    }
+    return bytes;
+}
 
 static void qwen_batch_runtime_free(ds4_qwen_batch_runtime *rt) {
     if (!rt) return;
@@ -38294,6 +38369,8 @@ static void qwen_batch_runtime_free(ds4_qwen_batch_runtime *rt) {
             qwen4exp_graph_free(&rt->graph[b]);
     }
     free(rt->graph);
+    ds4_gpu_tensor_free(rt->checkpoint_slab);
+    free(rt->checkpoint_logits);
     free(rt->bank_logits);
     free(rt->bank_logits_valid);
     free(rt);
@@ -38327,9 +38404,36 @@ static ds4_qwen_batch_runtime *qwen_batch_runtime_create(
             return NULL;
         }
     }
+    rt->checkpoint_slot_bytes =
+        qwen4exp_recurrent_checkpoint_bytes(&rt->graph[0]);
+    const char *partial_env = getenv("DS4_SERVER_FORK_PARTIAL");
+    const bool partial_enabled =
+        !(partial_env && partial_env[0] == '0' && partial_env[1] == '\0');
+    if (partial_enabled && rt->checkpoint_slot_bytes != 0u &&
+        rt->checkpoint_slot_bytes <=
+            UINT64_MAX / DS4_PARTIAL_CHECKPOINT_SLOTS) {
+        rt->checkpoint_slab = ds4_gpu_tensor_reserve(
+            rt->checkpoint_slot_bytes * DS4_PARTIAL_CHECKPOINT_SLOTS);
+    }
+    if (rt->checkpoint_slab) {
+        rt->checkpoint_logits = xcalloc(
+            (size_t)DS4_PARTIAL_CHECKPOINT_SLOTS * DS4_N_VOCAB,
+            sizeof(*rt->checkpoint_logits));
+        uint64_t stride = ((uint64_t)ctx_size +
+                           DS4_PARTIAL_PERIODIC_TARGET - 1u) /
+                          DS4_PARTIAL_PERIODIC_TARGET;
+        if (stride < 4096u) stride = 4096u;
+        stride = (stride + 4095u) & ~4095ull;
+        rt->checkpoint_stride = stride > UINT32_MAX
+            ? UINT32_MAX : (uint32_t)stride;
+    }
     fprintf(stderr,
-            "ds4: Qwen bank runtime: %u independent graphs, ctx=%u prefill=%u\n",
-            max_seq, ctx_size, prefill_cap);
+            "ds4: Qwen bank runtime: %u independent graphs, ctx=%u "
+            "prefill=%u, partial=%u x %.2f MiB checkpoints stride=%u\n",
+            max_seq, ctx_size, prefill_cap,
+            rt->checkpoint_slab ? DS4_PARTIAL_CHECKPOINT_SLOTS : 0u,
+            (double)rt->checkpoint_slot_bytes / 1048576.0,
+            rt->checkpoint_stride);
     return rt;
 }
 
@@ -38338,6 +38442,41 @@ static bool qwen_batch_runtime_reset_bank(
     if (!rt || bank >= rt->max_seq) return false;
     rt->bank_logits_valid[bank] = 0u;
     return qwen4exp_graph_reset(&rt->graph[bank], store);
+}
+
+static bool qwen4exp_graph_copy_qsa_prefix(
+        ds4_qwen_gpu_graph *dst, const ds4_qwen_gpu_graph *src,
+        uint32_t tokens) {
+    if (!dst || !src || tokens == 0u || tokens > src->length ||
+        tokens > dst->context_cap || dst->context_cap != src->context_cap) {
+        return false;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_qwen4exp_layer_is_full_attention(il)) continue;
+        ds4_qwen_qsa_state *d = &dst->qsa_state[il];
+        const ds4_qwen_qsa_state *s = &src->qsa_state[il];
+        const uint64_t index_row =
+            (uint64_t)s->index_head_dim * sizeof(float);
+        const uint64_t kv_row =
+            (uint64_t)s->kv_heads * s->head_dim * sizeof(float);
+        if (s->length < tokens || !qwen4exp_qsa_state_ensure(d, 0u, tokens) ||
+            ds4_gpu_tensor_copy(
+                d->raw_index, 0, s->raw_index, 0,
+                (uint64_t)tokens * index_row) == 0 ||
+            ds4_gpu_tensor_copy(
+                d->pooled_index, 0, s->pooled_index, 0,
+                (uint64_t)(tokens / s->ratio) * index_row) == 0 ||
+            ds4_gpu_tensor_copy(
+                d->k_cache, 0, s->k_cache, 0,
+                (uint64_t)tokens * kv_row) == 0 ||
+            ds4_gpu_tensor_copy(
+                d->v_cache, 0, s->v_cache, 0,
+                (uint64_t)tokens * kv_row) == 0) {
+            return false;
+        }
+        d->length = tokens;
+    }
+    return true;
 }
 
 static bool qwen4exp_graph_copy_state(
@@ -38352,31 +38491,10 @@ static bool qwen4exp_graph_copy_state(
         (uint64_t)DS4_N_EMBD * DS4_N_HC * 9u * sizeof(float);
     ok = ds4_gpu_tensor_copy(
              dst->ple.conv_state, 0, src->ple.conv_state, 0,
-             ple_conv_bytes) != 0;
+             ple_conv_bytes) != 0 &&
+         qwen4exp_graph_copy_qsa_prefix(dst, src, tokens);
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        if (ds4_qwen4exp_layer_is_full_attention(il)) {
-            ds4_qwen_qsa_state *d = &dst->qsa_state[il];
-            const ds4_qwen_qsa_state *s = &src->qsa_state[il];
-            const uint64_t index_row =
-                (uint64_t)s->index_head_dim * sizeof(float);
-            const uint64_t kv_row =
-                (uint64_t)s->kv_heads * s->head_dim * sizeof(float);
-            const uint64_t raw_bytes = (uint64_t)tokens * index_row;
-            const uint64_t pooled_bytes =
-                (uint64_t)(tokens / s->ratio) * index_row;
-            const uint64_t kv_bytes = (uint64_t)tokens * kv_row;
-            ok = qwen4exp_qsa_state_ensure(d, 0u, tokens) &&
-                 ds4_gpu_tensor_copy(
-                     d->raw_index, 0, s->raw_index, 0, raw_bytes) != 0 &&
-                 ds4_gpu_tensor_copy(
-                     d->pooled_index, 0, s->pooled_index, 0,
-                     pooled_bytes) != 0 &&
-                 ds4_gpu_tensor_copy(
-                     d->k_cache, 0, s->k_cache, 0, kv_bytes) != 0 &&
-                 ds4_gpu_tensor_copy(
-                     d->v_cache, 0, s->v_cache, 0, kv_bytes) != 0;
-            if (ok) d->length = tokens;
-        } else {
+        if (!ds4_qwen4exp_layer_is_full_attention(il)) {
             ds4_qwen_gdn_state *d = &dst->gdn_state[il];
             const ds4_qwen_gdn_state *s = &src->gdn_state[il];
             const uint64_t conv_bytes =
@@ -40449,54 +40567,215 @@ static bool dots3_graph_forward_chunk(
 
 enum { DS4_MOTIF3_DECODE_BATCH_MAX = DS4_MULTISEQ_MAX_SEQ };
 
-/* Shared partial-prefix checkpoint bookkeeping (Solar + Motif-3).  A slot is
- * an immutable snapshot of the non-rewindable part of one bank's state at a
- * committed position: Solar's KDA recurrent+conv state, Motif-3's SWA window
- * rows.  Banks hold reference bits instead of copies, so exact forks inherit
- * snapshots for free and a slot's pages become reclaimable exactly when the
- * last referencing lineage dies. */
-enum {
-    DS4_PARTIAL_CHECKPOINT_SLOTS = 32,
-    DS4_PARTIAL_PERIODIC_TARGET = 24,
-};
-
-typedef struct {
-    uint64_t bank_refs[2];
-    uint64_t last_use;
-    uint32_t pos;
-    uint8_t logits_valid;
-} ds4_partial_checkpoint;
-
-static bool partial_checkpoint_ref(const ds4_partial_checkpoint *cp,
-                                   uint32_t bank) {
-    return cp && bank < DS4_MULTISEQ_MAX_SEQ &&
-           (cp->bank_refs[bank >> 6u] & (1ull << (bank & 63u))) != 0u;
-}
-
-static void partial_checkpoint_set_ref(ds4_partial_checkpoint *cp,
-                                       uint32_t bank) {
-    cp->bank_refs[bank >> 6u] |= 1ull << (bank & 63u);
-}
-
-static void partial_checkpoint_clear_ref(ds4_partial_checkpoint *cp,
-                                         uint32_t bank) {
-    cp->bank_refs[bank >> 6u] &= ~(1ull << (bank & 63u));
-    if (cp->bank_refs[0] == 0u && cp->bank_refs[1] == 0u) {
-        cp->pos = 0u;
-        cp->logits_valid = 0u;
+static void qwen_batch_runtime_drop_checkpoints(
+        ds4_qwen_batch_runtime *rt, uint32_t bank) {
+    if (!rt || bank >= rt->max_seq) return;
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        if (partial_checkpoint_ref(&rt->checkpoint[i], bank))
+            partial_checkpoint_clear_ref(&rt->checkpoint[i], bank);
     }
 }
 
-static uint64_t ds4_mem_usable_beyond(uint64_t reserve);
+static void qwen_batch_runtime_inherit_checkpoints(
+        ds4_qwen_batch_runtime *rt, uint32_t src, uint32_t dst,
+        uint32_t cut) {
+    if (!rt || src >= rt->max_seq || dst >= rt->max_seq) return;
+    if (src == dst) {
+        for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+            ds4_partial_checkpoint *cp = &rt->checkpoint[i];
+            if (partial_checkpoint_ref(cp, dst) && cp->pos > cut)
+                partial_checkpoint_clear_ref(cp, dst);
+        }
+        return;
+    }
+    qwen_batch_runtime_drop_checkpoints(rt, dst);
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        ds4_partial_checkpoint *cp = &rt->checkpoint[i];
+        if (cp->pos != 0u && cp->pos <= cut &&
+            partial_checkpoint_ref(cp, src)) {
+            partial_checkpoint_set_ref(cp, dst);
+        }
+    }
+}
 
-/* Unmapped remainder of a demand-mapped span: what a capture would still
- * have to page in.  Zero means the span is already resident. */
-static uint64_t batch_span_need(const ds4_gpu_tensor *tensor,
-                                uint64_t offset, uint64_t bytes) {
-    if (!tensor || bytes == 0u) return 0u;
-    const uint64_t resident =
-        ds4_gpu_tensor_resident(tensor, offset, bytes);
-    return resident < bytes ? bytes - resident : 0u;
+static int qwen_batch_runtime_find_checkpoint(
+        ds4_qwen_batch_runtime *rt, uint32_t bank, uint32_t cut,
+        uint32_t request_len) {
+    int best = -1;
+    uint32_t best_pos = 0u;
+    if (!rt || bank >= rt->max_seq) return -1;
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        ds4_partial_checkpoint *cp = &rt->checkpoint[i];
+        if (cp->pos == 0u || cp->pos > cut || cp->pos < best_pos ||
+            !partial_checkpoint_ref(cp, bank) ||
+            (cp->pos == request_len && !cp->logits_valid)) {
+            continue;
+        }
+        best = (int)i;
+        best_pos = cp->pos;
+    }
+    return best;
+}
+
+static bool qwen_checkpoint_tensor_copy(
+        ds4_qwen_batch_runtime *rt, ds4_gpu_tensor *tensor,
+        uint64_t slot_base, uint64_t *cursor, bool to_slab) {
+    if (!rt || !tensor || !cursor) return false;
+    const uint64_t bytes = ds4_gpu_tensor_bytes(tensor);
+    const uint64_t slot_end = slot_base + rt->checkpoint_slot_bytes;
+    if (slot_end < slot_base || *cursor < slot_base || *cursor > slot_end ||
+        bytes == 0u || bytes > slot_end - *cursor) {
+        return false;
+    }
+    const bool ok = to_slab
+        ? ds4_gpu_tensor_copy(
+              rt->checkpoint_slab, *cursor, tensor, 0, bytes) != 0
+        : ds4_gpu_tensor_copy(
+              tensor, 0, rt->checkpoint_slab, *cursor, bytes) != 0;
+    if (ok) *cursor += bytes;
+    return ok;
+}
+
+static bool qwen_checkpoint_state_copy(
+        ds4_qwen_batch_runtime *rt, uint32_t bank, uint32_t slot,
+        bool to_slab) {
+    if (!rt || !rt->checkpoint_slab || bank >= rt->max_seq ||
+        slot >= DS4_PARTIAL_CHECKPOINT_SLOTS) {
+        return false;
+    }
+    ds4_qwen_gpu_graph *g = &rt->graph[bank];
+    const uint64_t base = (uint64_t)slot * rt->checkpoint_slot_bytes;
+    uint64_t cursor = base;
+    if (!qwen_checkpoint_tensor_copy(
+            rt, g->ple.conv_state, base, &cursor, to_slab)) {
+        return false;
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_qwen4exp_layer_is_full_attention(il)) continue;
+        if (!qwen_checkpoint_tensor_copy(
+                rt, g->gdn_state[il].conv, base, &cursor, to_slab) ||
+            !qwen_checkpoint_tensor_copy(
+                rt, g->gdn_state[il].recurrent, base, &cursor, to_slab)) {
+            return false;
+        }
+    }
+    return cursor - base == rt->checkpoint_slot_bytes;
+}
+
+static bool qwen_batch_runtime_capture_checkpoint(
+        ds4_qwen_batch_runtime *rt, uint32_t bank, uint32_t pos,
+        bool logits_valid, uint64_t reserve) {
+    if (!rt || !rt->checkpoint_slab || !rt->checkpoint_logits ||
+        bank >= rt->max_seq || pos == 0u || rt->graph[bank].length != pos) {
+        return false;
+    }
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        ds4_partial_checkpoint *cp = &rt->checkpoint[i];
+        if (cp->pos != pos || !partial_checkpoint_ref(cp, bank)) continue;
+        if (logits_valid && rt->bank_logits_valid[bank] &&
+            !cp->logits_valid) {
+            memcpy(rt->checkpoint_logits + (size_t)i * DS4_N_VOCAB,
+                   rt->bank_logits + (size_t)bank * DS4_N_VOCAB,
+                   (size_t)DS4_N_VOCAB * sizeof(float));
+            cp->logits_valid = 1u;
+        }
+        cp->last_use = ++rt->checkpoint_clock;
+        return true;
+    }
+
+    uint32_t slot = DS4_PARTIAL_CHECKPOINT_SLOTS;
+    uint64_t oldest = UINT64_MAX;
+    for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
+        const ds4_partial_checkpoint *cp = &rt->checkpoint[i];
+        if (cp->pos == 0u) {
+            slot = i;
+            break;
+        }
+        if (cp->last_use < oldest) {
+            oldest = cp->last_use;
+            slot = i;
+        }
+    }
+    if (slot >= DS4_PARTIAL_CHECKPOINT_SLOTS) return false;
+    const uint64_t off = (uint64_t)slot * rt->checkpoint_slot_bytes;
+    const uint64_t need = batch_span_need(
+        rt->checkpoint_slab, off, rt->checkpoint_slot_bytes);
+    const uint64_t usable = ds4_mem_usable_beyond(reserve);
+    if (need != 0u && usable != UINT64_MAX && need > usable) return false;
+    if (ds4_gpu_tensor_ensure(
+            rt->checkpoint_slab, off, rt->checkpoint_slot_bytes) == 0 ||
+        !qwen_checkpoint_state_copy(rt, bank, slot, true)) {
+        return false;
+    }
+
+    ds4_partial_checkpoint *cp = &rt->checkpoint[slot];
+    memset(cp, 0, sizeof(*cp));
+    cp->pos = pos;
+    cp->last_use = ++rt->checkpoint_clock;
+    partial_checkpoint_set_ref(cp, bank);
+    if (logits_valid && rt->bank_logits_valid[bank]) {
+        memcpy(rt->checkpoint_logits + (size_t)slot * DS4_N_VOCAB,
+               rt->bank_logits + (size_t)bank * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        cp->logits_valid = 1u;
+    }
+    return true;
+}
+
+static bool qwen_batch_runtime_checkpoint_due(
+        const ds4_qwen_batch_runtime *rt, uint32_t before,
+        uint32_t after) {
+    return rt && rt->checkpoint_stride != 0u && after > before &&
+           before / rt->checkpoint_stride != after / rt->checkpoint_stride;
+}
+
+static bool qwen_batch_runtime_restore_checkpoint(
+        ds4_qwen_batch_runtime *rt, ds4_ple_store *store,
+        const int *source_tokens, uint32_t src, uint32_t dst,
+        uint32_t slot, uint32_t cut, uint32_t *pos_out) {
+    if (!rt || !store || !source_tokens || src >= rt->max_seq ||
+        dst >= rt->max_seq || slot >= DS4_PARTIAL_CHECKPOINT_SLOTS) {
+        return false;
+    }
+    ds4_partial_checkpoint *cp = &rt->checkpoint[slot];
+    const uint32_t pos = cp->pos;
+    if (pos == 0u || pos > cut || !partial_checkpoint_ref(cp, src) ||
+        !qwen_checkpoint_state_copy(rt, dst, slot, false)) {
+        return false;
+    }
+    ds4_qwen_gpu_graph *dst_graph = &rt->graph[dst];
+    const ds4_qwen_gpu_graph *src_graph = &rt->graph[src];
+    if (src != dst) {
+        if (!qwen4exp_graph_copy_qsa_prefix(dst_graph, src_graph, pos))
+            return false;
+    } else {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (!ds4_qwen4exp_layer_is_full_attention(il)) continue;
+            if (dst_graph->qsa_state[il].length < pos) return false;
+            dst_graph->qsa_state[il].length = pos;
+        }
+    }
+    if (ds4_gpu_synchronize() == 0) return false;
+    const ds4_ple_hash_config *hash = ds4_ple_store_hash_config(store);
+    if (!hash) return false;
+    ds4_ple_hash_state_reset(&dst_graph->ple.hash_state, hash);
+    if (pos >= 2u)
+        dst_graph->ple.hash_state.previous[0] = source_tokens[pos - 2u];
+    dst_graph->ple.hash_state.previous[1] = source_tokens[pos - 1u];
+    dst_graph->ple.prepared_rows = 0u;
+    dst_graph->length = pos;
+    if (cp->logits_valid) {
+        memcpy(rt->bank_logits + (size_t)dst * DS4_N_VOCAB,
+               rt->checkpoint_logits + (size_t)slot * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        rt->bank_logits_valid[dst] = 1u;
+    } else {
+        rt->bank_logits_valid[dst] = 0u;
+    }
+    cp->last_use = ++rt->checkpoint_clock;
+    qwen_batch_runtime_inherit_checkpoints(rt, src, dst, cut);
+    if (pos_out) *pos_out = pos;
+    return true;
 }
 
 typedef struct ds4_motif3_batch_runtime {
@@ -50605,7 +50884,7 @@ static int qwen_batch_ctx_create_impl(
     for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b] = 1u;
     ctx->bank_last_use = xcalloc(
         ctx->max_seq, sizeof(*ctx->bank_last_use));
-    ctx->supports_partial_reuse = false;
+    ctx->supports_partial_reuse = ctx->qwen->checkpoint_slab != NULL;
     ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
     *out = ctx;
     return 0;
@@ -51536,6 +51815,7 @@ static void bank_hist_reset(ds4_batch_ctx *ctx, uint32_t b) {
 static void bank_hist_invalidate_all(ds4_batch_ctx *ctx) {
     for (uint32_t b = 0; b < ctx->max_seq; b++) {
         ctx->bank_gen[b]++;   /* Inc 5a */
+        if (ctx->qwen) qwen_batch_runtime_drop_checkpoints(ctx->qwen, b);
         if (ctx->solar) solar_batch_runtime_drop_checkpoints(ctx->solar, b);
         if (ctx->motif3) motif3_batch_runtime_drop_checkpoints(ctx->motif3, b);
     }
@@ -53434,6 +53714,7 @@ static float *family_banked_logits(ds4_batch_ctx *ctx, uint32_t bank) {
 
 static void family_banked_reset(ds4_batch_ctx *ctx, uint32_t bank) {
     if (ctx->qwen) {
+        qwen_batch_runtime_drop_checkpoints(ctx->qwen, bank);
         (void)qwen_batch_runtime_reset_bank(
             ctx->qwen, ctx->e->qwen_ple_store, bank);
     } else if (ctx->motif3) {
@@ -53446,8 +53727,13 @@ static void family_banked_reset(ds4_batch_ctx *ctx, uint32_t bank) {
 static bool family_banked_copy(
         ds4_batch_ctx *ctx, uint32_t src, uint32_t dst,
         uint32_t tokens) {
-    if (ctx->qwen)
-        return qwen_batch_runtime_copy_bank(ctx->qwen, src, dst, tokens);
+    if (ctx->qwen) {
+        const bool ok =
+            qwen_batch_runtime_copy_bank(ctx->qwen, src, dst, tokens);
+        if (ok) qwen_batch_runtime_inherit_checkpoints(
+            ctx->qwen, src, dst, tokens);
+        return ok;
+    }
     return ctx->motif3
         ? motif3_batch_runtime_copy_bank(ctx->motif3, src, dst)
         : exaone_batch_runtime_copy_bank(ctx->exaone, src, dst, tokens);
@@ -53486,6 +53772,26 @@ static bool family_banked_decode(
         : exaone_batch_runtime_decode(
               ctx->exaone, &ctx->e->model, &ctx->e->weights,
               banks, tokens, positions, rows);
+}
+
+static bool family_banked_checkpoint_due(
+        const ds4_batch_ctx *ctx, uint32_t before, uint32_t after) {
+    return ctx->qwen
+        ? qwen_batch_runtime_checkpoint_due(ctx->qwen, before, after)
+        : ctx->motif3 && motif3_batch_runtime_checkpoint_due(
+              ctx->motif3, before, after);
+}
+
+static void family_banked_capture_checkpoint(
+        ds4_batch_ctx *ctx, uint32_t bank, uint32_t pos,
+        bool logits_valid) {
+    if (ctx->qwen) {
+        (void)qwen_batch_runtime_capture_checkpoint(
+            ctx->qwen, bank, pos, logits_valid, ctx->serial_reserve);
+    } else if (ctx->motif3) {
+        (void)motif3_batch_runtime_capture_checkpoint(
+            ctx->motif3, bank, pos, logits_valid, ctx->serial_reserve);
+    }
 }
 
 static int family_banked_engine_continuous_generate(
@@ -53593,28 +53899,40 @@ static int family_banked_engine_continuous_generate(
                     forked = true;
                 } else if (source_prefix &&
                            requested_cached < source_frontier &&
-                           ctx->motif3) {
-                    /* P1 (Motif-3): the request diverges inside the source
-                     * bank's history.  Rewind to the nearest SWA-window
-                     * checkpoint at or below the cut; full-attention rows
-                     * below it copy straight from the source bank, and the
-                     * shared tail replays with the divergent suffix.  EXAONE
-                     * keeps exact-frontier reuse only (no checkpoint pool). */
-                    const int checkpoint =
-                        motif3_batch_runtime_find_checkpoint(
-                            ctx->motif3, (uint32_t)src, requested_cached,
-                            (uint32_t)req.n);
+                           (ctx->qwen || ctx->motif3)) {
+                    /* Rewind non-rewindable recurrent/window state to the
+                     * nearest checkpoint.  Append-only QSA/full-attention
+                     * rows below it copy directly from the source bank. */
+                    const int checkpoint = ctx->qwen
+                        ? qwen_batch_runtime_find_checkpoint(
+                              ctx->qwen, (uint32_t)src, requested_cached,
+                              (uint32_t)req.n)
+                        : motif3_batch_runtime_find_checkpoint(
+                              ctx->motif3, (uint32_t)src, requested_cached,
+                              (uint32_t)req.n);
                     uint32_t checkpoint_pos = 0u;
                     if (checkpoint >= 0) {
-                        if (!motif3_batch_runtime_restore_checkpoint(
-                                ctx->motif3, (uint32_t)src, b,
-                                (uint32_t)checkpoint, requested_cached,
-                                &checkpoint_pos)) {
+                        const bool restored = ctx->qwen
+                            ? qwen_batch_runtime_restore_checkpoint(
+                                  ctx->qwen, ctx->e->qwen_ple_store,
+                                  ctx->bank_hist +
+                                      (size_t)src * ctx->seq_cap,
+                                  (uint32_t)src, b, (uint32_t)checkpoint,
+                                  requested_cached, &checkpoint_pos)
+                            : motif3_batch_runtime_restore_checkpoint(
+                                  ctx->motif3, (uint32_t)src, b,
+                                  (uint32_t)checkpoint, requested_cached,
+                                  &checkpoint_pos);
+                        if (!restored) {
                             ctx->bank_gen[b]++;
                             ctx->bank_hist_valid[b] = 0u;
-                            motif3_batch_runtime_drop_checkpoints(
-                                ctx->motif3, b);
-                            FCG_ERR("continuous_generate: Motif-3 checkpoint "
+                            if (ctx->qwen)
+                                qwen_batch_runtime_drop_checkpoints(
+                                    ctx->qwen, b);
+                            else
+                                motif3_batch_runtime_drop_checkpoints(
+                                    ctx->motif3, b);
+                            FCG_ERR("continuous_generate: family checkpoint "
                                     "restore failed src=%d dst=%u cut=%u",
                                     src, b, requested_cached);
                             ok = false;
@@ -53749,17 +54067,12 @@ static int family_banked_engine_continuous_generate(
                     ds4_metric_add(
                         &ds4_metrics_get()->tokens_prefilled_computed, n);
                     ds4_metrics_window_add(0u, 0u, n);
-                    /* Long-prefill periodic snapshot: the SWA window at this
-                     * chunk boundary is still fully ring-resident (frontier
-                     * == pos + n), which is exactly what a later partial
-                     * fork below this point needs.  No logits mid-prompt. */
-                    if (ctx->motif3 && !final &&
-                        motif3_batch_runtime_checkpoint_due(
-                            ctx->motif3, pos, pos + n)) {
-                        (void)motif3_batch_runtime_capture_checkpoint(
-                            ctx->motif3, pb, pos + n, false,
-                            ctx->serial_reserve);
-                    }
+                    /* Long-prefill periodic snapshot.  No logits exist at a
+                     * mid-prompt frontier. */
+                    if (!final &&
+                        family_banked_checkpoint_due(ctx, pos, pos + n))
+                        family_banked_capture_checkpoint(
+                            ctx, pb, pos + n, false);
                 }
                 if (cb->prefill_off == cb->prefill_len) {
                     if (!family_banked_logits_valid(ctx, pb)) {
@@ -53770,11 +54083,8 @@ static int family_banked_engine_continuous_generate(
                     }
                     /* Every request boundary is a semantic checkpoint.  A
                      * repeated exact retry at the same frontier is a no-op. */
-                    if (ctx->motif3) {
-                        (void)motif3_batch_runtime_capture_checkpoint(
-                            ctx->motif3, pb, ctx->bank_hist_len[pb], true,
-                            ctx->serial_reserve);
-                    }
+                    family_banked_capture_checkpoint(
+                        ctx, pb, ctx->bank_hist_len[pb], true);
                     const int override = cb->sample_override
                         ? cb->sample_override(ud, cb->user)
                         : DS4_SAMPLE_OVERRIDE_NONE;
@@ -53856,13 +54166,10 @@ static int family_banked_engine_continuous_generate(
             bank_hist_append(ctx, b, cb->current);
             /* Decode-side periodic snapshot; the fresh step logits make it
              * usable even for a zero-suffix cut at exactly this frontier. */
-            if (ctx->motif3 && motif3_batch_runtime_checkpoint_due(
-                    ctx->motif3, decode_positions[row],
-                    ctx->bank_hist_len[b])) {
-                (void)motif3_batch_runtime_capture_checkpoint(
-                    ctx->motif3, b, ctx->bank_hist_len[b], true,
-                    ctx->serial_reserve);
-            }
+            if (family_banked_checkpoint_due(
+                    ctx, decode_positions[row], ctx->bank_hist_len[b]))
+                family_banked_capture_checkpoint(
+                    ctx, b, ctx->bank_hist_len[b], true);
             cb->stats.decode_steps++;
             ds4_metric_add(&ds4_metrics_get()->decode_steps, 1u);
             const int override = cb->sample_override

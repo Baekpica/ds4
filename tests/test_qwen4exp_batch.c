@@ -2,8 +2,8 @@
  *
  *   ./tests/test_qwen4exp_batch <first-model-shard.gguf>
  *
- * It compares two-bank generation with scalar sessions, then proves an
- * exact-frontier fork.  Partial mid-prefix reuse is a separate capability.
+ * It compares two-bank generation with scalar sessions, then proves exact-
+ * frontier and partial-prefix forks.
  */
 #include "../ds4.h"
 
@@ -153,6 +153,8 @@ int main(int argc, char **argv) {
     char err[256] = "";
     ds4_tokens prompt[2] = {0};
     ds4_tokens fork_prompt = {0};
+    ds4_tokens source_prompt = {0};
+    ds4_tokens branch_prompt = {0};
     ds4_tokens restored_prompt = {0};
     ds4_session_payload_file bank_payload = {0};
     ds4_batch_ctx *ctx = NULL;
@@ -184,7 +186,7 @@ int main(int argc, char **argv) {
     if (ds4_batch_ctx_create_fit(
             engine, 128, 2, 32, &ctx, err, sizeof(err)) != 0 ||
         !ctx || ds4_batch_ctx_max_seq(ctx) != 2 ||
-        ds4_batch_ctx_supports_partial_reuse(ctx)) {
+        !ds4_batch_ctx_supports_partial_reuse(ctx)) {
         fprintf(stderr, "Qwen batch context failed: %s\n", err);
         failed = 1;
         goto cleanup;
@@ -293,16 +295,108 @@ int main(int argc, char **argv) {
                 fork.token, oracle[0][1]);
         failed = 1;
     }
+    if (failed) goto cleanup;
+
+    /* Capture a semantic checkpoint at the first request boundary, extend
+     * the source by two tokens, then diverge after one shared suffix token.
+     * The partial fork must restore the older checkpoint, replay two rows,
+     * and match a cold serial oracle without mutating the source bank. */
+    fork_case source_base = {
+        .prompt = &prompt[0],
+        .place_bank = 1,
+        .cached = -1,
+        .computed = -1,
+        .bank = -1,
+    };
+    if (ds4_engine_continuous_generate(
+            ctx, fork_admit, NULL, fork_done, &source_base,
+            err, sizeof(err)) != 0 || source_base.failed ||
+        source_base.cached != 0 || source_base.computed != prompt[0].len ||
+        source_base.bank != 0) {
+        fprintf(stderr,
+                "Qwen partial source checkpoint failed: %s "
+                "split=%d+%d bank=%d\n",
+                err, source_base.cached, source_base.computed,
+                source_base.bank);
+        failed = 1;
+        goto cleanup;
+    }
+    for (int i = 0; i < prompt[0].len; i++)
+        ds4_tokens_push(&source_prompt, prompt[0].v[i]);
+    ds4_tokens_push(&source_prompt, source_base.token);
+    ds4_tokens_push(&source_prompt, prompt[1].v[0]);
+    fork_case source_tail = {
+        .prompt = &source_prompt,
+        .n_cached = prompt[0].len,
+        .place_bank = 1,
+        .cached = -1,
+        .computed = -1,
+        .bank = -1,
+    };
+    if (ds4_engine_continuous_generate(
+            ctx, fork_admit, NULL, fork_done, &source_tail,
+            err, sizeof(err)) != 0 || source_tail.failed ||
+        source_tail.cached != prompt[0].len || source_tail.computed != 2 ||
+        source_tail.bank != 0) {
+        fprintf(stderr,
+                "Qwen partial source extension failed: %s "
+                "split=%d+%d bank=%d\n",
+                err, source_tail.cached, source_tail.computed,
+                source_tail.bank);
+        failed = 1;
+        goto cleanup;
+    }
+    for (int i = 0; i < prompt[0].len + 1; i++)
+        ds4_tokens_push(&branch_prompt, source_prompt.v[i]);
+    ds4_tokens_push(
+        &branch_prompt,
+        (source_prompt.v[source_prompt.len - 1] + 1) %
+            ds4_engine_vocab_size(engine));
+    int branch_oracle = -1;
+    if (serial_greedy(
+            engine, &branch_prompt, 1, &branch_oracle,
+            err, sizeof(err)) != 0) {
+        fprintf(stderr, "Qwen partial cold oracle failed: %s\n", err);
+        failed = 1;
+        goto cleanup;
+    }
+    fork_case partial = {
+        .prompt = &branch_prompt,
+        .n_cached = prompt[0].len + 1,
+        .fork_bank = 1,
+        .place_bank = 2,
+        .cached = -1,
+        .computed = -1,
+        .bank = -1,
+    };
+    if (ds4_engine_continuous_generate(
+            ctx, fork_admit, NULL, fork_done, &partial,
+            err, sizeof(err)) != 0 || partial.failed ||
+        partial.cached != prompt[0].len || partial.computed != 2 ||
+        partial.bank != 1 || partial.token != branch_oracle ||
+        ds4_batch_ctx_bank_committed(ctx, 0, NULL) != source_prompt.len ||
+        ds4_batch_ctx_bank_committed(ctx, 1, NULL) != branch_prompt.len) {
+        fprintf(stderr,
+                "Qwen partial fork failed: %s split=%d+%d bank=%d "
+                "token=%d/%d source=%d destination=%d\n",
+                err, partial.cached, partial.computed, partial.bank,
+                partial.token, branch_oracle,
+                ds4_batch_ctx_bank_committed(ctx, 0, NULL),
+                ds4_batch_ctx_bank_committed(ctx, 1, NULL));
+        failed = 1;
+    }
 
 cleanup:
     ds4_session_payload_file_free(&bank_payload);
     ds4_tokens_free(&restored_prompt);
     ds4_batch_ctx_destroy(ctx);
+    ds4_tokens_free(&branch_prompt);
+    ds4_tokens_free(&source_prompt);
     ds4_tokens_free(&fork_prompt);
     ds4_tokens_free(&prompt[1]);
     ds4_tokens_free(&prompt[0]);
     ds4_engine_close(engine);
     if (!failed)
-        printf("Qwen3.8 two-bank parity and exact-frontier fork: PASS\n");
+        printf("Qwen3.8 two-bank parity, disk KV, and partial fork: PASS\n");
     return failed;
 }
