@@ -42040,6 +42040,7 @@ int ds4_session_output_head_bench(ds4_session *s, int iters, FILE *fp, char *err
 #define DS4_SESSION_EXAONE_LAYOUT_MAGIC UINT32_C(0x33415845) /* "EXA3" */
 #define DS4_SESSION_MOTIF3_LAYOUT_MAGIC UINT32_C(0x3346544d) /* "MTF3" */
 #define DS4_SESSION_DOTS3_LAYOUT_MAGIC  UINT32_C(0x33535444) /* "DTS3" */
+#define DS4_SESSION_QWEN4EXP_LAYOUT_MAGIC UINT32_C(0x334e5751) /* "QWN3" */
 
 static void payload_set_err(char *err, size_t errlen, const char *msg) {
     if (errlen != 0) snprintf(err, errlen, "%s", msg);
@@ -42300,6 +42301,292 @@ static int payload_write_logits(FILE *fp, const float *logits,
         if (payload_write_bytes(fp, buf, n, err, errlen) != 0) return 1;
         left -= n;
     }
+    return 0;
+}
+
+static uint32_t qwen4exp_full_attention_layers(void) {
+    uint32_t count = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        if (ds4_qwen4exp_layer_is_full_attention(il)) count++;
+    return count;
+}
+
+/* Qwen persists only mutable frontier state: PLE convolution, every GDN
+ * recurrent pair, and live QSA prefix rows. PLE's two-token hash frontier is
+ * reconstructed from the validated token history. */
+static uint64_t qwen4exp_payload_bytes_for_graph(
+        const ds4_qwen_gpu_graph *g, uint32_t n_tokens) {
+    if (!g || n_tokens == 0u || n_tokens > g->context_cap ||
+        !g->ple.conv_state) return 0u;
+    const uint64_t ple_conv_bytes =
+        (uint64_t)DS4_N_EMBD * DS4_N_HC * 9u * sizeof(float);
+    if (ds4_gpu_tensor_bytes(g->ple.conv_state) != ple_conv_bytes ||
+        ple_conv_bytes > UINT32_MAX) return 0u;
+    uint64_t bytes =
+        (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+    if (!payload_u64_add(&bytes, (uint64_t)n_tokens * sizeof(uint32_t)) ||
+        !payload_u64_add(&bytes,
+                         (uint64_t)DS4_N_VOCAB * sizeof(float)) ||
+        !payload_u64_add(&bytes, ple_conv_bytes)) return 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_qwen4exp_layer_is_full_attention(il)) {
+            const ds4_qwen_qsa_state *s = &g->qsa_state[il];
+            if (!s->raw_index || !s->pooled_index || !s->k_cache ||
+                !s->v_cache || s->context_cap != g->context_cap ||
+                s->ratio == 0u || s->index_head_dim == 0u ||
+                s->kv_heads == 0u || s->head_dim == 0u) return 0u;
+            const uint64_t index_row =
+                (uint64_t)s->index_head_dim * sizeof(float);
+            const uint64_t kv_row =
+                (uint64_t)s->kv_heads * s->head_dim * sizeof(float);
+            if (!payload_u64_add(&bytes, (uint64_t)n_tokens * index_row) ||
+                !payload_u64_add(
+                    &bytes, (uint64_t)(n_tokens / s->ratio) * index_row) ||
+                !payload_u64_add(&bytes, (uint64_t)n_tokens * kv_row) ||
+                !payload_u64_add(&bytes, (uint64_t)n_tokens * kv_row)) {
+                return 0u;
+            }
+        } else {
+            const ds4_qwen_gdn_state *s = &g->gdn_state[il];
+            if (!s->conv || !s->recurrent || s->conv_dim == 0u ||
+                s->conv_kernel == 0u || s->value_heads == 0u ||
+                s->head_dim == 0u ||
+                !payload_u64_add(
+                    &bytes, (uint64_t)s->conv_dim * s->conv_kernel *
+                                sizeof(float)) ||
+                !payload_u64_add(
+                    &bytes, (uint64_t)s->value_heads * s->head_dim *
+                                s->head_dim * sizeof(float))) return 0u;
+        }
+    }
+    return bytes;
+}
+
+static int qwen4exp_payload_save_graph(
+        ds4_qwen_gpu_graph *g, const int *tokens, uint32_t n_tokens,
+        const float *logits, FILE *fp, char *err, size_t errlen) {
+    const uint64_t total = qwen4exp_payload_bytes_for_graph(g, n_tokens);
+    if (!fp || !tokens || total == 0u || g->length != n_tokens) {
+        payload_set_err(err, errlen, "invalid Qwen4Exp session payload layout");
+        return 1;
+    }
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB) {
+            payload_set_err(err, errlen,
+                            "Qwen4Exp session payload contains an invalid token");
+            return 1;
+        }
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (ds4_qwen4exp_layer_is_full_attention(il) &&
+            g->qsa_state[il].length != n_tokens) {
+            payload_set_err(err, errlen,
+                            "Qwen4Exp QSA frontier does not match token history");
+            return 1;
+        }
+    }
+    if (ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen,
+                        "failed to synchronize accelerator before Qwen4Exp snapshot");
+        return 1;
+    }
+    const uint64_t ple_conv_bytes =
+        (uint64_t)DS4_N_EMBD * DS4_N_HC * 9u * sizeof(float);
+    const uint32_t qsa_kv_row_bytes =
+        DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    const uint32_t header[DS4_SESSION_PAYLOAD_U32_FIELDS] = {
+        DS4_SESSION_PAYLOAD_MAGIC,
+        DS4_SESSION_PAYLOAD_VERSION,
+        g->context_cap,
+        g->capacity,
+        qwen4exp_full_attention_layers(),
+        DS4_SESSION_QWEN4EXP_LAYOUT_MAGIC,
+        qsa_kv_row_bytes,
+        n_tokens,
+        DS4_N_LAYER,
+        DS4_N_SSM_CONV,
+        DS4_N_INDEXER_HEAD_DIM,
+        DS4_N_VOCAB,
+        (uint32_t)ple_conv_bytes,
+    };
+    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
+        if (payload_write_u32(fp, header[i], err, errlen) != 0) return 1;
+    for (uint32_t i = 0; i < n_tokens; i++)
+        if (payload_write_u32(fp, (uint32_t)tokens[i], err, errlen) != 0)
+            return 1;
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    int rc = payload_write_logits(fp, logits, buf, err, errlen);
+    if (rc == 0) {
+        rc = payload_write_tensor_span(
+            fp, g->ple.conv_state, 0, ple_conv_bytes,
+            buf, DS4_SESSION_IO_CHUNK, err, errlen);
+    }
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        if (ds4_qwen4exp_layer_is_full_attention(il)) {
+            const ds4_qwen_qsa_state *s = &g->qsa_state[il];
+            const uint64_t index_row =
+                (uint64_t)s->index_head_dim * sizeof(float);
+            const uint64_t kv_row =
+                (uint64_t)s->kv_heads * s->head_dim * sizeof(float);
+            rc = payload_write_tensor_span(
+                fp, s->raw_index, 0, (uint64_t)n_tokens * index_row,
+                buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) rc = payload_write_tensor_span(
+                fp, s->pooled_index, 0,
+                (uint64_t)(n_tokens / s->ratio) * index_row,
+                buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) rc = payload_write_tensor_span(
+                fp, s->k_cache, 0, (uint64_t)n_tokens * kv_row,
+                buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) rc = payload_write_tensor_span(
+                fp, s->v_cache, 0, (uint64_t)n_tokens * kv_row,
+                buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        } else {
+            const ds4_qwen_gdn_state *s = &g->gdn_state[il];
+            rc = payload_write_tensor_span(
+                fp, s->conv, 0,
+                (uint64_t)s->conv_dim * s->conv_kernel * sizeof(float),
+                buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            if (rc == 0) rc = payload_write_tensor_span(
+                fp, s->recurrent, 0,
+                (uint64_t)s->value_heads * s->head_dim * s->head_dim *
+                    sizeof(float),
+                buf, DS4_SESSION_IO_CHUNK, err, errlen);
+        }
+    }
+    free(buf);
+    return rc;
+}
+
+static int qwen4exp_payload_restore_graph(
+        ds4_qwen_gpu_graph *g, ds4_ple_store *store,
+        FILE *fp, uint64_t *remaining,
+        const uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS],
+        int **tokens_out, float *logits, char *err, size_t errlen) {
+    const uint32_t n_tokens = h[7];
+    const uint64_t ple_conv_bytes =
+        (uint64_t)DS4_N_EMBD * DS4_N_HC * 9u * sizeof(float);
+    const uint32_t qsa_kv_row_bytes =
+        DS4_N_HEAD_KV * DS4_N_HEAD_DIM * sizeof(float);
+    if (!g || !store || !fp || !remaining || !tokens_out || !logits ||
+        h[0] != DS4_SESSION_PAYLOAD_MAGIC ||
+        h[1] != DS4_SESSION_PAYLOAD_VERSION ||
+        h[2] == 0u || h[2] > g->context_cap ||
+        h[3] == 0u || h[3] > h[2] ||
+        h[4] != qwen4exp_full_attention_layers() ||
+        h[5] != DS4_SESSION_QWEN4EXP_LAYOUT_MAGIC ||
+        h[6] != qsa_kv_row_bytes || h[8] != DS4_N_LAYER ||
+        h[9] != DS4_N_SSM_CONV || h[10] != DS4_N_INDEXER_HEAD_DIM ||
+        h[11] != DS4_N_VOCAB || h[12] != ple_conv_bytes ||
+        n_tokens == 0u || n_tokens > h[2]) {
+        payload_set_err(err, errlen,
+                        "session payload was written for a different Qwen4Exp layout");
+        return 1;
+    }
+    const uint64_t total = qwen4exp_payload_bytes_for_graph(g, n_tokens);
+    const uint64_t header_bytes =
+        (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
+    if (total == 0u || *remaining != total - header_bytes) {
+        payload_set_err(err, errlen,
+                        "Qwen4Exp session payload byte count does not match its header");
+        return 1;
+    }
+    int *tokens = xmalloc((size_t)n_tokens * sizeof(*tokens));
+    int rc = 0;
+    for (uint32_t i = 0; rc == 0 && i < n_tokens; i++) {
+        uint32_t tok = 0u;
+        rc = payload_read_u32(fp, &tok, remaining, err, errlen);
+        if (rc == 0 && tok >= DS4_N_VOCAB) {
+            payload_set_err(err, errlen,
+                            "Qwen4Exp session payload contains an invalid token");
+            rc = 1;
+        }
+        tokens[i] = (int)tok;
+    }
+    if (rc == 0) rc = payload_read_bytes(
+        fp, logits, (uint64_t)DS4_N_VOCAB * sizeof(float),
+        remaining, err, errlen);
+    if (rc == 0 && !qwen4exp_graph_reset(g, store)) {
+        payload_set_err(err, errlen,
+                        "failed to reset Qwen4Exp graph before restore");
+        rc = 1;
+    }
+    uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
+    if (rc == 0) rc = payload_read_tensor_span(
+        fp, g->ple.conv_state, 0, ple_conv_bytes,
+        buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+    for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
+        if (ds4_qwen4exp_layer_is_full_attention(il)) {
+            ds4_qwen_qsa_state *s = &g->qsa_state[il];
+            const uint64_t index_row =
+                (uint64_t)s->index_head_dim * sizeof(float);
+            const uint64_t kv_row =
+                (uint64_t)s->kv_heads * s->head_dim * sizeof(float);
+            if (!qwen4exp_qsa_state_ensure(s, 0u, n_tokens)) {
+                payload_set_err(err, errlen,
+                                "failed to map Qwen4Exp QSA restore rows");
+                rc = 1;
+                break;
+            }
+            rc = payload_read_tensor_span(
+                fp, s->raw_index, 0, (uint64_t)n_tokens * index_row,
+                buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            if (rc == 0) rc = payload_read_tensor_span(
+                fp, s->pooled_index, 0,
+                (uint64_t)(n_tokens / s->ratio) * index_row,
+                buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            if (rc == 0) rc = payload_read_tensor_span(
+                fp, s->k_cache, 0, (uint64_t)n_tokens * kv_row,
+                buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            if (rc == 0) rc = payload_read_tensor_span(
+                fp, s->v_cache, 0, (uint64_t)n_tokens * kv_row,
+                buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+        } else {
+            ds4_qwen_gdn_state *s = &g->gdn_state[il];
+            rc = payload_read_tensor_span(
+                fp, s->conv, 0,
+                (uint64_t)s->conv_dim * s->conv_kernel * sizeof(float),
+                buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+            if (rc == 0) rc = payload_read_tensor_span(
+                fp, s->recurrent, 0,
+                (uint64_t)s->value_heads * s->head_dim * s->head_dim *
+                    sizeof(float),
+                buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
+        }
+    }
+    free(buf);
+    if (rc == 0 && *remaining != 0u) {
+        payload_set_err(err, errlen,
+                        "Qwen4Exp session payload has trailing bytes");
+        rc = 1;
+    }
+    if (rc == 0 && ds4_gpu_synchronize() == 0) {
+        payload_set_err(err, errlen,
+                        "failed to synchronize accelerator after Qwen4Exp restore");
+        rc = 1;
+    }
+    if (rc != 0) {
+        free(tokens);
+        (void)qwen4exp_graph_reset(g, store);
+        return 1;
+    }
+    const ds4_ple_hash_config *hash = ds4_ple_store_hash_config(store);
+    if (!hash) {
+        free(tokens);
+        (void)qwen4exp_graph_reset(g, store);
+        payload_set_err(err, errlen, "Qwen4Exp PLE hash config is unavailable");
+        return 1;
+    }
+    ds4_ple_hash_state_reset(&g->ple.hash_state, hash);
+    if (n_tokens >= 2u)
+        g->ple.hash_state.previous[0] = tokens[n_tokens - 2u];
+    g->ple.hash_state.previous[1] = tokens[n_tokens - 1u];
+    g->ple.prepared_rows = 0u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++)
+        if (ds4_qwen4exp_layer_is_full_attention(il))
+            g->qsa_state[il].length = n_tokens;
+    g->length = n_tokens;
+    *tokens_out = tokens;
     return 0;
 }
 
@@ -45235,7 +45522,12 @@ uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
 #ifndef DS4_NO_GPU
-    if (ds4_session_is_qwen4exp(s)) return 0u;
+    if (ds4_session_is_qwen4exp(s)) {
+        if (!s->qwen_graph_ready ||
+            s->qwen_graph.length != (uint32_t)s->checkpoint.len) return 0u;
+        return qwen4exp_payload_bytes_for_graph(
+            &s->qwen_graph, (uint32_t)s->checkpoint.len);
+    }
     if (ds4_session_is_motif3(s)) {
         if (!s->motif3_graph_ready ||
             s->motif3_graph.cache_len != (uint32_t)s->checkpoint.len) {
@@ -45410,12 +45702,19 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
-    if (ds4_session_is_qwen4exp(s)) {
-        payload_set_err(err, errlen,
-                        "Qwen4Exp recurrent session payloads are not supported");
-        return 1;
-    }
 #ifndef DS4_NO_GPU
+    if (ds4_session_is_qwen4exp(s)) {
+        if (!s->qwen_graph_ready ||
+            s->qwen_graph.length != (uint32_t)s->checkpoint.len) {
+            payload_set_err(err, errlen,
+                            "Qwen4Exp graph has no valid recurrent state to snapshot");
+            return 1;
+        }
+        return qwen4exp_payload_save_graph(
+            &s->qwen_graph, s->checkpoint.v,
+            (uint32_t)s->checkpoint.len, s->logits,
+            fp, err, errlen);
+    }
     if (ds4_session_is_motif3(s)) {
         if (!s->motif3_graph_ready ||
             s->motif3_graph.cache_len != (uint32_t)s->checkpoint.len) {
@@ -45854,15 +46153,17 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
-    if (ds4_session_is_qwen4exp(s)) {
-        payload_set_err(err, errlen,
-                        "Qwen4Exp recurrent session payloads are not supported");
-        return 1;
-    }
     s->generation++;   /* Inc 5a: content replaced from disk (even on failure
                         * the old checkpoint is no longer trustworthy) */
 #ifndef DS4_NO_GPU
-    if (ds4_session_is_motif3(s)) {
+    if (ds4_session_is_qwen4exp(s)) {
+        s->checkpoint_valid = false;
+        s->checkpoint.len = 0;
+        s->mtp_draft_valid = false;
+        if (s->qwen_graph_ready)
+            (void)qwen4exp_graph_reset(
+                &s->qwen_graph, s->engine->qwen_ple_store);
+    } else if (ds4_session_is_motif3(s)) {
         s->checkpoint_valid = false;
         s->checkpoint.len = 0;
         s->mtp_draft_valid = false;
@@ -45906,13 +46207,18 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         return session_solar_load_payload(
             s, fp, &remaining, h, err, errlen);
     }
-    if (ds4_session_is_motif3(s) || ds4_session_is_exaone(s) ||
-        ds4_session_is_dots3(s)) {
+    if (ds4_session_is_qwen4exp(s) || ds4_session_is_motif3(s) ||
+        ds4_session_is_exaone(s) || ds4_session_is_dots3(s)) {
         if (ds4_session_ensure_graph(s, err, errlen) != 0) return 1;
         float *new_logits = xmalloc(
             (size_t)DS4_N_VOCAB * sizeof(*new_logits));
         int *tokens = NULL;
-        const int rc = ds4_session_is_motif3(s)
+        const int rc = ds4_session_is_qwen4exp(s)
+            ? qwen4exp_payload_restore_graph(
+                  &s->qwen_graph, s->engine->qwen_ple_store,
+                  fp, &remaining, h,
+                  &tokens, new_logits, err, errlen)
+            : ds4_session_is_motif3(s)
             ? motif3_payload_restore_graph(
                   &s->motif3_graph, fp, &remaining, h,
                   &tokens, new_logits, err, errlen)
@@ -45928,6 +46234,10 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
             free(tokens);
             s->checkpoint_valid = false;
             s->checkpoint.len = 0;
+            if (ds4_session_is_qwen4exp(s)) {
+                (void)qwen4exp_graph_reset(
+                    &s->qwen_graph, s->engine->qwen_ple_store);
+            }
             if (ds4_session_is_motif3(s)) {
                 s->motif3_graph.cache_len = 0u;
                 s->motif3_graph.mtp_cache_len = 0u;
@@ -48016,6 +48326,77 @@ static int solar_cont_bank_restore_payload(
     return 0;
 }
 
+static uint64_t qwen_cont_bank_payload_bytes(ds4_batch_ctx *ctx,
+                                             uint32_t bank) {
+    if (!ctx || !ctx->qwen || bank >= ctx->max_seq ||
+        !ctx->bank_hist_valid[bank] || ctx->bank_hist_len[bank] == 0u ||
+        ctx->qwen->graph[bank].length != ctx->bank_hist_len[bank]) return 0u;
+    return qwen4exp_payload_bytes_for_graph(
+        &ctx->qwen->graph[bank], ctx->bank_hist_len[bank]);
+}
+
+static int qwen_cont_bank_save_payload(
+        ds4_batch_ctx *ctx, uint32_t bank, FILE *fp,
+        char *err, size_t errlen) {
+    if (qwen_cont_bank_payload_bytes(ctx, bank) == 0u) {
+        payload_set_err(err, errlen, "Qwen4Exp bank payload layout is invalid");
+        return 1;
+    }
+    return qwen4exp_payload_save_graph(
+        &ctx->qwen->graph[bank],
+        ctx->bank_hist + (size_t)bank * ctx->seq_cap,
+        ctx->bank_hist_len[bank], NULL, fp, err, errlen);
+}
+
+static int qwen_cont_bank_restore_payload(
+        ds4_batch_ctx *ctx, uint32_t bank, FILE *fp,
+        uint64_t payload_bytes, char *err, size_t errlen) {
+    ds4_qwen_batch_runtime *rt = ctx->qwen;
+    ctx->bank_gen[bank]++;
+    ctx->bank_hist_valid[bank] = 0u;
+    ctx->bank_hist_len[bank] = 0u;
+    if (!qwen_batch_runtime_reset_bank(
+            rt, ctx->e->qwen_ple_store, bank)) {
+        payload_set_err(err, errlen,
+                        "failed to reset Qwen4Exp bank before restore");
+        return 1;
+    }
+    uint64_t remaining = payload_bytes;
+    uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
+    for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
+        if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0)
+            return 1;
+    if (h[7] == 0u || h[7] > ctx->seq_cap) {
+        payload_set_err(err, errlen,
+                        "Qwen4Exp bank payload does not fit current token bound");
+        return 1;
+    }
+    int *tokens = NULL;
+    float *logits = rt->bank_logits + (size_t)bank * DS4_N_VOCAB;
+    if (qwen4exp_payload_restore_graph(
+            &rt->graph[bank], ctx->e->qwen_ple_store,
+            fp, &remaining, h, &tokens, logits, err, errlen) != 0) {
+        free(tokens);
+        (void)qwen_batch_runtime_reset_bank(
+            rt, ctx->e->qwen_ple_store, bank);
+        return 1;
+    }
+    memcpy(ctx->bank_hist + (size_t)bank * ctx->seq_cap, tokens,
+           (size_t)h[7] * sizeof(*tokens));
+    free(tokens);
+    bool logits_valid = false;
+    for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+        if (isfinite(logits[i]) && logits[i] != 0.0f) {
+            logits_valid = true;
+            break;
+        }
+    }
+    rt->bank_logits_valid[bank] = logits_valid ? 1u : 0u;
+    ctx->bank_hist_len[bank] = h[7];
+    ctx->bank_hist_valid[bank] = 1u;
+    return 0;
+}
+
 static uint64_t exaone_cont_bank_payload_bytes(ds4_batch_ctx *ctx,
                                                uint32_t bank) {
     if (!ctx || !ctx->exaone || bank >= ctx->max_seq ||
@@ -48170,10 +48551,10 @@ static int motif3_cont_bank_restore_payload(
 uint64_t ds4_cont_bank_payload_bytes(ds4_batch_ctx *ctx, uint32_t bank) {
     if (!ctx || bank >= (uint32_t)ctx->max_seq || !ctx->bank_hist_valid[bank] ||
         ctx->bank_hist_len[bank] == 0) return 0;
+    if (ctx->qwen) return qwen_cont_bank_payload_bytes(ctx, bank);
     if (ctx->motif3) return motif3_cont_bank_payload_bytes(ctx, bank);
     if (ctx->exaone) return exaone_cont_bank_payload_bytes(ctx, bank);
     if (ctx->solar) return solar_cont_bank_payload_bytes(ctx, bank);
-    if (ctx->qwen) return 0u; /* durable Qwen bank payload is not implemented */
     ds4_gpu_graph *g = &ctx->g;
     ds4_gpu_graph *wg = ds4_cont_bank_walk_graph(ctx);
     uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
@@ -48220,6 +48601,8 @@ int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank,
         payload_set_err(err, errlen, "bank has no reuse-trustworthy committed history");
         return 1;
     }
+    if (ctx->qwen)
+        return qwen_cont_bank_save_payload(ctx, bank, fp, err, errlen);
     if (ctx->motif3)
         return motif3_cont_bank_save_payload(ctx, bank, fp, err, errlen);
     if (ctx->exaone)
@@ -48227,11 +48610,6 @@ int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank,
     if (ctx->solar) {
         return solar_cont_bank_save_payload(
             ctx, bank, fp, err, errlen);
-    }
-    if (ctx->qwen) {
-        payload_set_err(err, errlen,
-                        "Qwen bank payload persistence is not implemented");
-        return 1;
     }
     ds4_gpu_graph *g = &ctx->g;
     const int *tokens = ctx->bank_hist + (uint64_t)bank * ctx->seq_cap;
@@ -48310,6 +48688,9 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
         payload_set_err(err, errlen, "invalid bank payload load");
         return 1;
     }
+    if (ctx->qwen)
+        return qwen_cont_bank_restore_payload(
+            ctx, bank, fp, payload_bytes, err, errlen);
     if (ctx->motif3)
         return motif3_cont_bank_restore_payload(
             ctx, bank, fp, payload_bytes, err, errlen);
@@ -48319,11 +48700,6 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
     if (ctx->solar) {
         return solar_cont_bank_restore_payload(
             ctx, bank, fp, payload_bytes, err, errlen);
-    }
-    if (ctx->qwen) {
-        payload_set_err(err, errlen,
-                        "Qwen bank payload restore is not implemented");
-        return 1;
     }
     ds4_gpu_graph *g = &ctx->g;
     uint64_t remaining = payload_bytes;

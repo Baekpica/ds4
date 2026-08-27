@@ -31,9 +31,55 @@ static int serial_greedy(ds4_engine *engine, const ds4_tokens *prompt,
     return 0;
 }
 
+static int serial_snapshot_roundtrip(ds4_engine *engine,
+                                     const ds4_tokens *prompt,
+                                     const int oracle[2],
+                                     char *err, size_t errlen) {
+    ds4_session *session = NULL;
+    ds4_session_snapshot snapshot = {0};
+    ds4_session_snapshot corrupt = {0};
+    int rc = 1;
+    if (ds4_session_create(&session, engine, 128) != 0 ||
+        ds4_session_sync(session, prompt, err, errlen) != 0 ||
+        ds4_session_save_snapshot(session, &snapshot, err, errlen) != 0 ||
+        snapshot.len != ds4_session_payload_bytes(session)) {
+        goto done;
+    }
+    corrupt.ptr = malloc((size_t)snapshot.len);
+    if (!corrupt.ptr) goto done;
+    memcpy(corrupt.ptr, snapshot.ptr, (size_t)snapshot.len);
+    corrupt.len = corrupt.cap = snapshot.len;
+    corrupt.ptr[5u * sizeof(uint32_t)] ^= UINT8_C(1);
+    if (ds4_session_load_snapshot(session, &corrupt, err, errlen) == 0 ||
+        ds4_session_pos(session) != 0) {
+        goto done;
+    }
+    ds4_session_snapshot truncated = snapshot;
+    truncated.len--;
+    if (ds4_session_load_snapshot(session, &truncated, err, errlen) == 0 ||
+        ds4_session_pos(session) != 0) {
+        goto done;
+    }
+    if (ds4_session_load_snapshot(session, &snapshot, err, errlen) != 0 ||
+        ds4_session_argmax(session) != oracle[0] ||
+        ds4_session_eval(session, oracle[0], err, errlen) != 0 ||
+        ds4_session_argmax(session) != oracle[1]) {
+        goto done;
+    }
+    rc = 0;
+done:
+    ds4_session_snapshot_free(&corrupt);
+    ds4_session_snapshot_free(&snapshot);
+    ds4_session_free(session);
+    return rc;
+}
+
 typedef struct {
     const ds4_tokens *prompt;
     int next;
+    int n_cached;
+    int fork_bank;
+    int place_bank;
     int cached;
     int computed;
     int bank;
@@ -59,9 +105,9 @@ static int fork_admit(void *ud, ds4_cont_request *req) {
     req->n = test->prompt->len;
     req->max_new = 1;
     req->eos = -1;
-    req->n_cached = test->prompt->len;
-    req->fork_bank = 1;
-    req->place_bank = 2;
+    req->n_cached = test->n_cached;
+    req->fork_bank = test->fork_bank;
+    req->place_bank = test->place_bank;
     req->on_admitted = fork_admitted;
     req->user = test;
     return 1;
@@ -107,6 +153,8 @@ int main(int argc, char **argv) {
     char err[256] = "";
     ds4_tokens prompt[2] = {0};
     ds4_tokens fork_prompt = {0};
+    ds4_tokens restored_prompt = {0};
+    ds4_session_payload_file bank_payload = {0};
     ds4_batch_ctx *ctx = NULL;
     ds4_tokenize_text(engine, "The capital of France is", &prompt[0]);
     ds4_tokenize_text(engine, "Two plus two equals", &prompt[1]);
@@ -117,14 +165,20 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    int oracle[2][2] = {{0}};
+    int oracle[2][3] = {{0}};
     for (int i = 0; i < 2; i++) {
         if (serial_greedy(
-                engine, &prompt[i], 2, oracle[i], err, sizeof(err)) != 0) {
+                engine, &prompt[i], 3, oracle[i], err, sizeof(err)) != 0) {
             fprintf(stderr, "Qwen scalar oracle %d failed: %s\n", i, err);
             failed = 1;
             goto cleanup;
         }
+    }
+    if (serial_snapshot_roundtrip(
+            engine, &prompt[0], oracle[0], err, sizeof(err)) != 0) {
+        fprintf(stderr, "Qwen serial snapshot round-trip failed: %s\n", err);
+        failed = 1;
+        goto cleanup;
     }
 
     if (ds4_batch_ctx_create_fit(
@@ -146,7 +200,8 @@ int main(int argc, char **argv) {
     }
     for (int i = 0; !failed && i < 2; i++) {
         if (got[i].n_tokens != 2 ||
-            memcmp(got[i].tokens, oracle[i], sizeof(oracle[i])) != 0) {
+            memcmp(got[i].tokens, oracle[i],
+                   2u * sizeof(oracle[i][0])) != 0) {
             fprintf(stderr,
                     "Qwen row %d differs from scalar: got=%d,%d want=%d,%d\n",
                     i,
@@ -160,10 +215,72 @@ int main(int argc, char **argv) {
     free(got[1].tokens);
     if (failed) goto cleanup;
 
+    const int *committed = NULL;
+    const int committed_n = ds4_batch_ctx_bank_committed(ctx, 0, &committed);
+    if (committed_n != prompt[0].len + 1 ||
+        ds4_cont_bank_payload_bytes(ctx, 0u) == 0u ||
+        ds4_cont_bank_stage_payload(
+            ctx, 0u, &bank_payload, err, sizeof(err)) != 0) {
+        fprintf(stderr, "Qwen durable bank stage failed: %s\n", err);
+        failed = 1;
+        goto cleanup;
+    }
+    FILE *bank_fp = fopen(bank_payload.path, "rb");
+    if (!bank_fp || ds4_cont_bank_restore_payload(
+            ctx, 1u, bank_fp, bank_payload.bytes,
+            err, sizeof(err)) != 0) {
+        fprintf(stderr, "Qwen durable bank restore failed: %s\n", err);
+        if (bank_fp) fclose(bank_fp);
+        failed = 1;
+        goto cleanup;
+    }
+    if (fclose(bank_fp) != 0) {
+        perror("Qwen durable bank close");
+        failed = 1;
+        goto cleanup;
+    }
+    restored_prompt.len = committed_n + 1;
+    restored_prompt.cap = restored_prompt.len;
+    restored_prompt.v = malloc(
+        (size_t)restored_prompt.len * sizeof(*restored_prompt.v));
+    if (!restored_prompt.v) {
+        fprintf(stderr, "Qwen restored prompt allocation failed\n");
+        failed = 1;
+        goto cleanup;
+    }
+    memcpy(restored_prompt.v, committed,
+           (size_t)committed_n * sizeof(*restored_prompt.v));
+    restored_prompt.v[committed_n] = oracle[0][1];
+    fork_case restored = {
+        .prompt = &restored_prompt,
+        .n_cached = committed_n,
+        .place_bank = 2,
+        .cached = -1,
+        .computed = -1,
+        .bank = -1,
+    };
+    if (ds4_engine_continuous_generate(
+            ctx, fork_admit, NULL, fork_done, &restored,
+            err, sizeof(err)) != 0 || restored.failed ||
+        restored.cached != committed_n || restored.computed != 1 ||
+        restored.bank != 1 || restored.token != oracle[0][2]) {
+        fprintf(stderr,
+                "Qwen restored bank continuation failed: %s "
+                "split=%d+%d bank=%d token=%d/%d\n",
+                err, restored.cached, restored.computed, restored.bank,
+                restored.token, oracle[0][2]);
+        failed = 1;
+        goto cleanup;
+    }
+
     for (int i = 0; i < prompt[0].len; i++)
         ds4_tokens_push(&fork_prompt, prompt[0].v[i]);
     ds4_tokens_push(&fork_prompt, oracle[0][0]);
-    fork_case fork = {.prompt = &fork_prompt, .cached = -1,
+    fork_case fork = {.prompt = &fork_prompt,
+                      .n_cached = fork_prompt.len,
+                      .fork_bank = 1,
+                      .place_bank = 2,
+                      .cached = -1,
                       .computed = -1, .bank = -1};
     if (ds4_engine_continuous_generate(
             ctx, fork_admit, NULL, fork_done, &fork,
@@ -178,6 +295,8 @@ int main(int argc, char **argv) {
     }
 
 cleanup:
+    ds4_session_payload_file_free(&bank_payload);
+    ds4_tokens_free(&restored_prompt);
     ds4_batch_ctx_destroy(ctx);
     ds4_tokens_free(&fork_prompt);
     ds4_tokens_free(&prompt[1]);
