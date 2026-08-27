@@ -16755,7 +16755,7 @@ __global__ static void qwen4exp_q5_0_tail_accum_kernel(
         sum += input[k] * value;
     }
 
-    __shared__ float partial[256];
+    __shared__ float partial[128];
     partial[threadIdx.x] = sum;
     __syncthreads();
     for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
@@ -29183,7 +29183,7 @@ extern "C" int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
             "qwen4exp_q5_0_expert_down_tail");
     if (!tail_weights) return 0;
     qwen4exp_q5_0_tail_accum_kernel<<<
-        (unsigned)tasks, 256u, 0, ds4_current_stream()>>>(
+        (unsigned)tasks, 128u, 0, ds4_current_stream()>>>(
             (float *)down->ptr, (const float *)mid->ptr,
             (const int32_t *)ids->ptr, tail_weights, mid_width, main_dim,
             tail_dim, out_dim, n_expert, tasks);
