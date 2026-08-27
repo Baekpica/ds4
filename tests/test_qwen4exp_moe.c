@@ -37,8 +37,14 @@ typedef struct {
     uint8_t qs[QK_5_0 / 2];
 } test_block_q5_0;
 
+typedef struct {
+    uint16_t d;
+    int8_t qs[QK_5_0];
+} test_block_q8_0;
+
 _Static_assert(sizeof(test_block_q6_k) == 210, "Q6_K block layout");
 _Static_assert(sizeof(test_block_q5_0) == 22, "Q5_0 block layout");
+_Static_assert(sizeof(test_block_q8_0) == 34, "Q8_0 block layout");
 
 #define REQUIRE(condition, message) do {                                      \
     if (!(condition)) {                                                       \
@@ -283,6 +289,16 @@ static void fill_q5_0(test_block_q5_0 *blocks, uint64_t count) {
     }
 }
 
+static void fill_q8_0(test_block_q8_0 *blocks, uint64_t count) {
+    uint32_t state = 0x7b392451u;
+    for (uint64_t block = 0; block < count; block++) {
+        blocks[block].d = 0x2800u; /* exactly 0.03125 */
+        for (uint32_t i = 0; i < QK_5_0; i++)
+            blocks[block].qs[i] =
+                (int8_t)((int)(next_u32(&state) % 255u) - 127);
+    }
+}
+
 static void dequant_q6(const test_block_q6_k *blocks, float *out) {
     for (uint32_t block_i = 0; block_i < DOWN_MAIN / QK_K; block_i++) {
         const test_block_q6_k *block = blocks + block_i;
@@ -336,6 +352,15 @@ static void dequant_q5_0(const test_block_q5_0 *blocks, float *out) {
     }
 }
 
+static void dequant_q8_0(const test_block_q8_0 *blocks, float *out) {
+    for (uint32_t block_i = 0; block_i < DOWN_TAIL / QK_5_0; block_i++) {
+        const test_block_q8_0 *block = blocks + block_i;
+        const float d = f16_to_f32(block->d);
+        for (uint32_t lane = 0; lane < QK_5_0; lane++)
+            out[block_i * QK_5_0 + lane] = d * (float)block->qs[lane];
+    }
+}
+
 static void compare_mmq(const char *name, const float *got,
                         const float *want, uint64_t count) {
     double error2 = 0.0;
@@ -363,7 +388,9 @@ static void compare_mmq(const char *name, const float *got,
 
 static void test_split_down(void *model_map, uint64_t model_size,
                             uint64_t main_offset, uint64_t main_bytes,
-                            uint64_t tail_offset, uint64_t tail_bytes) {
+                            uint64_t tail_offset, uint64_t tail_bytes,
+                            uint64_t q8_tail_offset,
+                            uint64_t q8_tail_bytes) {
     const uint64_t mid_count = (uint64_t)DOWN_ASSIGNMENTS * DOWN_MID;
     const uint64_t main_count = (uint64_t)DOWN_ASSIGNMENTS * DOWN_MAIN;
     const uint64_t down_count = (uint64_t)DOWN_ASSIGNMENTS * HIDDEN;
@@ -372,12 +399,14 @@ static void test_split_down(void *model_map, uint64_t model_size,
     float *packed_got = (float *)malloc(main_count * sizeof(*packed_got));
     float *main_want = (float *)malloc(down_count * sizeof(*main_want));
     float *tail_want = (float *)malloc(down_count * sizeof(*tail_want));
+    float *q8_tail_want = (float *)malloc(down_count * sizeof(*q8_tail_want));
     float *combined_want = (float *)malloc(down_count * sizeof(*combined_want));
     float *main_got = (float *)malloc(down_count * sizeof(*main_got));
     float *combined_got = (float *)malloc(down_count * sizeof(*combined_got));
     float *tail_got = (float *)malloc(down_count * sizeof(*tail_got));
     int32_t *ids = (int32_t *)malloc(DOWN_ASSIGNMENTS * sizeof(*ids));
     REQUIRE(mid && packed && packed_got && main_want && tail_want &&
+            q8_tail_want &&
             combined_want && main_got && combined_got && tail_got && ids,
             "split down host allocation");
 
@@ -396,6 +425,8 @@ static void test_split_down(void *model_map, uint64_t model_size,
         (const unsigned char *)model_map + main_offset);
     const test_block_q5_0 *tail_weights = (const test_block_q5_0 *)(
         (const unsigned char *)model_map + tail_offset);
+    const test_block_q8_0 *q8_tail_weights = (const test_block_q8_0 *)(
+        (const unsigned char *)model_map + q8_tail_offset);
     const uint64_t main_blocks_per_row = DOWN_MAIN / QK_K;
     const uint64_t tail_blocks_per_row = DOWN_TAIL / QK_5_0;
     float main_row[DOWN_MAIN];
@@ -420,6 +451,13 @@ static void test_split_down(void *model_map, uint64_t model_size,
             main_want[at] = main_sum;
             tail_want[at] = tail_sum;
             combined_want[at] = main_sum + tail_sum;
+            dequant_q8_0(q8_tail_weights +
+                ((uint64_t)expert * HIDDEN + out) * tail_blocks_per_row,
+                tail_row);
+            q8_tail_want[at] = 0.0f;
+            for (uint32_t k = 0; k < DOWN_TAIL; k++)
+                q8_tail_want[at] +=
+                    input[DOWN_MAIN + k] * tail_row[k];
         }
     }
 
@@ -476,6 +514,22 @@ static void test_split_down(void *model_map, uint64_t model_size,
     compare_mmq("Qwen combined Q6_K[512] + Q5_0[128]", combined_got,
                 combined_want, down_count);
 
+    REQUIRE(ds4_gpu_tensor_write(
+                d_down, 0, main_got, down_count * sizeof(*main_got)),
+            "reset expert-down main output");
+    REQUIRE(ds4_gpu_qwen4exp_q8_0_tail_accum_tensor(
+                d_down, d_mid, d_ids, model_map, model_size,
+                q8_tail_offset, q8_tail_bytes, DOWN_ASSIGNMENTS, DOWN_MID,
+                DOWN_MAIN, DOWN_TAIL, HIDDEN, DOWN_EXPERTS),
+            "Q8_0 expert-down tail accumulate launch");
+    REQUIRE(ds4_gpu_tensor_read(d_down, 0, combined_got,
+                                down_count * sizeof(float)),
+            "Q8_0 split down download");
+    for (uint64_t i = 0; i < down_count; i++)
+        tail_got[i] = combined_got[i] - main_got[i];
+    compare_f32("Qwen MTP Q8_0 128-column tail accumulation", tail_got,
+                q8_tail_want, down_count, 1.5e-4f, 1.5e-4f);
+
     REQUIRE(!ds4_gpu_qwen4exp_pack_expert_down_main_tensor(
                 d_mid, d_mid, DOWN_ASSIGNMENTS, DOWN_MID, DOWN_MAIN),
             "main pack rejects input/output alias");
@@ -484,6 +538,11 @@ static void test_split_down(void *model_map, uint64_t model_size,
                 tail_offset, tail_bytes, DOWN_ASSIGNMENTS, DOWN_MID,
                 DOWN_MAIN, DOWN_TAIL - 1u, HIDDEN, DOWN_EXPERTS),
             "tail accumulation rejects non-block width");
+    REQUIRE(!ds4_gpu_qwen4exp_q8_0_tail_accum_tensor(
+                d_down, d_mid, d_ids, model_map, model_size,
+                q8_tail_offset, q8_tail_bytes, DOWN_ASSIGNMENTS, DOWN_MID,
+                DOWN_MAIN, DOWN_TAIL - 1u, HIDDEN, DOWN_EXPERTS),
+            "Q8 tail accumulation rejects non-block width");
 
     ds4_gpu_tensor_free(d_down);
     ds4_gpu_tensor_free(d_ids);
@@ -496,6 +555,7 @@ static void test_split_down(void *model_map, uint64_t model_size,
     free(combined_want);
     free(tail_want);
     free(main_want);
+    free(q8_tail_want);
     free(packed_got);
     free(packed);
     free(mid);
@@ -516,7 +576,11 @@ int main(void) {
     const uint64_t tail_blocks =
         (uint64_t)DOWN_EXPERTS * HIDDEN * (DOWN_TAIL / QK_5_0);
     const uint64_t tail_bytes = tail_blocks * sizeof(test_block_q5_0);
-    const uint64_t model_size = (tail_offset + tail_bytes + 4095u) & ~4095ull;
+    const uint64_t q8_tail_offset =
+        (tail_offset + tail_bytes + 4095u) & ~4095ull;
+    const uint64_t q8_tail_bytes = tail_blocks * sizeof(test_block_q8_0);
+    const uint64_t model_size =
+        (q8_tail_offset + q8_tail_bytes + 4095u) & ~4095ull;
     void *model_map = NULL;
     REQUIRE(posix_memalign(&model_map, 4096u, (size_t)model_size) == 0,
             "aligned split-down model map");
@@ -525,6 +589,8 @@ int main(void) {
             main_blocks);
     fill_q5_0((test_block_q5_0 *)((unsigned char *)model_map + tail_offset),
               tail_blocks);
+    fill_q8_0((test_block_q8_0 *)(
+                  (unsigned char *)model_map + q8_tail_offset), tail_blocks);
     REQUIRE(ds4_gpu_set_model_map(model_map, model_size),
             "register split-down model map");
 
@@ -532,7 +598,7 @@ int main(void) {
     test_softmax_topk_router();
     test_shared_expert_gate();
     test_split_down(model_map, model_size, main_offset, main_bytes,
-                    tail_offset, tail_bytes);
+                    tail_offset, tail_bytes, q8_tail_offset, q8_tail_bytes);
 
     REQUIRE(ds4_gpu_synchronize(), "final CUDA synchronization");
     ds4_gpu_unregister_model_map(model_map);

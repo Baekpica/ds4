@@ -31,6 +31,37 @@ static int serial_greedy(ds4_engine *engine, const ds4_tokens *prompt,
     return 0;
 }
 
+static int speculative_greedy(ds4_engine *engine,
+                              const ds4_tokens *prompt,
+                              int budget, int *out, int *multi_accepts,
+                              char *err, size_t errlen) {
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, 128) != 0 ||
+        ds4_session_sync(session, prompt, err, errlen) != 0) {
+        ds4_session_free(session);
+        return 1;
+    }
+    int done = 0;
+    int multi = 0;
+    while (done < budget) {
+        const int token = ds4_session_argmax(session);
+        int accepted[2] = {-1, -1};
+        const int n = ds4_session_eval_speculative_argmax(
+            session, token, budget - done, -1, accepted, 2,
+            err, errlen);
+        if (n <= 0 || n > 2 || n > budget - done) {
+            ds4_session_free(session);
+            return 1;
+        }
+        memcpy(out + done, accepted, (size_t)n * sizeof(*out));
+        done += n;
+        if (n == 2) multi++;
+    }
+    ds4_session_free(session);
+    if (multi_accepts) *multi_accepts = multi;
+    return 0;
+}
+
 static int serial_snapshot_roundtrip(ds4_engine *engine,
                                      const ds4_tokens *prompt,
                                      const int oracle[2],
@@ -142,6 +173,7 @@ int main(int argc, char **argv) {
     opt.model_path = argv[1];
     opt.backend = DS4_BACKEND_CUDA;
     opt.n_threads = 8;
+    opt.mtp_draft_tokens = 2;
     opt.defer_boot_prewarm = true;
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) {
@@ -161,8 +193,10 @@ int main(int argc, char **argv) {
     ds4_tokenize_text(engine, "The capital of France is", &prompt[0]);
     ds4_tokenize_text(engine, "Two plus two equals", &prompt[1]);
     if (prompt[0].len <= 0 || prompt[1].len <= 0 ||
+        !ds4_engine_has_mtp(engine) ||
+        ds4_engine_mtp_draft_tokens(engine) != 2 ||
         !ds4_engine_supports_batching(engine)) {
-        fprintf(stderr, "Qwen tokenizer or batching capability failed\n");
+        fprintf(stderr, "Qwen tokenizer, MTP, or batching capability failed\n");
         failed = 1;
         goto cleanup;
     }
@@ -175,6 +209,24 @@ int main(int argc, char **argv) {
             failed = 1;
             goto cleanup;
         }
+    }
+    enum { MTP_BUDGET = 12 };
+    int mtp_oracle[MTP_BUDGET] = {0};
+    int mtp_got[MTP_BUDGET] = {0};
+    int mtp_multi_accepts = 0;
+    if (serial_greedy(
+            engine, &prompt[0], MTP_BUDGET, mtp_oracle,
+            err, sizeof(err)) != 0 ||
+        speculative_greedy(
+            engine, &prompt[0], MTP_BUDGET, mtp_got,
+            &mtp_multi_accepts, err, sizeof(err)) != 0 ||
+        memcmp(mtp_got, mtp_oracle, sizeof(mtp_got)) != 0 ||
+        mtp_multi_accepts == 0) {
+        fprintf(stderr,
+                "Qwen target-verified MTP failed: %s multi_accepts=%d\n",
+                err, mtp_multi_accepts);
+        failed = 1;
+        goto cleanup;
     }
     if (serial_snapshot_roundtrip(
             engine, &prompt[0], oracle[0], err, sizeof(err)) != 0) {

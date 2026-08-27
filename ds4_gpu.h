@@ -2254,8 +2254,8 @@ int ds4_gpu_qwen4exp_shared_expert_gate_tensor(
         uint32_t                hidden_size);
 
 /* Qwen4Exp's expert-down activation is 640-wide but the recipe stores the
- * weights as Q6_K[512] + Q5_0[128]. Pack the contiguous main input for MMQ,
- * then accumulate the tail projection directly into that MMQ output. */
+ * weights as a 512+128 split. Pack the contiguous main input for MMQ, then
+ * accumulate the Q5_0 base or Q8_0 MTP tail directly into that MMQ output. */
 int ds4_gpu_qwen4exp_pack_expert_down_main_tensor(
         ds4_gpu_tensor       *packed_main,
         const ds4_gpu_tensor *mid,
@@ -2264,6 +2264,21 @@ int ds4_gpu_qwen4exp_pack_expert_down_main_tensor(
         uint32_t                main_dim);
 
 int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
+        ds4_gpu_tensor       *down,
+        const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert);
+
+int ds4_gpu_qwen4exp_q8_0_tail_accum_tensor(
         ds4_gpu_tensor       *down,
         const ds4_gpu_tensor *mid,
         const ds4_gpu_tensor *ids,

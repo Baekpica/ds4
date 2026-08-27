@@ -122,8 +122,15 @@ typedef struct {
     uint8_t qs[16];
 } cuda_block_q5_0;
 
+typedef struct {
+    uint16_t d;
+    int8_t qs[32];
+} cuda_block_q8_0;
+
 static_assert(sizeof(cuda_block_q5_0) == 22,
               "GGUF Q5_0 block layout must remain byte exact");
+static_assert(sizeof(cuda_block_q8_0) == 34,
+              "GGUF Q8_0 block layout must remain byte exact");
 
 #include "ds4_iq2_tables_cuda.inc"
 
@@ -17086,6 +17093,59 @@ __global__ static void qwen4exp_q5_0_tail_accum_kernel(
     }
 }
 
+__global__ static void qwen4exp_q8_0_tail_accum_kernel(
+        float *down,
+        const float *mid,
+        const int32_t *ids,
+        const cuda_block_q8_0 *weights,
+        uint32_t mid_width,
+        uint32_t main_dim,
+        uint32_t tail_dim,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint64_t assignments) {
+    constexpr uint32_t warps_per_block = 8u;
+    constexpr uint32_t rows_per_warp = 8u;
+    constexpr uint32_t rows_per_block = warps_per_block * rows_per_warp;
+    const uint32_t output_tiles = (out_dim + rows_per_block - 1u) /
+                                  rows_per_block;
+    const uint64_t assignment = (uint64_t)blockIdx.x / output_tiles;
+    if (assignment >= assignments) return;
+    const uint32_t tile = (uint32_t)blockIdx.x % output_tiles;
+    const int32_t expert_i32 = ids[assignment];
+    if (expert_i32 < 0 || (uint32_t)expert_i32 >= n_expert) return;
+    const uint32_t expert = (uint32_t)expert_i32;
+    const uint32_t blocks_per_row = tail_dim / 32u;
+    const float *input = mid + assignment * mid_width + main_dim;
+
+    extern __shared__ float input_tail[];
+    for (uint32_t k = threadIdx.x; k < tail_dim; k += blockDim.x)
+        input_tail[k] = input[k];
+    __syncthreads();
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    for (uint32_t local_row = warp; local_row < rows_per_block;
+         local_row += warps_per_block) {
+        const uint32_t out_row = tile * rows_per_block + local_row;
+        if (out_row >= out_dim) break;
+        const cuda_block_q8_0 *row = weights +
+            ((uint64_t)expert * out_dim + out_row) * blocks_per_row;
+        float sum = 0.0f;
+        for (uint32_t block_i = 0; block_i < blocks_per_row; block_i++) {
+            const cuda_block_q8_0 *block = row + block_i;
+            const __half scale_h =
+                *reinterpret_cast<const __half *>(&block->d);
+            sum += input_tail[block_i * 32u + lane] *
+                   __half2float(scale_h) * (float)block->qs[lane];
+        }
+        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        if (lane == 0u)
+            down[assignment * out_dim + out_row] += sum;
+    }
+}
+
 __global__ static void swiglu_weighted_kernel(
         float *mid,
         const float *gate,
@@ -29583,6 +29643,65 @@ extern "C" int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
             (const int32_t *)ids->ptr, tail_weights, mid_width, main_dim,
             tail_dim, out_dim, n_expert, assignments);
     return cuda_ok(cudaGetLastError(), "Qwen4Exp Q5_0 tail accumulate launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_q8_0_tail_accum_tensor(
+        ds4_gpu_tensor       *down,
+        const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert) {
+    if (!down || !mid || !ids || !model_map || down->ptr == mid->ptr ||
+        assignments == 0u || mid_width == 0u || main_dim == 0u ||
+        tail_dim == 0u || tail_dim % 32u != 0u || out_dim == 0u ||
+        n_expert == 0u || main_dim > mid_width ||
+        tail_dim > mid_width - main_dim ||
+        assignments > UINT64_MAX / mid_width ||
+        assignments > UINT64_MAX / out_dim ||
+        (uint64_t)n_expert > UINT64_MAX / out_dim) {
+        return 0;
+    }
+    const uint64_t mid_count = assignments * mid_width;
+    const uint64_t tasks = assignments * out_dim;
+    const uint64_t rows = (uint64_t)n_expert * out_dim;
+    const uint64_t blocks_per_row = tail_dim / 32u;
+    if (rows > UINT64_MAX / blocks_per_row ||
+        rows * blocks_per_row > UINT64_MAX / sizeof(cuda_block_q8_0) ||
+        mid_count > UINT64_MAX / sizeof(float) ||
+        tasks > UINT64_MAX / sizeof(float) || tasks > (uint64_t)INT_MAX) {
+        return 0;
+    }
+    const uint64_t required_bytes =
+        rows * blocks_per_row * sizeof(cuda_block_q8_0);
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        weight_bytes < required_bytes ||
+        mid->bytes < mid_count * sizeof(float) ||
+        ids->bytes < assignments * sizeof(int32_t) ||
+        down->bytes < tasks * sizeof(float)) {
+        return 0;
+    }
+    const cuda_block_q8_0 *tail_weights =
+        (const cuda_block_q8_0 *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes,
+            "qwen4exp_q8_0_expert_down_tail");
+    if (!tail_weights) return 0;
+    constexpr uint64_t rows_per_block = 64u;
+    const uint64_t blocks = assignments *
+        ((out_dim + rows_per_block - 1u) / rows_per_block);
+    qwen4exp_q8_0_tail_accum_kernel<<<
+        (unsigned)blocks, 256u, tail_dim * sizeof(float), ds4_current_stream()>>>(
+            (float *)down->ptr, (const float *)mid->ptr,
+            (const int32_t *)ids->ptr, tail_weights, mid_width, main_dim,
+            tail_dim, out_dim, n_expert, assignments);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp Q8_0 tail accumulate launch");
 }
 
 extern "C" int ds4_gpu_swiglu_weighted_tensor(
