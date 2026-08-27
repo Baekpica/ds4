@@ -9425,6 +9425,100 @@ __global__ static void qwen4exp_qsa_attention_reduce_kernel(
     out[at] = value * gate_scale;
 }
 
+/* Qwen's twelve query heads share each KV head.  Reduce them in one block so
+ * the selected value is fetched once instead of twelve times. */
+__global__ static void qwen4exp_qsa_attention_reduce_gqa12_kernel(
+        float *out, float *scores, const float *gate, const float *v_cache,
+        const int32_t *selected, const uint32_t *counts,
+        uint32_t selected_cap) {
+    const uint32_t kv_head = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    const uint32_t d = threadIdx.x;
+    const uint32_t count = counts[row];
+    const uint64_t first_head = (uint64_t)row * 24u + kv_head * 12u;
+    const uint64_t selected_base = (uint64_t)row * selected_cap;
+    extern __shared__ float partial[];
+    float maximum[12];
+#pragma unroll
+    for (uint32_t h = 0; h < 12u; h++) maximum[h] = -INFINITY;
+    for (uint32_t slot = d; slot < count; slot += blockDim.x) {
+#pragma unroll
+        for (uint32_t h = 0; h < 12u; h++) {
+            const uint64_t score_base =
+                (first_head + h) * selected_cap;
+            maximum[h] = fmaxf(maximum[h], scores[score_base + slot]);
+        }
+    }
+#pragma unroll
+    for (uint32_t h = 0; h < 12u; h++)
+        partial[(uint64_t)h * blockDim.x + d] = maximum[h];
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (d < stride) {
+#pragma unroll
+            for (uint32_t h = 0; h < 12u; h++) {
+                const uint64_t at = (uint64_t)h * blockDim.x + d;
+                partial[at] = fmaxf(partial[at], partial[at + stride]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t h = 0; h < 12u; h++) maximum[h] = partial[h * blockDim.x];
+
+    float sum[12] = {0.0f};
+    for (uint32_t slot = d; slot < count; slot += blockDim.x) {
+#pragma unroll
+        for (uint32_t h = 0; h < 12u; h++) {
+            const uint64_t score_at =
+                (first_head + h) * selected_cap + slot;
+            const float weight = expf(scores[score_at] - maximum[h]);
+            scores[score_at] = weight;
+            sum[h] += weight;
+        }
+    }
+#pragma unroll
+    for (uint32_t h = 0; h < 12u; h++)
+        partial[(uint64_t)h * blockDim.x + d] = sum[h];
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (d < stride) {
+#pragma unroll
+            for (uint32_t h = 0; h < 12u; h++) {
+                const uint64_t at = (uint64_t)h * blockDim.x + d;
+                partial[at] += partial[at + stride];
+            }
+        }
+        __syncthreads();
+    }
+    float inv_sum[12];
+#pragma unroll
+    for (uint32_t h = 0; h < 12u; h++)
+        inv_sum[h] = count > 0u ? 1.0f / partial[h * blockDim.x] : 0.0f;
+
+    float value[12] = {0.0f};
+    for (uint32_t slot = 0; slot < count; slot++) {
+        const uint32_t token = (uint32_t)selected[selected_base + slot];
+        const float v = v_cache[
+            ((uint64_t)token * 2u + kv_head) * 256u + d];
+#pragma unroll
+        for (uint32_t h = 0; h < 12u; h++) {
+            const uint64_t score_at =
+                (first_head + h) * selected_cap + slot;
+            value[h] += scores[score_at] * inv_sum[h] * v;
+        }
+    }
+#pragma unroll
+    for (uint32_t h = 0; h < 12u; h++) {
+        const uint64_t at = (first_head + h) * 256u + d;
+        const float gate_value = gate[at];
+        const float gate_scale = gate_value >= 0.0f
+            ? 1.0f / (1.0f + expf(-gate_value))
+            : expf(gate_value) / (1.0f + expf(gate_value));
+        out[at] = value[h] * gate_scale;
+    }
+}
+
 /* v0.5 inc-12c: dual-emit twin of rms_norm_weight_kernel -- the f32 body is
  * copied VERBATIM (the reference kernel above stays byte-untouched for every
  * other caller) and each output value is additionally stored as
@@ -25611,14 +25705,25 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(
     }
     if (!cuda_ok(cudaGetLastError(), "Qwen4Exp QSA attention scores launch"))
         return 0;
-    qwen4exp_qsa_attention_reduce_kernel<<<
-        rows * heads, head_dim, head_dim * sizeof(float),
-        ds4_current_stream()>>>(
-        (float *)out->ptr, (float *)score_scratch->ptr,
-        (const float *)gate->ptr, (const float *)v_cache->ptr,
-        (const int32_t *)selected->ptr,
-        (const uint32_t *)counts->ptr, heads, kv_heads, head_dim,
-        selected_cap);
+    if (heads == 24u && kv_heads == 2u && head_dim == 256u) {
+        dim3 reduce_grid(kv_heads, rows);
+        qwen4exp_qsa_attention_reduce_gqa12_kernel<<<
+            reduce_grid, head_dim, 12u * head_dim * sizeof(float),
+            ds4_current_stream()>>>(
+            (float *)out->ptr, (float *)score_scratch->ptr,
+            (const float *)gate->ptr, (const float *)v_cache->ptr,
+            (const int32_t *)selected->ptr,
+            (const uint32_t *)counts->ptr, selected_cap);
+    } else {
+        qwen4exp_qsa_attention_reduce_kernel<<<
+            rows * heads, head_dim, head_dim * sizeof(float),
+            ds4_current_stream()>>>(
+            (float *)out->ptr, (float *)score_scratch->ptr,
+            (const float *)gate->ptr, (const float *)v_cache->ptr,
+            (const int32_t *)selected->ptr,
+            (const uint32_t *)counts->ptr, heads, kv_heads, head_dim,
+            selected_cap);
+    }
     return cuda_ok(cudaGetLastError(), "Qwen4Exp QSA attention reduce launch");
 }
 
