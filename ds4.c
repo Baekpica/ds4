@@ -5099,6 +5099,33 @@ static bool tensor_type_is_qwen4exp_matrix(uint32_t type) {
            type == DS4_TENSOR_IQ2_XXS;
 }
 
+static bool qwen4exp_ssd_precision_types(
+        ds4_str  variant,
+        uint32_t *edge_gate,
+        uint32_t *interior_gate,
+        uint32_t *down,
+        uint32_t *tail) {
+    uint32_t edge_type;
+    uint32_t interior_type;
+    uint32_t down_type;
+    if (ds4_streq(variant, "MQ-Q6-SSD-PLE-BF16")) {
+        edge_type = DS4_TENSOR_Q6_K;
+        interior_type = DS4_TENSOR_Q5_K;
+        down_type = DS4_TENSOR_Q6_K;
+    } else if (ds4_streq(variant, "MQ-Q5-SSD-PLE-BF16")) {
+        edge_type = DS4_TENSOR_Q5_K;
+        interior_type = DS4_TENSOR_Q4_K;
+        down_type = DS4_TENSOR_Q5_K;
+    } else {
+        return false;
+    }
+    if (edge_gate) *edge_gate = edge_type;
+    if (interior_gate) *interior_gate = interior_type;
+    if (down) *down = down_type;
+    if (tail) *tail = DS4_TENSOR_Q5_0;
+    return true;
+}
+
 static bool tensor_type_is_qwen4exp_plain(uint32_t type) {
     return type == DS4_TENSOR_F32 || type == DS4_TENSOR_BF16;
 }
@@ -5252,8 +5279,21 @@ static void weights_validate_qwen4exp_ple(
     tensor_expect_layout(p->head_vocab_sizes, DS4_TENSOR_I64, 1, 16, 0, 0);
 }
 
-static void weights_validate_qwen4exp_layout(const ds4_weights *w) {
-    if (!w) ds4_die("internal error: missing Qwen4Exp weights");
+static void weights_validate_qwen4exp_layout(
+        const ds4_weights *w,
+        const ds4_model   *m) {
+    if (!w || !m) ds4_die("internal error: missing Qwen4Exp weights or model");
+    ds4_str quantization = {0};
+    uint32_t edge_gate_type = 0;
+    uint32_t interior_gate_type = 0;
+    uint32_t down_type = 0;
+    uint32_t tail_type = 0;
+    const bool ssd_precision_recipe =
+        model_get_string(m, "general.quantization", &quantization) &&
+        qwen4exp_ssd_precision_types(
+            quantization, &edge_gate_type, &interior_gate_type,
+            &down_type, &tail_type);
+
     tensor_expect_qwen4exp_matrix(w->token_embd, 2,
                                   DS4_N_EMBD, DS4_N_VOCAB, 0);
     if (w->output_norm || w->output_hc_base || w->output_hc_fn ||
@@ -5262,12 +5302,6 @@ static void weights_validate_qwen4exp_layout(const ds4_weights *w) {
     tensor_expect_qwen4exp_matrix(w->output, 2,
                                   DS4_N_EMBD, DS4_N_VOCAB, 0);
     weights_validate_qwen4exp_hc(&w->qwen_input_hc, false);
-
-    const bool ssd_precision_recipe =
-        w->layer[0].ffn_gate_exps->type == DS4_TENSOR_Q6_K &&
-        w->layer[2].ffn_gate_exps->type == DS4_TENSOR_Q5_K &&
-        w->layer[0].ffn_down_exps->type == DS4_TENSOR_Q6_K &&
-        w->layer[0].ffn_down_exps_tail->type == DS4_TENSOR_Q5_0;
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
@@ -5283,13 +5317,17 @@ static void weights_validate_qwen4exp_layout(const ds4_weights *w) {
         if (ssd_precision_recipe) {
             const uint32_t gate_type =
                 il < 2u || il >= 46u
-                    ? DS4_TENSOR_Q6_K
-                    : DS4_TENSOR_Q5_K;
+                    ? edge_gate_type
+                    : interior_gate_type;
             if (l->ffn_gate_exps->type != gate_type ||
                 l->ffn_up_exps->type != gate_type ||
-                l->ffn_down_exps->type != DS4_TENSOR_Q6_K ||
-                l->ffn_down_exps_tail->type != DS4_TENSOR_Q5_0)
-                ds4_die("Qwen4Exp SSD-PLE precision map differs from MQ-Q6-SSD-PLE-BF16");
+                l->ffn_down_exps->type != down_type ||
+                l->ffn_down_exps_tail->type != tail_type) {
+                fprintf(stderr,
+                        "ds4: Qwen4Exp SSD-PLE precision map differs from %.*s\n",
+                        (int)quantization.len, quantization.ptr);
+                exit(1);
+            }
         }
     }
 
@@ -5310,9 +5348,11 @@ static void weights_validate_qwen4exp_layout(const ds4_weights *w) {
 
 /* Verify every tensor type and dimension used by the selected specialized
  * pipeline. After this succeeds, inference code can rely on fixed constants. */
-static void weights_validate_layout(const ds4_weights *w) {
+static void weights_validate_layout(
+        const ds4_weights *w,
+        const ds4_model   *m) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
-        weights_validate_qwen4exp_layout(w);
+        weights_validate_qwen4exp_layout(w, m);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_MOTIF3) {
@@ -6176,12 +6216,12 @@ static void config_validate_exaone_moe_model(const ds4_model *m) {
  * fail during model validation instead of silently attempting an incomplete
  * resident model. */
 static bool config_validate_qwen4exp_external_ple(const ds4_model *m) {
-    static const char *variant = "MQ-Q6-SSD-PLE-BF16";
     ds4_str quantization = {0};
     ds4_str value = {0};
     const bool named_external =
         model_get_string(m, "general.quantization", &quantization) &&
-        ds4_streq(quantization, variant);
+        qwen4exp_ssd_precision_types(
+            quantization, NULL, NULL, NULL, NULL);
     const bool declares_external =
         model_find_kv(m, "qwen4exp.ple.weight_storage") != NULL;
 
@@ -6849,7 +6889,7 @@ static void weights_bind(
         for (uint32_t il = 0; il < DS4_N_LAYER; il++)
             weights_bind_qwen4exp_layer(&w->layer[il], m, il);
         weights_bind_qwen4exp_mtp(w, m);
-        weights_validate_layout(w);
+        weights_validate_layout(w, m);
         return;
     }
 
@@ -6861,7 +6901,7 @@ static void weights_bind(
             weights_bind_motif3_layer(&w->layer[il], m, il);
         }
         weights_bind_motif3_mtp(w, m);
-        weights_validate_layout(w);
+        weights_validate_layout(w, m);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) {
@@ -6872,7 +6912,7 @@ static void weights_bind(
             weights_bind_dots3_note_layer(&w->layer[il], m, il);
         }
         w->dots3_token_embd_mtp = required_tensor(m, "token_embd_mtp.weight");
-        weights_validate_layout(w);
+        weights_validate_layout(w, m);
         return;
     }
     w->token_embd       = required_tensor(m, "token_embd.weight");
@@ -6940,7 +6980,7 @@ static void weights_bind(
         }
     }
 
-    weights_validate_layout(w);
+    weights_validate_layout(w, m);
 }
 
 typedef struct {

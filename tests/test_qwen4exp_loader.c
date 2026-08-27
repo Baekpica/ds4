@@ -5,7 +5,35 @@
  */
 #include "../ds4.c"
 
+static int check_ssd_precision_maps(void) {
+    const ds4_str q6 = {
+        "MQ-Q6-SSD-PLE-BF16", sizeof("MQ-Q6-SSD-PLE-BF16") - 1u
+    };
+    const ds4_str q5 = {
+        "MQ-Q5-SSD-PLE-BF16", sizeof("MQ-Q5-SSD-PLE-BF16") - 1u
+    };
+    const ds4_str unknown = {
+        "MQ-Q4-SSD-PLE-BF16", sizeof("MQ-Q4-SSD-PLE-BF16") - 1u
+    };
+    uint32_t edge = 0, interior = 0, down = 0, tail = 0;
+
+    if (!qwen4exp_ssd_precision_types(q6, &edge, &interior, &down, &tail) ||
+        edge != DS4_TENSOR_Q6_K || interior != DS4_TENSOR_Q5_K ||
+        down != DS4_TENSOR_Q6_K || tail != DS4_TENSOR_Q5_0)
+        return 1;
+    if (!qwen4exp_ssd_precision_types(q5, &edge, &interior, &down, &tail) ||
+        edge != DS4_TENSOR_Q5_K || interior != DS4_TENSOR_Q4_K ||
+        down != DS4_TENSOR_Q5_K || tail != DS4_TENSOR_Q5_0)
+        return 1;
+    return qwen4exp_ssd_precision_types(
+               unknown, &edge, &interior, &down, &tail) ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (check_ssd_precision_maps() != 0) {
+        fprintf(stderr, "Qwen4Exp SSD-PLE precision-map recognition failed\n");
+        return 1;
+    }
     if (argc != 2) {
         fprintf(stderr, "usage: %s <qwen4exp.gguf>\n", argv[0]);
         return 2;
@@ -72,7 +100,8 @@ int main(int argc, char **argv) {
     ds4_str quantization = {0};
     const bool external_ple =
         model_get_string(&model, "general.quantization", &quantization) &&
-        ds4_streq(quantization, "MQ-Q6-SSD-PLE-BF16");
+        qwen4exp_ssd_precision_types(
+            quantization, NULL, NULL, NULL, NULL);
     if (external_ple) {
         if (!config_validate_qwen4exp_external_ple(&model)) {
             fprintf(stderr, "SSD-PLE variant was not recognized as external\n");
