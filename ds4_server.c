@@ -921,6 +921,26 @@ static bool g_native_reasoning_effort = false;
  * reasoning regardless. */
 static bool g_reasoning_replay_drop = false;
 
+/* Issue #18 option E: at depth, the quant sometimes answers a tools-armed
+ * turn with a prose completion report instead of a tool call (measured 50%
+ * of turns at 70-80K in the field-shaped baseline; every slip fired right
+ * after a successful tool result).  A short protocol reminder rendered at
+ * the tail suppresses it: at the exact eliciting states the control arm
+ * slipped 6/72 sampled draws and the reminder arm 0/72, and the end-to-end
+ * pilot (reminder injected every turn, reasoning traces KEPT) submitted
+ * and resolved the task in 57 calls with zero slips where the bare engine
+ * died three runs.  Default ON, gated to rendered depth >= ~96KB (~30K+
+ * tokens): the slip class lives exclusively deep, and shallow
+ * chat-with-tools flows that legitimately answer in prose after a tool
+ * result must not be nudged into spurious calls.  --tool-call-reminder off
+ * (env DS4_TOOL_CALL_REMINDER=0) disables; DS4_TOOL_CALL_REMINDER_MIN_BYTES
+ * retunes the gate. */
+static bool g_tool_call_reminder = true;
+static size_t g_tool_reminder_min_bytes = 98304;
+#define DS4_TOOL_CALL_REMINDER_TEXT \
+    "\n\n[Reminder: respond with exactly one tool call in the required " \
+    "format. Plain-text replies are not accepted by this harness.]"
+
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
     if (!s) return false;
     /* The three levels the 0731 checkpoint defines, plus the OpenAI-style
@@ -2587,6 +2607,21 @@ static char *render_chat_prompt_text(const chat_msgs *msgs, const char *tool_sch
             if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
             buf_puts(&out, "<tool_result>");
             append_tool_result_text(&out, m->content);
+            /* issue #18 option E: past the depth gate, every tool result in
+             * a tools-armed conversation carries the protocol reminder.
+             * Per-result (not last-result-only) so the rendered history is
+             * byte-stable across turns and keep-mode warm reuse stays
+             * perfect; gated on rendered depth because the slip class lives
+             * exclusively deep (0/129 turns below 60K in the field
+             * baseline) while shallow chat-with-tools flows legitimately
+             * answer in prose after a tool result and must not be pushed
+             * into spurious calls.  The condition reads out.len BEFORE the
+             * append, so each result's verdict is a pure function of the
+             * conversation prefix. */
+            if (g_tool_call_reminder && tool_schemas && tool_schemas[0] &&
+                out.len >= g_tool_reminder_min_bytes) {
+                buf_puts(&out, DS4_TOOL_CALL_REMINDER_TEXT);
+            }
             buf_puts(&out, "</tool_result>");
             pending_assistant = true;
             pending_tool_result = true;
@@ -18934,6 +18969,16 @@ static void usage(FILE *fp) {
         "      before answering (the retry warm-admits its own bank, so the cost is one\n"
         "      generation). Serial-lane and streaming turns are not resampled. Off by\n"
         "      default. Env twin: DS4_TOOL_SLIP_RESAMPLE=1.\n"
+        "  --tool-call-reminder on|off\n"
+        "      Default on: past ~96KB of rendered conversation, every tool result in a\n"
+        "      tools-armed chat carries a short protocol reminder. At depth, low-bit\n"
+        "      quants otherwise answer some tools-armed turns with a prose completion\n"
+        "      report (measured 50%% of turns at 70-80K tokens; the reminder measured\n"
+        "      0/72 slips vs 6/72 without at the same states, and fixed the failing\n"
+        "      agent task end to end). Shallow conversations are never touched, so\n"
+        "      chat-with-tools flows that answer in prose after a tool result are\n"
+        "      unaffected. Env twins: DS4_TOOL_CALL_REMINDER=0 disables,\n"
+        "      DS4_TOOL_CALL_REMINDER_MIN_BYTES retunes the depth gate.\n"
         "  --reasoning-replay MODE\n"
         "      keep (default): reasoning_content echoed by the client in tool-context\n"
         "      history renders back into <think> blocks -- the V4 reference format\n"
@@ -19528,6 +19573,15 @@ static server_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--tool-slip-resample")) {
             c.tool_slip_resample = true;
+        } else if (!strcmp(arg, "--tool-call-reminder")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "on")) g_tool_call_reminder = true;
+            else if (!strcmp(v, "off")) g_tool_call_reminder = false;
+            else {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: unknown --tool-call-reminder '%s' (on, off)", v);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--reasoning-effort")) {
             const char *v = need_arg(&i, argc, argv, arg);
             if (!parse_reasoning_effort_name(v, &g_default_reasoning_effort)) {
@@ -19651,6 +19705,16 @@ static server_config parse_options(int argc, char **argv) {
     if (!c.tool_slip_resample) {   /* env twin of --tool-slip-resample */
         const char *rs = getenv("DS4_TOOL_SLIP_RESAMPLE");
         c.tool_slip_resample = rs && rs[0] == '1' && rs[1] == '\0';
+    }
+    {   /* env twins of --tool-call-reminder (default ON; "0" disables) */
+        const char *tr = getenv("DS4_TOOL_CALL_REMINDER");
+        if (tr && tr[0] == '0' && tr[1] == '\0') g_tool_call_reminder = false;
+        const char *tb = getenv("DS4_TOOL_CALL_REMINDER_MIN_BYTES");
+        if (tb && tb[0]) {
+            char *end = NULL;
+            long v = strtol(tb, &end, 10);
+            if (!*end && v >= 0) g_tool_reminder_min_bytes = (size_t)v;
+        }
     }
     return c;
 }
@@ -19934,6 +19998,12 @@ int main(int argc, char **argv) {
     if (s.tool_slip_resample)
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: tool-slip resample armed (cont non-streaming chat, one retry)");
+    if (!g_tool_call_reminder)
+        server_log(DS4_LOG_DEFAULT, "ds4-server: tool-call reminder disabled");
+    else if (g_tool_reminder_min_bytes != 98304)
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: tool-call reminder depth gate %zu bytes",
+                   g_tool_reminder_min_bytes);
     if (g_reasoning_replay_drop)
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: reasoning-replay=drop (history assistant turns render lean)");
@@ -21852,6 +21922,95 @@ static void test_reasoning_replay_drop_render(void) {
     g_reasoning_replay_drop = saved;
     free(keep);
     free(drop);
+    chat_msgs_free(&msgs);
+}
+
+static void test_tool_call_reminder_render(void) {
+    /* issue #18 option E: past the depth gate, EVERY tool result in a
+     * tools-armed render carries the reminder (history-stable per-result
+     * form); below the gate, with the knob off, or without tools, none. */
+    const bool saved_on = g_tool_call_reminder;
+    const size_t saved_gate = g_tool_reminder_min_bytes;
+    chat_msgs msgs = {0};
+    chat_msg m0 = {0};
+    m0.role = xstrdup("user");
+    m0.content = xstrdup("run the tests");
+    chat_msgs_push(&msgs, m0);
+    chat_msg m1 = {0};
+    m1.role = xstrdup("assistant");
+    m1.content = xstrdup("");
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\": \"make test\"}");
+    tool_calls_push(&m1.calls, tc);
+    chat_msgs_push(&msgs, m1);
+    chat_msg m2 = {0};
+    m2.role = xstrdup("tool");
+    m2.content = xstrdup("ok-first");
+    chat_msgs_push(&msgs, m2);
+    chat_msg m3 = {0};
+    m3.role = xstrdup("assistant");
+    m3.content = xstrdup("");
+    tool_call tc2 = {0};
+    tc2.name = xstrdup("bash");
+    tc2.arguments = xstrdup("{\"command\": \"make check\"}");
+    tool_calls_push(&m3.calls, tc2);
+    chat_msgs_push(&msgs, m3);
+    chat_msg m4 = {0};
+    m4.role = xstrdup("tool");
+    m4.content = xstrdup("ok-second");
+    chat_msgs_push(&msgs, m4);
+    const char *schemas = "## bash\ndescription";
+
+    int n;
+    const char *p;
+    char *r;
+
+    /* Below the gate: untouched. */
+    g_tool_call_reminder = true;
+    g_tool_reminder_min_bytes = (size_t)-1;
+    r = render_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(strstr(r, "[Reminder:") == NULL);
+    free(r);
+
+    /* Past the gate: BOTH results carry it, inside the result blocks. */
+    g_tool_reminder_min_bytes = 0;
+    r = render_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_LOW);
+    n = 0;
+    for (p = r; (p = strstr(p, "[Reminder:")) != NULL; p++) n++;
+    TEST_ASSERT(n == 2);
+    TEST_ASSERT(strstr(r, "not accepted by this harness.]</tool_result>") != NULL);
+
+    /* History stability: the shorter conversation's render (minus its
+     * trailing assistant-open) is a byte prefix of the longer one's. */
+    {
+        chat_msgs head = {0};
+        head.v = msgs.v;
+        head.len = 3;   /* user, assistant, first tool result */
+        char *r1 = render_chat_prompt_text(&head, schemas, NULL, DS4_THINK_LOW);
+        const char *tail_open = "<｜Assistant｜><think>";
+        size_t l1 = strlen(r1);
+        size_t lt = strlen(tail_open);
+        TEST_ASSERT(l1 > lt && !strcmp(r1 + l1 - lt, tail_open));
+        TEST_ASSERT(!strncmp(r, r1, l1 - lt));
+        free(r1);
+    }
+    free(r);
+
+    /* Knob off: none. */
+    g_tool_call_reminder = false;
+    r = render_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(strstr(r, "[Reminder:") == NULL);
+    free(r);
+
+    /* No tools declared: none, even past the gate. */
+    g_tool_call_reminder = true;
+    r = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(strstr(r, "[Reminder:") == NULL);
+    free(r);
+
+    g_tool_call_reminder = saved_on;
+    g_tool_reminder_min_bytes = saved_gate;
     chat_msgs_free(&msgs);
 }
 
@@ -29882,6 +30041,7 @@ static void ds4_server_unit_tests_run(void) {
     test_client_reasoning_effort_compat();
     test_tool_slip_dump();
     test_reasoning_replay_drop_render();
+    test_tool_call_reminder_render();
     test_cont_slip_resample_contract();
     test_slip_requeue_and_age_exemption();
     test_api_thinking_controls_parse();
