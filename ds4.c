@@ -20982,6 +20982,10 @@ static uint64_t ds4_mem_usable_beyond(uint64_t reserve);
 
 static void qwen4exp_graph_free(ds4_qwen_gpu_graph *graph) {
     if (!graph) return;
+    /* MTP prefix maintenance intentionally returns before a host read.  Drain
+     * that stream once at session teardown before releasing its VMM buffers. */
+    if (graph->mtp_hidden || graph->mtp_pending_hc ||
+        graph->mtp_target_backup) (void)ds4_gpu_synchronize();
     qwen4exp_qsa_state_free(&graph->mtp_qsa_state);
     ds4_gpu_tensor_free(graph->mtp_target_backup);
     ds4_gpu_tensor_free(graph->mtp_pending_hc);
@@ -62296,6 +62300,7 @@ static int ds4_session_eval_qwen_mtp(
             s, first_token, accepted, err, errlen);
     }
     const int draft = sample_argmax(s->mtp_logits, DS4_N_VOCAB);
+    ds4_metric_add(&ds4_metrics_get()->spec_drafts, 1);
     const ds4_ple_hash_state saved_hash = g->ple.hash_state;
     if (!qwen4exp_graph_mtp_backup_target(g)) {
         qwen4exp_graph_mtp_disable(g, "rollback reservation failed");
@@ -62322,6 +62327,7 @@ static int ds4_session_eval_qwen_mtp(
     int n_accepted = 1;
     const int target_next = sample_argmax(s->mtp_logits, DS4_N_VOCAB);
     if (target_next == draft) {
+        ds4_metric_add(&ds4_metrics_get()->spec_hits, 1);
         memcpy(s->logits, s->mtp_logits + DS4_N_VOCAB,
                (size_t)DS4_N_VOCAB * sizeof(*s->logits));
         token_vec_push(&s->checkpoint, first_token);
@@ -62370,6 +62376,7 @@ static int ds4_session_eval_qwen_mtp(
         const double expected = s->qwen_mtp_baseline_ms * committed;
         if (s->qwen_mtp_speculative_ms > expected * 1.03) {
             s->qwen_mtp_quenched = true;
+            ds4_metric_add(&ds4_metrics_get()->spec_quench, 1);
             fprintf(stderr,
                     "ds4: Qwen MTP quenched after %u cycles: "
                     "accepted=%u speculative=%.3f ms baseline=%.3f ms/token\n",

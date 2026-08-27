@@ -15436,7 +15436,12 @@ static void generate_job(server *s, job *j) {
             ds4_metric_add(&mreg->tokens_prefilled_cached, (uint64_t)cached);
     }
     if (cold_store_len == prompt_for_sync->len) {
-        if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
+        /* The request text is the exact cross-boot lookup key.  Rendering the
+         * tokens back to text can canonicalize model control tokens, so it is
+         * not necessarily byte-identical to the incoming rendered prompt. */
+        if (kv_cache_store_live_prefix_text(s, prompt_for_sync, cold_store_len,
+                                            "cold", j->req.prompt_text, 0,
+                                            "request-text")) {
             kv_cache_note_store(&s->kv, cold_store_len);
             suppressed_continued_last = -1;
         } else {
