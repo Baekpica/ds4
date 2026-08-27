@@ -30179,16 +30179,16 @@ static bool qwen4exp_engine_open_ple(ds4_engine *engine,
         strcpy(root, ".");
     }
     uint32_t cache_mb = qwen4exp_env_u32(
-        "DS4_QWEN_PLE_CACHE_MB", 512u, 512u, 2048u);
+        "DS4_QWEN_PLE_CACHE_MB", 2048u, 512u, 2048u);
     if (!qwen4exp_ple_cache_mb_valid(cache_mb)) {
         fprintf(stderr,
                 "ds4: ignoring DS4_QWEN_PLE_CACHE_MB=%u "
-                "(supported: 512, 1024, 2048); using 512\n",
+                "(supported: 512, 1024, 2048); using 2048\n",
                 cache_mb);
-        cache_mb = 512u;
+        cache_mb = 2048u;
     }
     const uint32_t workers = qwen4exp_env_u32(
-        "DS4_QWEN_PLE_WORKERS", 8u, 1u, 64u);
+        "DS4_QWEN_PLE_WORKERS", 16u, 1u, 64u);
     char error[512] = {0};
     engine->qwen_ple_store = ds4_ple_store_open(
         root, "ple/ple-manifest.json", (size_t)cache_mb << 20,
