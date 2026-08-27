@@ -20167,6 +20167,11 @@ static bool qwen4exp_qsa_state_reset(ds4_qwen_qsa_state *state) {
     return true;
 }
 
+static ds4_gpu_tensor *qwen4exp_qsa_state_reserve(uint64_t bytes) {
+    ds4_gpu_tensor *tensor = ds4_gpu_tensor_reserve(bytes);
+    return tensor ? tensor : ds4_gpu_tensor_alloc(bytes);
+}
+
 static bool qwen4exp_qsa_state_alloc(
         ds4_qwen_qsa_state *state,
         uint32_t            context_cap,
@@ -20198,10 +20203,10 @@ static bool qwen4exp_qsa_state_alloc(
     const uint64_t raw_bytes = raw_values * sizeof(float);
     const uint64_t pooled_bytes = pooled_values * sizeof(float);
     const uint64_t kv_bytes = kv_values * sizeof(float);
-    state->raw_index = ds4_gpu_tensor_alloc(raw_bytes);
-    state->pooled_index = ds4_gpu_tensor_alloc(pooled_bytes);
-    state->k_cache = ds4_gpu_tensor_alloc(kv_bytes);
-    state->v_cache = ds4_gpu_tensor_alloc(kv_bytes);
+    state->raw_index = qwen4exp_qsa_state_reserve(raw_bytes);
+    state->pooled_index = qwen4exp_qsa_state_reserve(pooled_bytes);
+    state->k_cache = qwen4exp_qsa_state_reserve(kv_bytes);
+    state->v_cache = qwen4exp_qsa_state_reserve(kv_bytes);
     if (!state->raw_index || !state->pooled_index ||
         !state->k_cache || !state->v_cache) {
         qwen4exp_qsa_state_free(state);
@@ -20209,6 +20214,33 @@ static bool qwen4exp_qsa_state_alloc(
     }
     state->bytes = raw_bytes + pooled_bytes + 2u * kv_bytes;
     return qwen4exp_qsa_state_reset(state);
+}
+
+static bool qwen4exp_qsa_state_ensure(ds4_qwen_qsa_state *state,
+                                      uint32_t pos0,
+                                      uint32_t n_tokens) {
+    if (!state || n_tokens == 0u || pos0 > state->context_cap ||
+        n_tokens > state->context_cap - pos0) return false;
+    const uint64_t index_row_bytes =
+        (uint64_t)state->index_head_dim * sizeof(float);
+    const uint64_t kv_row_bytes =
+        (uint64_t)state->kv_heads * state->head_dim * sizeof(float);
+    const uint32_t old_blocks = pos0 / state->ratio;
+    const uint32_t max_blocks = (pos0 + n_tokens) / state->ratio;
+    return ds4_gpu_tensor_ensure(
+               state->raw_index, (uint64_t)pos0 * index_row_bytes,
+               (uint64_t)n_tokens * index_row_bytes) != 0 &&
+           (max_blocks == old_blocks ||
+            ds4_gpu_tensor_ensure(
+                state->pooled_index,
+                (uint64_t)old_blocks * index_row_bytes,
+                (uint64_t)(max_blocks - old_blocks) * index_row_bytes) != 0) &&
+           ds4_gpu_tensor_ensure(
+               state->k_cache, (uint64_t)pos0 * kv_row_bytes,
+               (uint64_t)n_tokens * kv_row_bytes) != 0 &&
+           ds4_gpu_tensor_ensure(
+               state->v_cache, (uint64_t)pos0 * kv_row_bytes,
+               (uint64_t)n_tokens * kv_row_bytes) != 0;
 }
 
 static void qwen4exp_qsa_ws_free(ds4_qwen_qsa_ws *ws) {
@@ -20355,6 +20387,7 @@ static bool qwen4exp_qsa_forward(
         weights->output->dim[1] != hidden) {
         return false;
     }
+    if (!qwen4exp_qsa_state_ensure(state, pos0, n_tokens)) return false;
 
     if (!plain_graph_matmul_tensor(
                 ws->index_qk, model, weights->index_qk,
@@ -30115,7 +30148,7 @@ static bool qwen4exp_engine_open_ple(ds4_engine *engine,
         cache_mb = 512u;
     }
     const uint32_t workers = qwen4exp_env_u32(
-        "DS4_QWEN_PLE_WORKERS", 4u, 1u, 64u);
+        "DS4_QWEN_PLE_WORKERS", 8u, 1u, 64u);
     char error[512] = {0};
     engine->qwen_ple_store = ds4_ple_store_open(
         root, "ple/ple-manifest.json", (size_t)cache_mb << 20,

@@ -407,6 +407,23 @@ int main(int argc, char **argv) {
                 &state, TEST_CONTEXT, TEST_RATIO, TEST_INDEX_DIM,
                 TEST_KV_HEADS, TEST_HEAD_DIM),
             "allocate real QSA persistent state");
+    const uint64_t demand_page = ds4_gpu_vmm_demand_page();
+    if (demand_page != 0u) {
+        REQUIRE(ds4_gpu_tensor_resident(
+                    state.raw_index, 0,
+                    (uint64_t)TEST_CONTEXT * TEST_INDEX_DIM * sizeof(float)) == 0u &&
+                ds4_gpu_tensor_resident(
+                    state.pooled_index, 0,
+                    (uint64_t)(TEST_CONTEXT / TEST_RATIO) * TEST_INDEX_DIM *
+                        sizeof(float)) == 0u &&
+                ds4_gpu_tensor_resident(
+                    state.k_cache, 0,
+                    (uint64_t)TEST_CONTEXT * TEST_KV_DIM * sizeof(float)) == 0u &&
+                ds4_gpu_tensor_resident(
+                    state.v_cache, 0,
+                    (uint64_t)TEST_CONTEXT * TEST_KV_DIM * sizeof(float)) == 0u,
+                "QSA persistent state starts physically uncommitted");
+    }
     ds4_gpu_tensor *dinput =
         ds4_gpu_tensor_alloc(input_count * sizeof(float));
     ds4_gpu_tensor *doutput =
@@ -420,6 +437,22 @@ int main(int argc, char **argv) {
                 dinput, doutput, TEST_ROWS, 0u),
             "complete real QSA forward");
     REQUIRE(state.length == TEST_ROWS, "real QSA state length");
+    if (demand_page != 0u) {
+        REQUIRE(ds4_gpu_tensor_resident(
+                    state.raw_index, 0,
+                    (uint64_t)TEST_CONTEXT * TEST_INDEX_DIM * sizeof(float)) != 0u &&
+                ds4_gpu_tensor_resident(
+                    state.pooled_index, 0,
+                    (uint64_t)(TEST_CONTEXT / TEST_RATIO) * TEST_INDEX_DIM *
+                        sizeof(float)) != 0u &&
+                ds4_gpu_tensor_resident(
+                    state.k_cache, 0,
+                    (uint64_t)TEST_CONTEXT * TEST_KV_DIM * sizeof(float)) != 0u &&
+                ds4_gpu_tensor_resident(
+                    state.v_cache, 0,
+                    (uint64_t)TEST_CONTEXT * TEST_KV_DIM * sizeof(float)) != 0u,
+                "QSA forward commits every written cache range");
+    }
     REQUIRE(ds4_gpu_tensor_read(ws.index_qk, 0, gpu_index_qk,
                                 index_qk_count * sizeof(float)) &&
             ds4_gpu_tensor_read(ws.index_query, 0, gpu_index_q,

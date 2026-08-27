@@ -9141,11 +9141,21 @@ __global__ static void qwen4exp_qsa_attention_scores_kernel(
     extern __shared__ float partial[];
     partial[d] = product;
     __syncthreads();
-    for (uint32_t stride = head_dim >> 1; stride > 0; stride >>= 1) {
+    for (uint32_t stride = head_dim >> 1; stride >= 32u; stride >>= 1) {
         if (d < stride) partial[d] += partial[d + stride];
-        __syncthreads();
+        if (stride > 32u) __syncthreads();
     }
-    if (d == 0u) scores[score_at] = partial[0] * rsqrtf((float)head_dim);
+    if (d < 32u) {
+        const unsigned mask = __activemask();
+        __syncwarp(mask);
+        float sum = partial[d];
+        for (uint32_t stride = min(16u, head_dim >> 1); stride > 0u;
+             stride >>= 1) {
+            const float other = __shfl_down_sync(mask, sum, stride);
+            if (d < stride) sum += other;
+        }
+        if (d == 0u) scores[score_at] = sum * rsqrtf((float)head_dim);
+    }
 }
 
 __global__ static void qwen4exp_qsa_attention_reduce_kernel(
