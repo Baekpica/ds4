@@ -363,6 +363,19 @@ int ds4_mmq_q5_K_moe(
     int             n_expert_used,
     cudaStream_t    stream);
 
+int ds4_mmq_q5_K_moe_bounded(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    int             max_rows_per_expert,
+    cudaStream_t    stream);
+
 int ds4_mmq_q6_K_moe(
     const void    * W,
     const float   * X_f32,

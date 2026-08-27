@@ -1261,7 +1261,7 @@ template <typename BlockT, typename GenerateFn, typename DequantFn>
 bool run_qwen_high_precision_moe(
         const char *tag, int block_width, int M, int K, int nt, int ne,
         int nu, uint32_t seed, GenerateFn generate, DequantFn dequant,
-        moe_entry_fn entry) {
+        moe_entry_fn entry, moe_entry_fn equivalence_entry = nullptr) {
     auto fn = [generate, dequant, block_width](BlockT *blk, float *out,
                                   int n_experts, int rows, int cols,
                                   int blocks_per_expert, std::mt19937 &rng) {
@@ -1277,7 +1277,8 @@ bool run_qwen_high_precision_moe(
         }
     };
     return run_moe_generic<BlockT>(
-        tag, block_width, M, K, nt, ne, nu, seed, 0.20f, fn, entry);
+        tag, block_width, M, K, nt, ne, nu, seed, 0.20f, fn, entry,
+        equivalence_entry);
 }
 
 bool run_q5_K_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
@@ -1285,6 +1286,21 @@ bool run_q5_K_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
         "Q5_K/MOE", QK_K_LOCAL, M, K, nt, ne, nu, seed,
         generate_random_block_q5_K, dequantize_row_q5_K_cpu,
         ds4_mmq_q5_K_moe);
+}
+
+static int q5_K_moe_bounded_test_entry(
+        const void *w, const float *x, const int32_t *ids, float *out,
+        int M, int K, int nt, int ne, int nu, cudaStream_t stream) {
+    return ds4_mmq_q5_K_moe_bounded(
+        w, x, ids, out, M, K, nt, ne, nu, nt, stream);
+}
+
+bool run_q5_K_moe_bounded(
+        int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    return run_qwen_high_precision_moe<block_q5_K>(
+        "Q5_K/MOE_BOUNDED", QK_K_LOCAL, M, K, nt, ne, nu, seed,
+        generate_random_block_q5_K, dequantize_row_q5_K_cpu,
+        q5_K_moe_bounded_test_entry, ds4_mmq_q5_K_moe);
 }
 
 bool run_q6_K_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
@@ -1695,6 +1711,9 @@ int main(int argc, char ** argv) {
     all_ok &= run_q5_K_moe(
         /*M=*/128, /*K=*/256, /*nt=*/1, /*nexp=*/16, /*nused=*/10,
         0xC5FE01);
+    all_ok &= run_q5_K_moe_bounded(
+        /*M=*/128, /*K=*/512, /*nt=*/32, /*nexp=*/64, /*nused=*/10,
+        0xC5B008);
     all_ok &= run_q6_K_moe(
         /*M=*/128, /*K=*/512, /*nt=*/1, /*nexp=*/16, /*nused=*/10,
         0xC6FE01);

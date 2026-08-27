@@ -8787,18 +8787,113 @@ __global__ static void qwen4exp_gdn_recurrent_kernel(
         uint32_t key_heads, uint32_t value_heads, uint32_t head_dim,
         uint32_t key_dim, uint32_t value_dim, uint32_t repeat) {
     const uint32_t value_head = blockIdx.x;
-    const uint32_t v = threadIdx.x;
-    if (value_head >= value_heads || v >= head_dim) return;
+    const uint32_t tid = threadIdx.x;
+    if (value_head >= value_heads) return;
 
     extern __shared__ float shared[];
     float *q_raw = shared;
     float *k_raw = q_raw + head_dim;
-    float *q_sum = k_raw + head_dim;
-    float *k_sum = q_sum + head_dim;
     const uint32_t key_head = value_head / repeat;
     const float inv_sqrt_dim = rsqrtf((float)head_dim);
     const uint64_t state_head_base =
         (uint64_t)value_head * head_dim * head_dim;
+
+    if (head_dim == 128u && blockDim.x == 512u) {
+        constexpr uint32_t groups = 4u;
+        const uint32_t group = tid / head_dim;
+        const uint32_t v = tid % head_dim;
+        float *partial = k_raw + head_dim;
+        float *delta_shared = partial + groups * head_dim;
+
+        for (uint32_t token = 0; token < rows; token++) {
+            const uint64_t row_base =
+                (uint64_t)token * (2u * key_dim + value_dim);
+            if (tid < head_dim) {
+                const float qv = mixed_qkv[
+                    row_base + (uint64_t)key_head * head_dim + tid];
+                const float kv = mixed_qkv[
+                    row_base + key_dim +
+                    (uint64_t)key_head * head_dim + tid];
+                q_raw[tid] = qv;
+                k_raw[tid] = kv;
+                float q2 = qv * qv;
+                float k2 = kv * kv;
+                for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+                    q2 += __shfl_down_sync(0xffffffffu, q2, offset);
+                    k2 += __shfl_down_sync(0xffffffffu, k2, offset);
+                }
+                if ((tid & 31u) == 0u) {
+                    partial[tid >> 5u] = q2;
+                    delta_shared[tid >> 5u] = k2;
+                }
+            }
+            __syncthreads();
+            if (tid < 32u) {
+                float q2 = tid < 4u ? partial[tid] : 0.0f;
+                float k2 = tid < 4u ? delta_shared[tid] : 0.0f;
+                for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+                    q2 += __shfl_down_sync(0xffffffffu, q2, offset);
+                    k2 += __shfl_down_sync(0xffffffffu, k2, offset);
+                }
+                if (tid == 0u) {
+                    partial[0] = q2;
+                    delta_shared[0] = k2;
+                }
+            }
+            __syncthreads();
+
+            const float q_inv =
+                rsqrtf(partial[0] + 1.0e-6f) * inv_sqrt_dim;
+            const float k_inv = rsqrtf(delta_shared[0] + 1.0e-6f);
+            const uint64_t control_at =
+                (uint64_t)token * value_heads + value_head;
+            const float decay = expf(g[control_at]);
+            const uint64_t state_col = state_head_base + v;
+            float kv_mem = 0.0f;
+            for (uint32_t k = group; k < head_dim; k += groups) {
+                const uint64_t at = state_col + (uint64_t)k * head_dim;
+                kv_mem += state[at] * decay * (k_raw[k] * k_inv);
+            }
+            partial[(uint64_t)group * head_dim + v] = kv_mem;
+            __syncthreads();
+            if (group == 0u) {
+                kv_mem = partial[v] + partial[head_dim + v] +
+                         partial[2u * head_dim + v] +
+                         partial[3u * head_dim + v];
+                const float value = mixed_qkv[
+                    row_base + 2u * key_dim +
+                    (uint64_t)value_head * head_dim + v];
+                delta_shared[v] =
+                    (value - kv_mem) * beta[control_at];
+            }
+            __syncthreads();
+
+            const float delta = delta_shared[v];
+            float result = 0.0f;
+            for (uint32_t k = group; k < head_dim; k += groups) {
+                const uint64_t at = state_col + (uint64_t)k * head_dim;
+                const float sv = state[at] * decay +
+                                 (k_raw[k] * k_inv) * delta;
+                state[at] = sv;
+                result += sv * (q_raw[k] * q_inv);
+            }
+            partial[(uint64_t)group * head_dim + v] = result;
+            __syncthreads();
+            if (group == 0u) {
+                out[((uint64_t)token * value_heads + value_head) *
+                    head_dim + v] =
+                    partial[v] + partial[head_dim + v] +
+                    partial[2u * head_dim + v] +
+                    partial[3u * head_dim + v];
+            }
+        }
+        return;
+    }
+
+    const uint32_t v = tid;
+    if (v >= head_dim) return;
+    float *q_sum = k_raw + head_dim;
+    float *k_sum = q_sum + head_dim;
 
     for (uint32_t token = 0; token < rows; token++) {
         const uint64_t row_base =
@@ -8809,15 +8904,46 @@ __global__ static void qwen4exp_gdn_recurrent_kernel(
             row_base + key_dim + (uint64_t)key_head * head_dim + v];
         q_raw[v] = qv;
         k_raw[v] = kv;
-        q_sum[v] = qv * qv;
-        k_sum[v] = kv * kv;
-        __syncthreads();
-        for (uint32_t stride = head_dim >> 1; stride > 0; stride >>= 1) {
-            if (v < stride) {
-                q_sum[v] += q_sum[v + stride];
-                k_sum[v] += k_sum[v + stride];
+        if (head_dim >= 32u) {
+            const uint32_t lane = v & 31u;
+            const uint32_t warp = v >> 5u;
+            const uint32_t warps = head_dim >> 5u;
+            float q2 = qv * qv;
+            float k2 = kv * kv;
+            for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+                q2 += __shfl_down_sync(0xffffffffu, q2, offset);
+                k2 += __shfl_down_sync(0xffffffffu, k2, offset);
+            }
+            if (lane == 0u) {
+                q_sum[warp] = q2;
+                k_sum[warp] = k2;
             }
             __syncthreads();
+            if (warp == 0u) {
+                q2 = lane < warps ? q_sum[lane] : 0.0f;
+                k2 = lane < warps ? k_sum[lane] : 0.0f;
+                for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+                    q2 += __shfl_down_sync(0xffffffffu, q2, offset);
+                    k2 += __shfl_down_sync(0xffffffffu, k2, offset);
+                }
+                if (lane == 0u) {
+                    q_sum[0] = q2;
+                    k_sum[0] = k2;
+                }
+            }
+            __syncthreads();
+        } else {
+            q_sum[v] = qv * qv;
+            k_sum[v] = kv * kv;
+            __syncthreads();
+            for (uint32_t stride = head_dim >> 1; stride > 0;
+                 stride >>= 1) {
+                if (v < stride) {
+                    q_sum[v] += q_sum[v + stride];
+                    k_sum[v] += k_sum[v + stride];
+                }
+                __syncthreads();
+            }
         }
 
         const float q_inv = rsqrtf(q_sum[0] + 1.0e-6f) * inv_sqrt_dim;
@@ -8831,7 +8957,6 @@ __global__ static void qwen4exp_gdn_recurrent_kernel(
         for (uint32_t k = 0; k < head_dim; k++) {
             const uint64_t at = state_col + (uint64_t)k * head_dim;
             const float sv = state[at] * decay;
-            state[at] = sv;
             kv_mem += sv * (k_raw[k] * k_inv);
         }
         const float value = mixed_qkv[
@@ -8841,7 +8966,8 @@ __global__ static void qwen4exp_gdn_recurrent_kernel(
         float result = 0.0f;
         for (uint32_t k = 0; k < head_dim; k++) {
             const uint64_t at = state_col + (uint64_t)k * head_dim;
-            const float sv = state[at] + (k_raw[k] * k_inv) * delta;
+            const float sv = state[at] * decay +
+                             (k_raw[k] * k_inv) * delta;
             state[at] = sv;
             result += sv * (q_raw[k] * q_inv);
         }
@@ -16834,44 +16960,54 @@ __global__ static void qwen4exp_q5_0_tail_accum_kernel(
         uint32_t tail_dim,
         uint32_t out_dim,
         uint32_t n_expert,
-        uint64_t tasks) {
-    const uint64_t task = (uint64_t)blockIdx.x;
-    if (task >= tasks) return;
-    const uint64_t assignment = task / out_dim;
-    const uint32_t out_row = (uint32_t)(task % out_dim);
+        uint64_t assignments) {
+    constexpr uint32_t warps_per_block = 8u;
+    constexpr uint32_t rows_per_warp = 8u;
+    constexpr uint32_t rows_per_block = warps_per_block * rows_per_warp;
+    const uint32_t output_tiles = (out_dim + rows_per_block - 1u) /
+                                  rows_per_block;
+    const uint64_t assignment = (uint64_t)blockIdx.x / output_tiles;
+    if (assignment >= assignments) return;
+    const uint32_t tile = (uint32_t)blockIdx.x % output_tiles;
     const int32_t expert_i32 = ids[assignment];
     if (expert_i32 < 0 || (uint32_t)expert_i32 >= n_expert) return;
     const uint32_t expert = (uint32_t)expert_i32;
     const uint32_t blocks_per_row = tail_dim / 32u;
-    const cuda_block_q5_0 *row = weights +
-        ((uint64_t)expert * out_dim + out_row) * blocks_per_row;
     const float *input = mid + assignment * mid_width + main_dim;
 
-    float sum = 0.0f;
-    for (uint32_t k = threadIdx.x; k < tail_dim; k += blockDim.x) {
-        const cuda_block_q5_0 *block = row + k / 32u;
-        const uint32_t within = k & 31u;
-        const uint32_t qh = (uint32_t)block->qh[0] |
-                            ((uint32_t)block->qh[1] << 8u) |
-                            ((uint32_t)block->qh[2] << 16u) |
-                            ((uint32_t)block->qh[3] << 24u);
-        const uint8_t packed = block->qs[within & 15u];
-        const uint32_t low = within < 16u ? packed & 15u : packed >> 4u;
-        const uint32_t quant = low | (((qh >> within) & 1u) << 4u);
-        const __half scale_h = *reinterpret_cast<const __half *>(&block->d);
-        const float value = __half2float(scale_h) * ((float)quant - 16.0f);
-        sum += input[k] * value;
-    }
-
-    __shared__ float partial[128];
-    partial[threadIdx.x] = sum;
+    extern __shared__ float input_tail[];
+    for (uint32_t k = threadIdx.x; k < tail_dim; k += blockDim.x)
+        input_tail[k] = input[k];
     __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
-        if (threadIdx.x < stride)
-            partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    for (uint32_t local_row = warp; local_row < rows_per_block;
+         local_row += warps_per_block) {
+        const uint32_t out_row = tile * rows_per_block + local_row;
+        if (out_row >= out_dim) break;
+        const cuda_block_q5_0 *row = weights +
+            ((uint64_t)expert * out_dim + out_row) * blocks_per_row;
+        float sum = 0.0f;
+        for (uint32_t block_i = 0; block_i < blocks_per_row; block_i++) {
+            const cuda_block_q5_0 *block = row + block_i;
+            const uint32_t qh = (uint32_t)block->qh[0] |
+                                ((uint32_t)block->qh[1] << 8u) |
+                                ((uint32_t)block->qh[2] << 16u) |
+                                ((uint32_t)block->qh[3] << 24u);
+            const uint8_t packed = block->qs[lane & 15u];
+            const uint32_t low = lane < 16u ? packed & 15u : packed >> 4u;
+            const uint32_t quant = low | (((qh >> lane) & 1u) << 4u);
+            const __half scale_h =
+                *reinterpret_cast<const __half *>(&block->d);
+            sum += input_tail[block_i * 32u + lane] *
+                   __half2float(scale_h) * ((float)quant - 16.0f);
+        }
+        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        if (lane == 0u)
+            down[assignment * out_dim + out_row] += sum;
     }
-    if (threadIdx.x == 0u) down[task] += partial[0];
 }
 
 __global__ static void swiglu_weighted_kernel(
@@ -25152,9 +25288,12 @@ extern "C" int ds4_gpu_qwen4exp_gdn_recurrent_tensor(
         g->bytes < control_values * sizeof(float)) {
         return 0;
     }
-    const uint32_t shared_bytes = 4u * head_dim * (uint32_t)sizeof(float);
+    const uint32_t threads = head_dim == 128u ? 512u : head_dim;
+    const uint32_t shared_values = head_dim == 128u
+        ? 7u * head_dim : 4u * head_dim;
+    const uint32_t shared_bytes = shared_values * (uint32_t)sizeof(float);
     qwen4exp_gdn_recurrent_kernel<<<
-            value_heads, head_dim, shared_bytes, ds4_current_stream()>>>(
+            value_heads, threads, shared_bytes, ds4_current_stream()>>>(
             (float *)out->ptr, (float *)state->ptr,
             (const float *)mixed_qkv->ptr, (const float *)beta->ptr,
             (const float *)g->ptr, rows, key_heads, value_heads, head_dim,
@@ -29302,11 +29441,14 @@ extern "C" int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
             model_map, weight_offset, weight_bytes,
             "qwen4exp_q5_0_expert_down_tail");
     if (!tail_weights) return 0;
+    constexpr uint64_t rows_per_block = 64u;
+    const uint64_t blocks = assignments *
+        ((out_dim + rows_per_block - 1u) / rows_per_block);
     qwen4exp_q5_0_tail_accum_kernel<<<
-        (unsigned)tasks, 128u, 0, ds4_current_stream()>>>(
+        (unsigned)blocks, 256u, tail_dim * sizeof(float), ds4_current_stream()>>>(
             (float *)down->ptr, (const float *)mid->ptr,
             (const int32_t *)ids->ptr, tail_weights, mid_width, main_dim,
-            tail_dim, out_dim, n_expert, tasks);
+            tail_dim, out_dim, n_expert, assignments);
     return cuda_ok(cudaGetLastError(), "Qwen4Exp Q5_0 tail accumulate launch");
 }
 
@@ -29418,7 +29560,8 @@ static int routed_matmul_tensor_impl(
     const char *bound_global = getenv("DS4_MMQ_EXPERT_BOUND");
     const char *bound_type = weight_type == 11u
         ? getenv("DS4_MMQ_Q3_BOUND")
-        : weight_type == 12u ? getenv("DS4_MMQ_Q4_BOUND") : NULL;
+        : weight_type == 12u ? getenv("DS4_MMQ_Q4_BOUND")
+        : weight_type == 13u ? getenv("DS4_MMQ_Q5_BOUND") : NULL;
     const bool use_bucket_bound =
         !use_vec && max_rows_per_expert > 0u &&
         !(bound_global && bound_global[0] == '0') &&
@@ -29486,7 +29629,23 @@ static int routed_matmul_tensor_impl(
     case 13u:
         rc = use_vec
             ? ds4_mmq_q5_K_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
-            : ds4_mmq_q5_K_moe(weights, xp, idp, op, M, K, NT, NE, NU, stream);
+            : use_bucket_bound
+                ? ds4_mmq_q5_K_moe_bounded(
+                      weights, xp, idp, op, M, K, NT, NE, NU,
+                      (int)max_rows_per_expert, stream)
+                : ds4_mmq_q5_K_moe(
+                      weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        if (use_bucket_bound) {
+            static bool logged_q5_bound = false;
+            if (!logged_q5_bound) {
+                logged_q5_bound = true;
+                fprintf(stderr,
+                        "ds4: Q5_K routed MMQ expert-bucket bound active "
+                        "(rows=%llu bound=%u)\n",
+                        (unsigned long long)assignments,
+                        max_rows_per_expert);
+            }
+        }
         break;
     case 14u:
         rc = use_vec

@@ -172,14 +172,15 @@ static bool d2r_iq2_enabled() {
     return cached != 0;
 }
 
-// Compact routed Q3/Q4 MMQ schedules instead of making stream-K walk the
+// Compact routed Q3/Q4/Q5 MMQ schedules instead of making stream-K walk the
 // rectangular [expert, proven-max-bucket] launch space.  Keep independent
 // rollback switches for production A/Bs.
 static bool moe_worklist_enabled(ggml_type type) {
     const char *global = getenv("DS4_MMQ_WORKLIST");
     const char *specific = type == GGML_TYPE_Q3_K
         ? getenv("DS4_MMQ_Q3_WORKLIST")
-        : type == GGML_TYPE_Q4_K ? getenv("DS4_MMQ_Q4_WORKLIST") : NULL;
+        : type == GGML_TYPE_Q4_K ? getenv("DS4_MMQ_Q4_WORKLIST")
+        : type == GGML_TYPE_Q5_K ? getenv("DS4_MMQ_Q5_WORKLIST") : NULL;
     return !(global && global[0] == '0') &&
            !(specific && specific[0] == '0');
 }
@@ -1408,7 +1409,8 @@ int ds4_mmq_moe_impl(
 
     if (ncols_max_hint > 0 && x_soa == NULL && moe_worklist_enabled(type)) {
         int worklist_rc = -1;
-        if constexpr (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K) {
+        if constexpr (type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
+                      type == GGML_TYPE_Q5_K) {
             worklist_rc = ds4_mmq_moe_worklist_launch<type>(
                 tag, *ctx, W, (const int *)src1_q8_1.get(),
                 ids_dst.get(), expert_bounds.get(), out_f32,
@@ -2600,6 +2602,22 @@ extern "C" int ds4_mmq_q5_K_moe(
         cudaStream_t stream) {
     return ds4_mmq_moe_impl<GGML_TYPE_Q5_K>("ds4_mmq_q5_K_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q5_K_moe_bounded(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        int max_rows_per_expert, cudaStream_t stream) {
+    if (max_rows_per_expert <= 0) {
+        fprintf(stderr, "ds4_mmq_q5_K_moe_bounded: invalid bound %d\n",
+                max_rows_per_expert);
+        return -1;
+    }
+    return ds4_mmq_moe_impl<GGML_TYPE_Q5_K>(
+        "ds4_mmq_q5_K_moe_bounded", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream,
+        /*x_soa=*/NULL, /*soa_blocks=*/0, /*sanitize_out=*/true,
+        /*ncols_max_hint=*/max_rows_per_expert);
 }
 
 extern "C" int ds4_mmq_q6_K_moe(
