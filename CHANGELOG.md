@@ -5,6 +5,30 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.6.5 — 2026-08-27
+
+- **`--tool-call-reminder on|off`, default on** (env
+  `DS4_TOOL_CALL_REMINDER=0` disables,
+  `DS4_TOOL_CALL_REMINDER_MIN_BYTES` retunes the gate) — the
+  reference-faithful fix for the deep tool-protocol slip. At depth the
+  2.4-bpw quant answers some tools-armed turns with a prose completion
+  report instead of a tool call (measured: 50% of turns at 70-80K
+  prompt tokens; every observed slip fired right after a successful
+  tool result). Past ~96KB of rendered conversation (~30K+ tokens),
+  every tool result in a tools-armed chat now carries a short protocol
+  reminder. Measured: 0/72 sampled slips with the reminder vs 6/72
+  without at the exact captured slip states, and the failing agent task
+  end to end went from three dead runs to submitted and
+  harness-resolved in 57 calls with zero slips — with reasoning traces
+  kept, no resample spent, and no format deviation. The reminder is
+  injected on every qualifying result (not just the last) so the
+  rendered history is byte-stable across turns and warm prefix reuse is
+  unaffected; shallow conversations are never touched, so
+  chat-with-tools flows that legitimately answer in prose after a tool
+  result see no change. Disclosure: default-on means benchmark runs
+  carry it unless disabled; runs reporting benchmark numbers should say
+  which position the knob was in.
+
 ## v0.6.4 — 2026-08-26
 
 The issue-#18 residual-gap release: with `--reasoning-replay drop

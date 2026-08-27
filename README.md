@@ -268,8 +268,23 @@ syntax, but can create repeated text when applied to long code or file bodies.
 
 ### Replayed reasoning and agent-loop robustness
 
-Two v0.6.4 knobs target long agent loops (measured on SWE-rebench-class
+Three knobs target long agent loops (measured on SWE-rebench-class
 workloads; see the changelog for the receipts):
+
+**`--tool-call-reminder on|off`, default on** (v0.6.5; env
+`DS4_TOOL_CALL_REMINDER=0` disables). At depth, low-bit quants answer
+some tools-armed turns with a prose completion report instead of a tool
+call — measured at 50% of turns in the 70-80K band, always right after a
+successful tool result, and agent harnesses abandon tasks over it. Past
+~96KB of rendered conversation (~30K+ tokens), every tool result now
+carries a short protocol reminder. At the exact captured slip states the
+reminder measured 0/72 sampled slips vs 6/72 without, and it fixed the
+failing agent task end to end (submitted and harness-resolved, zero
+slips) with reasoning traces kept and no format deviation — the
+reference-faithful fix. Shallow conversations are never touched, so
+chat-with-tools flows that legitimately answer in prose after a tool
+result are unaffected. The injection is byte-stable across turns, so
+warm prefix reuse is unchanged.
 
 **`--reasoning-replay keep|drop`** (env `DS4_REASONING_REPLAY=drop`).
 Most OpenAI-style agent scaffolds echo each assistant message back
@@ -366,11 +381,13 @@ higher than the `--ctx` value you started the server with:
 ./ds4-server --ctx 524288 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
 
-For long agent loops on quantized weights, also consider
-`--reasoning-replay drop --tool-slip-resample` (v0.6.4+): the first keeps
-scaffold-echoed reasoning out of the prompt so conversations run 16-28%
-shallower, the second retries a turn once when a tools-armed request
-settles as prose instead of a tool call. See
+For long agent loops on quantized weights: since v0.6.5 the deep
+tool-protocol reminder is on by default (the measured fix for agent
+tasks dying to prose slips at depth), and two optional levers remain,
+`--reasoning-replay drop` (keep scaffold-echoed reasoning out of the
+prompt; conversations run 16-28% shallower at the cost of llama.cpp-style
+format deviation) and `--tool-slip-resample` (one retry when a
+tools-armed turn still settles as prose). See
 [Replayed reasoning and agent-loop robustness](#replayed-reasoning-and-agent-loop-robustness)
 for the mechanics and measurements.
 

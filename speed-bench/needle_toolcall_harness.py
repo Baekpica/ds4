@@ -154,6 +154,21 @@ def run_seed(seed, outf):
                 resp, dt = post(probe)
                 rec.update(classify(resp))
                 rec["latency_s"] = round(dt, 1)
+                # FP-flake law (release-process §8 EOS-flake class): cont
+                # temp-0 is NOT run-deterministic -- 8 greedy draws at one
+                # byte-identical 96K state produced 8 different tool calls
+                # (repro 2026-08-27), so a single greedy non-tool draw at a
+                # near-tie is the known FP-noise class, not a verdict.  One
+                # retry is the law; the first draw is disclosed in the
+                # record so a deterministic failure (retry also non-tool)
+                # still fails the gate.
+                if TEMP == "greedy" and rec.get("outcome") != "tool_call":
+                    first = {"outcome": rec.get("outcome"),
+                             "detail": rec.get("detail")}
+                    resp2, dt2 = post(probe)
+                    rec.update(classify(resp2))
+                    rec["latency_s"] = round(dt + dt2, 1)
+                    rec["flake_retry_first_draw"] = first
             except Exception as e:
                 rec.update({"outcome": "error", "detail": repr(e)[:300]})
             outf.write(json.dumps(rec) + "\n")
