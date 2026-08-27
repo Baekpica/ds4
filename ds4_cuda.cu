@@ -9306,22 +9306,22 @@ __global__ static void qwen4exp_qsa_attention_scores_kernel(
 }
 
 /* Qwen's 24-query/2-KV GQA shape shares one key across twelve query heads.
- * Score those heads together so the key load and reduction barriers are not
- * repeated in twelve separate blocks. */
+ * Four warps each score three heads without a block barrier or shared-memory
+ * reduction. */
 __global__ static void qwen4exp_qsa_attention_scores_gqa12_kernel(
         float *scores, const float *query, const float *k_cache,
         const int32_t *selected, const uint32_t *counts,
-        uint32_t rows, uint32_t head_dim, uint32_t selected_cap,
-        uint32_t cache_cap) {
+        uint32_t rows, uint32_t selected_cap, uint32_t cache_cap) {
     const uint32_t slot = blockIdx.x;
     const uint32_t kv_head = blockIdx.y;
     const uint32_t row = blockIdx.z;
-    const uint32_t d = threadIdx.x;
-    if (row >= rows || kv_head >= 2u || slot >= selected_cap ||
-        d >= head_dim) return;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= rows || kv_head >= 2u || slot >= selected_cap || warp >= 4u)
+        return;
     if (slot >= counts[row]) {
-        if (d == 0u) {
-            for (uint32_t h = 0; h < 12u; h++)
+        if (lane == 0u) {
+            for (uint32_t h = warp; h < 12u; h += 4u)
                 scores[((uint64_t)row * 24u + kv_head * 12u + h) *
                        selected_cap + slot] = -INFINITY;
         }
@@ -9329,47 +9329,28 @@ __global__ static void qwen4exp_qsa_attention_scores_gqa12_kernel(
     }
     const int32_t token = selected[(uint64_t)row * selected_cap + slot];
     if (token < 0 || (uint32_t)token >= cache_cap) {
-        if (d == 0u) {
-            for (uint32_t h = 0; h < 12u; h++)
+        if (lane == 0u) {
+            for (uint32_t h = warp; h < 12u; h += 4u)
                 scores[((uint64_t)row * 24u + kv_head * 12u + h) *
                        selected_cap + slot] = -INFINITY;
         }
         return;
     }
-    const float key = k_cache[
-        (uint64_t)(uint32_t)token * 2u * head_dim +
-        (uint64_t)kv_head * head_dim + d];
-    extern __shared__ float partial[];
-    for (uint32_t h = 0; h < 12u; h++) {
+    const float *key = k_cache +
+        (uint64_t)(uint32_t)token * 512u + (uint64_t)kv_head * 256u;
+    for (uint32_t h = warp; h < 12u; h += 4u) {
         const uint32_t head = kv_head * 12u + h;
-        partial[(uint64_t)h * head_dim + d] =
-            query[((uint64_t)row * 24u + head) * head_dim + d] * key;
-    }
-    __syncthreads();
-    for (uint32_t stride = head_dim >> 1; stride >= 32u; stride >>= 1) {
-        if (d < stride) {
-            for (uint32_t h = 0; h < 12u; h++)
-                partial[(uint64_t)h * head_dim + d] +=
-                    partial[(uint64_t)h * head_dim + d + stride];
-        }
-        if (stride > 32u) __syncthreads();
-    }
-    if (d < 32u) {
-        const unsigned mask = __activemask();
-        __syncwarp(mask);
-        for (uint32_t h = 0; h < 12u; h++) {
-            float sum = partial[(uint64_t)h * head_dim + d];
-            for (uint32_t stride = min(16u, head_dim >> 1); stride > 0u;
-                 stride >>= 1) {
-                const float other = __shfl_down_sync(mask, sum, stride);
-                if (d < stride) sum += other;
-            }
-            if (d == 0u) {
-                const uint32_t head = kv_head * 12u + h;
-                scores[((uint64_t)row * 24u + head) * selected_cap + slot] =
-                    sum * rsqrtf((float)head_dim);
-            }
-        }
+        const float *q = query + ((uint64_t)row * 24u + head) * 256u;
+        float sum = 0.0f;
+#pragma unroll
+        for (uint32_t d = lane; d < 256u; d += 32u)
+            sum += q[d] * key[d];
+#pragma unroll
+        for (uint32_t stride = 16u; stride > 0u; stride >>= 1u)
+            sum += __shfl_down_sync(0xffffffffu, sum, stride);
+        if (lane == 0u)
+            scores[((uint64_t)row * 24u + head) * selected_cap + slot] =
+                sum * 0.0625f;
     }
 }
 
@@ -25720,12 +25701,10 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(
     if (heads == 24u && kv_heads == 2u && head_dim == 256u) {
         dim3 score_grid(selected_cap, kv_heads, rows);
         qwen4exp_qsa_attention_scores_gqa12_kernel<<<
-            score_grid, head_dim, 12u * head_dim * sizeof(float),
-            ds4_current_stream()>>>(
+            score_grid, 128u, 0, ds4_current_stream()>>>(
             (float *)score_scratch->ptr, (const float *)query->ptr,
             (const float *)k_cache->ptr, (const int32_t *)selected->ptr,
-            (const uint32_t *)counts->ptr, rows, head_dim,
-            selected_cap, cache_cap);
+            (const uint32_t *)counts->ptr, rows, selected_cap, cache_cap);
     } else {
         dim3 score_grid(selected_cap, heads, rows);
         qwen4exp_qsa_attention_scores_kernel<<<
