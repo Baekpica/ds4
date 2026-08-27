@@ -2565,6 +2565,7 @@ __global__ static void ds4_q5_0_f32_expert_major_accum_kernel(
     }
 
     __shared__ float input[k_tail];
+    __shared__ float result[k_rows_per_block];
     const int begin = expert_bounds[expert];
     const int end = expert_bounds[expert + 1];
     for (int sorted = begin; sorted < end; ++sorted) {
@@ -2588,9 +2589,14 @@ __global__ static void ds4_q5_0_f32_expert_major_accum_kernel(
             for (int offset = 16; offset > 0; offset >>= 1)
                 sum += __shfl_down_sync(0xffffffffu, sum, offset);
             if (lane == 0)
-                out[(int64_t)dst * M + row] += sum;
+                result[row_i * k_warps + warp] = sum;
         }
         __syncthreads();
+        if (threadIdx.x < k_rows_per_block) {
+            const int row = (int)blockIdx.x * k_rows_per_block + threadIdx.x;
+            if (row < M)
+                out[(int64_t)dst * M + row] += result[threadIdx.x];
+        }
     }
 }
 
