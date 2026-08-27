@@ -38268,6 +38268,191 @@ static bool exaone_graph_decode(ds4_exaone_gpu_graph *g,
     return exaone_graph_output_head(g, m, w, g->cur, 0);
 }
 
+/* Qwen's kernels are still single-row/single-sequence, but the server can
+ * keep two independent graphs alive and interleave them through the existing
+ * continuous scheduler.  ponytail: cap this first banked runtime at two;
+ * lift it only after Qwen shares prefill scratch or gains a true row batch. */
+enum { DS4_QWEN_BANK_MAX = 2 };
+
+typedef struct ds4_qwen_batch_runtime {
+    uint32_t max_seq;
+    uint32_t ctx_size;
+    uint32_t prefill_cap;
+    ds4_qwen_gpu_graph *graph;
+    float *bank_logits;
+    uint8_t *bank_logits_valid;
+} ds4_qwen_batch_runtime;
+
+static bool qwen4exp_graph_session_fit_check(
+    ds4_backend backend, uint32_t ctx_size, uint32_t prefill_cap,
+    bool loud, ds4_session_graph_fit_quote *q);
+
+static void qwen_batch_runtime_free(ds4_qwen_batch_runtime *rt) {
+    if (!rt) return;
+    if (rt->graph) {
+        for (uint32_t b = 0; b < rt->max_seq; b++)
+            qwen4exp_graph_free(&rt->graph[b]);
+    }
+    free(rt->graph);
+    free(rt->bank_logits);
+    free(rt->bank_logits_valid);
+    free(rt);
+}
+
+static ds4_qwen_batch_runtime *qwen_batch_runtime_create(
+        ds4_engine *e, uint32_t ctx_size, uint32_t max_seq,
+        uint32_t prefill_cap) {
+    if (!e || max_seq == 0u || max_seq > DS4_QWEN_BANK_MAX ||
+        prefill_cap == 0u || prefill_cap > ctx_size) return NULL;
+    ds4_qwen_batch_runtime *rt = xcalloc(1, sizeof(*rt));
+    rt->max_seq = max_seq;
+    rt->ctx_size = ctx_size;
+    rt->prefill_cap = prefill_cap;
+    rt->graph = xcalloc(max_seq, sizeof(*rt->graph));
+    rt->bank_logits = xcalloc(
+        (size_t)max_seq * DS4_N_VOCAB, sizeof(*rt->bank_logits));
+    rt->bank_logits_valid = xcalloc(
+        max_seq, sizeof(*rt->bank_logits_valid));
+    if (!rt->graph || !rt->bank_logits || !rt->bank_logits_valid) {
+        qwen_batch_runtime_free(rt);
+        return NULL;
+    }
+    for (uint32_t b = 0; b < max_seq; b++) {
+        if (!qwen4exp_graph_session_fit_check(
+                e->backend, ctx_size, prefill_cap, true, NULL) ||
+            !qwen4exp_graph_alloc(
+                &rt->graph[b], &e->weights, e->qwen_ple_store,
+                ctx_size, prefill_cap)) {
+            qwen_batch_runtime_free(rt);
+            return NULL;
+        }
+    }
+    fprintf(stderr,
+            "ds4: Qwen bank runtime: %u independent graphs, ctx=%u prefill=%u\n",
+            max_seq, ctx_size, prefill_cap);
+    return rt;
+}
+
+static bool qwen_batch_runtime_reset_bank(
+        ds4_qwen_batch_runtime *rt, ds4_ple_store *store, uint32_t bank) {
+    if (!rt || bank >= rt->max_seq) return false;
+    rt->bank_logits_valid[bank] = 0u;
+    return qwen4exp_graph_reset(&rt->graph[bank], store);
+}
+
+static bool qwen4exp_graph_copy_state(
+        ds4_qwen_gpu_graph *dst, const ds4_qwen_gpu_graph *src,
+        uint32_t tokens) {
+    if (!dst || !src || tokens == 0u || src->length != tokens ||
+        tokens > dst->context_cap || dst->context_cap != src->context_cap)
+        return false;
+
+    bool ok = true;
+    const uint64_t ple_conv_bytes =
+        (uint64_t)DS4_N_EMBD * DS4_N_HC * 9u * sizeof(float);
+    ok = ds4_gpu_tensor_copy(
+             dst->ple.conv_state, 0, src->ple.conv_state, 0,
+             ple_conv_bytes) != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (ds4_qwen4exp_layer_is_full_attention(il)) {
+            ds4_qwen_qsa_state *d = &dst->qsa_state[il];
+            const ds4_qwen_qsa_state *s = &src->qsa_state[il];
+            const uint64_t index_row =
+                (uint64_t)s->index_head_dim * sizeof(float);
+            const uint64_t kv_row =
+                (uint64_t)s->kv_heads * s->head_dim * sizeof(float);
+            const uint64_t raw_bytes = (uint64_t)tokens * index_row;
+            const uint64_t pooled_bytes =
+                (uint64_t)(tokens / s->ratio) * index_row;
+            const uint64_t kv_bytes = (uint64_t)tokens * kv_row;
+            ok = qwen4exp_qsa_state_ensure(d, 0u, tokens) &&
+                 ds4_gpu_tensor_copy(
+                     d->raw_index, 0, s->raw_index, 0, raw_bytes) != 0 &&
+                 ds4_gpu_tensor_copy(
+                     d->pooled_index, 0, s->pooled_index, 0,
+                     pooled_bytes) != 0 &&
+                 ds4_gpu_tensor_copy(
+                     d->k_cache, 0, s->k_cache, 0, kv_bytes) != 0 &&
+                 ds4_gpu_tensor_copy(
+                     d->v_cache, 0, s->v_cache, 0, kv_bytes) != 0;
+            if (ok) d->length = tokens;
+        } else {
+            ds4_qwen_gdn_state *d = &dst->gdn_state[il];
+            const ds4_qwen_gdn_state *s = &src->gdn_state[il];
+            const uint64_t conv_bytes =
+                (uint64_t)s->conv_dim * s->conv_kernel * sizeof(float);
+            const uint64_t recurrent_bytes =
+                (uint64_t)s->value_heads * s->head_dim * s->head_dim *
+                sizeof(float);
+            ok = ds4_gpu_tensor_copy(
+                     d->conv, 0, s->conv, 0, conv_bytes) != 0 &&
+                 ds4_gpu_tensor_copy(
+                     d->recurrent, 0, s->recurrent, 0,
+                     recurrent_bytes) != 0;
+        }
+    }
+    if (!ok || ds4_gpu_synchronize() == 0) return false;
+    dst->ple.hash_state = src->ple.hash_state;
+    dst->ple.prepared_rows = 0u;
+    dst->length = tokens;
+    return true;
+}
+
+static bool qwen_batch_runtime_copy_bank(
+        ds4_qwen_batch_runtime *rt, uint32_t src, uint32_t dst,
+        uint32_t tokens) {
+    if (!rt || src >= rt->max_seq || dst >= rt->max_seq) return false;
+    if (src != dst &&
+        !qwen4exp_graph_copy_state(&rt->graph[dst], &rt->graph[src], tokens)) {
+        rt->bank_logits_valid[dst] = 0u;
+        return false;
+    }
+    if (rt->bank_logits_valid[src]) {
+        memcpy(rt->bank_logits + (size_t)dst * DS4_N_VOCAB,
+               rt->bank_logits + (size_t)src * DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+        rt->bank_logits_valid[dst] = 1u;
+    } else {
+        rt->bank_logits_valid[dst] = 0u;
+    }
+    return true;
+}
+
+static bool qwen_batch_runtime_prefill(
+        ds4_qwen_batch_runtime *rt, ds4_engine *e, uint32_t bank,
+        const int *tokens, uint32_t rows, uint32_t pos, bool final) {
+    if (!rt || !e || bank >= rt->max_seq) return false;
+    rt->bank_logits_valid[bank] = 0u;
+    const bool ok = qwen4exp_graph_forward_chunk(
+        &rt->graph[bank], &e->model, &e->weights,
+        e->qwen_ple_store, e->qwen_ple_cuda,
+        tokens, rows, pos,
+        final ? rt->bank_logits + (size_t)bank * DS4_N_VOCAB : NULL);
+    if (ok && final) rt->bank_logits_valid[bank] = 1u;
+    return ok;
+}
+
+static bool qwen_batch_runtime_decode(
+        ds4_qwen_batch_runtime *rt, ds4_engine *e,
+        const uint32_t *banks, const int *tokens,
+        const uint32_t *positions, uint32_t rows) {
+    if (!rt || !e || !banks || !tokens || !positions || rows == 0u ||
+        rows > rt->max_seq) return false;
+    for (uint32_t i = 0; i < rows; i++) {
+        const uint32_t bank = banks[i];
+        if (bank >= rt->max_seq) return false;
+        rt->bank_logits_valid[bank] = 0u;
+        if (!qwen4exp_graph_forward_chunk(
+                &rt->graph[bank], &e->model, &e->weights,
+                e->qwen_ple_store, e->qwen_ple_cuda,
+                &tokens[i], 1u, positions[i],
+                rt->bank_logits + (size_t)bank * DS4_N_VOCAB))
+            return false;
+        rt->bank_logits_valid[bank] = 1u;
+    }
+    return true;
+}
+
 enum { DS4_EXAONE_DECODE_BATCH_MAX = DS4_MULTISEQ_MAX_SEQ };
 
 typedef struct ds4_exaone_batch_runtime {
@@ -47392,6 +47577,7 @@ struct ds4_batch_ctx {
     ds4_solar_batch_runtime *solar; /* non-NULL selects the Solar dispatch */
     ds4_exaone_batch_runtime *exaone; /* non-NULL selects the EXAONE dispatch */
     ds4_motif3_batch_runtime *motif3; /* non-NULL selects the Motif-3 dispatch */
+    ds4_qwen_batch_runtime *qwen; /* non-NULL selects the Qwen bank dispatch */
     bool            supports_partial_reuse; /* explicit runtime capability */
     ds4_gpu_graph   g;
     ds4_batch_slabs sl;            /* allocated for max_seq banks */
@@ -47987,6 +48173,7 @@ uint64_t ds4_cont_bank_payload_bytes(ds4_batch_ctx *ctx, uint32_t bank) {
     if (ctx->motif3) return motif3_cont_bank_payload_bytes(ctx, bank);
     if (ctx->exaone) return exaone_cont_bank_payload_bytes(ctx, bank);
     if (ctx->solar) return solar_cont_bank_payload_bytes(ctx, bank);
+    if (ctx->qwen) return 0u; /* durable Qwen bank payload is not implemented */
     ds4_gpu_graph *g = &ctx->g;
     ds4_gpu_graph *wg = ds4_cont_bank_walk_graph(ctx);
     uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
@@ -48040,6 +48227,11 @@ int ds4_cont_bank_save_payload(ds4_batch_ctx *ctx, uint32_t bank,
     if (ctx->solar) {
         return solar_cont_bank_save_payload(
             ctx, bank, fp, err, errlen);
+    }
+    if (ctx->qwen) {
+        payload_set_err(err, errlen,
+                        "Qwen bank payload persistence is not implemented");
+        return 1;
     }
     ds4_gpu_graph *g = &ctx->g;
     const int *tokens = ctx->bank_hist + (uint64_t)bank * ctx->seq_cap;
@@ -48127,6 +48319,11 @@ int ds4_cont_bank_restore_payload(ds4_batch_ctx *ctx, uint32_t bank,
     if (ctx->solar) {
         return solar_cont_bank_restore_payload(
             ctx, bank, fp, payload_bytes, err, errlen);
+    }
+    if (ctx->qwen) {
+        payload_set_err(err, errlen,
+                        "Qwen bank payload restore is not implemented");
+        return 1;
     }
     ds4_gpu_graph *g = &ctx->g;
     uint64_t remaining = payload_bytes;
@@ -49604,7 +49801,7 @@ uint64_t ds4_batch_ctx_trim_free(ds4_batch_ctx *ctx, uint64_t want_bytes) {
     /* EXAONE and Motif banks use fixed CUDA allocations.  They are fit before
      * allocation and cannot be partially unmapped; never fall through to the
      * unrelated DeepSeek slab trimmer. */
-    if (ctx->exaone || ctx->motif3) return 0;
+    if (ctx->exaone || ctx->motif3 || ctx->qwen) return 0;
     if (ctx->solar) {
         /* ds4_gpu_tensor_trim unmaps VMM pages.  gen_mu prevents new server
          * launches but does not drain work already queued on the device; match
@@ -49856,7 +50053,8 @@ int ds4_batch_ctx_reclaim_prepare(ds4_batch_ctx *ctx, const uint32_t *ordered_id
     memset(plan, 0, sizeof(*plan));
     plan->want_bytes = want_bytes;
     if (!ctx || !ds4_batch_trim_enabled()) return DS4_RECLAIM_UNSUPPORTED;
-    if (ctx->exaone || ctx->motif3) return DS4_RECLAIM_UNSUPPORTED;
+    if (ctx->exaone || ctx->motif3 || ctx->qwen)
+        return DS4_RECLAIM_UNSUPPORTED;
     if (ctx->solar) return DS4_RECLAIM_UNSUPPORTED;
     if (ctx->in_pass) return DS4_RECLAIM_BUSY;
     if (!ordered_ids || n_ids == 0 || want_bytes == 0) return DS4_RECLAIM_OK;
@@ -49988,6 +50186,54 @@ int ds4_batch_ctx_reclaim_commit(ds4_batch_ctx *ctx, ds4_reclaim_plan *plan,
     }
     if (result) *result = rr;
     return rr.status;
+}
+
+static int qwen_batch_ctx_create_impl(
+        ds4_engine *e, int ctx_size, int max_seq,
+        ds4_batch_ctx **out, char *err, size_t errlen) {
+#define QBC_ERR(...) do { if (err && errlen) snprintf(err, errlen, __VA_ARGS__); } while (0)
+    uint32_t chosen = (uint32_t)max_seq;
+    if (chosen > DS4_QWEN_BANK_MAX) chosen = DS4_QWEN_BANK_MAX;
+    const uint32_t prefill_cap =
+        qwen4exp_graph_prefill_cap_for_context((uint32_t)ctx_size);
+    ds4_batch_ctx *ctx = xcalloc(1, sizeof(*ctx));
+    ctx->e = e;
+    ctx->ctx_size = (uint32_t)ctx_size;
+    ctx->prefill_cap = prefill_cap;
+    ctx->raw_cap = (uint32_t)ctx_size;
+    ctx->seq_cap = (uint32_t)ctx_size;
+    ctx->max_seq = chosen;
+    ctx->qwen = qwen_batch_runtime_create(
+        e, ctx->ctx_size, ctx->max_seq, ctx->prefill_cap);
+    if (!ctx->qwen) {
+        QBC_ERR("batch_ctx_create: Qwen bank runtime allocation failed "
+                "(max_seq=%u ctx=%u prefill=%u)",
+                ctx->max_seq, ctx->ctx_size, ctx->prefill_cap);
+        free(ctx);
+        return 1;
+    }
+    if ((uint64_t)ctx->max_seq * ctx->seq_cap >
+        SIZE_MAX / sizeof(*ctx->bank_hist)) {
+        QBC_ERR("batch_ctx_create: Qwen bank history size overflow");
+        qwen_batch_runtime_free(ctx->qwen);
+        free(ctx);
+        return 1;
+    }
+    ctx->bank_hist = xmalloc(
+        (size_t)ctx->max_seq * ctx->seq_cap * sizeof(*ctx->bank_hist));
+    ctx->bank_hist_len = xcalloc(
+        ctx->max_seq, sizeof(*ctx->bank_hist_len));
+    ctx->bank_hist_valid = xcalloc(
+        ctx->max_seq, sizeof(*ctx->bank_hist_valid));
+    ctx->bank_gen = xmalloc(ctx->max_seq * sizeof(*ctx->bank_gen));
+    for (uint32_t b = 0; b < ctx->max_seq; b++) ctx->bank_gen[b] = 1u;
+    ctx->bank_last_use = xcalloc(
+        ctx->max_seq, sizeof(*ctx->bank_last_use));
+    ctx->supports_partial_reuse = false;
+    ds4_metric_set(&ds4_metrics_get()->banks_total, ctx->max_seq);
+    *out = ctx;
+    return 0;
+#undef QBC_ERR
 }
 
 static int solar_batch_ctx_create_impl(
@@ -50228,6 +50474,10 @@ static int ds4_batch_ctx_create_impl(ds4_engine *e, int ctx_size, int max_seq, i
     if (!ds4_engine_supports_batching(e)) {
         BC_ERR("batch_ctx_create: this model does not yet implement the multi-sequence graph");
         return 1;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        return qwen_batch_ctx_create_impl(
+            e, ctx_size, max_seq, out, err, errlen);
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_SOLAR_OPEN2) {
         const int rc = solar_batch_ctx_create_impl(
@@ -50841,6 +51091,16 @@ int ds4_batch_ctx_create_fit(ds4_engine *e, int ctx_size, int max_seq, int max_t
 
 void ds4_batch_ctx_destroy(ds4_batch_ctx *ctx) {
     if (!ctx) return;
+    if (ctx->qwen) {
+        qwen_batch_runtime_free(ctx->qwen);
+        free(ctx->bank_hist);
+        free(ctx->bank_hist_len);
+        free(ctx->bank_hist_valid);
+        free(ctx->bank_gen);
+        free(ctx->bank_last_use);
+        free(ctx);
+        return;
+    }
     if (ctx->motif3) {
         motif3_batch_runtime_free(ctx->motif3);
         free(ctx->bank_hist);
@@ -51325,6 +51585,8 @@ int ds4_batch_ctx_raw_cap(const ds4_batch_ctx *ctx) {
  * it shaped instead of presenting an env-dependent raw_ring as zero-config
  * output. */
 uint32_t ds4_cont_prefill_chunk_tokens(void) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP)
+        return qwen4exp_graph_prefill_cap_for_context(DS4_ROPE_ORIG_CTX);
     return bg_prefill_chunk_tokens();
 }
 
@@ -51395,7 +51657,7 @@ static int ds4_engine_batched_generate_ctx_impl(ds4_batch_ctx *ctx, const ds4_to
     for (int i = 0; i < n; i++) {
         if (prompts[i].len <= 0) { BCG_ERR("batched_generate_ctx: prompt %d is empty", i); return 1; }
         const uint32_t L = (uint32_t)prompts[i].len;
-        if ((ctx->exaone || ctx->motif3) && L > ctx->seq_cap) {
+        if ((ctx->exaone || ctx->motif3 || ctx->qwen) && L > ctx->seq_cap) {
             BCG_ERR("batched_generate_ctx: family prompt %d length %u "
                     "exceeds context %u", i, L, ctx->seq_cap);
             return 1;
@@ -51407,7 +51669,7 @@ static int ds4_engine_batched_generate_ctx_impl(ds4_batch_ctx *ctx, const ds4_to
         }
         n_packed += L;
     }
-    if (ctx->exaone || ctx->motif3) {
+    if (ctx->exaone || ctx->motif3 || ctx->qwen) {
         return family_engine_batched_generate_ctx(
             ctx, prompts, n, max_new_tokens, eos_ids, out, err, errlen);
     }
@@ -52774,24 +53036,31 @@ static int solar_engine_continuous_generate(
  * at reset/copy/prefill/decode/logits; keeping those six operations here makes
  * the public scheduling semantics identical without a generic callback layer. */
 static uint32_t family_banked_prefill_cap(const ds4_batch_ctx *ctx) {
+    if (ctx->qwen) return ctx->qwen->prefill_cap;
     return ctx->motif3 ? ctx->motif3->prefill_cap
                        : ctx->exaone->shared_ws.prefill_cap;
 }
 
 static bool family_banked_logits_valid(
         const ds4_batch_ctx *ctx, uint32_t bank) {
+    if (ctx->qwen) return ctx->qwen->bank_logits_valid[bank] != 0u;
     return ctx->motif3 ? ctx->motif3->bank_logits_valid[bank] != 0u
                        : ctx->exaone->bank_logits_valid[bank] != 0u;
 }
 
 static float *family_banked_logits(ds4_batch_ctx *ctx, uint32_t bank) {
+    if (ctx->qwen)
+        return ctx->qwen->bank_logits + (size_t)bank * DS4_N_VOCAB;
     return (ctx->motif3 ? ctx->motif3->bank_logits
                         : ctx->exaone->bank_logits) +
            (size_t)bank * DS4_N_VOCAB;
 }
 
 static void family_banked_reset(ds4_batch_ctx *ctx, uint32_t bank) {
-    if (ctx->motif3) {
+    if (ctx->qwen) {
+        (void)qwen_batch_runtime_reset_bank(
+            ctx->qwen, ctx->e->qwen_ple_store, bank);
+    } else if (ctx->motif3) {
         motif3_batch_runtime_reset_bank(ctx->motif3, bank);
     } else {
         ctx->exaone->bank_logits_valid[bank] = 0u;
@@ -52801,6 +53070,8 @@ static void family_banked_reset(ds4_batch_ctx *ctx, uint32_t bank) {
 static bool family_banked_copy(
         ds4_batch_ctx *ctx, uint32_t src, uint32_t dst,
         uint32_t tokens) {
+    if (ctx->qwen)
+        return qwen_batch_runtime_copy_bank(ctx->qwen, src, dst, tokens);
     return ctx->motif3
         ? motif3_batch_runtime_copy_bank(ctx->motif3, src, dst)
         : exaone_batch_runtime_copy_bank(ctx->exaone, src, dst, tokens);
@@ -52809,6 +53080,10 @@ static bool family_banked_copy(
 static bool family_banked_prefill(
         ds4_batch_ctx *ctx, uint32_t bank, const int *tokens,
         uint32_t rows, uint32_t pos, bool final) {
+    if (ctx->qwen) {
+        return qwen_batch_runtime_prefill(
+            ctx->qwen, ctx->e, bank, tokens, rows, pos, final);
+    }
     if (ctx->motif3) {
         return motif3_batch_runtime_prefill(
             ctx->motif3, &ctx->e->model, &ctx->e->weights,
@@ -52825,6 +53100,9 @@ static bool family_banked_prefill(
 static bool family_banked_decode(
         ds4_batch_ctx *ctx, const uint32_t *banks, const int *tokens,
         const uint32_t *positions, uint32_t rows) {
+    if (ctx->qwen)
+        return qwen_batch_runtime_decode(
+            ctx->qwen, ctx->e, banks, tokens, positions, rows);
     return ctx->motif3
         ? motif3_batch_runtime_decode(
               ctx->motif3, &ctx->e->model, &ctx->e->weights,
@@ -52845,7 +53123,8 @@ static int family_banked_engine_continuous_generate(
     const uint32_t MS = ctx->max_seq;
     ds4_family_cont_bank *bank = xcalloc(MS, sizeof(*bank));
     uint32_t prefill_cursor = 0u;
-    bool ok = ctx->exaone != NULL || ctx->motif3 != NULL;
+    bool ok = ctx->exaone != NULL || ctx->motif3 != NULL ||
+              ctx->qwen != NULL;
     ctx->last_done_set = 0u;
     ds4_metric_set(&ds4_metrics_get()->banks_live, 0u);
 
@@ -53313,7 +53592,7 @@ static int family_engine_batched_generate_ctx(
         .out = out,
         .n = n,
     };
-    const int rc = (ctx->exaone || ctx->motif3)
+    const int rc = (ctx->exaone || ctx->motif3 || ctx->qwen)
         ? family_banked_engine_continuous_generate(
               ctx, family_static_admit, NULL, family_static_done,
               &batch, err, errlen)
@@ -53374,7 +53653,7 @@ static int ds4_engine_continuous_generate_impl(ds4_batch_ctx *ctx,
         CG_ERR("continuous_generate: this model does not yet implement the multi-sequence graph");
         return 1;
     }
-    if (ctx->exaone || ctx->motif3) {
+    if (ctx->exaone || ctx->motif3 || ctx->qwen) {
         return family_banked_engine_continuous_generate(
             ctx, admit, on_token, on_done, ud, err, errlen);
     }
@@ -58599,8 +58878,11 @@ bool ds4_engine_supports_batching(ds4_engine *e) {
     /* dots3 serves through serial latent sessions for now; its persistent
      * multi-bank runtime is future work, and refusing here routes the
      * server onto the serial lane instead of the DeepSeek bank body. */
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE ||
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) return false;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DOTS3_NOTE) return false;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        const char *enabled = getenv("DS4_QWEN_BATCH");
+        return enabled && enabled[0] == '1' && enabled[1] == '\0';
+    }
     /* Solar, EXAONE, and Motif dispatch to family-specific persistent-bank
      * runtimes; DeepSeek retains the upstream multi-sequence graph. */
     return true;

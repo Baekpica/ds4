@@ -90,7 +90,7 @@ endif
         test-qwen4exp-ple-compute test-qwen4exp-ple-forward \
         test-qwen4exp-moe test-qwen4exp-moe-forward test-qwen4exp-gdn \
         test-qwen4exp-gdn-forward test-qwen4exp-qsa \
-        test-qwen4exp-qsa-forward \
+        test-qwen4exp-qsa-forward test-qwen4exp-batch \
         test-mmq-parity test-model-family-kernels \
         test-solar-loader test-solar-kda test-solar-kda-prefill \
         test-solar-kda-chunk \
@@ -510,6 +510,17 @@ test-qwen4exp-qsa-forward: tests/test_qwen4exp_qsa_forward
 		{ echo "set DS4_QWEN4EXP_MODEL to the first SSD-PLE GGUF shard" >&2; exit 2; }
 	./tests/test_qwen4exp_qsa_forward "$(DS4_QWEN4EXP_MODEL)"
 
+tests/test_qwen4exp_batch.o: tests/test_qwen4exp_batch.c ds4.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen4exp_batch: tests/test_qwen4exp_batch.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen4exp-batch: tests/test_qwen4exp_batch
+	@test -n "$(DS4_QWEN4EXP_MODEL)" || \
+		{ echo "set DS4_QWEN4EXP_MODEL to the first SSD-PLE GGUF shard" >&2; exit 2; }
+	./tests/test_qwen4exp_batch "$(DS4_QWEN4EXP_MODEL)"
+
 # The test includes ds4.c directly for its static graph seams, so it must
 # not also link ds4.o (duplicate externs); ds4_cuda.o resolves against the
 # test object's own copy.
@@ -764,4 +775,4 @@ tests/test_motif3_long: tests/test_motif3_long.o ds4_kvstore.o rax.o $(CORE_OBJS
 endif
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test tests/test_qwen4exp_loader tests/test_qwen4exp_ple tests/test_qwen4exp_ple_cuda tests/test_qwen4exp_ple_cuda.o tests/test_qwen4exp_primitives tests/test_qwen4exp_primitives.o tests/test_qwen4exp_hc_forward tests/test_qwen4exp_hc_forward.o tests/test_qwen4exp_ple_compute tests/test_qwen4exp_ple_compute.o tests/test_qwen4exp_ple_forward tests/test_qwen4exp_ple_forward.o tests/libds4ple_test.so tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_batch tests/test_motif3_long tests/test_motif3_resident.o tests/test_motif3_batch.o tests/test_motif3_long.o tests/test_exaone_ref tests/test_exaone_kernels tests/test_exaone_batch tests/test_exaone_ref.o tests/test_exaone_kernels.o tests/test_exaone_batch.o *.o cuda/qwen38_ple.o cuda/mmq/test/test_mmq_parity.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_repack_premapped tests/test_mmq_parity tests/test_model_family_kernels tests/test_model_family_kernels.o tests/test_solar_forward tests/test_solar_forward.o tests/test_solar_session tests/test_solar_session.o tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_kda_chunk tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_kda_chunk.o tests/test_solar_gates.o tests/test_solar_kv.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_weight_server ds4_cpu ds4_native ds4_server_test ds4_test tests/test_qwen4exp_loader tests/test_qwen4exp_ple tests/test_qwen4exp_ple_cuda tests/test_qwen4exp_ple_cuda.o tests/test_qwen4exp_primitives tests/test_qwen4exp_primitives.o tests/test_qwen4exp_hc_forward tests/test_qwen4exp_hc_forward.o tests/test_qwen4exp_ple_compute tests/test_qwen4exp_ple_compute.o tests/test_qwen4exp_ple_forward tests/test_qwen4exp_ple_forward.o tests/test_qwen4exp_batch tests/test_qwen4exp_batch.o tests/libds4ple_test.so tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_batch tests/test_motif3_long tests/test_motif3_resident.o tests/test_motif3_batch.o tests/test_motif3_long.o tests/test_exaone_ref tests/test_exaone_kernels tests/test_exaone_batch tests/test_exaone_ref.o tests/test_exaone_kernels.o tests/test_exaone_batch.o *.o cuda/qwen38_ple.o cuda/mmq/test/test_mmq_parity.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_repack_premapped tests/test_mmq_parity tests/test_model_family_kernels tests/test_model_family_kernels.o tests/test_solar_forward tests/test_solar_forward.o tests/test_solar_session tests/test_solar_session.o tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_kda_chunk tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_kda_chunk.o tests/test_solar_gates.o tests/test_solar_kv.o
