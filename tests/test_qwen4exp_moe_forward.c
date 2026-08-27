@@ -405,6 +405,8 @@ int main(int argc, char **argv) {
     REQUIRE(ds4_gpu_init(), "CUDA init");
     REQUIRE(unsetenv("DS4_CUDA_COPY_MODEL") == 0,
             "disable whole-fixture copy override");
+    REQUIRE(setenv("DS4_QWEN_Q5_TAIL_EXPERT_MAJOR", "1", 1) == 0,
+            "force expert-major Q5_0 tail real-artifact path");
     REQUIRE(ds4_gpu_set_model_map(fixture, fixture_bytes),
             "register compact real MoE fixture");
     ds4_qwen_moe_ws ws;

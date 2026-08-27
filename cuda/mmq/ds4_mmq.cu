@@ -2513,6 +2513,87 @@ int ds4_mmq_moe_pair_impl(
     return 0;
 }
 
+/* Qwen3.8's 128-wide Q5_0 down tail is too narrow for the tensor-core MMQ
+ * path. Sort assignments once, then keep each expert row's four Q5 blocks
+ * resident while walking that expert's routed activations in F32. */
+__global__ static void ds4_q5_0_f32_expert_major_accum_kernel(
+        const block_q5_0 * __restrict__ W,
+        const float      * __restrict__ X,
+        const int32_t    * __restrict__ ids_src1,
+        const int32_t    * __restrict__ ids_dst,
+        const int32_t    * __restrict__ expert_bounds,
+        float            * __restrict__ out,
+        int M,
+        int x_stride,
+        int x_offset) {
+    constexpr int k_tail = 128;
+    constexpr int k_blocks = k_tail / QK5_0;
+    constexpr int k_rows_per_warp = 4;
+    constexpr int k_warps = 8;
+    constexpr int k_rows_per_block = k_rows_per_warp * k_warps;
+
+    const int expert = (int)blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int row_base = (int)blockIdx.x * k_rows_per_block + warp;
+    const int blocks_per_expert = M * k_blocks;
+
+    float scales[k_rows_per_warp][k_blocks];
+    int quants[k_rows_per_warp][k_blocks];
+#pragma unroll
+    for (int row_i = 0; row_i < k_rows_per_warp; ++row_i) {
+        const int row = row_base + row_i * k_warps;
+#pragma unroll
+        for (int block_i = 0; block_i < k_blocks; ++block_i) {
+            float scale = 0.0f;
+            int quant = 0;
+            if (row < M) {
+                const block_q5_0 *block = W + expert * blocks_per_expert +
+                    row * k_blocks + block_i;
+                const uint32_t qh = (uint32_t)block->qh[0] |
+                                    ((uint32_t)block->qh[1] << 8) |
+                                    ((uint32_t)block->qh[2] << 16) |
+                                    ((uint32_t)block->qh[3] << 24);
+                const uint8_t packed = block->qs[lane & 15];
+                const int low = lane < 16 ? packed & 15 : packed >> 4;
+                quant = (low | (int)(((qh >> lane) & 1u) << 4)) - 16;
+                scale = __half2float(block->d);
+            }
+            scales[row_i][block_i] = scale;
+            quants[row_i][block_i] = quant;
+        }
+    }
+
+    __shared__ float input[k_tail];
+    const int begin = expert_bounds[expert];
+    const int end = expert_bounds[expert + 1];
+    for (int sorted = begin; sorted < end; ++sorted) {
+        const int src = ids_src1[sorted];
+        const int dst = ids_dst[sorted];
+        if (threadIdx.x < k_tail)
+            input[threadIdx.x] = X[(int64_t)src * x_stride + x_offset +
+                                   threadIdx.x];
+        __syncthreads();
+
+#pragma unroll
+        for (int row_i = 0; row_i < k_rows_per_warp; ++row_i) {
+            const int row = row_base + row_i * k_warps;
+            if (row >= M) continue;
+            float sum = 0.0f;
+#pragma unroll
+            for (int block_i = 0; block_i < k_blocks; ++block_i)
+                sum += input[block_i * QK5_0 + lane] *
+                       scales[row_i][block_i] * quants[row_i][block_i];
+#pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1)
+                sum += __shfl_down_sync(0xffffffffu, sum, offset);
+            if (lane == 0)
+                out[(int64_t)dst * M + row] += sum;
+        }
+        __syncthreads();
+    }
+}
+
 } // anonymous namespace
 
 extern "C" int ds4_mmq_q8_0_moe(
@@ -2634,6 +2715,47 @@ extern "C" int ds4_mmq_q5_0_moe(
         cudaStream_t stream) {
     return ds4_mmq_moe_impl<GGML_TYPE_Q5_0>("ds4_mmq_q5_0_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q5_0_f32_moe_accum(
+        const void *W, const float *X, const int32_t *ids, float *out,
+        int M, int K, int x_stride, int x_offset, int n_tokens,
+        int n_experts, int n_expert_used, cudaStream_t stream) {
+    if (!W || !X || !ids || !out || M <= 0 || K != 128 ||
+        x_offset < 0 || x_stride < x_offset + K || n_tokens <= 0 ||
+        n_experts <= 0 || n_expert_used <= 0 ||
+        n_expert_used > n_experts ||
+        (int64_t)n_tokens * n_expert_used > INT_MAX) {
+        return -1;
+    }
+
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
+    if (!ctx) return -1;
+    if ((size_t)n_tokens * sizeof(int32_t) >
+            ggml_cuda_info().devices[dev].smpbo &&
+        !ds4_mmid_large_enabled()) {
+        return -1;
+    }
+
+    ds4_pool_set_stream(stream);
+    const int assignments = n_tokens * n_expert_used;
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx->pool(), assignments);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx->pool(), assignments);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx->pool(), n_experts + 1);
+    cudaMemsetAsync(ids_src1.get(), 0, assignments * sizeof(int32_t), stream);
+    cudaMemsetAsync(ids_dst.get(), 0, assignments * sizeof(int32_t), stream);
+    ggml_cuda_launch_mm_ids_helper(
+        ids, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+        n_experts, n_tokens, n_expert_used, 1, n_expert_used, 1, stream);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return -2;
+
+    const dim3 grid((unsigned)(M + 31) / 32u, (unsigned)n_experts);
+    ds4_q5_0_f32_expert_major_accum_kernel<<<grid, 256, 0, stream>>>(
+        (const block_q5_0 *)W, X, ids_src1.get(), ids_dst.get(),
+        expert_bounds.get(), out, M, x_stride, x_offset);
+    return cudaGetLastError() == cudaSuccess ? 0 : -3;
 }
 
 extern "C" int ds4_mmq_q4_K_moe_bounded(

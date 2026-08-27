@@ -1317,6 +1317,21 @@ bool run_q5_0_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
         ds4_mmq_q5_0_moe);
 }
 
+static int q5_0_f32_moe_accum_test_entry(
+        const void *w, const float *x, const int32_t *ids, float *out,
+        int M, int K, int nt, int ne, int nu, cudaStream_t stream) {
+    return ds4_mmq_q5_0_f32_moe_accum(
+        w, x, ids, out, M, K, K, 0, nt, ne, nu, stream);
+}
+
+bool run_q5_0_f32_moe_accum(
+        int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    return run_qwen_high_precision_moe<block_q5_0>(
+        "Q5_0/F32_MOE_ACCUM", QK5_0, M, K, nt, ne, nu, seed,
+        generate_random_block_q5_0, dequantize_row_q5_0_cpu,
+        q5_0_f32_moe_accum_test_entry);
+}
+
 static int q4_K_moe_pair_bounded_test_entry(
         const void *wa, const void *wb, const float *x,
         const int32_t *ids, float *out_a, float *out_b,
@@ -1720,6 +1735,9 @@ int main(int argc, char ** argv) {
     all_ok &= run_q5_0_moe(
         /*M=*/128, /*K=*/128, /*nt=*/1, /*nexp=*/16, /*nused=*/10,
         0xC50F01);
+    all_ok &= run_q5_0_f32_moe_accum(
+        /*M=*/128, /*K=*/128, /*nt=*/32, /*nexp=*/64, /*nused=*/10,
+        0xC50F32);
 
     // Step 3 - paired MoE (one quantize, two matmuls).  Each call asserts
     // bit-identity vs two back-to-back single-W moe calls over the same

@@ -400,6 +400,22 @@ int ds4_mmq_q5_0_moe(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// Expert-major Q5_0 path that keeps the activation in F32 and accumulates
+// into out_f32. x_stride/x_offset select the tail inside each activation row.
+int ds4_mmq_q5_0_f32_moe_accum(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             x_stride,
+    int             x_offset,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
 int ds4_mmq_q4_K_moe_bounded(
     const void    * W,
     const float   * X_f32,

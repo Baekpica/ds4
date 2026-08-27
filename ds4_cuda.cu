@@ -29550,6 +29550,8 @@ extern "C" int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
         tail_dim == 0u || tail_dim % 32u != 0u || out_dim == 0u ||
         n_expert == 0u || main_dim > mid_width ||
         tail_dim > mid_width - main_dim ||
+        mid_width > INT_MAX || main_dim > INT_MAX || tail_dim > INT_MAX ||
+        n_expert > INT_MAX ||
         assignments > UINT64_MAX / mid_width ||
         assignments > UINT64_MAX / out_dim ||
         (uint64_t)n_expert > UINT64_MAX / out_dim) {
@@ -29579,6 +29581,20 @@ extern "C" int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
             model_map, weight_offset, weight_bytes,
             "qwen4exp_q5_0_expert_down_tail");
     if (!tail_weights) return 0;
+    const char *expert_major = getenv("DS4_QWEN_Q5_TAIL_EXPERT_MAJOR");
+    const int use_expert_major =
+        !(expert_major && expert_major[0] == '0') &&
+        (assignments >= (uint64_t)n_expert * 8u ||
+         (expert_major && expert_major[0] == '1'));
+    if (use_expert_major &&
+        ds4_mmq_q5_0_f32_moe_accum(
+            tail_weights, (const float *)mid->ptr,
+            (const int32_t *)ids->ptr, (float *)down->ptr,
+            (int)out_dim, (int)tail_dim, (int)mid_width, (int)main_dim,
+            (int)assignments, (int)n_expert, 1,
+            ds4_current_stream()) == 0) {
+        return 1;
+    }
     constexpr uint64_t rows_per_block = 64u;
     const uint64_t blocks = assignments *
         ((out_dim + rows_per_block - 1u) / rows_per_block);

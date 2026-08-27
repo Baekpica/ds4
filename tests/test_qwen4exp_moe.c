@@ -505,6 +505,8 @@ int main(void) {
     REQUIRE(ds4_gpu_init(), "CUDA init");
     REQUIRE(unsetenv("DS4_CUDA_COPY_MODEL") == 0,
             "disable whole-map test copy");
+    REQUIRE(setenv("DS4_QWEN_Q5_TAIL_EXPERT_MAJOR", "1", 1) == 0,
+            "force expert-major Q5_0 tail test path");
 
     const uint64_t main_offset = 4096u;
     const uint64_t main_blocks =
