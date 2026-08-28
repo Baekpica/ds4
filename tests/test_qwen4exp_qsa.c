@@ -272,6 +272,77 @@ static void attention_reference(float *out, const float *query,
     free(weights);
 }
 
+static void check_vision_attention(void) {
+    enum { VROWS = 3, VHEADS = 2, VDIM = 72, VWIDTH = VHEADS * VDIM };
+    float qkv[VROWS * 3 * VWIDTH];
+    float want[VROWS * VWIDTH], got[VROWS * VWIDTH];
+    int32_t segment_start[VROWS] = {0, 0, 0};
+    int32_t segment_end[VROWS] = {VROWS, VROWS, VROWS};
+
+    for (uint32_t row = 0; row < VROWS; row++) {
+        for (uint32_t head = 0; head < VHEADS; head++) {
+            float *q = qkv + (uint64_t)row * 3u * VWIDTH +
+                       (uint64_t)head * VDIM;
+            float *k = q + VWIDTH;
+            float *v = k + VWIDTH;
+            for (uint32_t d = 0; d < VDIM; d++) {
+                q[d] = 0.31f * sinf((float)(row * 137u + head * 73u + d + 1u) * 0.071f);
+                k[d] = 0.27f * cosf((float)(row * 109u + head * 59u + d + 3u) * 0.053f);
+                v[d] = 0.23f * sinf((float)(row * 97u + head * 47u + d + 5u) * 0.037f);
+            }
+        }
+    }
+    for (uint32_t row = 0; row < VROWS; row++) {
+        for (uint32_t head = 0; head < VHEADS; head++) {
+            const float *q = qkv + (uint64_t)row * 3u * VWIDTH +
+                             (uint64_t)head * VDIM;
+            float score[VROWS], maximum = -INFINITY, sum = 0.0f;
+            for (uint32_t key_row = 0; key_row < VROWS; key_row++) {
+                const float *k = qkv + (uint64_t)key_row * 3u * VWIDTH +
+                                 VWIDTH + (uint64_t)head * VDIM;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < VDIM; d++) dot += q[d] * k[d];
+                score[key_row] = dot / sqrtf((float)VDIM);
+                maximum = fmaxf(maximum, score[key_row]);
+            }
+            for (uint32_t key_row = 0; key_row < VROWS; key_row++) {
+                score[key_row] = expf(score[key_row] - maximum);
+                sum += score[key_row];
+            }
+            for (uint32_t d = 0; d < VDIM; d++) {
+                float value = 0.0f;
+                for (uint32_t key_row = 0; key_row < VROWS; key_row++) {
+                    const float *v = qkv + (uint64_t)key_row * 3u * VWIDTH +
+                                     2u * VWIDTH + (uint64_t)head * VDIM;
+                    value += score[key_row] * v[d];
+                }
+                want[((uint64_t)row * VHEADS + head) * VDIM + d] = value / sum;
+            }
+        }
+    }
+
+    ds4_gpu_tensor *dqkv = ds4_gpu_tensor_alloc(sizeof(qkv));
+    ds4_gpu_tensor *dout = ds4_gpu_tensor_alloc(sizeof(got));
+    ds4_gpu_tensor *dstart = ds4_gpu_tensor_alloc(sizeof(segment_start));
+    ds4_gpu_tensor *dend = ds4_gpu_tensor_alloc(sizeof(segment_end));
+    REQUIRE(dqkv && dout && dstart && dend, "vision attention GPU allocation");
+    REQUIRE(ds4_gpu_tensor_write(dqkv, 0, qkv, sizeof(qkv)),
+            "vision attention QKV upload");
+    REQUIRE(ds4_gpu_tensor_write(dstart, 0, segment_start, sizeof(segment_start)) &&
+            ds4_gpu_tensor_write(dend, 0, segment_end, sizeof(segment_end)),
+            "vision attention segment upload");
+    REQUIRE(ds4_gpu_qwen4exp_vision_attention_tensor(
+                dout, dqkv, dstart, dend, VROWS, VHEADS, VDIM),
+            "vision attention launch");
+    read_f32(dout, got, VROWS * VWIDTH, "vision attention download");
+    compare_f32("Qwen vision full-attention softmax", got, want,
+                VROWS * VWIDTH, 5.0e-5f, 5.0e-5);
+    ds4_gpu_tensor_free(dend);
+    ds4_gpu_tensor_free(dstart);
+    ds4_gpu_tensor_free(dout);
+    ds4_gpu_tensor_free(dqkv);
+}
+
 int main(void) {
     const uint64_t raw_count = (uint64_t)CACHE_CAP * INDEX_DIM;
     const uint64_t pooled_count = (uint64_t)BLOCK_CAP * INDEX_DIM;
@@ -428,6 +499,7 @@ int main(void) {
                         tokens_want, counts_want);
 
     REQUIRE(ds4_gpu_init(), "CUDA init");
+    check_vision_attention();
     REQUIRE(unsetenv("DS4_CUDA_COPY_MODEL") == 0,
             "disable QSA fixture whole copy");
     REQUIRE(ds4_gpu_set_model_map(model_map, model_size),

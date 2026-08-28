@@ -26007,7 +26007,8 @@ __global__ static void qwen4exp_vision_attention_kernel(
         if (lane < head_dim) dot += q[lane] * k[lane];
         if (lane + 32u < head_dim) dot += q[lane + 32u] * k[lane + 32u];
         if (lane + 64u < head_dim) dot += q[lane + 64u] * k[lane + 64u];
-        dot = warp_sum_f32(dot) * rsqrtf((float)head_dim);
+        dot = warp_sum_f32(dot);
+        dot = __shfl_sync(0xffffffffu, dot, 0) * rsqrtf((float)head_dim);
         const float next_m = fmaxf(m, dot);
         const float alpha = isfinite(m) ? expf(m - next_m) : 0.0f;
         const float beta = expf(dot - next_m);
