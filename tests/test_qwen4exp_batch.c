@@ -437,6 +437,48 @@ int main(int argc, char **argv) {
                 ds4_batch_ctx_bank_committed(ctx, 1, NULL));
         failed = 1;
     }
+    if (failed) goto cleanup;
+
+    /* An idle Qwen bank can fund a serial graph, then rebuild cold on demand. */
+    const uint32_t victim[] = {0u};
+    ds4_reclaim_plan reclaim = {0};
+    ds4_reclaim_result released = {0};
+    if (ds4_batch_ctx_reclaim_prepare(
+            ctx, victim, 1u, 1u, &reclaim) != DS4_RECLAIM_OK ||
+        reclaim.n != 1u || reclaim.banks[0].bank != 0u ||
+        ds4_batch_ctx_reclaim_commit(
+            ctx, &reclaim, &released) != DS4_RECLAIM_OK ||
+        released.banks_reclaimed != 1u || released.bytes_released == 0u ||
+        released.bytes_released != reclaim.est_bytes ||
+        ds4_batch_ctx_bank_committed(ctx, 0, NULL) != 0) {
+        fprintf(stderr,
+                "Qwen idle graph reclaim failed: status=%s planned=%u "
+                "reclaimed=%u released=%.2f MiB\n",
+                ds4_reclaim_status_str(released.status), reclaim.n,
+                released.banks_reclaimed,
+                (double)released.bytes_released / 1048576.0);
+        failed = 1;
+        goto cleanup;
+    }
+    fork_case rebuilt = {
+        .prompt = &prompt[0],
+        .place_bank = 1,
+        .cached = -1,
+        .computed = -1,
+        .bank = -1,
+    };
+    if (ds4_engine_continuous_generate(
+            ctx, fork_admit, NULL, fork_done, &rebuilt,
+            err, sizeof(err)) != 0 || rebuilt.failed ||
+        rebuilt.cached != 0 || rebuilt.computed != prompt[0].len ||
+        rebuilt.bank != 0 || rebuilt.token != oracle[0][0]) {
+        fprintf(stderr,
+                "Qwen graph rebuild failed: %s split=%d+%d bank=%d "
+                "token=%d/%d\n",
+                err, rebuilt.cached, rebuilt.computed, rebuilt.bank,
+                rebuilt.token, oracle[0][0]);
+        failed = 1;
+    }
 
 cleanup:
     ds4_session_payload_file_free(&bank_payload);
@@ -449,6 +491,7 @@ cleanup:
     ds4_tokens_free(&prompt[0]);
     ds4_engine_close(engine);
     if (!failed)
-        printf("Qwen3.8 two-bank parity, disk KV, and partial fork: PASS\n");
+        printf("Qwen3.8 two-bank parity, disk KV, partial fork, and graph "
+               "lifecycle: PASS\n");
     return failed;
 }

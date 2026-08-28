@@ -38615,6 +38615,7 @@ typedef struct ds4_qwen_batch_runtime {
     uint32_t ctx_size;
     uint32_t prefill_cap;
     ds4_qwen_gpu_graph *graph;
+    uint64_t graph_bytes[DS4_QWEN_BANK_MAX];
     float *bank_logits;
     uint8_t *bank_logits_valid;
 
@@ -38627,6 +38628,25 @@ typedef struct ds4_qwen_batch_runtime {
     uint64_t checkpoint_slot_bytes;
     uint32_t checkpoint_stride;
 } ds4_qwen_batch_runtime;
+
+static uint64_t qwen_batch_census_live(void) {
+    ds4_mem_cell cell;
+    return ds4_gpu_mem_census_read(
+               DS4_MEMC_BATCH_BANK, DS4_MEMD_UNIFIED_DEVICE, &cell) == 0
+        ? ds4_mem_cell_live(&cell) : 0u;
+}
+
+static bool qwen_batch_runtime_graph_live(
+        const ds4_qwen_batch_runtime *rt, uint32_t bank) {
+    return rt && bank < rt->max_seq && rt->graph[bank].context_cap != 0u;
+}
+
+static void qwen_batch_runtime_note_growth(
+        ds4_qwen_batch_runtime *rt, uint32_t bank, uint64_t before) {
+    const uint64_t after = qwen_batch_census_live();
+    if (rt && bank < rt->max_seq && after > before)
+        rt->graph_bytes[bank] += after - before;
+}
 
 static bool qwen4exp_graph_session_fit_check(
     ds4_backend backend, uint32_t ctx_size, uint32_t prefill_cap,
@@ -38684,6 +38704,7 @@ static ds4_qwen_batch_runtime *qwen_batch_runtime_create(
         return NULL;
     }
     for (uint32_t b = 0; b < max_seq; b++) {
+        const uint64_t before = qwen_batch_census_live();
         if (!qwen4exp_graph_session_fit_check(
                 e->backend, ctx_size, prefill_cap, true, NULL) ||
             !qwen4exp_graph_alloc(
@@ -38692,6 +38713,10 @@ static ds4_qwen_batch_runtime *qwen_batch_runtime_create(
             qwen_batch_runtime_free(rt);
             return NULL;
         }
+        const uint64_t after = qwen_batch_census_live();
+        rt->graph_bytes[b] = after > before
+            ? after - before
+            : qwen4exp_graph_bytes_estimate(ctx_size, prefill_cap);
     }
     rt->checkpoint_slot_bytes =
         qwen4exp_recurrent_checkpoint_bytes(&rt->graph[0]);
@@ -38724,6 +38749,49 @@ static ds4_qwen_batch_runtime *qwen_batch_runtime_create(
             (double)rt->checkpoint_slot_bytes / 1048576.0,
             rt->checkpoint_stride);
     return rt;
+}
+
+static bool qwen_batch_runtime_ensure_graph(
+        ds4_qwen_batch_runtime *rt, ds4_engine *e, uint32_t bank) {
+    if (!rt || !e || bank >= rt->max_seq) return false;
+    if (qwen_batch_runtime_graph_live(rt, bank)) return true;
+    if (rt->graph_bytes[bank] != 0u) {
+        uint64_t free_bytes = 0u, total_bytes = 0u;
+        if (ds4_gpu_mem_info(&free_bytes, &total_bytes) == 0) {
+            const uint64_t substrate = ds4_gpu_substrate_outstanding();
+            free_bytes = free_bytes > substrate ? free_bytes - substrate : 0u;
+            const uint64_t headroom = ds4_session_graph_headroom_bytes();
+            if (rt->graph_bytes[bank] > UINT64_MAX - headroom ||
+                free_bytes < rt->graph_bytes[bank] + headroom) {
+                ds4_metric_add(&ds4_metrics_get()->graph_fit_refusals, 1u);
+                fprintf(stderr,
+                        "ds4: Qwen bank %u rebuild fit check FAILED: need "
+                        "%.2f GiB + %.0f MiB headroom, free %.2f GiB\n",
+                        bank, (double)rt->graph_bytes[bank] / 1073741824.0,
+                        (double)headroom / 1048576.0,
+                        (double)free_bytes / 1073741824.0);
+                return false;
+            }
+        }
+    } else if (!qwen4exp_graph_session_fit_check(
+                   e->backend, rt->ctx_size, rt->prefill_cap, true, NULL)) {
+        return false;
+    }
+    const uint64_t before = qwen_batch_census_live();
+    ds4_gpu_mem_scope_begin(DS4_MEMC_BATCH_BANK);
+    const bool ok = qwen4exp_graph_alloc(
+        &rt->graph[bank], &e->weights, e->qwen_ple_store,
+        rt->ctx_size, rt->prefill_cap);
+    ds4_gpu_mem_scope_end();
+    if (!ok) return false;
+    const uint64_t after = qwen_batch_census_live();
+    rt->graph_bytes[bank] = after > before
+        ? after - before
+        : qwen4exp_graph_bytes_estimate(rt->ctx_size, rt->prefill_cap);
+    fprintf(stderr,
+            "ds4: Qwen bank %u graph rebuilt on demand (%.2f GiB)\n",
+            bank, (double)rt->graph_bytes[bank] / 1073741824.0);
+    return true;
 }
 
 static bool qwen_batch_runtime_reset_bank(
@@ -38809,10 +38877,15 @@ static bool qwen_batch_runtime_copy_bank(
         ds4_qwen_batch_runtime *rt, uint32_t src, uint32_t dst,
         uint32_t tokens) {
     if (!rt || src >= rt->max_seq || dst >= rt->max_seq) return false;
-    if (src != dst &&
-        !qwen4exp_graph_copy_state(&rt->graph[dst], &rt->graph[src], tokens)) {
-        rt->bank_logits_valid[dst] = 0u;
-        return false;
+    if (src != dst) {
+        const uint64_t before = qwen_batch_census_live();
+        const bool copied = qwen4exp_graph_copy_state(
+            &rt->graph[dst], &rt->graph[src], tokens);
+        qwen_batch_runtime_note_growth(rt, dst, before);
+        if (!copied) {
+            rt->bank_logits_valid[dst] = 0u;
+            return false;
+        }
     }
     if (rt->bank_logits_valid[src]) {
         memcpy(rt->bank_logits + (size_t)dst * DS4_N_VOCAB,
@@ -38830,12 +38903,14 @@ static bool qwen_batch_runtime_prefill(
         const int *tokens, uint32_t rows, uint32_t pos, bool final) {
     if (!rt || !e || bank >= rt->max_seq) return false;
     rt->bank_logits_valid[bank] = 0u;
+    const uint64_t before = qwen_batch_census_live();
     const bool ok = qwen4exp_graph_forward_chunk(
         &rt->graph[bank], &e->model, &e->weights,
         e->qwen_ple_store, e->qwen_ple_cuda,
         tokens, rows, pos,
         final ? 1u : 0u,
         final ? rt->bank_logits + (size_t)bank * DS4_N_VOCAB : NULL);
+    qwen_batch_runtime_note_growth(rt, bank, before);
     if (ok && final) rt->bank_logits_valid[bank] = 1u;
     return ok;
 }
@@ -38850,13 +38925,15 @@ static bool qwen_batch_runtime_decode(
         const uint32_t bank = banks[i];
         if (bank >= rt->max_seq) return false;
         rt->bank_logits_valid[bank] = 0u;
-        if (!qwen4exp_graph_forward_chunk(
+        const uint64_t before = qwen_batch_census_live();
+        const bool ok = qwen4exp_graph_forward_chunk(
                 &rt->graph[bank], &e->model, &e->weights,
                 e->qwen_ple_store, e->qwen_ple_cuda,
                 &tokens[i], 1u, positions[i],
                 1u,
-                rt->bank_logits + (size_t)bank * DS4_N_VOCAB))
-            return false;
+                rt->bank_logits + (size_t)bank * DS4_N_VOCAB);
+        qwen_batch_runtime_note_growth(rt, bank, before);
+        if (!ok) return false;
         rt->bank_logits_valid[bank] = 1u;
     }
     return true;
@@ -40872,6 +40949,21 @@ static void qwen_batch_runtime_drop_checkpoints(
     }
 }
 
+static uint64_t qwen_batch_runtime_retire_graph(
+        ds4_qwen_batch_runtime *rt, uint32_t bank) {
+    if (!qwen_batch_runtime_graph_live(rt, bank)) return 0u;
+    const uint64_t before = qwen_batch_census_live();
+    qwen_batch_runtime_drop_checkpoints(rt, bank);
+    rt->bank_logits_valid[bank] = 0u;
+    qwen4exp_graph_free(&rt->graph[bank]);
+    const uint64_t after = qwen_batch_census_live();
+    const uint64_t released = before > after ? before - after : 0u;
+    fprintf(stderr,
+            "ds4: Qwen bank %u idle graph retired (%.2f GiB released)\n",
+            bank, (double)released / 1073741824.0);
+    return released;
+}
+
 static void qwen_batch_runtime_inherit_checkpoints(
         ds4_qwen_batch_runtime *rt, uint32_t src, uint32_t dst,
         uint32_t cut) {
@@ -41042,7 +41134,11 @@ static bool qwen_batch_runtime_restore_checkpoint(
     ds4_qwen_gpu_graph *dst_graph = &rt->graph[dst];
     const ds4_qwen_gpu_graph *src_graph = &rt->graph[src];
     if (src != dst) {
-        if (!qwen4exp_graph_copy_qsa_prefix(dst_graph, src_graph, pos))
+        const uint64_t before = qwen_batch_census_live();
+        const bool copied =
+            qwen4exp_graph_copy_qsa_prefix(dst_graph, src_graph, pos);
+        qwen_batch_runtime_note_growth(rt, dst, before);
+        if (!copied)
             return false;
     } else {
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -48931,6 +49027,11 @@ static int qwen_cont_bank_restore_payload(
         ds4_batch_ctx *ctx, uint32_t bank, FILE *fp,
         uint64_t payload_bytes, char *err, size_t errlen) {
     ds4_qwen_batch_runtime *rt = ctx->qwen;
+    if (!qwen_batch_runtime_ensure_graph(rt, ctx->e, bank)) {
+        payload_set_err(err, errlen,
+                        "failed to rebuild Qwen4Exp bank before restore");
+        return 1;
+    }
     ctx->bank_gen[bank]++;
     ctx->bank_hist_valid[bank] = 0u;
     ctx->bank_hist_len[bank] = 0u;
@@ -48952,9 +49053,12 @@ static int qwen_cont_bank_restore_payload(
     }
     int *tokens = NULL;
     float *logits = rt->bank_logits + (size_t)bank * DS4_N_VOCAB;
-    if (qwen4exp_payload_restore_graph(
+    const uint64_t before = qwen_batch_census_live();
+    const int restore_rc = qwen4exp_payload_restore_graph(
             &rt->graph[bank], ctx->e->qwen_ple_store,
-            fp, &remaining, h, &tokens, logits, err, errlen) != 0) {
+            fp, &remaining, h, &tokens, logits, err, errlen);
+    qwen_batch_runtime_note_growth(rt, bank, before);
+    if (restore_rc != 0) {
         free(tokens);
         (void)qwen_batch_runtime_reset_bank(
             rt, ctx->e->qwen_ple_store, bank);
@@ -51008,7 +51112,7 @@ int ds4_batch_ctx_reclaim_prepare(ds4_batch_ctx *ctx, const uint32_t *ordered_id
     memset(plan, 0, sizeof(*plan));
     plan->want_bytes = want_bytes;
     if (!ctx || !ds4_batch_trim_enabled()) return DS4_RECLAIM_UNSUPPORTED;
-    if (ctx->exaone || ctx->motif3 || ctx->qwen)
+    if (ctx->exaone || ctx->motif3)
         return DS4_RECLAIM_UNSUPPORTED;
     if (ctx->solar) return DS4_RECLAIM_UNSUPPORTED;
     if (ctx->in_pass) return DS4_RECLAIM_BUSY;
@@ -51024,7 +51128,10 @@ int ds4_batch_ctx_reclaim_prepare(ds4_batch_ctx *ctx, const uint32_t *ordered_id
         const uint32_t b = ordered_ids[i];
         if (b >= (uint32_t)ctx->max_seq || seen[b]) continue;
         seen[b] = 1;
-        const uint64_t est = ds4_batch_bank_trim_estimate(ctx, b);
+        const uint64_t est = ctx->qwen
+            ? (qwen_batch_runtime_graph_live(ctx->qwen, b)
+                ? ctx->qwen->graph_bytes[b] : 0u)
+            : ds4_batch_bank_trim_estimate(ctx, b);
         if (est == 0) continue;               /* floor-resident: nothing mapped */
         ds4_reclaim_bank *rb = &plan->banks[plan->n++];
         rb->bank = b;
@@ -51067,6 +51174,7 @@ int ds4_batch_ctx_reclaim_commit(ds4_batch_ctx *ctx, ds4_reclaim_plan *plan,
     }
     uint32_t stale = 0, failed = 0, partial = 0;
     bool synced = false;
+    bool captures_invalidated = false;
     for (uint32_t i = 0; i < plan->n; i++) {
         ds4_reclaim_bank *rb = &plan->banks[i];
         const uint32_t v = rb->bank;
@@ -51086,6 +51194,34 @@ int ds4_batch_ctx_reclaim_commit(ds4_batch_ctx *ctx, ds4_reclaim_plan *plan,
                 break;
             }
             synced = true;
+        }
+        if (ctx->qwen) {
+            const uint64_t pre = qwen_batch_runtime_graph_live(ctx->qwen, v)
+                ? ctx->qwen->graph_bytes[v] : 0u;
+            if (pre == 0u) {
+                rb->status = DS4_RECLAIM_STALE_PLAN;
+                stale++;
+                continue;
+            }
+            if (!captures_invalidated) {
+                ds4_gpu_invalidate_captured_graphs("Qwen idle graph retire");
+                captures_invalidated = true;
+            }
+            const uint64_t got =
+                qwen_batch_runtime_retire_graph(ctx->qwen, v);
+            rb->got_bytes = got;
+            ctx->bank_gen[v]++;
+            ctx->bank_hist_valid[v] = 0u;
+            ctx->bank_hist_len[v] = 0u;
+            rr.banks_reclaimed++;
+            rr.bytes_released += got;
+            if (got != 0u) {
+                rb->status = DS4_RECLAIM_OK;
+            } else {
+                rb->status = DS4_RECLAIM_PARTIAL;
+                partial++;
+            }
+            continue;
         }
         const uint64_t pre = ds4_batch_bank_trim_estimate(ctx, v);
         if (pre == 0) {                        /* preimage vanished: stale, keep */
@@ -53997,6 +54133,18 @@ static uint32_t family_banked_prefill_cap(const ds4_batch_ctx *ctx) {
                        : ctx->exaone->shared_ws.prefill_cap;
 }
 
+static bool family_banked_graph_live(
+        const ds4_batch_ctx *ctx, uint32_t bank) {
+    return !ctx->qwen || qwen_batch_runtime_graph_live(ctx->qwen, bank);
+}
+
+static uint32_t family_banked_graphs_live(const ds4_batch_ctx *ctx) {
+    uint32_t live = 0u;
+    for (uint32_t b = 0; b < ctx->max_seq; b++)
+        live += family_banked_graph_live(ctx, b);
+    return live;
+}
+
 static bool family_banked_logits_valid(
         const ds4_batch_ctx *ctx, uint32_t bank) {
     if (ctx->qwen) return ctx->qwen->bank_logits_valid[bank] != 0u;
@@ -54107,12 +54255,34 @@ static int family_banked_engine_continuous_generate(
     uint32_t prefill_cursor = 0u;
     bool ok = ctx->exaone != NULL || ctx->motif3 != NULL ||
               ctx->qwen != NULL;
+    bool rehydrate_blocked = false;
     ctx->last_done_set = 0u;
     ds4_metric_set(&ds4_metrics_get()->banks_live, 0u);
 
     while (ok) {
         bool admit_returned_none = false;
         while (family_cont_busy_count(bank, MS) < MS) {
+            if (ctx->qwen && !rehydrate_blocked) {
+                const uint32_t busy = family_cont_busy_count(bank, MS);
+                const uint32_t resident = family_banked_graphs_live(ctx);
+                if (resident < MS && busy >= resident) {
+                    bool rebuilt = false;
+                    for (uint32_t b = 0; b < MS; b++) {
+                        if (bank[b].phase == FAMILY_CONT_FREE &&
+                            !family_banked_graph_live(ctx, b) &&
+                            qwen_batch_runtime_ensure_graph(
+                                ctx->qwen, ctx->e, b)) {
+                            rebuilt = true;
+                            break;
+                        }
+                    }
+                    if (!rebuilt) {
+                        rehydrate_blocked = true;
+                        admit_returned_none = true;
+                        break;
+                    }
+                }
+            }
             ds4_cont_request req;
             memset(&req, 0, sizeof(req));
             if (!admit(ud, &req)) {
@@ -54135,15 +54305,28 @@ static int family_banked_engine_continuous_generate(
                 on_done(ud, req.user, NULL, 0, 0);
                 continue;
             }
+            if (target >= 0 &&
+                !family_banked_graph_live(ctx, (uint32_t)target) &&
+                !qwen_batch_runtime_ensure_graph(
+                    ctx->qwen, ctx->e, (uint32_t)target)) {
+                ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1u);
+                on_done(ud, req.user, NULL, 0, 0);
+                FCG_ERR("continuous_generate: Qwen bank %d graph rebuild "
+                        "failed", target);
+                ok = false;
+                break;
+            }
             if (target < 0) {
                 for (uint32_t b = 0; b < MS; b++) {
-                    if (bank[b].phase == FAMILY_CONT_FREE && (int)b != src) {
+                    if (bank[b].phase == FAMILY_CONT_FREE && (int)b != src &&
+                        family_banked_graph_live(ctx, b)) {
                         target = (int)b;
                         break;
                     }
                 }
                 if (target < 0 && src >= 0 && (uint32_t)src < MS &&
-                    bank[src].phase == FAMILY_CONT_FREE) {
+                    bank[src].phase == FAMILY_CONT_FREE &&
+                    family_banked_graph_live(ctx, (uint32_t)src)) {
                     target = src;
                 }
                 if (target < 0) break;
