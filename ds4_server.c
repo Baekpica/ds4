@@ -990,6 +990,59 @@ static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effor
  * option parsing, read-only after. */
 static ds4_think_mode g_default_reasoning_effort = DS4_THINK_LOW;
 
+/* Issue #18: the OpenAI-surface reasoning_effort field is compat-mapped by
+ * default -- prefixed tiers (high/max) resolve to LOW, so a client field can
+ * never inject the checkpoint's effort preambles.  Agent frameworks send
+ * "high" meaning the OpenAI knob ("think more"), not DeepSeek's position-0
+ * "write out your entire deliberation" paragraph; delivering the paragraph
+ * degrades deep-context tool calling (needle matrix: 6/50 failures >=96K
+ * with the prefix vs 0/100 without, and it is the v0.5.2 -> v0.6.2 field
+ * regression -- v0.5.2 and llama.cpp both no-op the field).  Operators who
+ * want the checkpoint's native tiers back opt in with
+ * --reasoning-effort-native; the operator's own --reasoning-effort default
+ * is always honored as written, since setting it IS the native opt-in for
+ * that level. */
+static bool g_native_reasoning_effort = false;
+
+/* Issue #18 residual: agent scaffolds that echo assistant messages verbatim
+ * re-send reasoning_content, and the tool-context render re-emits it inside
+ * <think>...</think>.  That IS the V4 reference format: the reference
+ * encoding disables drop_thinking whenever tools are present, and
+ * DeepSeek's API returns 400 in tool loops when reasoning_content is NOT
+ * passed back (api-docs thinking-mode guide, verified 2026-08-26).  The
+ * cost is depth: the conversation runs 16-28% deeper per turn than on
+ * llama.cpp, whose template default drops replayed reasoning (a deviation
+ * from the reference format), and depth is where the low-bit quant's
+ * tool-protocol adherence slips (measured 50% no-tool-call turns at
+ * 70-80K).  --reasoning-replay drop reproduces llama.cpp's deviation
+ * opt-in, trading format fidelity for shallower context; the cont bank's
+ * partial-prefix admission absorbs the divergence at a measured cost of a
+ * one-turn tail re-prefill (~270 tokens / ~0.6s per turn).  Default keeps
+ * the replay (reference-faithful, warm in-place reuse); assistant turns
+ * being CONTINUED (after the last user message) always keep their
+ * reasoning regardless. */
+static bool g_reasoning_replay_drop = false;
+
+/* Issue #18 option E: at depth, the quant sometimes answers a tools-armed
+ * turn with a prose completion report instead of a tool call (measured 50%
+ * of turns at 70-80K in the field-shaped baseline; every slip fired right
+ * after a successful tool result).  A short protocol reminder rendered at
+ * the tail suppresses it: at the exact eliciting states the control arm
+ * slipped 6/72 sampled draws and the reminder arm 0/72, and the end-to-end
+ * pilot (reminder injected every turn, reasoning traces KEPT) submitted
+ * and resolved the task in 57 calls with zero slips where the bare engine
+ * died three runs.  Default ON, gated to rendered depth >= ~96KB (~30K+
+ * tokens): the slip class lives exclusively deep, and shallow
+ * chat-with-tools flows that legitimately answer in prose after a tool
+ * result must not be nudged into spurious calls.  --tool-call-reminder off
+ * (env DS4_TOOL_CALL_REMINDER=0) disables; DS4_TOOL_CALL_REMINDER_MIN_BYTES
+ * retunes the gate. */
+static bool g_tool_call_reminder = true;
+static size_t g_tool_reminder_min_bytes = 98304;
+#define DS4_TOOL_CALL_REMINDER_TEXT \
+    "\n\n[Reminder: respond with exactly one tool call in the required " \
+    "format. Plain-text replies are not accepted by this harness.]"
+
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
     if (!s) return false;
     /* The three levels the 0731 checkpoint defines, plus the OpenAI-style
@@ -1029,6 +1082,15 @@ static bool parse_reasoning_effort_value(const char **p, ds4_think_mode *out) {
     if (!json_string(p, &effort)) return false;
     bool ok = parse_reasoning_effort_name(effort, out);
     free(effort);
+    /* Client-field entry point only (the --reasoning-effort flag parses via
+     * parse_reasoning_effort_name directly), so the compat clamp lives here:
+     * without the native opt-in, request fields cannot reach a prefixed
+     * tier.  NONE passes through -- disabling thinking stays client-reachable. */
+    if (ok && !g_native_reasoning_effort &&
+        (*out == DS4_THINK_HIGH || *out == DS4_THINK_MAX))
+    {
+        *out = DS4_THINK_LOW;
+    }
     return ok;
 }
 
@@ -2925,6 +2987,21 @@ static char *render_dsml_chat_prompt_text_choice(
             if (!pending_tool_result) buf_puts(&out, "<｜User｜>");
             buf_puts(&out, "<tool_result>");
             append_tool_result_text(&out, m->content);
+            /* issue #18 option E: past the depth gate, every tool result in
+             * a tools-armed conversation carries the protocol reminder.
+             * Per-result (not last-result-only) so the rendered history is
+             * byte-stable across turns and keep-mode warm reuse stays
+             * perfect; gated on rendered depth because the slip class lives
+             * exclusively deep (0/129 turns below 60K in the field
+             * baseline) while shallow chat-with-tools flows legitimately
+             * answer in prose after a tool result and must not be pushed
+             * into spurious calls.  The condition reads out.len BEFORE the
+             * append, so each result's verdict is a pure function of the
+             * conversation prefix. */
+            if (g_tool_call_reminder && tool_schemas && tool_schemas[0] &&
+                out.len >= g_tool_reminder_min_bytes) {
+                buf_puts(&out, DS4_TOOL_CALL_REMINDER_TEXT);
+            }
             buf_puts(&out, "</tool_result>");
             pending_assistant = true;
             pending_tool_result = true;
@@ -2932,7 +3009,8 @@ static char *render_dsml_chat_prompt_text_choice(
             if (pending_assistant) {
                 buf_puts(&out, "<｜Assistant｜>");
                 if (think) {
-                    if (tool_context || i > last_user_idx) {
+                    if ((tool_context && !g_reasoning_replay_drop) ||
+                        i > last_user_idx) {
                         buf_puts(&out, "<think>");
                         buf_puts(&out, m->reasoning ? m->reasoning : "");
                         buf_puts(&out, "</think>");
@@ -4682,6 +4760,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
+        !g_reasoning_replay_drop &&
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text_for_model(
         r->model_syntax, &msgs, active_tool_schemas, &r->tool_orders,
@@ -4884,6 +4963,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
     request_acquire_cont_pin(s, r);   /* Inc 5b: pin the LIVE record */
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
+        !g_reasoning_replay_drop &&
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text_for_model(
         r->model_syntax, &msgs, active_tool_schemas, &r->tool_orders,
@@ -5821,6 +5901,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     r->prompt_preserves_reasoning =
+        !g_reasoning_replay_drop &&
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     responses_prepare_live_continuation(r, &msgs);
     request_acquire_cont_pin(s, r);   /* Inc 5b: pin the LIVE record */
@@ -6787,6 +6868,34 @@ static bool parse_qwen_generated_message(const char *text,
     return calls->len > 0;
 }
 
+/* Issue #18 fray tolerance: at depth the model mixes DSML tag spellings
+ * inside one block. Match every element independently and terminate a
+ * parameter value at the earliest supported end-tag spelling. */
+static const char *dsml_match_any3(const char *p, const char *t0,
+                                   const char *t1, const char *t2) {
+    if (!strncmp(p, t0, strlen(t0))) return t0;
+    if (!strncmp(p, t1, strlen(t1))) return t1;
+    if (!strncmp(p, t2, strlen(t2))) return t2;
+    return NULL;
+}
+
+static const char *dsml_find_earliest3(const char *hay, const char *t0,
+                                       const char *t1, const char *t2,
+                                       const char **matched) {
+    const char *cands[3] = {t0, t1, t2};
+    const char *best = NULL;
+    const char *tag = NULL;
+    for (int i = 0; i < 3; i++) {
+        const char *s = strstr(hay, cands[i]);
+        if (s && (!best || s < best)) {
+            best = s;
+            tag = cands[i];
+        }
+    }
+    if (matched) *matched = tag;
+    return best;
+}
+
 static bool parse_generated_message_ex_format(
         const char *text, bool require_thinking_closed,
         ds4_chat_format format, const tool_schema_orders *orders,
@@ -6854,26 +6963,8 @@ static bool parse_generated_message_ex_format(
     size_t content_len = trim_tool_separator_ws(text, 0, (size_t)(start - text));
     const char *raw_block_start = start;
     const char *tool_calls_start = DS4_TOOL_CALLS_START;
-    const char *tool_calls_end = DS4_TOOL_CALLS_END;
-    const char *invoke_start = DS4_INVOKE_START;
-    const char *invoke_end = DS4_INVOKE_END;
-    const char *param_start = DS4_PARAM_START;
-    const char *param_end = DS4_PARAM_END;
-    if (style == 1) {
-        tool_calls_start = "<tool_calls>";
-        tool_calls_end = "</tool_calls>";
-        invoke_start = "<invoke";
-        invoke_end = "</invoke>";
-        param_start = "<parameter";
-        param_end = "</parameter>";
-    } else if (style == 2) {
-        tool_calls_start = DS4_TOOL_CALLS_START_SHORT;
-        tool_calls_end = DS4_TOOL_CALLS_END_SHORT;
-        invoke_start = DS4_INVOKE_START_SHORT;
-        invoke_end = DS4_INVOKE_END_SHORT;
-        param_start = DS4_PARAM_START_SHORT;
-        param_end = DS4_PARAM_END_SHORT;
-    }
+    if (style == 1) tool_calls_start = "<tool_calls>";
+    else if (style == 2) tool_calls_start = DS4_TOOL_CALLS_START_SHORT;
 
     const char *p = strstr(start, tool_calls_start);
     if (!p) return false;
@@ -6881,14 +6972,19 @@ static bool parse_generated_message_ex_format(
 
     for (;;) {
         p = skip_ascii_ws(p);
-        if (!strncmp(p, tool_calls_end, strlen(tool_calls_end))) {
-            const char *raw_block_end = p + strlen(tool_calls_end);
+        const char *block_end_tag = dsml_match_any3(p, DS4_TOOL_CALLS_END,
+                                                    DS4_TOOL_CALLS_END_SHORT,
+                                                    "</tool_calls>");
+        if (block_end_tag) {
+            const char *raw_block_end = p + strlen(block_end_tag);
             free(calls->raw_dsml);
             calls->raw_dsml = xstrndup(raw_block_start, (size_t)(raw_block_end - raw_block_start));
             split_reasoning_content(text, content_len, content_out, reasoning_out);
             return true;
         }
-        if (strncmp(p, invoke_start, strlen(invoke_start)) != 0) return false;
+        if (!dsml_match_any3(p, DS4_INVOKE_START, DS4_INVOKE_START_SHORT,
+                             "<invoke"))
+            return false;
         const char *tag_end = strchr(p, '>');
         if (!tag_end) return false;
         char *tag = xstrndup(p, (size_t)(tag_end - p + 1));
@@ -6900,11 +6996,15 @@ static bool parse_generated_message_ex_format(
         buf args = {0};
         while (true) {
             p = skip_ascii_ws(p);
-            if (!strncmp(p, invoke_end, strlen(invoke_end))) {
-                p += strlen(invoke_end);
+            const char *inv_end_tag = dsml_match_any3(p, DS4_INVOKE_END,
+                                                      DS4_INVOKE_END_SHORT,
+                                                      "</invoke>");
+            if (inv_end_tag) {
+                p += strlen(inv_end_tag);
                 break;
             }
-            if (strncmp(p, param_start, strlen(param_start)) != 0) {
+            if (!dsml_match_any3(p, DS4_PARAM_START, DS4_PARAM_START_SHORT,
+                                 "<parameter")) {
                 free(name);
                 buf_free(&args);
                 return false;
@@ -6927,13 +7027,19 @@ static bool parse_generated_message_ex_format(
                 return false;
             }
             const char *value_start = tag_end + 1;
-            if (!param_is_string &&
-                !strncmp(skip_ascii_ws(value_start), param_start, strlen(param_start)))
-            {
+            const char *nested_tag = dsml_match_any3(skip_ascii_ws(value_start),
+                                                     DS4_PARAM_START,
+                                                     DS4_PARAM_START_SHORT,
+                                                     "<parameter");
+            if (!param_is_string && nested_tag) {
+                const char *nested_end =
+                    !strcmp(nested_tag, DS4_PARAM_START) ? DS4_PARAM_END :
+                    !strcmp(nested_tag, DS4_PARAM_START_SHORT) ? DS4_PARAM_END_SHORT :
+                    "</parameter>";
                 buf nested = {0};
                 const char *nested_p = value_start;
-                if (!dsml_parse_nested_params_object(&nested_p, param_start,
-                                                     param_end, &nested)) {
+                if (!dsml_parse_nested_params_object(&nested_p, nested_tag,
+                                                     nested_end, &nested)) {
                     free(name);
                     free(param_name);
                     buf_free(&nested);
@@ -6945,13 +7051,18 @@ static bool parse_generated_message_ex_format(
                                         "false");
                 buf_free(&nested);
                 p = skip_ascii_ws(nested_p);
-                if (!strncmp(p, param_end, strlen(param_end))) {
-                    p += strlen(param_end);
-                }
+                const char *outer_end_tag = dsml_match_any3(p, DS4_PARAM_END,
+                                                            DS4_PARAM_END_SHORT,
+                                                            "</parameter>");
+                if (outer_end_tag) p += strlen(outer_end_tag);
                 free(param_name);
                 continue;
             }
-            const char *value_end = strstr(value_start, param_end);
+            const char *value_end_tag = NULL;
+            const char *value_end = dsml_find_earliest3(value_start, DS4_PARAM_END,
+                                                        DS4_PARAM_END_SHORT,
+                                                        "</parameter>",
+                                                        &value_end_tag);
             if (!value_end) {
                 free(name);
                 free(param_name);
@@ -6968,7 +7079,7 @@ static bool parse_generated_message_ex_format(
             free(param_is_string);
             free(raw_value);
             free(value);
-            p = value_end + strlen(param_end);
+            p = value_end + strlen(value_end_tag);
         }
 
         tool_call tc = {0};
@@ -11094,6 +11205,21 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    /* issue #18 forensics: --trace covers only the serial lane, so a
+     * cont-served tools-armed turn that settles without tool calls (the
+     * field failure shape) was never captured byte-level -- agent harnesses
+     * discard the rejected response.  When armed, both lanes dump one JSON
+     * file per such turn: raw request body + generated text + parse verdict. */
+    const char *tool_slip_dir;
+    pthread_mutex_t tool_slip_mu;
+    uint64_t tool_slip_seq;
+    /* issue #18 option C: when a cont-served non-streaming tools-armed chat
+     * turn settles at finish=stop with no tool calls (the measured 50%
+     * failure shape at 70-80K depth), requeue it once at the FIFO head for
+     * a fresh draw instead of writing the prose -- the retired bank warm-
+     * admits the full prompt, so the retry costs one generation, not a
+     * prefill.  Opt-in; disclosed in release notes (it is our sampler). */
+    bool tool_slip_resample;
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -11136,6 +11262,11 @@ struct job {
     /* Inc 2e: this request's HTTP body size, charged against the server's
      * inflight_body_bytes bound from enqueue until settle. */
     size_t body_bytes;
+    /* issue #18 option C: number of tool-slip resamples already spent on this
+     * job (cap 1).  Worker-owned; also exempts the retry from the queue-age
+     * shed (t_arrive is the ORIGINAL arrival, deliberately not refreshed --
+     * timings stay honest about total latency). */
+    int slip_attempts;
 };
 
 /* Inc 2c: CANCELED = the CLIENT ended the request (disconnected while
@@ -14483,6 +14614,61 @@ static bool should_remember_thinking_checkpoint(const request *r,
     return true;
 }
 
+/* issue #18 forensics: one self-contained JSON file per tools-armed chat
+ * completion that settles WITHOUT tool calls.  saw_tool_start distinguishes
+ * the two field failure shapes (false = pure prose, true = tool markup the
+ * parser rejected); the raw request body makes the file a byte-exact replay
+ * fixture.  Legitimate prose answers on tool_choice=auto requests dump too --
+ * the knob is an opt-in debug instrument, the reader filters. */
+static void tool_slip_dump(server *s, const request *req, const char *lane,
+                           const char *finish, int completion_tokens,
+                           bool saw_tool_start, bool saw_tool_end,
+                           const char *gen_text, size_t gen_len) {
+    if (!s->tool_slip_dir || !req->has_tools || req->kind != REQ_CHAT) return;
+    pthread_mutex_lock(&s->tool_slip_mu);
+    const uint64_t id = ++s->tool_slip_seq;
+    pthread_mutex_unlock(&s->tool_slip_mu);
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/slip-%lld-%llu.json",
+             s->tool_slip_dir, (long long)time(NULL), (unsigned long long)id);
+    buf b = {0};
+    char meta[256];
+    buf_puts(&b, "{\"lane\":");
+    json_escape(&b, lane);
+    buf_puts(&b, ",\"finish\":");
+    json_escape(&b, finish ? finish : "");
+    snprintf(meta, sizeof(meta),
+             ",\"prompt_tokens\":%d,\"completion_tokens\":%d,"
+             "\"saw_tool_start\":%s,\"saw_tool_end\":%s,"
+             "\"think\":\"%s\",\"stream\":%s,",
+             req->prompt.len, completion_tokens,
+             saw_tool_start ? "true" : "false",
+             saw_tool_end ? "true" : "false",
+             ds4_think_mode_name(req->think_mode),
+             req->stream ? "true" : "false");
+    buf_puts(&b, meta);
+    buf_puts(&b, "\"generated_text\":");
+    json_escape_n(&b, gen_text ? gen_text : "", gen_len);
+    buf_puts(&b, ",\"request_body\":");
+    if (req->raw_body) json_escape(&b, req->raw_body);
+    else buf_puts(&b, "null");
+    buf_puts(&b, "}\n");
+    FILE *fp = fopen(path, "w");
+    if (fp) {
+        fwrite(b.ptr, 1, b.len, fp);
+        fclose(fp);
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: %s chat tools-armed turn settled with no tool calls; dumped %s (finish=%s gen=%d saw_start=%d)",
+                   lane, path, finish ? finish : "?", completion_tokens,
+                   saw_tool_start);
+    } else {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: tool-slip dump open failed: %s: %s",
+                   path, strerror(errno));
+    }
+    buf_free(&b);
+}
+
 static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
                                    bool responses_protocol) {
     if (!calls || calls->len == 0) return;
@@ -16019,6 +16205,10 @@ decode_again:
         } else if (j->req.api == API_RESPONSES) {
             responses_live_clear(s);
         }
+        if (!parsed_calls.len)
+            tool_slip_dump(s, &j->req, "serial", final_finish, acc.completion,
+                           acc.saw_tool_start, acc.saw_tool_end,
+                           acc.text.ptr, acc.text.len);
     }
     log_tool_calls_summary(ctx_span, &parsed_calls,
                            responses_protocol);
@@ -16613,6 +16803,22 @@ static enq_verdict enqueue(server *s, job *j) {
     return ENQ_OK;
 }
 
+/* issue #18 option C: put a slip-resample retry back at the FIFO HEAD.  Head,
+ * not tail: the job's just-retired bank still holds its full prompt, so an
+ * immediate re-admit warm-matches everything and the retry costs only the
+ * generation.  Deliberately NOT the client enqueue path: no shed bounds (the
+ * job was already admitted once) and no body-bytes re-charge (still charged
+ * -- Inc 2e charges from enqueue until settle, and this job has not settled). */
+static void requeue_job_head(server *s, job *j) {
+    pthread_mutex_lock(&s->mu);
+    j->next = s->head;
+    s->head = j;
+    if (!s->tail) s->tail = j;
+    s->queued++;
+    pthread_cond_signal(&s->cv);
+    pthread_mutex_unlock(&s->mu);
+}
+
 /* Unlink the FIFO head.  Callers hold s->mu; head must be non-NULL.  The
  * single decrement site for the queue-depth accounting, shared by all three
  * pull paths (dequeue, coalesce_gather, cont_admit) so they cannot drift. */
@@ -16653,6 +16859,10 @@ static bool client_disconnected(int fd) {
  * outwaited it.  Callers decide the shed site; the check is just arithmetic
  * so it can run under s->mu. */
 static bool job_queue_aged(const server *s, const job *j) {
+    /* A slip-resample retry keeps its original t_arrive (honest latency), so
+     * a long first generation must not read as queue age -- it was served,
+     * not stuck. */
+    if (j->slip_attempts > 0) return false;
     return s->max_queue_age > 0 && now_sec() - j->t_arrive > s->max_queue_age;
 }
 
@@ -19181,6 +19391,10 @@ static void cont_resolve_chat(server *s, job *j, cont_stream *st,
                 ds4_batch_ctx_bank_committed(s->batch_ctx, j->cont_bank, NULL));
         }
         *fin_io = "tool_calls";
+    } else {
+        tool_slip_dump(s, &j->req, "cont", *fin_io, st->acc.completion,
+                       st->acc.saw_tool_start, st->acc.saw_tool_end,
+                       st->acc.text.ptr, st->acc.text.len);
     }
 }
 
@@ -19270,8 +19484,14 @@ static void cont_stream_finalize(server *s, job *j, const char *fin) {
 /* A1: format a NON-streaming continuous row's response from its host-side
  * accumulated text (stop-truncated / tool-scanned) -- write_batch_completion's
  * shape, but from st->acc.text instead of a re-detok, with scan-verdict finish
- * semantics and real tool parsing.  Frees the cont_stream state. */
-static void write_cont_completion(server *s, job *j, int engine_finish) {
+ * semantics and real tool parsing.  Frees the cont_stream state.
+ *
+ * Returns true when the response was written (the normal settle).  Returns
+ * false ONLY on the issue-#18 slip-resample path: a tools-armed chat turn
+ * settled at finish=stop with no tool calls and --tool-slip-resample is
+ * armed -- nothing was written, the stream state is freed, and the caller
+ * must requeue the job instead of finishing it. */
+static bool write_cont_completion(server *s, job *j, int engine_finish) {
     cont_stream *st = j->cstream;
     char id[96];
     snprintf(id, sizeof(id), "%s-%llu",
@@ -19287,6 +19507,22 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
         char *content = NULL, *reasoning = NULL;
         if (j->req.has_tools) {
             cont_resolve_chat(s, j, st, &fin, &content, &reasoning, &calls);
+            if (s->tool_slip_resample && !calls.len && !j->req.stream &&
+                j->slip_attempts == 0 && !strcmp(fin, "stop")) {
+                j->slip_attempts = 1;
+                /* A pinned seed would redraw the identical slip; perturb it
+                 * for the retry only.  Unpinned requests draw fresh entropy
+                 * anyway. */
+                if (j->req.seed) j->req.seed++;
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: cont chat ctx=%d gen=%d tools-armed turn settled with no tool calls; resampling once",
+                           prompt_tokens, st->acc.completion);
+                free(content);
+                free(reasoning);
+                tool_calls_free(&calls);
+                cont_stream_discard(j);
+                return false;
+            }
         } else {
             char perr[160] = {0};
             bool recovered = false;
@@ -19340,6 +19576,7 @@ static void write_cont_completion(server *s, job *j, int engine_finish) {
     }
     log_cont_completion(j, st, prompt_tokens, fin);
     cont_stream_discard(j);
+    return true;
 }
 
 /* Inc 7c: one sample of the projection-cost counters (ns spent + one token
@@ -19550,7 +19787,17 @@ static void cont_on_done(void *ud, void *user, const int *tokens, int n, int fin
     if (j->req.stream) {                       /* W6: close the live SSE stream. */
         cont_stream_finalize(cs->s, j, finish ? "stop" : "length");
     } else if (j->cstream) {                   /* A1: stop/tool row -> host-side text. */
-        write_cont_completion(cs->s, j, finish);
+        if (!write_cont_completion(cs->s, j, finish)) {
+            /* issue #18 option C: slip resample.  Nothing was written; the
+             * job goes back to the FIFO head for one fresh draw (its retired
+             * bank warm-admits the full prompt).  The client thread is still
+             * parked on j->done, so job_finish is deliberately NOT called,
+             * and this settle never counted as served. */
+            cs->served--;
+            t_emit_job = NULL;
+            requeue_job_head(cs->s, j);
+            return;
+        }
     } else {                                   /* W5: write the whole response now. */
         ds4_batch_gen_result r = { .tokens = (int *)tokens, .n_tokens = n, .finish = finish };
         write_batch_completion(cs->s, j, &r);
@@ -21973,6 +22220,8 @@ typedef struct {
     char model_id_buf[256];
     const char *chdir_path;
     const char *trace_path;
+    const char *tool_slip_dump_dir;
+    bool tool_slip_resample;
     const char *kv_disk_dir;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
@@ -22125,9 +22374,46 @@ static void usage(FILE *fp) {
         "      Add Access-Control-Allow-* headers for browser JS clients. Does not change --host.\n"
         "  --trace FILE\n"
         "      Write a human-readable session trace: prompts, cache decisions, output, tool calls.\n"
+        "      Serial lane only: continuously-batched rows do not trace yet.\n"
+        "  --tool-slip-dump DIR\n"
+        "      Dump one JSON file per tools-armed chat completion that settles without\n"
+        "      tool calls (raw request body + generated text + parse verdict), both\n"
+        "      lanes -- the issue #18 forensic instrument. Env twin: DS4_TOOL_SLIP_DUMP_DIR.\n"
+        "  --tool-slip-resample\n"
+        "      When a continuously-batched non-streaming tools-armed chat turn settles\n"
+        "      at finish=stop with no tool calls, requeue it once for a fresh draw\n"
+        "      before answering (the retry warm-admits its own bank, so the cost is one\n"
+        "      generation). Serial-lane and streaming turns are not resampled. Off by\n"
+        "      default. Env twin: DS4_TOOL_SLIP_RESAMPLE=1.\n"
+        "  --tool-call-reminder on|off\n"
+        "      Default on: past ~96KB of rendered conversation, every tool result in a\n"
+        "      tools-armed chat carries a short protocol reminder. At depth, low-bit\n"
+        "      quants otherwise answer some tools-armed turns with a prose completion\n"
+        "      report (measured 50%% of turns at 70-80K tokens; the reminder measured\n"
+        "      0/72 slips vs 6/72 without at the same states, and fixed the failing\n"
+        "      agent task end to end). Shallow conversations are never touched, so\n"
+        "      chat-with-tools flows that answer in prose after a tool result are\n"
+        "      unaffected. Env twins: DS4_TOOL_CALL_REMINDER=0 disables,\n"
+        "      DS4_TOOL_CALL_REMINDER_MIN_BYTES retunes the depth gate.\n"
+        "  --reasoning-replay MODE\n"
+        "      keep (default): reasoning_content echoed by the client in tool-context\n"
+        "      history renders back into <think> blocks -- the V4 reference format\n"
+        "      (DeepSeek's API requires the echo in tool loops), and it keeps the\n"
+        "      rendered prefix aligned with live KV for warm in-place reuse. drop:\n"
+        "      render history assistant turns lean, like llama.cpp's template\n"
+        "      default (a deviation from the reference format) -- 16-28%% shallower\n"
+        "      conversations on echoing agent scaffolds, at the cost of a one-turn-\n"
+        "      tail re-prefill per turn; measured to help low-bit quants at depth.\n"
+        "      Assistant turns being continued (after the last user message) always\n"
+        "      keep their reasoning. Env twin: DS4_REASONING_REPLAY=drop.\n"
         "  --reasoning-effort LEVEL\n"
         "      Default reasoning effort for requests that do not send one: low (default),\n"
         "      high, max, or off. Explicit request values always win.\n"
+        "  --reasoning-effort-native\n"
+        "      Let client reasoning_effort fields reach the checkpoint's prefixed tiers\n"
+        "      (high/max inject DeepSeek's effort preambles at position 0). Default off:\n"
+        "      client high/max compat-map to low -- the preambles measurably degrade\n"
+        "      deep-context tool calling (issue #18). Env twin: DS4_REASONING_EFFORT_NATIVE=1.\n"
         "  --mem-floor-gb N\n"
         "      System memory admissions must always leave free, in GiB. Default: 4.\n"
         "      KV-cache growth is trimmed or rejected before free memory drops below\n"
@@ -22695,6 +22981,30 @@ static server_config parse_options(int argc, char **argv) {
             c.no_serial = true;
         } else if (!strcmp(arg, "--trace")) {
             c.trace_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--tool-slip-dump")) {
+            c.tool_slip_dump_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--reasoning-effort-native")) {
+            g_native_reasoning_effort = true;
+        } else if (!strcmp(arg, "--reasoning-replay")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "drop")) g_reasoning_replay_drop = true;
+            else if (!strcmp(v, "keep")) g_reasoning_replay_drop = false;
+            else {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: unknown --reasoning-replay '%s' (keep, drop)", v);
+                exit(2);
+            }
+        } else if (!strcmp(arg, "--tool-slip-resample")) {
+            c.tool_slip_resample = true;
+        } else if (!strcmp(arg, "--tool-call-reminder")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (!strcmp(v, "on")) g_tool_call_reminder = true;
+            else if (!strcmp(v, "off")) g_tool_call_reminder = false;
+            else {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: unknown --tool-call-reminder '%s' (on, off)", v);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--reasoning-effort")) {
             const char *v = need_arg(&i, argc, argv, arg);
             if (!parse_reasoning_effort_name(v, &g_default_reasoning_effort)) {
@@ -22814,6 +23124,28 @@ static server_config parse_options(int argc, char **argv) {
         const char *ne = getenv("DS4_SERVER_NO_SERIAL");
         c.no_serial = ne && ne[0] == '1' && ne[1] == '\0';
     }
+    if (!g_native_reasoning_effort) {   /* env twin of --reasoning-effort-native */
+        const char *ne = getenv("DS4_REASONING_EFFORT_NATIVE");
+        g_native_reasoning_effort = ne && ne[0] == '1' && ne[1] == '\0';
+    }
+    if (!g_reasoning_replay_drop) {   /* env twin of --reasoning-replay drop */
+        const char *rr = getenv("DS4_REASONING_REPLAY");
+        if (rr && !strcmp(rr, "drop")) g_reasoning_replay_drop = true;
+    }
+    if (!c.tool_slip_resample) {   /* env twin of --tool-slip-resample */
+        const char *rs = getenv("DS4_TOOL_SLIP_RESAMPLE");
+        c.tool_slip_resample = rs && rs[0] == '1' && rs[1] == '\0';
+    }
+    {   /* env twins of --tool-call-reminder (default ON; "0" disables) */
+        const char *tr = getenv("DS4_TOOL_CALL_REMINDER");
+        if (tr && tr[0] == '0' && tr[1] == '\0') g_tool_call_reminder = false;
+        const char *tb = getenv("DS4_TOOL_CALL_REMINDER_MIN_BYTES");
+        if (tb && tb[0]) {
+            char *end = NULL;
+            long v = strtol(tb, &end, 10);
+            if (!*end && v >= 0) g_tool_reminder_min_bytes = (size_t)v;
+        }
+    }
     return c;
 }
 
@@ -22833,6 +23165,10 @@ int main(int argc, char **argv) {
                    cfg.chdir_path, strerror(errno));
         return 1;
     }
+    if (g_native_reasoning_effort)
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: native reasoning-effort tiers: client high/max "
+                   "inject the checkpoint's effort preambles");
     if (g_default_reasoning_effort != DS4_THINK_LOW) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: default reasoning effort: %s",
                    ds4_think_mode_name(g_default_reasoning_effort));
@@ -23074,6 +23410,37 @@ int main(int argc, char **argv) {
         setvbuf(s.trace, NULL, _IONBF, 0);
         server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
     }
+    pthread_mutex_init(&s.tool_slip_mu, NULL);
+    if (!cfg.tool_slip_dump_dir) {   /* env twin of --tool-slip-dump */
+        const char *env = getenv("DS4_TOOL_SLIP_DUMP_DIR");
+        if (env && env[0]) cfg.tool_slip_dump_dir = env;
+    }
+    if (cfg.tool_slip_dump_dir) {
+        if (mkdir(cfg.tool_slip_dump_dir, 0755) != 0 && errno != EEXIST) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: failed to create tool-slip dump dir %s: %s",
+                       cfg.tool_slip_dump_dir, strerror(errno));
+            server_close_resources(&s);
+            return 1;
+        }
+        s.tool_slip_dir = cfg.tool_slip_dump_dir;
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: dumping tools-armed no-tool-call turns to %s",
+                   s.tool_slip_dir);
+    }
+    s.tool_slip_resample = cfg.tool_slip_resample;
+    if (s.tool_slip_resample)
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: tool-slip resample armed (cont non-streaming chat, one retry)");
+    if (!g_tool_call_reminder)
+        server_log(DS4_LOG_DEFAULT, "ds4-server: tool-call reminder disabled");
+    else if (g_tool_reminder_min_bytes != 98304)
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: tool-call reminder depth gate %zu bytes",
+                   g_tool_reminder_min_bytes);
+    if (g_reasoning_replay_drop)
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: reasoning-replay=drop (history assistant turns render lean)");
 
     /* W4: build the persistent batched-generation context, sized to the same
      * coalescing bounds the worker enforces (so every coalesced group fits).  On
@@ -25358,6 +25725,358 @@ static void test_model_family_aliases(void) {
     TEST_ASSERT(!server_model_alias_known("glm-5.2"));
 }
 
+static void test_client_reasoning_effort_compat(void) {
+    /* Issue #18: by default a client reasoning_effort field cannot reach a
+     * prefixed tier -- "high"/"max" compat-map to LOW at the shared client
+     * parse entry (parse_reasoning_effort_value), which every endpoint's
+     * field parser goes through.  The preambles measurably degrade
+     * deep-context tool calling; llama.cpp and pre-rename engines no-op the
+     * field, and this restores that behavior as the default. */
+    const bool saved = g_native_reasoning_effort;
+    ds4_think_mode m;
+    const char *p;
+
+    g_native_reasoning_effort = false;
+    p = "\"high\""; m = DS4_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_value(&p, &m) && m == DS4_THINK_LOW);
+    p = "\"xhigh\""; m = DS4_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_value(&p, &m) && m == DS4_THINK_LOW);
+    p = "\"max\""; m = DS4_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_value(&p, &m) && m == DS4_THINK_LOW);
+    /* Disabling thinking stays client-reachable through the clamp. */
+    p = "\"off\""; m = DS4_THINK_LOW;
+    TEST_ASSERT(parse_reasoning_effort_value(&p, &m) && m == DS4_THINK_NONE);
+
+    /* --reasoning-effort-native restores the checkpoint's native tiers. */
+    g_native_reasoning_effort = true;
+    p = "\"high\""; m = DS4_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_value(&p, &m) && m == DS4_THINK_HIGH);
+    p = "\"max\""; m = DS4_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_value(&p, &m) && m == DS4_THINK_MAX);
+    g_native_reasoning_effort = saved;
+
+    /* The operator flag path (parse_reasoning_effort_name direct) is never
+     * clamped: setting --reasoning-effort IS the opt-in for that level. */
+    ds4_think_mode op = DS4_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_name("high", &op) && op == DS4_THINK_HIGH);
+}
+
+static void test_tool_slip_dump(void) {
+    /* issue #18 forensics: a tools-armed chat turn with no parsed calls
+     * writes one JSON file carrying the raw request and the generated text;
+     * disarmed / no-tools / non-chat turns write nothing. */
+    char tmpl[] = "/tmp/ds4-tool-slip-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.tool_slip_mu, NULL);
+    s.tool_slip_dir = dir;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.has_tools = true;
+    r.think_mode = DS4_THINK_LOW;
+    r.prompt.len = 42;
+    r.raw_body = xstrdup("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+    const char *gen = "<think>done</think>All tests pass.\nWhat \"next\"?";
+
+    tool_slip_dump(&s, &r, "cont", "stop", 7, false, false, gen, strlen(gen));
+
+    char slip_path[4096] = {0};
+    int n_files = 0;
+    DIR *dp = opendir(dir);
+    TEST_ASSERT(dp != NULL);
+    if (dp) {
+        struct dirent *de;
+        while ((de = readdir(dp)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            n_files++;
+            snprintf(slip_path, sizeof(slip_path), "%s/%s", dir, de->d_name);
+            TEST_ASSERT(strncmp(de->d_name, "slip-", 5) == 0);
+        }
+        closedir(dp);
+    }
+    TEST_ASSERT(n_files == 1);
+
+    FILE *fp = fopen(slip_path, "r");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        char body[8192] = {0};
+        size_t got = fread(body, 1, sizeof(body) - 1, fp);
+        fclose(fp);
+        TEST_ASSERT(got > 0);
+        TEST_ASSERT(strstr(body, "\"lane\":\"cont\"") != NULL);
+        TEST_ASSERT(strstr(body, "\"finish\":\"stop\"") != NULL);
+        TEST_ASSERT(strstr(body, "\"prompt_tokens\":42") != NULL);
+        TEST_ASSERT(strstr(body, "\"completion_tokens\":7") != NULL);
+        TEST_ASSERT(strstr(body, "\"saw_tool_start\":false") != NULL);
+        TEST_ASSERT(strstr(body, "\"think\":\"low\"") != NULL);
+        /* Generated text and raw body survive JSON-escaped byte-exact. */
+        TEST_ASSERT(strstr(body, "All tests pass.\\nWhat \\\"next\\\"?") != NULL);
+        TEST_ASSERT(strstr(body, "\"request_body\":\"{\\\"messages\\\"") != NULL);
+    }
+
+    /* Disarmed and non-qualifying turns write nothing new. */
+    const char *keep = s.tool_slip_dir;
+    s.tool_slip_dir = NULL;
+    tool_slip_dump(&s, &r, "cont", "stop", 7, false, false, gen, strlen(gen));
+    s.tool_slip_dir = keep;
+    r.has_tools = false;
+    tool_slip_dump(&s, &r, "serial", "stop", 7, false, false, gen, strlen(gen));
+    r.has_tools = true;
+    r.kind = REQ_COMPLETION;
+    tool_slip_dump(&s, &r, "serial", "stop", 7, false, false, gen, strlen(gen));
+    n_files = 0;
+    dp = opendir(dir);
+    if (dp) {
+        struct dirent *de;
+        while ((de = readdir(dp)) != NULL) {
+            if (de->d_name[0] == '.') continue;
+            n_files++;
+        }
+        closedir(dp);
+    }
+    TEST_ASSERT(n_files == 1);
+
+    unlink(slip_path);
+    rmdir(dir);
+    request_free(&r);
+    pthread_mutex_destroy(&s.tool_slip_mu);
+}
+
+static void test_reasoning_replay_drop_render(void) {
+    /* issue #18 A1: --reasoning-replay drop renders HISTORY assistant turns
+     * lean (the bare </think> replay form the lean path already uses), while
+     * an assistant turn being CONTINUED (after the last user-like message)
+     * keeps its reasoning in both modes. */
+    const bool saved = g_reasoning_replay_drop;
+    chat_msgs msgs = {0};
+    chat_msg m0 = {0};
+    m0.role = xstrdup("user");
+    m0.content = xstrdup("do the task");
+    chat_msgs_push(&msgs, m0);
+    chat_msg m1 = {0};
+    m1.role = xstrdup("assistant");
+    m1.content = xstrdup("");
+    m1.reasoning = xstrdup("REPLAYED-THOUGHTS");
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\": \"ls\"}");
+    tool_calls_push(&m1.calls, tc);
+    chat_msgs_push(&msgs, m1);
+    chat_msg m2 = {0};
+    m2.role = xstrdup("tool");
+    m2.content = xstrdup("ok");
+    chat_msgs_push(&msgs, m2);
+    chat_msg m3 = {0};
+    m3.role = xstrdup("assistant");
+    m3.content = xstrdup("partial answer");
+    m3.reasoning = xstrdup("CONT-THOUGHTS");
+    chat_msgs_push(&msgs, m3);
+    const char *schemas = "## bash\ndescription";
+
+    g_reasoning_replay_drop = false;
+    char *keep = render_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(strstr(keep, "REPLAYED-THOUGHTS") != NULL);
+    TEST_ASSERT(strstr(keep, "CONT-THOUGHTS") != NULL);
+
+    g_reasoning_replay_drop = true;
+    char *drop = render_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(strstr(drop, "REPLAYED-THOUGHTS") == NULL);
+    /* The history turn takes the lean replay form (no <think> opener)... */
+    TEST_ASSERT(strstr(drop, "<｜Assistant｜></think>") != NULL);
+    /* ...its visible content and calls survive... */
+    TEST_ASSERT(strstr(drop, "<｜DSML｜invoke name=\"bash\">") != NULL);
+    /* ...and the continuation turn (after the tool result) keeps thinking. */
+    TEST_ASSERT(strstr(drop, "CONT-THOUGHTS") != NULL);
+
+    g_reasoning_replay_drop = saved;
+    free(keep);
+    free(drop);
+    chat_msgs_free(&msgs);
+}
+
+static void test_tool_call_reminder_render(void) {
+    /* issue #18 option E: past the depth gate, EVERY tool result in a
+     * tools-armed render carries the reminder (history-stable per-result
+     * form); below the gate, with the knob off, or without tools, none. */
+    const bool saved_on = g_tool_call_reminder;
+    const size_t saved_gate = g_tool_reminder_min_bytes;
+    chat_msgs msgs = {0};
+    chat_msg m0 = {0};
+    m0.role = xstrdup("user");
+    m0.content = xstrdup("run the tests");
+    chat_msgs_push(&msgs, m0);
+    chat_msg m1 = {0};
+    m1.role = xstrdup("assistant");
+    m1.content = xstrdup("");
+    tool_call tc = {0};
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\": \"make test\"}");
+    tool_calls_push(&m1.calls, tc);
+    chat_msgs_push(&msgs, m1);
+    chat_msg m2 = {0};
+    m2.role = xstrdup("tool");
+    m2.content = xstrdup("ok-first");
+    chat_msgs_push(&msgs, m2);
+    chat_msg m3 = {0};
+    m3.role = xstrdup("assistant");
+    m3.content = xstrdup("");
+    tool_call tc2 = {0};
+    tc2.name = xstrdup("bash");
+    tc2.arguments = xstrdup("{\"command\": \"make check\"}");
+    tool_calls_push(&m3.calls, tc2);
+    chat_msgs_push(&msgs, m3);
+    chat_msg m4 = {0};
+    m4.role = xstrdup("tool");
+    m4.content = xstrdup("ok-second");
+    chat_msgs_push(&msgs, m4);
+    const char *schemas = "## bash\ndescription";
+
+    int n;
+    const char *p;
+    char *r;
+
+    /* Below the gate: untouched. */
+    g_tool_call_reminder = true;
+    g_tool_reminder_min_bytes = (size_t)-1;
+    r = render_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(strstr(r, "[Reminder:") == NULL);
+    free(r);
+
+    /* Past the gate: BOTH results carry it, inside the result blocks. */
+    g_tool_reminder_min_bytes = 0;
+    r = render_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_LOW);
+    n = 0;
+    for (p = r; (p = strstr(p, "[Reminder:")) != NULL; p++) n++;
+    TEST_ASSERT(n == 2);
+    TEST_ASSERT(strstr(r, "not accepted by this harness.]</tool_result>") != NULL);
+
+    /* History stability: the shorter conversation's render (minus its
+     * trailing assistant-open) is a byte prefix of the longer one's. */
+    {
+        chat_msgs head = {0};
+        head.v = msgs.v;
+        head.len = 3;   /* user, assistant, first tool result */
+        char *r1 = render_chat_prompt_text(&head, schemas, NULL, DS4_THINK_LOW);
+        const char *tail_open = "<｜Assistant｜><think>";
+        size_t l1 = strlen(r1);
+        size_t lt = strlen(tail_open);
+        TEST_ASSERT(l1 > lt && !strcmp(r1 + l1 - lt, tail_open));
+        TEST_ASSERT(!strncmp(r, r1, l1 - lt));
+        free(r1);
+    }
+    free(r);
+
+    /* Knob off: none. */
+    g_tool_call_reminder = false;
+    r = render_chat_prompt_text(&msgs, schemas, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(strstr(r, "[Reminder:") == NULL);
+    free(r);
+
+    /* No tools declared: none, even past the gate. */
+    g_tool_call_reminder = true;
+    r = render_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_LOW);
+    TEST_ASSERT(strstr(r, "[Reminder:") == NULL);
+    free(r);
+
+    g_tool_call_reminder = saved_on;
+    g_tool_reminder_min_bytes = saved_gate;
+    chat_msgs_free(&msgs);
+}
+
+static void test_cont_slip_resample_contract(void) {
+    /* issue #18 option C: the FIRST tools-armed no-tool-call stop settle on a
+     * non-streaming cont chat row returns false (nothing written, stream
+     * state freed, one attempt recorded); the SECOND settles normally. */
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0) return;
+    server s;
+    memset(&s, 0, sizeof(s));
+    s.tool_slip_resample = true;
+    job j;
+    memset(&j, 0, sizeof(j));
+    j.fd = sv[0];
+    pthread_mutex_init(&j.mu, NULL);
+    pthread_cond_init(&j.cv, NULL);
+    request_init(&j.req, REQ_CHAT, 128);
+    j.req.api = API_OPENAI;
+    j.req.stream = false;
+    j.req.has_tools = true;
+    j.req.think_mode = DS4_THINK_NONE;
+    j.req.prompt.len = 10;
+    j.req.seed = 7;
+
+    cont_stream *st = cont_stream_ensure(&j);
+    buf_puts(&st->acc.text, "I believe the task is complete.");
+    TEST_ASSERT(!write_cont_completion(&s, &j, 1));
+    TEST_ASSERT(j.slip_attempts == 1);
+    TEST_ASSERT(j.cstream == NULL);
+    TEST_ASSERT(j.req.seed == 8);          /* pinned seed perturbed for the redraw */
+    char probe;
+    TEST_ASSERT(recv(sv[1], &probe, 1, MSG_PEEK | MSG_DONTWAIT) < 0);  /* nothing written */
+
+    st = cont_stream_ensure(&j);
+    buf_puts(&st->acc.text, "Still prose on the retry.");
+    TEST_ASSERT(write_cont_completion(&s, &j, 1));
+    TEST_ASSERT(j.slip_attempts == 1);     /* one retry only */
+    char out[2048] = {0};
+    ssize_t got = recv(sv[1], out, sizeof(out) - 1, MSG_DONTWAIT);
+    TEST_ASSERT(got > 0);
+    TEST_ASSERT(strstr(out, "Still prose on the retry.") != NULL);
+    TEST_ASSERT(strstr(out, "\"finish_reason\":\"stop\"") != NULL);
+
+    /* Length settles never resample (fresh job, same prose, engine_finish=0). */
+    job j2;
+    memset(&j2, 0, sizeof(j2));
+    j2.fd = sv[0];
+    pthread_mutex_init(&j2.mu, NULL);
+    pthread_cond_init(&j2.cv, NULL);
+    request_init(&j2.req, REQ_CHAT, 128);
+    j2.req.api = API_OPENAI;
+    j2.req.has_tools = true;
+    j2.req.think_mode = DS4_THINK_NONE;
+    j2.req.prompt.len = 10;
+    st = cont_stream_ensure(&j2);
+    buf_puts(&st->acc.text, "cut off mid");
+    TEST_ASSERT(write_cont_completion(&s, &j2, 0));
+    TEST_ASSERT(j2.slip_attempts == 0);
+    while (recv(sv[1], out, sizeof(out) - 1, MSG_DONTWAIT) > 0) {}
+
+    request_free(&j.req);
+    request_free(&j2.req);
+    buf_free(&j.out);
+    buf_free(&j2.out);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_slip_requeue_and_age_exemption(void) {
+    server s;
+    memset(&s, 0, sizeof(s));
+    pthread_mutex_init(&s.mu, NULL);
+    pthread_cond_init(&s.cv, NULL);
+    job j, j2;
+    memset(&j, 0, sizeof(j));
+    memset(&j2, 0, sizeof(j2));
+    requeue_job_head(&s, &j);
+    TEST_ASSERT(s.head == &j && s.tail == &j && s.queued == 1);
+    requeue_job_head(&s, &j2);
+    TEST_ASSERT(s.head == &j2 && s.head->next == &j && s.tail == &j);
+    TEST_ASSERT(s.queued == 2);
+    /* Age shed: a retry (slip_attempts>0) is exempt -- its t_arrive is the
+     * original arrival, not queue wait. */
+    s.max_queue_age = 1.0;
+    j.t_arrive = now_sec() - 100.0;
+    TEST_ASSERT(job_queue_aged(&s, &j));
+    j.slip_attempts = 1;
+    TEST_ASSERT(!job_queue_aged(&s, &j));
+}
+
 static void test_api_thinking_controls_parse(void) {
     bool enabled = true;
     const char *thinking = "{\"type\":\"disabled\",\"budget_tokens\":1024}";
@@ -25367,17 +26086,28 @@ static void test_api_thinking_controls_parse(void) {
     TEST_ASSERT(parse_thinking_control_value(&thinking, &enabled));
     TEST_ASSERT(enabled);
 
+    /* Client effort fields (Anthropic output_config and the OpenAI field
+     * alike) ride the issue-#18 compat clamp: prefixed tiers need the
+     * operator's --reasoning-effort-native. */
     ds4_think_mode mode = DS4_THINK_LOW;
     char oc_err[160] = {0};
     const char *anth_effort = "{\"effort\":\"max\",\"other\":true}";
     TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode, oc_err, sizeof(oc_err)));
-    TEST_ASSERT(mode == DS4_THINK_MAX);
+    TEST_ASSERT(mode == DS4_THINK_LOW);
     TEST_ASSERT(oc_err[0] == '\0');
+
+    const bool saved_native = g_native_reasoning_effort;
+    g_native_reasoning_effort = true;
+    anth_effort = "{\"effort\":\"max\",\"other\":true}";
+    mode = DS4_THINK_LOW;
+    TEST_ASSERT(parse_output_config_effort(&anth_effort, &mode, oc_err, sizeof(oc_err)));
+    TEST_ASSERT(mode == DS4_THINK_MAX);
 
     const char *openai_effort = "\"xhigh\"";
     mode = DS4_THINK_LOW;
     TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
     TEST_ASSERT(mode == DS4_THINK_HIGH);
+    g_native_reasoning_effort = saved_native;
 }
 
 static void test_render_think_max_prompt_prefix(void) {
@@ -25977,7 +26707,69 @@ static void test_parse_motif3_tool_call_message(void) {
     TEST_ASSERT(calls.raw_tool_text &&
                 !strncmp(calls.raw_tool_text, "\n<tool_call>",
                          strlen("\n<tool_call>")));
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+}
 
+static void test_parse_mixed_style_dsml_tool_block(void) {
+    /* Issue #18 live specimen shape: DSML envelope + invoke, but plain-XML
+     * <parameter> tags inside, emitted at ~96K depth under the effort
+     * preamble.  The strict per-block style resolution demoted the whole
+     * output to content text; the harness then answered "no tool calls
+     * found" and the capture's death loop followed (flow 103 is the model
+     * saying so).  Per-element matching must recover it. */
+    const char *generated =
+        "We need to respond with submit.</think>\n\n"
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<parameter name=\"command\" string=\"true\">submit</parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, true, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(!strcmp(calls.v[0].name, "bash"));
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"submit\"") != NULL);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+
+    /* Mixed CLOSER spelling: DSML parameter opened, XML close.  The value
+     * runs to the earliest end-tag spelling. */
+    const char *mixed_close =
+        "</think>\n\n"
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</parameter>\n"
+        "</invoke>\n"
+        "</｜DSML｜tool_calls>";
+    content = NULL;
+    reasoning = NULL;
+    memset(&calls, 0, sizeof(calls));
+    TEST_ASSERT(parse_generated_message_ex(mixed_close, true, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"ls -la\"") != NULL);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+
+    /* Fully well-formed DSML must keep parsing exactly as before. */
+    const char *canonical =
+        "</think>\n\n"
+        "<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">pytest -q</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    content = NULL;
+    reasoning = NULL;
+    memset(&calls, 0, sizeof(calls));
+    TEST_ASSERT(parse_generated_message_ex(canonical, true, &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"pytest -q\"") != NULL);
     free(content);
     free(reasoning);
     tool_calls_free(&calls);
@@ -26020,7 +26812,6 @@ static void test_motif3_no_think_tool_visible_checkpoint(void) {
     tool_calls_free(&calls);
     request_free(&r);
 }
-
 static void test_dsml_parser_recovers_loose_nested_parameters(void) {
     const char *generated =
         "review done\n\n"
@@ -34361,6 +35152,12 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen4exp_native_chat_protocol();
     test_reasoning_effort_mapping();
     test_model_family_aliases();
+    test_client_reasoning_effort_compat();
+    test_tool_slip_dump();
+    test_reasoning_replay_drop_render();
+    test_tool_call_reminder_render();
+    test_cont_slip_resample_contract();
+    test_slip_requeue_and_age_exemption();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
     test_render_think_effort_prefix_tiers();
@@ -34417,6 +35214,7 @@ static void ds4_server_unit_tests_run(void) {
     test_parse_short_dsml_and_canonical_suffix();
     test_parse_motif3_tool_call_message();
     test_motif3_no_think_tool_visible_checkpoint();
+    test_parse_mixed_style_dsml_tool_block();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
