@@ -1275,9 +1275,20 @@ int ds4_gpu_qwen4exp_rope_tensor(
         uint32_t          pos0,
         float             freq_base);
 
+int ds4_gpu_qwen4exp_mrope_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *positions,
+        uint32_t              rows,
+        uint32_t              heads,
+        uint32_t              head_dim,
+        uint32_t              rotary_dim,
+        uint32_t              pos0,
+        float                 freq_base);
+
 int ds4_gpu_qwen4exp_qsa_pool_blocks_tensor(
         ds4_gpu_tensor       *pooled_cache,
         const ds4_gpu_tensor *raw_key_cache,
+        const ds4_gpu_tensor *positions,
         const void             *model_map,
         uint64_t                model_size,
         uint64_t                norm_weight_offset,
@@ -1338,6 +1349,72 @@ int ds4_gpu_qwen4exp_qsa_attention_tensor(
         uint32_t                head_dim,
         uint32_t                selected_cap,
         uint32_t                cache_cap);
+
+/* Qwen4Exp embedded vision tower.  The public runtime keeps image decoding on
+ * the host; these small entries cover only operations not already expressible
+ * through the existing BF16/Q8 matrix helpers. */
+int ds4_gpu_qwen4exp_vision_patch_position_tensor(
+        ds4_gpu_tensor       *hidden,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              patch_bias_offset,
+        uint64_t              position_weight_offset,
+        const ds4_gpu_tensor *position_indices,
+        const ds4_gpu_tensor *position_weights,
+        uint32_t              rows,
+        uint32_t              hidden_dim);
+int ds4_gpu_qwen4exp_vision_layernorm_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *in,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              bias_offset,
+        uint32_t              rows,
+        uint32_t              dim,
+        float                 eps);
+int ds4_gpu_qwen4exp_vision_qkv_rope_tensor(
+        ds4_gpu_tensor       *qkv,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              bias_offset,
+        const ds4_gpu_tensor *height_positions,
+        const ds4_gpu_tensor *width_positions,
+        uint32_t              rows,
+        uint32_t              heads,
+        uint32_t              head_dim,
+        float                 freq_base);
+int ds4_gpu_qwen4exp_vision_attention_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *segment_start,
+        const ds4_gpu_tensor *segment_end,
+        uint32_t              rows,
+        uint32_t              heads,
+        uint32_t              head_dim);
+int ds4_gpu_qwen4exp_vision_bias_gelu_tensor(
+        ds4_gpu_tensor *x,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        bias_offset,
+        uint32_t        rows,
+        uint32_t        dim,
+        int             tanh_approx);
+int ds4_gpu_qwen4exp_vision_bias_residual_tensor(
+        ds4_gpu_tensor       *residual,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              bias_offset,
+        uint32_t              rows,
+        uint32_t              dim);
+int ds4_gpu_qwen4exp_vision_bias_tensor(
+        ds4_gpu_tensor *x,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        bias_offset,
+        uint32_t        rows,
+        uint32_t        dim);
 
 /* CUDA prefill producer: writes the same f32 RMS-norm result as the classic
  * rows entry and, when profitable, also publishes its exact internal Q8_1

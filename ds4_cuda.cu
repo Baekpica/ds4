@@ -9101,11 +9101,37 @@ __global__ static void qwen4exp_rope_first_kernel(
     (void)rows;
 }
 
+__global__ static void qwen4exp_mrope_first_kernel(
+        float *x, const int32_t *positions, uint32_t rows,
+        uint32_t heads, uint32_t head_dim, uint32_t rotary_dim,
+        uint32_t pos0, qwen4exp_rope_freqs freqs, uint64_t pairs) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pairs) return;
+    const uint32_t half = rotary_dim / 2u;
+    const uint32_t pair = (uint32_t)(i % half);
+    const uint64_t head_row = i / half;
+    const uint32_t row = (uint32_t)(head_row / heads);
+    const uint64_t base = head_row * head_dim;
+    /* mrope_section=[11,11,10] is interleaved THW; the final pair (31)
+     * naturally lands on H. */
+    const uint32_t axis = pair % 3u;
+    const int32_t position = positions[(uint64_t)(pos0 + row) * 3u + axis];
+    const float theta = (float)position * freqs.inv_freq[pair];
+    float c, s;
+    qwen4exp_reduced_sincos(theta, &s, &c);
+    const float x0 = x[base + pair];
+    const float x1 = x[base + pair + half];
+    x[base + pair] = x0 * c - x1 * s;
+    x[base + pair + half] = x1 * c + x0 * s;
+    (void)rows;
+}
+
 /* Materialize each completed four-token index block exactly once. The raw
  * key mean is accumulated in F32, followed by Qwen's zero-centred RMSNorm
  * and RoPE at the first token position of the group. */
 __global__ static void qwen4exp_qsa_pool_blocks_kernel(
         float *pooled_cache, const float *raw_key_cache, const float *weight,
+        const int32_t *positions,
         uint32_t first_block, uint32_t n_blocks, uint32_t ratio,
         uint32_t head_dim, uint32_t rotary_dim, qwen4exp_rope_freqs freqs,
         float eps) {
@@ -9133,7 +9159,11 @@ __global__ static void qwen4exp_qsa_pool_blocks_kernel(
     const uint64_t out_base = (uint64_t)block * head_dim;
     const uint32_t half = rotary_dim / 2u;
     if (d < half) {
-        const float theta = (float)(block * ratio) * freqs.inv_freq[d];
+        const uint32_t axis = d % 3u;
+        const float pos = positions
+            ? (float)positions[(uint64_t)block * ratio * 3u + axis]
+            : (float)(block * ratio);
+        const float theta = pos * freqs.inv_freq[d];
         float c, s;
         qwen4exp_reduced_sincos(theta, &s, &c);
         const float x0 = value[d];
@@ -25605,9 +25635,36 @@ extern "C" int ds4_gpu_qwen4exp_rope_tensor(
     return cuda_ok(cudaGetLastError(), "Qwen4Exp first-dimension RoPE launch");
 }
 
+extern "C" int ds4_gpu_qwen4exp_mrope_tensor(
+        ds4_gpu_tensor *x, const ds4_gpu_tensor *positions,
+        uint32_t rows, uint32_t heads, uint32_t head_dim,
+        uint32_t rotary_dim, uint32_t pos0, float freq_base) {
+    if (!x || !positions || rows == 0u || heads == 0u || head_dim == 0u ||
+        rotary_dim == 0u || rotary_dim > head_dim ||
+        rotary_dim > QWEN4EXP_QSA_MAX_ROTARY_DIM || (rotary_dim & 1u) ||
+        !isfinite(freq_base) || freq_base <= 0.0f ||
+        (uint64_t)rows > UINT64_MAX / heads / head_dim) return 0;
+    const uint64_t values = (uint64_t)rows * heads * head_dim;
+    const uint64_t pairs = (uint64_t)rows * heads * (rotary_dim / 2u);
+    const uint64_t position_rows = (uint64_t)pos0 + rows;
+    if (values > UINT64_MAX / sizeof(float) ||
+        position_rows > UINT64_MAX / 3u / sizeof(int32_t) ||
+        pairs == 0u || (pairs + 255u) / 256u > (uint64_t)INT_MAX ||
+        x->bytes < values * sizeof(float) ||
+        positions->bytes < position_rows * 3u * sizeof(int32_t)) return 0;
+    qwen4exp_rope_freqs freqs;
+    if (!qwen4exp_rope_freqs_init(&freqs, rotary_dim, freq_base)) return 0;
+    qwen4exp_mrope_first_kernel<<<
+        (pairs + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)x->ptr, (const int32_t *)positions->ptr,
+        rows, heads, head_dim, rotary_dim, pos0, freqs, pairs);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp M-RoPE launch");
+}
+
 extern "C" int ds4_gpu_qwen4exp_qsa_pool_blocks_tensor(
         ds4_gpu_tensor *pooled_cache,
         const ds4_gpu_tensor *raw_key_cache,
+        const ds4_gpu_tensor *positions,
         const void *model_map, uint64_t model_size,
         uint64_t norm_weight_offset, uint32_t first_block,
         uint32_t n_blocks, uint32_t block_cap, uint32_t ratio,
@@ -25629,7 +25686,9 @@ extern "C" int ds4_gpu_qwen4exp_qsa_pool_blocks_tensor(
         pooled_values > UINT64_MAX / sizeof(float) ||
         raw_values > UINT64_MAX / sizeof(float) ||
         pooled_cache->bytes < pooled_values * sizeof(float) ||
-        raw_key_cache->bytes < raw_values * sizeof(float)) {
+        raw_key_cache->bytes < raw_values * sizeof(float) ||
+        (positions && positions->bytes <
+            (uint64_t)(first_block + n_blocks) * ratio * 3u * sizeof(int32_t))) {
         return 0;
     }
     const float *weight = (const float *)cuda_model_range_ptr(
@@ -25642,7 +25701,8 @@ extern "C" int ds4_gpu_qwen4exp_qsa_pool_blocks_tensor(
         n_blocks, head_dim, 2u * head_dim * sizeof(float),
         ds4_current_stream()>>>(
         (float *)pooled_cache->ptr, (const float *)raw_key_cache->ptr,
-        weight, first_block, n_blocks, ratio, head_dim, rotary_dim,
+        weight, positions ? (const int32_t *)positions->ptr : NULL,
+        first_block, n_blocks, ratio, head_dim, rotary_dim,
         freqs, eps);
     return cuda_ok(cudaGetLastError(), "Qwen4Exp QSA pooled blocks launch");
 }
@@ -25811,6 +25871,315 @@ extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(
             selected_cap);
     }
     return cuda_ok(cudaGetLastError(), "Qwen4Exp QSA attention reduce launch");
+}
+
+__global__ static void qwen4exp_vision_patch_position_kernel(
+        float *hidden, const float *bias,
+        const cuda_block_q8_0 *position,
+        const int32_t *indices, const float *weights,
+        uint32_t rows, uint32_t dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = (uint64_t)rows * dim;
+    if (i >= count) return;
+    const uint32_t row = (uint32_t)(i / dim);
+    const uint32_t d = (uint32_t)(i - (uint64_t)row * dim);
+    const uint32_t blocks = dim / 32u;
+    float p = 0.0f;
+    for (uint32_t k = 0; k < 4u; k++) {
+        const uint32_t index = (uint32_t)indices[4u * row + k];
+        const cuda_block_q8_0 *b = position +
+            (uint64_t)index * blocks + d / 32u;
+        p += weights[4u * row + k] *
+             __half2float(*(const __half *)&b->d) * (float)b->qs[d & 31u];
+    }
+    hidden[i] += bias[d] + p;
+}
+
+__global__ static void qwen4exp_vision_layernorm_kernel(
+        float *out, const float *in, const float *weight, const float *bias,
+        uint32_t rows, uint32_t dim, float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *src = in + (uint64_t)row * dim;
+    float *dst = out + (uint64_t)row * dim;
+    __shared__ float red[256];
+    float sum = 0.0f;
+    for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) sum += src[d];
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t off = blockDim.x >> 1u; off; off >>= 1u) {
+        if (threadIdx.x < off) red[threadIdx.x] += red[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float mean = red[0] / (float)dim;
+    float sq = 0.0f;
+    for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) {
+        const float v = src[d] - mean;
+        sq += v * v;
+    }
+    red[threadIdx.x] = sq;
+    __syncthreads();
+    for (uint32_t off = blockDim.x >> 1u; off; off >>= 1u) {
+        if (threadIdx.x < off) red[threadIdx.x] += red[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(red[0] / (float)dim + eps);
+    for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x)
+        dst[d] = (src[d] - mean) * inv * weight[d] + bias[d];
+}
+
+__global__ static void qwen4exp_vision_bias_kernel(
+        float *x, const float *bias, uint64_t count, uint32_t dim,
+        int activation) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float v = x[i] + bias[i % dim];
+    if (activation == 1) {
+        const float c = 0.7978845608028654f;
+        v = 0.5f * v * (1.0f + tanhf(c * (v + 0.044715f * v * v * v)));
+    } else if (activation == 2) {
+        v = 0.5f * v * (1.0f + erff(v * 0.7071067811865475f));
+    }
+    x[i] = v;
+}
+
+__global__ static void qwen4exp_vision_bias_residual_kernel(
+        float *residual, const float *x, const float *bias,
+        uint64_t count, uint32_t dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) residual[i] += x[i] + bias[i % dim];
+}
+
+__global__ static void qwen4exp_vision_rope_kernel(
+        float *qkv, const int32_t *height, const int32_t *width,
+        uint32_t rows, uint32_t heads, uint32_t head_dim, float freq_base) {
+    const uint32_t half = head_dim / 2u;
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t pairs = (uint64_t)rows * heads * half;
+    if (i >= pairs) return;
+    const uint32_t f = (uint32_t)(i % half);
+    const uint64_t rh = i / half;
+    const uint32_t row = (uint32_t)(rh / heads);
+    const uint32_t head = (uint32_t)(rh - (uint64_t)row * heads);
+    const uint32_t axis_half = half / 2u;
+    const uint32_t pos = f < axis_half ? (uint32_t)height[row]
+                                        : (uint32_t)width[row];
+    const uint32_t fi = f < axis_half ? f : f - axis_half;
+    const float angle = (float)pos * powf(freq_base,
+        -(2.0f * (float)fi) / (float)half);
+    float sine, cosine;
+    sincosf(angle, &sine, &cosine);
+    const uint64_t row_base = (uint64_t)row * 3u * heads * head_dim;
+    for (uint32_t qk = 0; qk < 2u; qk++) {
+        float *base = qkv + row_base +
+            (uint64_t)(qk * heads + head) * head_dim;
+        const float a = base[f];
+        const float b = base[f + half];
+        base[f] = a * cosine - b * sine;
+        base[f + half] = b * cosine + a * sine;
+    }
+}
+
+/* ponytail: correctness-first O(P^2) online attention avoids an N-by-N score
+ * allocation; replace with a tiled FlashAttention kernel if large-image
+ * profiling shows this simple path is the bottleneck. */
+__global__ static void qwen4exp_vision_attention_kernel(
+        float *out, const float *qkv,
+        const int32_t *segment_start, const int32_t *segment_end,
+        uint32_t rows, uint32_t heads, uint32_t head_dim) {
+    const uint32_t item = blockIdx.x;
+    const uint32_t row = item / heads;
+    const uint32_t head = item - row * heads;
+    if (row >= rows || threadIdx.x >= 32u) return;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t width = heads * head_dim;
+    const float *q = qkv + (uint64_t)row * 3u * width +
+                     (uint64_t)head * head_dim;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+    const int32_t begin = segment_start[row];
+    const int32_t end = segment_end[row];
+    for (int32_t key_row = begin; key_row < end; key_row++) {
+        const float *k = qkv + (uint64_t)key_row * 3u * width + width +
+                         (uint64_t)head * head_dim;
+        float dot = 0.0f;
+        if (lane < head_dim) dot += q[lane] * k[lane];
+        if (lane + 32u < head_dim) dot += q[lane + 32u] * k[lane + 32u];
+        if (lane + 64u < head_dim) dot += q[lane + 64u] * k[lane + 64u];
+        dot = warp_sum_f32(dot) * rsqrtf((float)head_dim);
+        const float next_m = fmaxf(m, dot);
+        const float alpha = isfinite(m) ? expf(m - next_m) : 0.0f;
+        const float beta = expf(dot - next_m);
+        const float *v = qkv + (uint64_t)key_row * 3u * width + 2u * width +
+                         (uint64_t)head * head_dim;
+        if (lane < head_dim) acc0 = acc0 * alpha + v[lane] * beta;
+        if (lane + 32u < head_dim)
+            acc1 = acc1 * alpha + v[lane + 32u] * beta;
+        if (lane + 64u < head_dim)
+            acc2 = acc2 * alpha + v[lane + 64u] * beta;
+        l = l * alpha + beta;
+        m = next_m;
+    }
+    float *dst = out + (uint64_t)row * width +
+                 (uint64_t)head * head_dim;
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    if (lane < head_dim) dst[lane] = acc0 * inv;
+    if (lane + 32u < head_dim) dst[lane + 32u] = acc1 * inv;
+    if (lane + 64u < head_dim) dst[lane + 64u] = acc2 * inv;
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_patch_position_tensor(
+        ds4_gpu_tensor *hidden, const void *model_map, uint64_t model_size,
+        uint64_t patch_bias_offset, uint64_t position_weight_offset,
+        const ds4_gpu_tensor *position_indices,
+        const ds4_gpu_tensor *position_weights,
+        uint32_t rows, uint32_t hidden_dim) {
+    const uint64_t values = (uint64_t)rows * hidden_dim;
+    const uint64_t bias_bytes = (uint64_t)hidden_dim * sizeof(float);
+    const uint64_t pos_bytes =
+        (uint64_t)2304u * (hidden_dim / 32u) * sizeof(cuda_block_q8_0);
+    if (!hidden || !model_map || !position_indices || !position_weights ||
+        rows == 0u || hidden_dim == 0u || hidden_dim % 32u != 0u ||
+        values > UINT64_MAX / sizeof(float) ||
+        hidden->bytes < values * sizeof(float) ||
+        position_indices->bytes < (uint64_t)rows * 4u * sizeof(int32_t) ||
+        position_weights->bytes < (uint64_t)rows * 4u * sizeof(float) ||
+        patch_bias_offset > model_size || bias_bytes > model_size - patch_bias_offset ||
+        position_weight_offset > model_size || pos_bytes > model_size - position_weight_offset)
+        return 0;
+    const float *bias = (const float *)cuda_model_range_ptr(
+        model_map, patch_bias_offset, bias_bytes, "Qwen vision patch bias");
+    const cuda_block_q8_0 *position =
+        (const cuda_block_q8_0 *)cuda_model_range_ptr(
+            model_map, position_weight_offset, pos_bytes,
+            "Qwen vision position embedding");
+    if (!bias || !position) return 0;
+    qwen4exp_vision_patch_position_kernel<<<
+        (values + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)hidden->ptr, bias, position,
+        (const int32_t *)position_indices->ptr,
+        (const float *)position_weights->ptr, rows, hidden_dim);
+    return cuda_ok(cudaGetLastError(), "Qwen vision patch/position launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_layernorm_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t bias_offset,
+        uint32_t rows, uint32_t dim, float eps) {
+    const uint64_t values = (uint64_t)rows * dim;
+    const uint64_t bytes = (uint64_t)dim * sizeof(float);
+    if (!out || !in || !model_map || rows == 0u || dim == 0u || dim > 65536u ||
+        values > UINT64_MAX / sizeof(float) ||
+        out->bytes < values * sizeof(float) || in->bytes < values * sizeof(float) ||
+        weight_offset > model_size || bytes > model_size - weight_offset ||
+        bias_offset > model_size || bytes > model_size - bias_offset) return 0;
+    const float *weight = (const float *)cuda_model_range_ptr(
+        model_map, weight_offset, bytes, "Qwen vision LayerNorm weight");
+    const float *bias = (const float *)cuda_model_range_ptr(
+        model_map, bias_offset, bytes, "Qwen vision LayerNorm bias");
+    if (!weight || !bias) return 0;
+    qwen4exp_vision_layernorm_kernel<<<
+        rows, 256u, 0, ds4_current_stream()>>>(
+        (float *)out->ptr, (const float *)in->ptr, weight, bias, rows, dim, eps);
+    return cuda_ok(cudaGetLastError(), "Qwen vision LayerNorm launch");
+}
+
+static int qwen4exp_vision_bias_common(
+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+        uint64_t bias_offset, uint32_t rows, uint32_t dim, int activation) {
+    const uint64_t values = (uint64_t)rows * dim;
+    const uint64_t bytes = (uint64_t)dim * sizeof(float);
+    if (!x || !model_map || rows == 0u || dim == 0u ||
+        values > UINT64_MAX / sizeof(float) || x->bytes < values * sizeof(float) ||
+        bias_offset > model_size || bytes > model_size - bias_offset) return 0;
+    const float *bias = (const float *)cuda_model_range_ptr(
+        model_map, bias_offset, bytes, "Qwen vision bias");
+    if (!bias) return 0;
+    qwen4exp_vision_bias_kernel<<<
+        (values + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)x->ptr, bias, values, dim, activation);
+    return cuda_ok(cudaGetLastError(), "Qwen vision bias/activation launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_bias_gelu_tensor(
+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+        uint64_t bias_offset, uint32_t rows, uint32_t dim, int tanh_approx) {
+    return qwen4exp_vision_bias_common(
+        x, model_map, model_size, bias_offset, rows, dim,
+        tanh_approx ? 1 : 2);
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_bias_tensor(
+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+        uint64_t bias_offset, uint32_t rows, uint32_t dim) {
+    return qwen4exp_vision_bias_common(
+        x, model_map, model_size, bias_offset, rows, dim, 0);
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_bias_residual_tensor(
+        ds4_gpu_tensor *residual, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t bias_offset,
+        uint32_t rows, uint32_t dim) {
+    const uint64_t values = (uint64_t)rows * dim;
+    const uint64_t bytes = (uint64_t)dim * sizeof(float);
+    if (!residual || !x || !model_map || rows == 0u || dim == 0u ||
+        values > UINT64_MAX / sizeof(float) ||
+        residual->bytes < values * sizeof(float) || x->bytes < values * sizeof(float) ||
+        bias_offset > model_size || bytes > model_size - bias_offset) return 0;
+    const float *bias = (const float *)cuda_model_range_ptr(
+        model_map, bias_offset, bytes, "Qwen vision residual bias");
+    if (!bias) return 0;
+    qwen4exp_vision_bias_residual_kernel<<<
+        (values + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)residual->ptr, (const float *)x->ptr, bias, values, dim);
+    return cuda_ok(cudaGetLastError(), "Qwen vision residual launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_qkv_rope_tensor(
+        ds4_gpu_tensor *qkv, const void *model_map, uint64_t model_size,
+        uint64_t bias_offset, const ds4_gpu_tensor *height_positions,
+        const ds4_gpu_tensor *width_positions, uint32_t rows,
+        uint32_t heads, uint32_t head_dim, float freq_base) {
+    const uint32_t dim = 3u * heads * head_dim;
+    if (!qkv || !height_positions || !width_positions || rows == 0u ||
+        heads == 0u || head_dim == 0u || (head_dim & 3u) != 0u ||
+        height_positions->bytes < (uint64_t)rows * sizeof(int32_t) ||
+        width_positions->bytes < (uint64_t)rows * sizeof(int32_t) ||
+        !isfinite(freq_base) || freq_base <= 0.0f ||
+        !qwen4exp_vision_bias_common(qkv, model_map, model_size,
+                                     bias_offset, rows, dim, 0)) return 0;
+    const uint64_t pairs = (uint64_t)rows * heads * (head_dim / 2u);
+    qwen4exp_vision_rope_kernel<<<
+        (pairs + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)qkv->ptr,
+        (const int32_t *)height_positions->ptr,
+        (const int32_t *)width_positions->ptr,
+        rows, heads, head_dim, freq_base);
+    return cuda_ok(cudaGetLastError(), "Qwen vision QKV RoPE launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_attention_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *segment_start,
+        const ds4_gpu_tensor *segment_end,
+        uint32_t rows, uint32_t heads, uint32_t head_dim) {
+    const uint64_t values = (uint64_t)rows * heads * head_dim;
+    if (!out || !qkv || !segment_start || !segment_end || rows == 0u ||
+        heads == 0u || head_dim == 0u || head_dim > 96u ||
+        values > UINT64_MAX / sizeof(float) ||
+        out->bytes < values * sizeof(float) ||
+        qkv->bytes < 3u * values * sizeof(float) ||
+        segment_start->bytes < (uint64_t)rows * sizeof(int32_t) ||
+        segment_end->bytes < (uint64_t)rows * sizeof(int32_t) ||
+        (uint64_t)rows * heads > (uint64_t)INT_MAX) return 0;
+    qwen4exp_vision_attention_kernel<<<
+        rows * heads, 32u, 0, ds4_current_stream()>>>(
+        (float *)out->ptr, (const float *)qkv->ptr,
+        (const int32_t *)segment_start->ptr,
+        (const int32_t *)segment_end->ptr, rows, heads, head_dim);
+    return cuda_ok(cudaGetLastError(), "Qwen vision attention launch");
 }
 
 extern "C" int ds4_gpu_rms_norm_weight_rows_q8_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {

@@ -133,8 +133,32 @@ static void rope_first(float *x, uint32_t rows, uint32_t heads,
     }
 }
 
+static void mrope_first(float *x, uint32_t rows, uint32_t heads,
+                        uint32_t head_dim, const int32_t *positions,
+                        uint32_t pos0) {
+    const uint32_t half = ROTARY_DIM / 2u;
+    float inv_freq[ROTARY_DIM / 2u];
+    for (uint32_t d = 0; d < half; d++)
+        inv_freq[d] = 1.0f / powf(10000000.0f,
+            (2.0f * (float)d) / (float)ROTARY_DIM);
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t head = 0; head < heads; head++) {
+            float *v = x + ((uint64_t)row * heads + head) * head_dim;
+            for (uint32_t d = 0; d < half; d++) {
+                const float theta =
+                    (float)positions[((uint64_t)pos0 + row) * 3u + d % 3u] *
+                    inv_freq[d];
+                const float c = cosf(theta), s = sinf(theta);
+                const float x0 = v[d], x1 = v[d + half];
+                v[d] = x0 * c - x1 * s;
+                v[d + half] = x1 * c + x0 * s;
+            }
+        }
+    }
+}
+
 static void pool_blocks(float *pooled, const float *raw,
-                        const float *weight) {
+                        const float *weight, const int32_t *positions) {
     for (uint32_t block = 0; block < BLOCK_CAP; block++) {
         float *out = pooled + (uint64_t)block * INDEX_DIM;
         for (uint32_t d = 0; d < INDEX_DIM; d++) {
@@ -144,7 +168,11 @@ static void pool_blocks(float *pooled, const float *raw,
             out[d] = sum / (float)RATIO;
         }
         zero_rms_norm(out, weight, 1u, INDEX_DIM, INDEX_DIM);
-        rope_first(out, 1u, 1u, INDEX_DIM, block * RATIO);
+        if (positions)
+            mrope_first(out, 1u, 1u, INDEX_DIM,
+                        positions, block * RATIO);
+        else
+            rope_first(out, 1u, 1u, INDEX_DIM, block * RATIO);
     }
 }
 
@@ -316,8 +344,16 @@ int main(void) {
 #undef HOST_ALLOC
     int32_t *tokens_want = malloc(token_count * sizeof(int32_t));
     int32_t *tokens_got = malloc(token_count * sizeof(int32_t));
+    int32_t *mrope_positions =
+        malloc((uint64_t)CACHE_CAP * 3u * sizeof(int32_t));
     uint32_t counts_want[ROWS], counts_got[ROWS];
-    REQUIRE(tokens_want && tokens_got, "QSA token selection allocation");
+    REQUIRE(tokens_want && tokens_got && mrope_positions,
+            "QSA token/position allocation");
+    for (uint32_t i = 0; i < CACHE_CAP; i++) {
+        mrope_positions[3u * i] = (int32_t)(i % 97u);
+        mrope_positions[3u * i + 1u] = (int32_t)((2u * i + 7u) % 83u);
+        mrope_positions[3u * i + 2u] = (int32_t)((3u * i + 11u) % 71u);
+    }
 
     for (uint64_t i = 0; i < raw_count; i++)
         raw[i] = 0.31f * sinf((float)(i + 5u) * 0.0031f) +
@@ -343,7 +379,7 @@ int main(void) {
     zero_rms_norm(index_query_want, index_q_weight,
                   ROWS, INDEX_Q_DIM, INDEX_DIM);
     rope_first(index_query_want, ROWS, INDEX_HEADS, INDEX_DIM, POS0);
-    pool_blocks(pooled_want, raw_want, index_k_weight);
+    pool_blocks(pooled_want, raw_want, index_k_weight, NULL);
     block_scores(scores_want, index_query_want, pooled_want);
     select_tokens(tokens_want, counts_want, scores_want);
 
@@ -403,6 +439,7 @@ int main(void) {
     DEV_ALLOC(dpool, pooled_count, float);
     DEV_ALLOC(dindex_qk, index_qk_count, float);
     DEV_ALLOC(dindex_q, index_q_count, float);
+    DEV_ALLOC(dmrope, (uint64_t)CACHE_CAP * 3u, int32_t);
     DEV_ALLOC(dscores, score_count, float);
     DEV_ALLOC(dblocks, (uint64_t)ROWS * 512u, uint32_t);
     DEV_ALLOC(dtokens, token_count, int32_t);
@@ -419,6 +456,10 @@ int main(void) {
 #undef DEV_ALLOC
     upload_f32(draw, raw, raw_count, "raw index cache upload");
     upload_f32(dindex_qk, index_qk, index_qk_count, "index qk upload");
+    REQUIRE(ds4_gpu_tensor_write(
+                dmrope, 0, mrope_positions,
+                (uint64_t)CACHE_CAP * 3u * sizeof(int32_t)),
+            "M-RoPE positions upload");
     REQUIRE(ds4_gpu_qwen4exp_qsa_split_index_tensor(
                 dindex_q, draw, dindex_qk, ROWS, POS0, CACHE_CAP,
                 INDEX_HEADS, INDEX_DIM),
@@ -432,7 +473,7 @@ int main(void) {
                 ROTARY_DIM, POS0, 10000000.0f),
             "QSA index query RoPE");
     REQUIRE(ds4_gpu_qwen4exp_qsa_pool_blocks_tensor(
-                dpool, draw, model_map, model_size, index_k_norm_offset,
+                dpool, draw, NULL, model_map, model_size, index_k_norm_offset,
                 0u, BLOCK_CAP, BLOCK_CAP, RATIO, INDEX_DIM,
                 ROTARY_DIM, 10000000.0f, 1.0e-6f),
             "QSA pooled index blocks");
@@ -456,6 +497,39 @@ int main(void) {
     read_f32(dpool, pooled_got, pooled_count, "QSA pool download");
     compare_f32("QSA four-token pooled key cache", pooled_got, pooled_want,
                 pooled_count, 4.0e-6f, 4.0e-6);
+
+    pool_blocks(pooled_want, raw_want, index_k_weight, mrope_positions);
+    REQUIRE(ds4_gpu_qwen4exp_qsa_pool_blocks_tensor(
+                dpool, draw, dmrope, model_map, model_size,
+                index_k_norm_offset, 0u, BLOCK_CAP, BLOCK_CAP, RATIO,
+                INDEX_DIM, ROTARY_DIM, 10000000.0f, 1.0e-6f),
+            "QSA M-RoPE pooled index blocks");
+    read_f32(dpool, pooled_got, pooled_count, "QSA M-RoPE pool download");
+    compare_f32("QSA M-RoPE pooled key cache", pooled_got, pooled_want,
+                pooled_count, 4.0e-6f, 4.0e-6);
+
+    for (uint32_t row = 0; row < ROWS; row++)
+        memcpy(index_query_want + (uint64_t)row * INDEX_Q_DIM,
+               index_qk + (uint64_t)row * INDEX_QK_DIM,
+               INDEX_Q_DIM * sizeof(float));
+    memcpy(index_query_got, index_query_want,
+           index_q_count * sizeof(float));
+    zero_rms_norm(index_query_want, index_q_weight,
+                  ROWS, INDEX_Q_DIM, INDEX_DIM);
+    zero_rms_norm(index_query_got, index_q_weight,
+                  ROWS, INDEX_Q_DIM, INDEX_DIM);
+    mrope_first(index_query_want, ROWS, INDEX_HEADS, INDEX_DIM,
+                mrope_positions, POS0);
+    upload_f32(dindex_q, index_query_got, index_q_count,
+               "QSA M-RoPE input upload");
+    REQUIRE(ds4_gpu_qwen4exp_mrope_tensor(
+                dindex_q, dmrope, ROWS, INDEX_HEADS, INDEX_DIM,
+                ROTARY_DIM, POS0, 10000000.0f),
+            "QSA interleaved M-RoPE");
+    read_f32(dindex_q, index_query_got, index_q_count,
+             "QSA M-RoPE query download");
+    compare_f32("QSA interleaved THW M-RoPE", index_query_got,
+                index_query_want, index_q_count, 4.0e-6f, 4.0e-6);
     read_f32(dscores, scores_got, score_count, "QSA scores download");
     for (uint32_t row = 0; row < ROWS; row++) {
         const uint32_t visible_blocks = (POS0 + row + 1u) / RATIO;
@@ -537,7 +611,7 @@ int main(void) {
     ds4_gpu_tensor *all[] = {
         dout, dattn_scores, dvcache, dkcache, dvalue, dkey, dgate, dquery,
         dqproj, dcounts, dtokens, dblocks, dscores, dindex_q, dindex_qk,
-        dpool, draw,
+        dmrope, dpool, draw,
     };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
         ds4_gpu_tensor_free(all[i]);
@@ -546,7 +620,7 @@ int main(void) {
     free(attn_got); free(attn_want); free(v_cache_want); free(k_cache_want);
     free(v_cache); free(k_cache); free(key_want); free(value); free(key);
     free(gate_got); free(gate_want); free(query_got); free(query_want);
-    free(q_projected); free(tokens_got); free(tokens_want);
+    free(q_projected); free(mrope_positions); free(tokens_got); free(tokens_want);
     free(scores_got); free(scores_want); free(index_query_got);
     free(index_query_want); free(index_qk); free(pooled_got);
     free(pooled_want); free(raw_want); free(raw); free(model_map);

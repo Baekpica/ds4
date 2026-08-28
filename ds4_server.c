@@ -533,6 +533,9 @@ typedef enum {
 
 #define DS4_QWEN_IM_START             "<|im_start|>"
 #define DS4_QWEN_IM_END               "<|im_end|>"
+#define DS4_QWEN_VISION_START         "<|vision_start|>"
+#define DS4_QWEN_IMAGE_PAD            "<|image_pad|>"
+#define DS4_QWEN_VISION_END           "<|vision_end|>"
 #define DS4_QWEN_TOOL_CALL_START      "<tool_call>"
 #define DS4_QWEN_TOOL_CALL_END        "</tool_call>"
 #define DS4_QWEN_TOOL_RESPONSE_START  "<tool_response>"
@@ -612,6 +615,43 @@ typedef struct {
     int cap;
 } tool_schema_orders;
 
+typedef enum {
+    CHAT_IMAGE_PNG,
+    CHAT_IMAGE_JPEG,
+} chat_image_mime;
+
+typedef struct {
+    chat_image_mime mime;
+    uint8_t *data;
+    size_t len;
+    ds4_qwen_image_info info;
+    uint32_t token_offset;
+} chat_image;
+
+typedef struct {
+    chat_image *v;
+    int len;
+    int cap;
+    size_t total_bytes;
+} chat_images;
+
+typedef enum {
+    CHAT_PART_TEXT,
+    CHAT_PART_IMAGE,
+} chat_part_kind;
+
+typedef struct {
+    chat_part_kind kind;
+    char *text;
+    int image_index;
+} chat_part;
+
+typedef struct {
+    chat_part *v;
+    int len;
+    int cap;
+} chat_parts;
+
 typedef struct {
     char *role;
     char *content;
@@ -621,6 +661,7 @@ typedef struct {
     int tool_call_ids_len;
     int tool_call_ids_cap;
     tool_calls calls;
+    chat_parts parts;
 } chat_msg;
 
 typedef struct {
@@ -757,6 +798,7 @@ typedef struct {
     bool live_state_bank_owned;
     tool_replay_stats tool_replay;
     req_timings timings;
+    chat_images images;
     /* v0.5.6 Inc 2a: immutable route requirements (ds4_req_need bits),
      * computed ONCE at enqueue() -- the single post-parse choke point -- and
      * read-only afterward.  Every dispatch-time routing decision consumes
@@ -791,6 +833,297 @@ static void tool_calls_push(tool_calls *calls, tool_call tc) {
     calls->v[calls->len++] = tc;
 }
 
+#define CHAT_IMAGE_MAX_COUNT 4
+#define CHAT_IMAGE_MAX_BYTES ((size_t)10u * 1024u * 1024u)
+#define CHAT_IMAGE_TOTAL_MAX ((size_t)20u * 1024u * 1024u)
+
+static void chat_parts_free(chat_parts *parts) {
+    if (!parts) return;
+    for (int i = 0; i < parts->len; i++) free(parts->v[i].text);
+    free(parts->v);
+    memset(parts, 0, sizeof(*parts));
+}
+
+static void chat_parts_push(chat_parts *parts, chat_part part) {
+    if (parts->len == parts->cap) {
+        parts->cap = parts->cap ? parts->cap * 2 : 4;
+        parts->v = xrealloc(parts->v,
+                            (size_t)parts->cap * sizeof(parts->v[0]));
+    }
+    parts->v[parts->len++] = part;
+}
+
+static void chat_parts_push_text(chat_parts *parts, const char *text) {
+    if (!parts) return;
+    chat_part part = {
+        .kind = CHAT_PART_TEXT,
+        .text = xstrdup(text ? text : ""),
+        .image_index = -1,
+    };
+    chat_parts_push(parts, part);
+}
+
+static void chat_images_free(chat_images *images) {
+    if (!images) return;
+    for (int i = 0; i < images->len; i++) free(images->v[i].data);
+    free(images->v);
+    memset(images, 0, sizeof(*images));
+}
+
+static int base64_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return 26 + c - 'a';
+    if (c >= '0' && c <= '9') return 52 + c - '0';
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static bool base64_decode_image(const char *src, size_t request_remaining,
+                                uint8_t **out, size_t *out_len,
+                                char *err, size_t errlen) {
+    const size_t n = src ? strlen(src) : 0u;
+    if (!n || (n & 3u)) {
+        if (err && errlen) snprintf(err, errlen, "invalid image base64 length");
+        return false;
+    }
+    size_t padding = src[n - 1] == '=' ? 1u : 0u;
+    if (n > 1u && src[n - 2] == '=') padding++;
+    const size_t decoded = n / 4u * 3u - padding;
+    if (decoded == 0u || decoded > CHAT_IMAGE_MAX_BYTES) {
+        if (err && errlen)
+            snprintf(err, errlen, "image exceeds 10 MiB decoded limit");
+        return false;
+    }
+    if (decoded > request_remaining) {
+        if (err && errlen)
+            snprintf(err, errlen, "images exceed 20 MiB request limit");
+        return false;
+    }
+    uint8_t *dst = xmalloc(decoded);
+    size_t w = 0u;
+    for (size_t i = 0; i < n; i += 4u) {
+        const bool last = i + 4u == n;
+        const int a = base64_value((unsigned char)src[i]);
+        const int b = base64_value((unsigned char)src[i + 1]);
+        const int c = src[i + 2] == '=' ? -2 :
+                      base64_value((unsigned char)src[i + 2]);
+        const int d = src[i + 3] == '=' ? -2 :
+                      base64_value((unsigned char)src[i + 3]);
+        if (a < 0 || b < 0 || c == -1 || d == -1 ||
+            (!last && (c < 0 || d < 0)) ||
+            (c == -2 && d != -2) ||
+            (c == -2 && (b & 15)) ||
+            (d == -2 && c >= 0 && (c & 3))) {
+            free(dst);
+            if (err && errlen) snprintf(err, errlen, "invalid image base64 data");
+            return false;
+        }
+        const uint32_t v = (uint32_t)a << 18 | (uint32_t)b << 12 |
+                           (uint32_t)(c < 0 ? 0 : c) << 6 |
+                           (uint32_t)(d < 0 ? 0 : d);
+        if (w < decoded) dst[w++] = (uint8_t)(v >> 16);
+        if (w < decoded) dst[w++] = (uint8_t)(v >> 8);
+        if (w < decoded) dst[w++] = (uint8_t)v;
+    }
+    if (w != decoded) {
+        free(dst);
+        if (err && errlen) snprintf(err, errlen, "invalid image base64 padding");
+        return false;
+    }
+    *out = dst;
+    *out_len = decoded;
+    return true;
+}
+
+static bool chat_image_magic_matches(chat_image_mime mime,
+                                     const uint8_t *data, size_t len) {
+    static const uint8_t png_magic[8] = {
+        0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'
+    };
+    if (mime == CHAT_IMAGE_PNG)
+        return len >= sizeof(png_magic) &&
+               !memcmp(data, png_magic, sizeof(png_magic));
+    return len >= 3u && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff;
+}
+
+static bool chat_images_add_base64(chat_images *images, const char *mime_type,
+                                   const char *payload, int *index,
+                                   char *err, size_t errlen) {
+    if (!images || !mime_type || !payload) {
+        if (err && errlen) snprintf(err, errlen, "image storage is unavailable");
+        return false;
+    }
+    chat_image_mime mime;
+    if (!strcmp(mime_type, "image/png")) mime = CHAT_IMAGE_PNG;
+    else if (!strcmp(mime_type, "image/jpeg")) mime = CHAT_IMAGE_JPEG;
+    else {
+        if (err && errlen)
+            snprintf(err, errlen, "unsupported image media type: %s", mime_type);
+        return false;
+    }
+    if (images->len >= CHAT_IMAGE_MAX_COUNT) {
+        if (err && errlen) snprintf(err, errlen, "at most 4 images are supported");
+        return false;
+    }
+    uint8_t *data = NULL;
+    size_t len = 0u;
+    if (images->total_bytes > CHAT_IMAGE_TOTAL_MAX) {
+        if (err && errlen)
+            snprintf(err, errlen, "images exceed 20 MiB request limit");
+        return false;
+    }
+    if (!base64_decode_image(payload,
+                             CHAT_IMAGE_TOTAL_MAX - images->total_bytes,
+                             &data, &len, err, errlen)) return false;
+    if (!chat_image_magic_matches(mime, data, len)) {
+        free(data);
+        if (err && errlen)
+            snprintf(err, errlen, "image bytes do not match declared media type");
+        return false;
+    }
+    if (images->len == images->cap) {
+        images->cap = images->cap ? images->cap * 2 : 2;
+        images->v = xrealloc(images->v,
+                             (size_t)images->cap * sizeof(images->v[0]));
+    }
+    chat_image *image = &images->v[images->len];
+    memset(image, 0, sizeof(*image));
+    image->mime = mime;
+    image->data = data;
+    image->len = len;
+    if (index) *index = images->len;
+    images->len++;
+    images->total_bytes += len;
+    return true;
+}
+
+static bool chat_images_add_data_uri(chat_images *images, const char *uri,
+                                     int *index, char *err, size_t errlen) {
+    static const char prefix[] = "data:";
+    static const char marker[] = ";base64,";
+    if (!uri || strncmp(uri, prefix, sizeof(prefix) - 1u)) {
+        if (err && errlen)
+            snprintf(err, errlen, "image_url must be a base64 data URI");
+        return false;
+    }
+    const char *sep = strstr(uri + sizeof(prefix) - 1u, marker);
+    if (!sep || sep == uri + sizeof(prefix) - 1u) {
+        if (err && errlen)
+            snprintf(err, errlen, "image_url must be a base64 data URI");
+        return false;
+    }
+    char *mime = xstrndup(uri + sizeof(prefix) - 1u,
+                          (size_t)(sep - (uri + sizeof(prefix) - 1u)));
+    const bool ok = chat_images_add_base64(
+        images, mime, sep + sizeof(marker) - 1u, index, err, errlen);
+    free(mime);
+    return ok;
+}
+
+static void chat_msg_append_text_part(chat_msg *msg, const char *text) {
+    chat_parts_push_text(&msg->parts, text);
+    buf b = {0};
+    buf_puts(&b, msg->content ? msg->content : "");
+    buf_puts(&b, text ? text : "");
+    free(msg->content);
+    msg->content = buf_take(&b);
+}
+
+static void chat_msg_append_image_part(chat_msg *msg, int image_index) {
+    chat_part part = {
+        .kind = CHAT_PART_IMAGE,
+        .image_index = image_index,
+    };
+    chat_parts_push(&msg->parts, part);
+}
+
+static bool chat_msgs_validate_images(const chat_msgs *msgs,
+                                      const chat_images *images,
+                                      ds4_chat_format format,
+                                      char *err, size_t errlen) {
+    if (!images || images->len == 0) return true;
+    if (format != DS4_CHAT_FORMAT_QWEN4EXP) {
+        if (err && errlen)
+            snprintf(err, errlen, "image input is supported only by Qwen4Exp");
+        return false;
+    }
+    bool seen[CHAT_IMAGE_MAX_COUNT] = {false};
+    int seen_count = 0;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const chat_msg *msg = &msgs->v[i];
+        for (int j = 0; j < msg->parts.len; j++) {
+            const chat_part *part = &msg->parts.v[j];
+            if (part->kind != CHAT_PART_IMAGE) continue;
+            if (!msg->role || strcmp(msg->role, "user")) {
+                if (err && errlen)
+                    snprintf(err, errlen, "images are allowed only in user messages");
+                return false;
+            }
+            if (part->image_index < 0 || part->image_index >= images->len) {
+                if (err && errlen) snprintf(err, errlen, "invalid image reference");
+                return false;
+            }
+            if (!seen[part->image_index]) {
+                seen[part->image_index] = true;
+                seen_count++;
+            }
+        }
+    }
+    if (seen_count != images->len) {
+        if (err && errlen) snprintf(err, errlen, "unreferenced image payload");
+        return false;
+    }
+    return true;
+}
+
+static bool request_expand_qwen_image_tokens(request *r,
+                                             char *err, size_t errlen) {
+    if (!r || r->images.len == 0) return true;
+    uint64_t expanded_len = (uint32_t)r->prompt.len;
+    for (int i = 0; i < r->images.len; i++) {
+        chat_image *image = &r->images.v[i];
+        if (ds4_qwen_image_probe(image->data, image->len, &image->info,
+                                 err, errlen) != 0)
+            return false;
+        expanded_len += image->info.token_count - 1u;
+    }
+    if (expanded_len > INT_MAX) {
+        if (err && errlen) snprintf(err, errlen, "expanded image prompt is too large");
+        return false;
+    }
+    int *tokens = xmalloc((size_t)expanded_len * sizeof(tokens[0]));
+    uint32_t out = 0u;
+    int image_index = 0;
+    for (int i = 0; i < r->prompt.len; i++) {
+        if (r->prompt.v[i] != DS4_QWEN_IMAGE_PAD_TOKEN_ID) {
+            tokens[out++] = r->prompt.v[i];
+            continue;
+        }
+        if (image_index >= r->images.len) {
+            free(tokens);
+            if (err && errlen)
+                snprintf(err, errlen, "ambiguous literal <|image_pad|> in prompt");
+            return false;
+        }
+        chat_image *image = &r->images.v[image_index++];
+        image->token_offset = out;
+        for (uint32_t j = 0; j < image->info.token_count; j++)
+            tokens[out++] = DS4_QWEN_IMAGE_PAD_TOKEN_ID;
+    }
+    if (image_index != r->images.len || out != expanded_len) {
+        free(tokens);
+        if (err && errlen)
+            snprintf(err, errlen, "Qwen image placeholder count does not match payloads");
+        return false;
+    }
+    free(r->prompt.v);
+    r->prompt.v = tokens;
+    r->prompt.len = (int)out;
+    r->prompt.cap = (int)out;
+    return true;
+}
+
 static void chat_msg_add_tool_call_id(chat_msg *m, const char *id) {
     if (!m || !id || !id[0]) return;
     if (!m->tool_call_id) m->tool_call_id = xstrdup(id);
@@ -813,6 +1146,7 @@ static void chat_msg_free(chat_msg *m) {
     for (int i = 0; i < m->tool_call_ids_len; i++) free(m->tool_call_ids[i]);
     free(m->tool_call_ids);
     tool_calls_free(&m->calls);
+    chat_parts_free(&m->parts);
     memset(m, 0, sizeof(*m));
 }
 
@@ -942,6 +1276,7 @@ static void request_free(request *r) {
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
+    chat_images_free(&r->images);
     memset(r, 0, sizeof(*r));
 }
 
@@ -2089,7 +2424,151 @@ bad:
     return false;
 }
 
-static bool parse_messages(const char **p, chat_msgs *msgs) {
+static bool parse_chat_image_url_value(const char **p, char **url) {
+    json_ws(p);
+    if (**p == '"') return json_string(p, url);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "url")) {
+            free(*url);
+            *url = NULL;
+            if (!json_string(p, url)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return *url != NULL;
+}
+
+static bool parse_openai_message_content_mm(const char **p, chat_msg *msg,
+                                            chat_images *images,
+                                            char *err, size_t errlen) {
+    json_ws(p);
+    if (**p == '"') return json_string(p, &msg->content);
+    if (json_lit(p, "null")) {
+        msg->content = xstrdup("");
+        return true;
+    }
+    if (**p != '[') goto bad;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != ']') {
+        char *type = NULL;
+        char *text = NULL;
+        char *image_url = NULL;
+        if (**p == '"') {
+            if (!json_string(p, &text)) goto bad;
+            chat_msg_append_text_part(msg, text);
+        } else if (**p == '{') {
+            (*p)++;
+            json_ws(p);
+            while (**p && **p != '}') {
+                char *key = NULL;
+                if (!json_string(p, &key)) goto block_bad;
+                json_ws(p);
+                if (**p != ':') {
+                    free(key);
+                    goto block_bad;
+                }
+                (*p)++;
+                if (!strcmp(key, "type")) {
+                    free(type);
+                    type = NULL;
+                    if (!json_string(p, &type)) {
+                        free(key);
+                        goto block_bad;
+                    }
+                } else if (!strcmp(key, "text")) {
+                    free(text);
+                    text = NULL;
+                    if (!json_string(p, &text)) {
+                        free(key);
+                        goto block_bad;
+                    }
+                } else if (!strcmp(key, "image_url")) {
+                    free(image_url);
+                    image_url = NULL;
+                    if (!parse_chat_image_url_value(p, &image_url)) {
+                        free(key);
+                        goto block_bad;
+                    }
+                } else if (!json_skip_value(p)) {
+                    free(key);
+                    goto block_bad;
+                }
+                free(key);
+                json_ws(p);
+                if (**p == ',') (*p)++;
+                json_ws(p);
+            }
+            if (**p != '}') goto block_bad;
+            (*p)++;
+            if (type && !strcmp(type, "text") && text) {
+                chat_msg_append_text_part(msg, text);
+            } else if (type && !strcmp(type, "image_url") && image_url) {
+                int image_index = -1;
+                if (!chat_images_add_data_uri(images, image_url, &image_index,
+                                              err, errlen))
+                    goto block_bad;
+                chat_msg_append_image_part(msg, image_index);
+            } else {
+                if (err && errlen && !err[0])
+                    snprintf(err, errlen, "unsupported chat content block");
+                goto block_bad;
+            }
+            free(type);
+            free(text);
+            free(image_url);
+            type = NULL;
+            text = NULL;
+            image_url = NULL;
+        } else {
+            goto bad;
+        }
+        free(type);
+        free(text);
+        free(image_url);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+        continue;
+block_bad:
+        free(type);
+        free(text);
+        free(image_url);
+        goto bad;
+    }
+    if (**p != ']') goto bad;
+    (*p)++;
+    if (!msg->content) msg->content = xstrdup("");
+    return true;
+bad:
+    if (err && errlen && !err[0]) snprintf(err, errlen, "invalid chat content");
+    return false;
+}
+
+static bool parse_messages_mm(const char **p, chat_msgs *msgs,
+                              chat_images *images, char *err, size_t errlen) {
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
@@ -2099,6 +2578,7 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         if (**p != '{') return false;
         (*p)++;
         chat_msg msg = {0};
+        bool got_content = false;
         json_ws(p);
         while (**p && **p != '}') {
             char *key = NULL;
@@ -2116,8 +2596,15 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                     goto fail;
                 }
             } else if (!strcmp(key, "content")) {
+                if (got_content) {
+                    free(key);
+                    goto fail;
+                }
+                got_content = true;
                 free(msg.content);
-                if (!json_content(p, &msg.content)) {
+                msg.content = NULL;
+                if (!parse_openai_message_content_mm(p, &msg, images,
+                                                     err, errlen)) {
                     free(key);
                     goto fail;
                 }
@@ -2177,11 +2664,54 @@ static bool append_anthropic_block_content(buf *dst, const char *text) {
     return true;
 }
 
+static bool parse_anthropic_image_source(const char **p, char **source_type,
+                                         char **media_type, char **data) {
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        char **dst = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        if (!strcmp(key, "type")) dst = source_type;
+        else if (!strcmp(key, "media_type")) dst = media_type;
+        else if (!strcmp(key, "data")) dst = data;
+        if (dst) {
+            free(*dst);
+            *dst = NULL;
+            if (!json_string(p, dst)) {
+                free(key);
+                return false;
+            }
+        } else if (!json_skip_value(p)) {
+            free(key);
+            return false;
+        }
+        free(key);
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
 /* Anthropic content is block-structured, while the engine consumes one compact
  * chat_msg per role.  Parsing collapses text/thinking into strings, converts
  * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
  * escaped text because DS4 sees tool results in its chat template. */
-static bool parse_anthropic_content_block(const char **p, const char *role, chat_msg *msg) {
+static bool parse_anthropic_content_block_mm(const char **p, const char *role,
+                                             chat_msg *msg,
+                                             chat_images *images,
+                                             char *err, size_t errlen) {
     (void)role;
     if (**p != '{') return false;
     (*p)++;
@@ -2192,6 +2722,9 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     char *name = NULL;
     char *input = NULL;
     char *tool_result = NULL;
+    char *source_type = NULL;
+    char *media_type = NULL;
+    char *image_data = NULL;
 
     json_ws(p);
     while (**p && **p != '}') {
@@ -2245,6 +2778,12 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "source")) {
+            if (!parse_anthropic_image_source(
+                    p, &source_type, &media_type, &image_data)) {
+                free(key);
+                goto bad;
+            }
         } else if (!json_skip_value(p)) {
             free(key);
             goto bad;
@@ -2262,7 +2801,20 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
      * caller may not know the enclosing role yet while parsing content blocks.
      * Classify protocol blocks by their own "type" field; later rendering and
      * validation use the final message role. */
-    if (type && !strcmp(type, "tool_use")) {
+    if (type && !strcmp(type, "image")) {
+        int image_index = -1;
+        if (!source_type || strcmp(source_type, "base64") ||
+            !media_type || !image_data) {
+            if (err && errlen && !err[0])
+                snprintf(err, errlen,
+                         "Anthropic image source must use base64 data");
+            goto bad;
+        }
+        if (!chat_images_add_base64(images, media_type, image_data,
+                                    &image_index, err, errlen))
+            goto bad;
+        chat_msg_append_image_part(msg, image_index);
+    } else if (type && !strcmp(type, "tool_use")) {
         tool_call tc = {0};
         tc.id = id ? xstrdup(id) : NULL;
         tc.name = name ? xstrdup(name) : xstrdup("");
@@ -2279,11 +2831,7 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
         msg->content = buf_take(&b);
     } else {
         if (text) {
-            buf b = {0};
-            buf_puts(&b, msg->content ? msg->content : "");
-            append_anthropic_block_content(&b, text);
-            free(msg->content);
-            msg->content = buf_take(&b);
+            chat_msg_append_text_part(msg, text);
         }
         if (thinking) {
             buf b = {0};
@@ -2301,6 +2849,9 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     free(name);
     free(input);
     free(tool_result);
+    free(source_type);
+    free(media_type);
+    free(image_data);
     return true;
 bad:
     free(type);
@@ -2310,10 +2861,15 @@ bad:
     free(name);
     free(input);
     free(tool_result);
+    free(source_type);
+    free(media_type);
+    free(image_data);
     return false;
 }
 
-static bool parse_anthropic_content(const char **p, chat_msg *msg) {
+static bool parse_anthropic_content_mm(const char **p, chat_msg *msg,
+                                       chat_images *images,
+                                       char *err, size_t errlen) {
     json_ws(p);
     if (**p == '"') return json_string(p, &msg->content);
     if (json_lit(p, "null")) {
@@ -2327,14 +2883,12 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg) {
         if (**p == '"') {
             char *s = NULL;
             if (!json_string(p, &s)) return false;
-            buf b = {0};
-            buf_puts(&b, msg->content ? msg->content : "");
-            buf_puts(&b, s);
-            free(msg->content);
-            msg->content = buf_take(&b);
+            chat_msg_append_text_part(msg, s);
             free(s);
         } else if (**p == '{') {
-            if (!parse_anthropic_content_block(p, msg->role ? msg->role : "", msg)) return false;
+            if (!parse_anthropic_content_block_mm(
+                    p, msg->role ? msg->role : "", msg,
+                    images, err, errlen)) return false;
         } else if (!json_skip_value(p)) {
             return false;
         }
@@ -2348,7 +2902,9 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg) {
     return true;
 }
 
-static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
+static bool parse_anthropic_messages_mm(const char **p, chat_msgs *msgs,
+                                        chat_images *images,
+                                        char *err, size_t errlen) {
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
@@ -2377,7 +2933,8 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
             } else if (!strcmp(key, "content")) {
                 free(msg.content);
                 msg.content = NULL;
-                if (!parse_anthropic_content(p, &msg)) {
+                if (!parse_anthropic_content_mm(p, &msg, images,
+                                                err, errlen)) {
                     free(key);
                     goto fail;
                 }
@@ -2408,6 +2965,13 @@ fail:
     (*p)++;
     return true;
 }
+
+#ifdef DS4_SERVER_TEST
+static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
+    char err[1] = {0};
+    return parse_anthropic_messages_mm(p, msgs, NULL, err, sizeof(err));
+}
+#endif
 
 static bool anthropic_system_part_is_private(const char *s) {
     return s && !strncmp(s, "x-anthropic-", 12);
@@ -3883,6 +4447,26 @@ static int render_qwen_tool_result_block(buf *out, const chat_msgs *msgs,
     return end;
 }
 
+static void append_qwen_message_content(buf *out, const chat_msg *msg) {
+    if (!msg || msg->parts.len == 0) {
+        motif3_buf_put_trimmed(out, msg ? msg->content : "");
+        return;
+    }
+    buf content = {0};
+    for (int i = 0; i < msg->parts.len; i++) {
+        const chat_part *part = &msg->parts.v[i];
+        if (part->kind == CHAT_PART_TEXT) {
+            buf_puts(&content, part->text ? part->text : "");
+        } else {
+            buf_puts(&content, DS4_QWEN_VISION_START DS4_QWEN_IMAGE_PAD
+                               DS4_QWEN_VISION_END);
+        }
+    }
+    char *rendered = buf_take(&content);
+    motif3_buf_put_trimmed(out, rendered);
+    free(rendered);
+}
+
 static char *render_qwen_chat_prompt_text_choice_impl(
         const chat_msgs *msgs, const char *tool_schemas,
         const tool_schema_orders *tool_orders, ds4_think_mode think_mode,
@@ -3929,7 +4513,7 @@ static char *render_qwen_chat_prompt_text_choice_impl(
         } else if (!strcmp(m->role, "user") &&
                    !chat_msg_is_model_tool_result(m)) {
             buf_puts(&out, DS4_QWEN_IM_START "user\n");
-            motif3_buf_put_trimmed(&out, m->content);
+            append_qwen_message_content(&out, m);
             buf_puts(&out, DS4_QWEN_IM_END "\n");
         } else if (chat_msg_is_model_tool_result(m)) {
             i = render_qwen_tool_result_block(&out, msgs, i) - 1;
@@ -4607,7 +5191,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         p++;
         if (!strcmp(key, "messages")) {
             chat_msgs_free(&msgs);
-            if (!parse_messages(&p, &msgs)) {
+            chat_images_free(&r->images);
+            if (!parse_messages_mm(&p, &msgs, &r->images,
+                                   err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -4753,6 +5339,13 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
+    if (!chat_msgs_validate_images(&msgs, &r->images, r->chat_format,
+                                   err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
@@ -4766,6 +5359,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         r->model_syntax, &msgs, active_tool_schemas, &r->tool_orders,
         r->think_mode, r->tool_choice, r->chat_format);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (!request_expand_qwen_image_tokens(r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     chat_msgs_free(&msgs);
     free(tool_schemas);
     return true;
@@ -4809,7 +5408,9 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         p++;
         if (!strcmp(key, "messages")) {
             chat_msgs_free(&msgs);
-            if (!parse_anthropic_messages(&p, &msgs)) {
+            chat_images_free(&r->images);
+            if (!parse_anthropic_messages_mm(
+                    &p, &msgs, &r->images, err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -4944,6 +5545,14 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         request_free(r);
         return false;
     }
+    if (!chat_msgs_validate_images(&msgs, &r->images, r->chat_format,
+                                   err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
     r->think_mode = think_mode_from_enabled(thinking_enabled, reasoning_effort);
@@ -4969,6 +5578,13 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         r->model_syntax, &msgs, active_tool_schemas, &r->tool_orders,
         r->think_mode, r->tool_choice, r->chat_format);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (!request_expand_qwen_image_tokens(r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
@@ -4987,9 +5603,16 @@ bad:
  * recognized text blocks. Numbers / objects / arrays-of-primitives at the top
  * level all reject so the client sees a 400 instead of an answer built on
  * silently dropped context. */
-static bool parse_responses_content_array(const char **p, char **out) {
+static bool parse_responses_content_array_mm(const char **p, char **out,
+                                             chat_parts *parts,
+                                             chat_images *images,
+                                             char *err, size_t errlen) {
     json_ws(p);
-    if (**p == '"') return json_string(p, out);
+    if (**p == '"') {
+        if (!json_string(p, out)) return false;
+        chat_parts_push_text(parts, *out);
+        return true;
+    }
     if (json_lit(p, "null")) {
         *out = xstrdup("");
         return true;
@@ -5005,17 +5628,20 @@ static bool parse_responses_content_array(const char **p, char **out) {
             char *s = NULL;
             if (!json_string(p, &s)) goto fail;
             buf_puts(&b, s);
+            chat_parts_push_text(parts, s);
             free(s);
         } else if (**p == '{') {
             (*p)++;
             char *type = NULL;
             char *text = NULL;
+            char *image_url = NULL;
             json_ws(p);
             while (**p && **p != '}') {
                 char *key = NULL;
                 if (!json_string(p, &key)) {
                     free(type);
                     free(text);
+                    free(image_url);
                     goto fail;
                 }
                 json_ws(p);
@@ -5023,6 +5649,7 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     free(key);
                     free(type);
                     free(text);
+                    free(image_url);
                     goto fail;
                 }
                 (*p)++;
@@ -5031,6 +5658,7 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     if (!json_string(p, &type)) {
                         free(key);
                         free(text);
+                        free(image_url);
                         goto fail;
                     }
                 } else if (!strcmp(key, "text")) {
@@ -5044,12 +5672,23 @@ static bool parse_responses_content_array(const char **p, char **out) {
                     } else if (!json_string(p, &text)) {
                         free(key);
                         free(type);
+                        free(image_url);
+                        goto fail;
+                    }
+                } else if (!strcmp(key, "image_url")) {
+                    free(image_url);
+                    image_url = NULL;
+                    if (!json_string(p, &image_url)) {
+                        free(key);
+                        free(type);
+                        free(text);
                         goto fail;
                     }
                 } else if (!json_skip_value(p)) {
                     free(key);
                     free(type);
                     free(text);
+                    free(image_url);
                     goto fail;
                 }
                 free(key);
@@ -5060,28 +5699,45 @@ static bool parse_responses_content_array(const char **p, char **out) {
             if (**p != '}') {
                 free(type);
                 free(text);
+                free(image_url);
                 goto fail;
             }
             (*p)++;
-            /* Fail closed: a content object must carry a known text-like type
-             * AND a text field. Anything else — missing type, missing text,
-             * image/file/audio types, future schema-drift — is rejected so the
-             * client gets a 400 instead of an answer built on context the
-             * server discarded silently. */
             bool is_text_block = type && (
                 !strcmp(type, "input_text") ||
                 !strcmp(type, "output_text") ||
                 !strcmp(type, "text") ||
                 !strcmp(type, "summary_text") ||
                 !strcmp(type, "reasoning_text"));
-            if (!is_text_block || !text) {
+            if (is_text_block && text) {
+                buf_puts(&b, text);
+                chat_parts_push_text(parts, text);
+            } else if (type && !strcmp(type, "input_image") && image_url &&
+                       parts && images) {
+                int image_index = -1;
+                if (!chat_images_add_data_uri(images, image_url, &image_index,
+                                              err, errlen)) {
+                    free(type);
+                    free(text);
+                    free(image_url);
+                    goto fail;
+                }
+                chat_part part = {
+                    .kind = CHAT_PART_IMAGE,
+                    .image_index = image_index,
+                };
+                chat_parts_push(parts, part);
+            } else {
+                if (err && errlen && !err[0])
+                    snprintf(err, errlen, "unsupported Responses content block");
                 free(type);
                 free(text);
+                free(image_url);
                 goto fail;
             }
-            buf_puts(&b, text);
             free(type);
             free(text);
+            free(image_url);
         } else {
             /* Reject primitives, arrays-of-arrays, nulls: a content array
              * element must be either a string or a typed text object. */
@@ -5098,6 +5754,12 @@ static bool parse_responses_content_array(const char **p, char **out) {
 fail:
     buf_free(&b);
     return false;
+}
+
+static bool parse_responses_content_array(const char **p, char **out) {
+    char err[1] = {0};
+    return parse_responses_content_array_mm(
+        p, out, NULL, NULL, err, sizeof(err));
 }
 
 /* Codex /v1/responses input items have a `type` discriminator (message,
@@ -5117,9 +5779,11 @@ fail:
  *
  * Reasoning items are merged into the next assistant message so
  * render_chat_prompt_text can wrap them in <think>. */
-static bool parse_responses_input(const char **p, chat_msgs *msgs,
-                                  buf *loaded_tool_schemas,
-                                  tool_schema_orders *orders) {
+static bool parse_responses_input_mm(const char **p, chat_msgs *msgs,
+                                     buf *loaded_tool_schemas,
+                                     tool_schema_orders *orders,
+                                     chat_images *images,
+                                     char *err, size_t errlen) {
     json_ws(p);
     if (**p != '[') return false;
     (*p)++;
@@ -5145,6 +5809,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
         char *result = NULL;
         char *tools_json = NULL;
         char *status_str = NULL;
+        chat_parts content_parts = {0};
         json_ws(p);
         while (**p && **p != '}') {
             char *key = NULL;
@@ -5169,7 +5834,10 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                 }
             } else if (!strcmp(key, "content")) {
                 free(content);
-                if (!parse_responses_content_array(p, &content)) {
+                content = NULL;
+                chat_parts_free(&content_parts);
+                if (!parse_responses_content_array_mm(
+                        p, &content, &content_parts, images, err, errlen)) {
                     free(key);
                     goto item_fail;
                 }
@@ -5303,6 +5971,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_parts_free(&content_parts);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -5322,6 +5991,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_parts_free(&content_parts);
             goto fail;
         }
         (*p)++;
@@ -5349,6 +6019,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_parts_free(&content_parts);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -5379,6 +6050,8 @@ item_fail:
             msg.role = xstrdup(role ? role : "user");
             msg.content = content ? content : xstrdup("");
             content = NULL;
+            msg.parts = content_parts;
+            memset(&content_parts, 0, sizeof(content_parts));
             if (!strcmp(msg.role, "assistant") && pending_reasoning.len) {
                 msg.reasoning = buf_take(&pending_reasoning);
             }
@@ -5506,6 +6179,7 @@ item_fail:
                     free(result);
                     free(tools_json);
                     free(status_str);
+                    chat_parts_free(&content_parts);
                     buf_free(&pending_reasoning);
                     return false;
                 }
@@ -5546,6 +6220,7 @@ item_fail:
             free(result);
             free(tools_json);
             free(status_str);
+            chat_parts_free(&content_parts);
             buf_free(&pending_reasoning);
             return false;
         }
@@ -5565,6 +6240,7 @@ item_fail:
         free(result);
         free(tools_json);
         free(status_str);
+        chat_parts_free(&content_parts);
         json_ws(p);
         if (**p == ',') (*p)++;
         json_ws(p);
@@ -5588,6 +6264,16 @@ fail:
     buf_free(&pending_reasoning);
     return false;
 }
+
+#ifdef DS4_SERVER_TEST
+static bool parse_responses_input(const char **p, chat_msgs *msgs,
+                                  buf *loaded_tool_schemas,
+                                  tool_schema_orders *orders) {
+    char err[1] = {0};
+    return parse_responses_input_mm(p, msgs, loaded_tool_schemas, orders,
+                                    NULL, err, sizeof(err));
+}
+#endif
 
 /* Responses API has `reasoning: {"effort": "...", "summary": "..."}`. effort
  * controls thinking depth; summary mode (auto/concise/detailed) controls
@@ -5693,6 +6379,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         p++;
         if (!strcmp(key, "input")) {
             chat_msgs_free(&msgs);
+            chat_images_free(&r->images);
             json_ws(&p);
             /* Codex CLI always sends `input` as an array; tolerate bare strings
              * for parity with other Responses-API callers. */
@@ -5706,8 +6393,9 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 msg.role = xstrdup("user");
                 msg.content = plain;
                 chat_msgs_push(&msgs, msg);
-            } else if (!parse_responses_input(&p, &msgs, &loaded_tool_schemas,
-                                              &r->tool_orders)) {
+            } else if (!parse_responses_input_mm(
+                           &p, &msgs, &loaded_tool_schemas, &r->tool_orders,
+                           &r->images, err, errlen)) {
                 free(key);
                 goto bad;
             }
@@ -5881,6 +6569,16 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         request_free(r);
         return false;
     }
+    if (!chat_msgs_validate_images(&msgs, &r->images, r->chat_format,
+                                   err, errlen)) {
+        chat_msgs_free(&msgs);
+        buf_free(&combined_tool_schemas);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     const char *active_tool_schemas =
         r->has_tools ? combined_tool_schemas.ptr : NULL;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
@@ -5909,6 +6607,15 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         r->model_syntax, &msgs, active_tool_schemas, &r->tool_orders,
         r->think_mode, r->tool_choice, r->chat_format);
     ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    if (!request_expand_qwen_image_tokens(r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        buf_free(&combined_tool_schemas);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     chat_msgs_free(&msgs);
     buf_free(&combined_tool_schemas);
     buf_free(&loaded_tool_schemas);
@@ -13384,6 +14091,7 @@ static void kv_cache_store_bank(server *s, int bank, const char *reason,
     if (min_committed <= 0) return;
     if (!s->kv.enabled || !s->batch_ctx || !s->warm) return;
     if (bank < 0 || bank >= s->batch_ctx_max_seq || !s->warm[bank].valid) return;
+    if (ds4_batch_ctx_bank_multimodal(s->batch_ctx, bank)) return;
     if (s->warm[bank].partial_only) return;
     if (!s->warm[bank].text || s->warm[bank].len == 0) return;
     const int *htok = NULL;
@@ -16495,6 +17203,7 @@ enum ds4_req_need {
     DS4_NEED_DURABLE_RESPONSE     = 1u << 9,   /* previous_response_id/conversation store */
     DS4_NEED_PREFILL_ONLY         = 1u << 10,  /* retire without sampling a seed token */
     DS4_NEED_BANK_FRONTIER        = 1u << 11,  /* Inc 6b: tool-result turn resuming a BANK's live KV */
+    DS4_NEED_IMAGE                = 1u << 12,  /* Qwen vision tower requires bank runtime */
 };
 
 /* Requirements from a parsed request.  Two scoping decisions are deliberate
@@ -16529,6 +17238,7 @@ static uint32_t request_compute_needs(const request *r) {
     if (r->stops.len > 0)                       n |= DS4_NEED_STOP_SCAN;
     if (r->has_tools)                           n |= DS4_NEED_TOOL_SCAN;
     if (r->return_token_ids)                    n |= DS4_NEED_TOKEN_IDS;
+    if (r->images.len > 0)                      n |= DS4_NEED_IMAGE;
     if (r->responses_requires_live_tool_state || r->responses_requires_live_reasoning ||
         r->anthropic_requires_live_tool_state) {
         /* Inc 6b: a live continuation whose pinned record is BANK-owned is
@@ -16557,7 +17267,8 @@ static uint32_t request_compute_needs(const request *r) {
  * except durable references, which the parse layer rejects. */
 #define ROUTE_CONT_MASK  (DS4_NEED_STREAMING | DS4_NEED_PER_ROW_SAMPLING | \
                           DS4_NEED_THINKING | DS4_NEED_STOP_SCAN |         \
-                          DS4_NEED_TOOL_SCAN | DS4_NEED_TOKEN_IDS)
+                          DS4_NEED_TOOL_SCAN | DS4_NEED_TOKEN_IDS |         \
+                          DS4_NEED_IMAGE)
 #define ROUTE_STATIC_MASK ((uint32_t)0)
 #define ROUTE_SERIAL_MASK (~(uint32_t)DS4_NEED_DURABLE_RESPONSE)
 
@@ -16721,6 +17432,11 @@ static ds4_route_decision route_decide(uint32_t needs, ds4_wire_surface surf,
         d.lane = ROUTE_LANE_CONTINUOUS;
         d.reason = (needs & DS4_NEED_BANK_FRONTIER) ? ROUTE_REASON_CONT_BANK
                                                     : ROUTE_REASON_CONT;
+        return d;
+    }
+    if (needs & DS4_NEED_IMAGE) {
+        d.lane = ROUTE_LANE_NONE;
+        d.reason = ROUTE_REASON_CONT_UNAVAILABLE;
         return d;
     }
     /* Static fallback, scoped to its exact capabilities (plan §5 Inc 3
@@ -18146,6 +18862,12 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
                              int finish) {
     if (!s->warm || j->cont_bank < 0 || j->cont_bank >= s->batch_ctx_max_seq) return;
     const int bank = j->cont_bank;
+    /* Image-pad tokens do not identify the pixels.  Until disk/warm records
+     * carry an image digest, never reuse or persist an image bank by text. */
+    if (ds4_batch_ctx_bank_multimodal(s->batch_ctx, bank)) {
+        warm_rec_invalidate(s, bank);
+        return;
+    }
     if (!tokens || n <= 0) {
         /* v0.5.4 (376884 posts 126-127): an aborted/failed admission leaves
          * the bank at its chunk watermark -- a valid, SHORTER committed
@@ -18477,7 +19199,10 @@ static bool cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
         if (o && o != j && o->cont_bank >= 0 && o->cont_bank < s->batch_ctx_max_seq)
             occ[o->cont_bank] = true;
     }
-    const char *ptext = j->req.prompt_text;
+    /* Image-pad text does not identify pixels.  Keep multimodal requests out
+     * of live/disk prefix matching and let the common cold-placement tail
+     * select their bank. */
+    const char *ptext = j->req.images.len ? NULL : j->req.prompt_text;
     const size_t plen = ptext ? strlen(ptext) : 0;
     int best = -1;
     size_t best_len = 0;
@@ -19025,6 +19750,17 @@ static int cont_admit(void *ud, ds4_cont_request *req) {
     cs->inflight[slot] = j;
     req->tokens  = j->req.prompt.v;
     req->n       = j->req.prompt.len;
+    req->image_count = (uint32_t)j->req.images.len;
+    for (uint32_t i = 0u; i < req->image_count; i++) {
+        const chat_image *image = &j->req.images.v[i];
+        req->images[i] = (ds4_qwen_image_input) {
+            .data = image->data,
+            .data_len = image->len,
+            .token_offset = image->token_offset,
+            .grid_h = image->info.grid_h,
+            .grid_w = image->info.grid_w,
+        };
+    }
     req->max_new = request_decode_budget(&j->req, s->default_tokens);
     req->eos     = ds4_token_eos(s->engine);
     req->user    = j;
@@ -25772,6 +26508,102 @@ static void test_qwen4exp_native_chat_protocol(void) {
     tool_schema_orders_free(&orders);
 }
 
+static void test_qwen4exp_image_api_normalization(void) {
+    static const char png_b64[] =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mP8"
+        "z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    char chat_json[1024];
+    char responses_json[1024];
+    char anthropic_json[1024];
+    snprintf(chat_json, sizeof(chat_json),
+        "[{\"role\":\"user\",\"content\":["
+        "{\"type\":\"text\",\"text\":\"before\"},"
+        "{\"type\":\"image_url\",\"image_url\":{"
+        "\"url\":\"data:image/png;base64,%s\"}},"
+        "{\"type\":\"text\",\"text\":\"after\"}]}]", png_b64);
+    snprintf(responses_json, sizeof(responses_json),
+        "[{\"type\":\"message\",\"role\":\"user\",\"content\":["
+        "{\"type\":\"input_text\",\"text\":\"before\"},"
+        "{\"type\":\"input_image\","
+        "\"image_url\":\"data:image/png;base64,%s\"},"
+        "{\"type\":\"input_text\",\"text\":\"after\"}]}]", png_b64);
+    snprintf(anthropic_json, sizeof(anthropic_json),
+        "[{\"role\":\"user\",\"content\":["
+        "{\"type\":\"text\",\"text\":\"before\"},"
+        "{\"type\":\"image\",\"source\":{\"type\":\"base64\","
+        "\"media_type\":\"image/png\",\"data\":\"%s\"}},"
+        "{\"type\":\"text\",\"text\":\"after\"}]}]", png_b64);
+
+    chat_images images[3] = {{0}};
+    chat_msgs msgs[3] = {{0}};
+    char err[160] = {0};
+    const char *p = chat_json;
+    TEST_ASSERT(parse_messages_mm(&p, &msgs[0], &images[0], err, sizeof(err)));
+    p = responses_json;
+    TEST_ASSERT(parse_responses_input_mm(
+        &p, &msgs[1], NULL, NULL, &images[1], err, sizeof(err)));
+    p = anthropic_json;
+    TEST_ASSERT(parse_anthropic_messages_mm(
+        &p, &msgs[2], &images[2], err, sizeof(err)));
+
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(images[i].len == 1);
+        TEST_ASSERT(images[i].v[0].mime == CHAT_IMAGE_PNG);
+        TEST_ASSERT(images[i].v[0].len > 8);
+        TEST_ASSERT(msgs[i].len == 1);
+        TEST_ASSERT(msgs[i].v[0].parts.len == 3);
+        TEST_ASSERT(msgs[i].v[0].parts.v[0].kind == CHAT_PART_TEXT);
+        TEST_ASSERT(msgs[i].v[0].parts.v[1].kind == CHAT_PART_IMAGE);
+        TEST_ASSERT(msgs[i].v[0].parts.v[2].kind == CHAT_PART_TEXT);
+        TEST_ASSERT(!strcmp(msgs[i].v[0].content, "beforeafter"));
+    }
+    TEST_ASSERT(images[0].v[0].len == images[1].v[0].len &&
+                images[0].v[0].len == images[2].v[0].len);
+    TEST_ASSERT(!memcmp(images[0].v[0].data, images[1].v[0].data,
+                        images[0].v[0].len));
+    TEST_ASSERT(!memcmp(images[0].v[0].data, images[2].v[0].data,
+                        images[0].v[0].len));
+    ds4_qwen_image_info info = {0};
+    TEST_ASSERT(ds4_qwen_image_probe(
+        images[0].v[0].data, images[0].v[0].len,
+        &info, err, sizeof(err)) == 0);
+    TEST_ASSERT(info.source_width == 1u && info.source_height == 1u);
+    TEST_ASSERT(info.resized_width == 256u && info.resized_height == 256u);
+    TEST_ASSERT(info.grid_w == 16u && info.grid_h == 16u &&
+                info.token_count == 64u);
+
+    char *prompt = render_chat_prompt_text_choice_format(
+        &msgs[0], NULL, NULL, DS4_THINK_NONE, TOOL_CHOICE_AUTO,
+        DS4_CHAT_FORMAT_QWEN4EXP);
+    TEST_ASSERT(prompt && strstr(prompt,
+        "before<|vision_start|><|image_pad|><|vision_end|>after") != NULL);
+    free(prompt);
+
+    for (int i = 0; i < 3; i++) {
+        chat_msgs_free(&msgs[i]);
+        chat_images_free(&images[i]);
+    }
+
+    chat_images bad_images = {0};
+    chat_msgs bad_msgs = {0};
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"https://example.com/x.png\"}}]}]";
+    memset(err, 0, sizeof(err));
+    TEST_ASSERT(!parse_messages_mm(&p, &bad_msgs, &bad_images,
+                                   err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "base64 data URI") != NULL);
+    chat_msgs_free(&bad_msgs);
+    chat_images_free(&bad_images);
+
+    uint8_t *bounded = NULL;
+    size_t bounded_len = 0u;
+    memset(err, 0, sizeof(err));
+    TEST_ASSERT(!base64_decode_image(
+        png_b64, 0u, &bounded, &bounded_len, err, sizeof(err)));
+    TEST_ASSERT(bounded == NULL && bounded_len == 0u);
+    TEST_ASSERT(strstr(err, "20 MiB request limit") != NULL);
+}
+
 static void test_reasoning_effort_mapping(void) {
     ds4_think_mode mode = DS4_THINK_NONE;
     /* The three levels are distinct now; aliases round DOWN to the nearest. */
@@ -30755,6 +31587,9 @@ static void test_request_compute_needs_matrix(void) {
     /* OpenAI explicit-zero budget is NOT the Anthropic prewarm contract. */
     r.max_tokens_set = true; r.max_tokens = 0;
     TEST_ASSERT(request_compute_needs(&r) == 0);
+    r.images.len = 1;
+    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_IMAGE);
+    r.images.len = 0;
     request_free(&r);
 
     request_init(&r, REQ_CHAT, 128);
@@ -30955,6 +31790,10 @@ static void test_route_decide_reason_table(void) {
 
     d = route_decide(0, DS4_WIRE_OPENAI_CHAT, &on);
     TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+    d = route_decide(DS4_NEED_IMAGE, DS4_WIRE_OPENAI_CHAT, &on);
+    TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT);
+    d = route_decide(DS4_NEED_IMAGE, DS4_WIRE_OPENAI_CHAT, &no_ctx);
+    TEST_ASSERT(d.lane == ROUTE_LANE_NONE && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
     d = route_decide(DS4_NEED_STREAMING, DS4_WIRE_OPENAI_CHAT, &no_ctx);
     TEST_ASSERT(d.lane == ROUTE_LANE_SERIAL && d.reason == ROUTE_REASON_CONT_UNAVAILABLE);
     d = route_decide(0, DS4_WIRE_OPENAI_CHAT, &no_ctx);
@@ -35280,6 +36119,7 @@ static void ds4_server_unit_tests_run(void) {
     test_solar_native_tool_recovery();
     test_solar_native_anthropic_tool_result_rendering();
     test_qwen4exp_native_chat_protocol();
+    test_qwen4exp_image_api_normalization();
     test_reasoning_effort_mapping();
     test_model_family_aliases();
     test_client_reasoning_effort_compat();

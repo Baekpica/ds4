@@ -224,7 +224,7 @@ proof-cuda-opp-c: ds4
 		--check-expected tests/proof/expected/cuda-opp-c-full.json
 endif
 
-ds4.o: ds4.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h vendor/stb_image.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_ple.o: ds4_ple.c ds4_ple.h

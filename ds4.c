@@ -41,6 +41,20 @@
 #include "ds4_ple.h"
 #include "cuda/qwen38_ple.h"
 
+#define STBI_NO_STDIO
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_PNG
+#define STBI_FAILURE_USERMSG
+#define STB_IMAGE_IMPLEMENTATION
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#endif
+#include "vendor/stb_image.h"
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
 #endif
@@ -75,6 +89,90 @@ typedef enum {
 #define DS4_DEFAULT_ROPE_YARN_BETA_SLOW (1.0f)
 #define DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE (160000.0f)
 #define DS4_DEFAULT_ROPE_ORIG_CTX       UINT64_C(65536)
+
+#define DS4_QWEN_IMAGE_FACTOR       32u
+#define DS4_QWEN_IMAGE_MIN_PIXELS   UINT64_C(65536)
+#define DS4_QWEN_IMAGE_MAX_PIXELS   UINT64_C(16777216)
+
+int ds4_qwen_image_probe(const uint8_t *data, size_t data_len,
+                         ds4_qwen_image_info *info,
+                         char *err, size_t errlen) {
+    if (!data || data_len == 0u || data_len > INT_MAX || !info) {
+        if (err && errlen) snprintf(err, errlen, "invalid image payload");
+        return 1;
+    }
+    int width = 0, height = 0, channels = 0;
+    if (!stbi_info_from_memory(data, (int)data_len,
+                               &width, &height, &channels) ||
+        width <= 0 || height <= 0) {
+        if (err && errlen)
+            snprintf(err, errlen, "cannot read PNG/JPEG dimensions: %s",
+                     stbi_failure_reason() ? stbi_failure_reason() : "invalid image");
+        return 1;
+    }
+    const uint64_t source_pixels = (uint64_t)(uint32_t)width * (uint32_t)height;
+    if (source_pixels > DS4_QWEN_IMAGE_MAX_PIXELS) {
+        if (err && errlen)
+            snprintf(err, errlen, "source image exceeds 16,777,216 pixels");
+        return 1;
+    }
+    const uint32_t short_side = width < height ? (uint32_t)width : (uint32_t)height;
+    const uint32_t long_side = width > height ? (uint32_t)width : (uint32_t)height;
+    if ((uint64_t)long_side > (uint64_t)short_side * 200u) {
+        if (err && errlen)
+            snprintf(err, errlen, "image aspect ratio must not exceed 200:1");
+        return 1;
+    }
+
+    uint32_t resized_h = (uint32_t)lrint((double)height /
+                                         DS4_QWEN_IMAGE_FACTOR) *
+                         DS4_QWEN_IMAGE_FACTOR;
+    uint32_t resized_w = (uint32_t)lrint((double)width /
+                                         DS4_QWEN_IMAGE_FACTOR) *
+                         DS4_QWEN_IMAGE_FACTOR;
+    if (resized_h < DS4_QWEN_IMAGE_FACTOR) resized_h = DS4_QWEN_IMAGE_FACTOR;
+    if (resized_w < DS4_QWEN_IMAGE_FACTOR) resized_w = DS4_QWEN_IMAGE_FACTOR;
+    uint64_t resized_pixels = (uint64_t)resized_h * resized_w;
+    if (resized_pixels > DS4_QWEN_IMAGE_MAX_PIXELS) {
+        const double beta = sqrt((double)source_pixels /
+                                 (double)DS4_QWEN_IMAGE_MAX_PIXELS);
+        resized_h = (uint32_t)floor((double)height / beta /
+                                    DS4_QWEN_IMAGE_FACTOR) *
+                    DS4_QWEN_IMAGE_FACTOR;
+        resized_w = (uint32_t)floor((double)width / beta /
+                                    DS4_QWEN_IMAGE_FACTOR) *
+                    DS4_QWEN_IMAGE_FACTOR;
+        if (resized_h < DS4_QWEN_IMAGE_FACTOR) resized_h = DS4_QWEN_IMAGE_FACTOR;
+        if (resized_w < DS4_QWEN_IMAGE_FACTOR) resized_w = DS4_QWEN_IMAGE_FACTOR;
+    } else if (resized_pixels < DS4_QWEN_IMAGE_MIN_PIXELS) {
+        const double beta = sqrt((double)DS4_QWEN_IMAGE_MIN_PIXELS /
+                                 (double)source_pixels);
+        resized_h = (uint32_t)ceil((double)height * beta /
+                                   DS4_QWEN_IMAGE_FACTOR) *
+                    DS4_QWEN_IMAGE_FACTOR;
+        resized_w = (uint32_t)ceil((double)width * beta /
+                                   DS4_QWEN_IMAGE_FACTOR) *
+                    DS4_QWEN_IMAGE_FACTOR;
+    }
+    const uint32_t grid_h = resized_h / 16u;
+    const uint32_t grid_w = resized_w / 16u;
+    const uint64_t tokens = (uint64_t)grid_h * grid_w / 4u;
+    if ((grid_h & 1u) || (grid_w & 1u) || tokens == 0u ||
+        tokens > UINT32_MAX) {
+        if (err && errlen) snprintf(err, errlen, "invalid Qwen image grid");
+        return 1;
+    }
+    *info = (ds4_qwen_image_info) {
+        .source_width = (uint32_t)width,
+        .source_height = (uint32_t)height,
+        .resized_width = resized_w,
+        .resized_height = resized_h,
+        .grid_h = grid_h,
+        .grid_w = grid_w,
+        .token_count = (uint32_t)tokens,
+    };
+    return 0;
+}
 
 /* Reasoning-effort prefixes, verbatim from the DeepSeek-V4-Flash-0731 reference
  * encoder (encoding/encoding_dsv4.py, REASONING_EFFORT_PROMPTS).  Upstream's
@@ -1761,6 +1859,44 @@ typedef struct {
     ds4_tensor *head_offsets;
     ds4_tensor *head_vocab_sizes;
 } ds4_qwen_ple_weights;
+
+enum {
+    DS4_QWEN_VISION_LAYER_COUNT = 27,
+    DS4_QWEN_VISION_HIDDEN = 1152,
+    DS4_QWEN_VISION_FF = 4304,
+    DS4_QWEN_VISION_HEADS = 16,
+    DS4_QWEN_VISION_HEAD_DIM = 72,
+    DS4_QWEN_VISION_PATCH_DIM = 3 * 2 * 16 * 16,
+    DS4_QWEN_VISION_MERGED = 4 * 1152,
+};
+
+typedef struct {
+    ds4_tensor *norm1_weight;
+    ds4_tensor *norm1_bias;
+    ds4_tensor *qkv_weight;
+    ds4_tensor *qkv_bias;
+    ds4_tensor *output_weight;
+    ds4_tensor *output_bias;
+    ds4_tensor *norm2_weight;
+    ds4_tensor *norm2_bias;
+    ds4_tensor *ffn_up_weight;
+    ds4_tensor *ffn_up_bias;
+    ds4_tensor *ffn_down_weight;
+    ds4_tensor *ffn_down_bias;
+} ds4_qwen_vision_layer_weights;
+
+typedef struct {
+    ds4_tensor *patch_weight;
+    ds4_tensor *patch_bias;
+    ds4_tensor *position_weight;
+    ds4_qwen_vision_layer_weights layer[DS4_QWEN_VISION_LAYER_COUNT];
+    ds4_tensor *merger_norm_weight;
+    ds4_tensor *merger_norm_bias;
+    ds4_tensor *merger_up_weight;
+    ds4_tensor *merger_up_bias;
+    ds4_tensor *merger_down_weight;
+    ds4_tensor *merger_down_bias;
+} ds4_qwen_vision_weights;
 
 typedef struct {
     ds4_str key;
@@ -4055,6 +4191,7 @@ typedef struct {
     ds4_tensor *qwen_mtp_fc_embedding_norm;
     ds4_tensor *qwen_mtp_fc_hidden_norm;
     ds4_layer_weights qwen_mtp;
+    ds4_qwen_vision_weights qwen_vision;
 } ds4_weights;
 
 typedef struct {
@@ -4235,6 +4372,29 @@ static void tensor_expect_layout4(
 
     const uint64_t want[4] = {d0, d1, d2, d3};
     for (uint32_t i = 0; i < ndim; i++) {
+        if (t->dim[i] == want[i]) continue;
+        fprintf(stderr,
+                "ds4: tensor %.*s has dim[%u]=%" PRIu64
+                ", expected %" PRIu64 "\n",
+                (int)t->name.len, t->name.ptr, i, t->dim[i], want[i]);
+        exit(1);
+    }
+}
+
+static void tensor_expect_layout5(
+        const ds4_tensor *t,
+        uint32_t type,
+        uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3, uint64_t d4) {
+    if (!t) ds4_die("internal error: missing tensor while validating layout");
+    if (t->type != type || t->ndim != 5u) {
+        fprintf(stderr,
+                "ds4: tensor %.*s has type/rank %s/%u, expected %s/5\n",
+                (int)t->name.len, t->name.ptr, tensor_type_name(t->type),
+                t->ndim, tensor_type_name(type));
+        exit(1);
+    }
+    const uint64_t want[5] = {d0, d1, d2, d3, d4};
+    for (uint32_t i = 0; i < 5u; i++) {
         if (t->dim[i] == want[i]) continue;
         fprintf(stderr,
                 "ds4: tensor %.*s has dim[%u]=%" PRIu64
@@ -5279,6 +5439,61 @@ static void weights_validate_qwen4exp_ple(
     tensor_expect_layout(p->head_vocab_sizes, DS4_TENSOR_I64, 1, 16, 0, 0);
 }
 
+static void weights_validate_qwen4exp_vision(
+        const ds4_qwen_vision_weights *v) {
+    if (!v) ds4_die("internal error: missing Qwen4Exp vision weights");
+    tensor_expect_layout5(v->patch_weight, DS4_TENSOR_BF16,
+                          16u, 16u, 2u, 3u, DS4_QWEN_VISION_HIDDEN);
+    tensor_expect_layout(v->patch_bias, DS4_TENSOR_F32, 1,
+                         DS4_QWEN_VISION_HIDDEN, 0u, 0u);
+    tensor_expect_layout(v->position_weight, DS4_TENSOR_Q8_0, 2,
+                         DS4_QWEN_VISION_HIDDEN, 2304u, 0u);
+    for (uint32_t il = 0; il < DS4_QWEN_VISION_LAYER_COUNT; il++) {
+        const ds4_qwen_vision_layer_weights *l = &v->layer[il];
+        tensor_expect_layout(l->norm1_weight, DS4_TENSOR_F32, 1,
+                             DS4_QWEN_VISION_HIDDEN, 0u, 0u);
+        tensor_expect_layout(l->norm1_bias, DS4_TENSOR_F32, 1,
+                             DS4_QWEN_VISION_HIDDEN, 0u, 0u);
+        tensor_expect_layout(l->qkv_weight, DS4_TENSOR_Q8_0, 2,
+                             DS4_QWEN_VISION_HIDDEN,
+                             3u * DS4_QWEN_VISION_HIDDEN, 0u);
+        tensor_expect_layout(l->qkv_bias, DS4_TENSOR_F32, 1,
+                             3u * DS4_QWEN_VISION_HIDDEN, 0u, 0u);
+        tensor_expect_layout(l->output_weight, DS4_TENSOR_Q8_0, 2,
+                             DS4_QWEN_VISION_HIDDEN,
+                             DS4_QWEN_VISION_HIDDEN, 0u);
+        tensor_expect_layout(l->output_bias, DS4_TENSOR_F32, 1,
+                             DS4_QWEN_VISION_HIDDEN, 0u, 0u);
+        tensor_expect_layout(l->norm2_weight, DS4_TENSOR_F32, 1,
+                             DS4_QWEN_VISION_HIDDEN, 0u, 0u);
+        tensor_expect_layout(l->norm2_bias, DS4_TENSOR_F32, 1,
+                             DS4_QWEN_VISION_HIDDEN, 0u, 0u);
+        tensor_expect_layout(l->ffn_up_weight, DS4_TENSOR_Q8_0, 2,
+                             DS4_QWEN_VISION_HIDDEN,
+                             DS4_QWEN_VISION_FF, 0u);
+        tensor_expect_layout(l->ffn_up_bias, DS4_TENSOR_F32, 1,
+                             DS4_QWEN_VISION_FF, 0u, 0u);
+        tensor_expect_layout(l->ffn_down_weight, DS4_TENSOR_BF16, 2,
+                             DS4_QWEN_VISION_FF,
+                             DS4_QWEN_VISION_HIDDEN, 0u);
+        tensor_expect_layout(l->ffn_down_bias, DS4_TENSOR_F32, 1,
+                             DS4_QWEN_VISION_HIDDEN, 0u, 0u);
+    }
+    tensor_expect_layout(v->merger_norm_weight, DS4_TENSOR_F32, 1,
+                         DS4_QWEN_VISION_HIDDEN, 0u, 0u);
+    tensor_expect_layout(v->merger_norm_bias, DS4_TENSOR_F32, 1,
+                         DS4_QWEN_VISION_HIDDEN, 0u, 0u);
+    tensor_expect_layout(v->merger_up_weight, DS4_TENSOR_Q8_0, 2,
+                         DS4_QWEN_VISION_MERGED,
+                         DS4_QWEN_VISION_MERGED, 0u);
+    tensor_expect_layout(v->merger_up_bias, DS4_TENSOR_F32, 1,
+                         DS4_QWEN_VISION_MERGED, 0u, 0u);
+    tensor_expect_layout(v->merger_down_weight, DS4_TENSOR_Q8_0, 2,
+                         DS4_QWEN_VISION_MERGED, DS4_N_EMBD, 0u);
+    tensor_expect_layout(v->merger_down_bias, DS4_TENSOR_F32, 1,
+                         DS4_N_EMBD, 0u, 0u);
+}
+
 static void weights_validate_qwen4exp_layout(
         const ds4_weights *w,
         const ds4_model   *m) {
@@ -5302,6 +5517,7 @@ static void weights_validate_qwen4exp_layout(
     tensor_expect_qwen4exp_matrix(w->output, 2,
                                   DS4_N_EMBD, DS4_N_VOCAB, 0);
     weights_validate_qwen4exp_hc(&w->qwen_input_hc, false);
+    weights_validate_qwen4exp_vision(&w->qwen_vision);
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
@@ -6862,6 +7078,35 @@ static void weights_bind_qwen4exp_mtp(
     l->qwen_ffn_hc.inject = required_tensor(m, "mtp.blk.0.hc_ffn.inject.weight");
 }
 
+static void weights_bind_qwen4exp_vision(
+        ds4_qwen_vision_weights *v,
+        const ds4_model         *m) {
+    v->patch_weight = required_tensor(m, "vision.patch_embed.weight");
+    v->patch_bias = required_tensor(m, "vision.patch_embed.bias");
+    v->position_weight = required_tensor(m, "vision.position_embd.weight");
+    for (uint32_t il = 0; il < DS4_QWEN_VISION_LAYER_COUNT; il++) {
+        ds4_qwen_vision_layer_weights *l = &v->layer[il];
+        l->norm1_weight = required_tensorf(m, "vblk.%u.norm1.weight", il);
+        l->norm1_bias = required_tensorf(m, "vblk.%u.norm1.bias", il);
+        l->qkv_weight = required_tensorf(m, "vblk.%u.attn_qkv.weight", il);
+        l->qkv_bias = required_tensorf(m, "vblk.%u.attn_qkv.bias", il);
+        l->output_weight = required_tensorf(m, "vblk.%u.attn_output.weight", il);
+        l->output_bias = required_tensorf(m, "vblk.%u.attn_output.bias", il);
+        l->norm2_weight = required_tensorf(m, "vblk.%u.norm2.weight", il);
+        l->norm2_bias = required_tensorf(m, "vblk.%u.norm2.bias", il);
+        l->ffn_up_weight = required_tensorf(m, "vblk.%u.ffn_up.weight", il);
+        l->ffn_up_bias = required_tensorf(m, "vblk.%u.ffn_up.bias", il);
+        l->ffn_down_weight = required_tensorf(m, "vblk.%u.ffn_down.weight", il);
+        l->ffn_down_bias = required_tensorf(m, "vblk.%u.ffn_down.bias", il);
+    }
+    v->merger_norm_weight = required_tensor(m, "vision.merger.norm.weight");
+    v->merger_norm_bias = required_tensor(m, "vision.merger.norm.bias");
+    v->merger_up_weight = required_tensor(m, "vision.merger.ffn_up.weight");
+    v->merger_up_bias = required_tensor(m, "vision.merger.ffn_up.bias");
+    v->merger_down_weight = required_tensor(m, "vision.merger.ffn_down.weight");
+    v->merger_down_bias = required_tensor(m, "vision.merger.ffn_down.bias");
+}
+
 static void weights_bind(
         ds4_weights     *w,
         const ds4_model *m,
@@ -6889,6 +7134,7 @@ static void weights_bind(
         for (uint32_t il = 0; il < DS4_N_LAYER; il++)
             weights_bind_qwen4exp_layer(&w->layer[il], m, il);
         weights_bind_qwen4exp_mtp(w, m);
+        weights_bind_qwen4exp_vision(&w->qwen_vision, m);
         weights_validate_layout(w, m);
         return;
     }
@@ -20386,7 +20632,8 @@ static bool qwen4exp_qsa_forward(
         const ds4_gpu_tensor       *input,
         ds4_gpu_tensor             *output,
         uint32_t                    n_tokens,
-        uint32_t                    pos0) {
+        uint32_t                    pos0,
+        const ds4_gpu_tensor       *mrope_positions) {
     if (!ws || !state || !model || !weights || !input || !output ||
         n_tokens == 0u || n_tokens > ws->capacity || pos0 != state->length ||
         pos0 > state->context_cap || n_tokens > state->context_cap - pos0 ||
@@ -20440,9 +20687,14 @@ static bool qwen4exp_qsa_forward(
                 ws->index_query, ws->index_query,
                 model->map, model->size, weights->index_q_norm->abs_offset,
                 index_q_dim, index_head_dim, n_tokens, DS4_RMS_EPS) ||
-        !ds4_gpu_qwen4exp_rope_tensor(
-                ws->index_query, n_tokens, index_heads, index_head_dim,
-                ws->rotary_dim, pos0, DS4_ROPE_FREQ_BASE)) {
+        !(mrope_positions
+              ? ds4_gpu_qwen4exp_mrope_tensor(
+                    ws->index_query, mrope_positions, n_tokens,
+                    index_heads, index_head_dim, ws->rotary_dim,
+                    pos0, DS4_ROPE_FREQ_BASE)
+              : ds4_gpu_qwen4exp_rope_tensor(
+                    ws->index_query, n_tokens, index_heads, index_head_dim,
+                    ws->rotary_dim, pos0, DS4_ROPE_FREQ_BASE))) {
         return false;
     }
 
@@ -20450,7 +20702,7 @@ static bool qwen4exp_qsa_forward(
     const uint32_t max_blocks = (pos0 + n_tokens) / ws->ratio;
     if (max_blocks > old_blocks &&
         !ds4_gpu_qwen4exp_qsa_pool_blocks_tensor(
-                state->pooled_index, state->raw_index,
+                state->pooled_index, state->raw_index, mrope_positions,
                 model->map, model->size,
                 weights->index_k_norm->abs_offset,
                 old_blocks, max_blocks - old_blocks, state->block_cap,
@@ -20509,12 +20761,20 @@ static bool qwen4exp_qsa_forward(
                 ws->key, ws->key, model->map, model->size,
                 weights->k_norm->abs_offset, kv_dim, head_dim,
                 n_tokens, DS4_RMS_EPS) ||
-        !ds4_gpu_qwen4exp_rope_tensor(
-                ws->query, n_tokens, heads, head_dim, ws->rotary_dim,
-                pos0, DS4_ROPE_FREQ_BASE) ||
-        !ds4_gpu_qwen4exp_rope_tensor(
-                ws->key, n_tokens, kv_heads, head_dim, ws->rotary_dim,
-                pos0, DS4_ROPE_FREQ_BASE) ||
+        !(mrope_positions
+              ? ds4_gpu_qwen4exp_mrope_tensor(
+                    ws->query, mrope_positions, n_tokens, heads, head_dim,
+                    ws->rotary_dim, pos0, DS4_ROPE_FREQ_BASE)
+              : ds4_gpu_qwen4exp_rope_tensor(
+                    ws->query, n_tokens, heads, head_dim, ws->rotary_dim,
+                    pos0, DS4_ROPE_FREQ_BASE)) ||
+        !(mrope_positions
+              ? ds4_gpu_qwen4exp_mrope_tensor(
+                    ws->key, mrope_positions, n_tokens, kv_heads, head_dim,
+                    ws->rotary_dim, pos0, DS4_ROPE_FREQ_BASE)
+              : ds4_gpu_qwen4exp_rope_tensor(
+                    ws->key, n_tokens, kv_heads, head_dim, ws->rotary_dim,
+                    pos0, DS4_ROPE_FREQ_BASE)) ||
         !ds4_gpu_qwen4exp_qsa_store_kv_tensor(
                 state->k_cache, state->v_cache, ws->key, ws->value,
                 n_tokens, pos0, state->context_cap, kv_heads, head_dim) ||
@@ -20948,6 +21208,295 @@ static bool qwen4exp_ple_forward(ds4_qwen_ple_ws *ws,
 }
 
 typedef struct {
+    int ksize;
+    int *bounds;
+    int32_t *weights;
+} ds4_qwen_resize_axis;
+
+static void qwen4exp_resize_axis_free(ds4_qwen_resize_axis *a) {
+    if (!a) return;
+    free(a->weights);
+    free(a->bounds);
+    memset(a, 0, sizeof(*a));
+}
+
+static double qwen4exp_bicubic_filter(double x) {
+    const double a = -0.5;
+    if (x < 0.0) x = -x;
+    if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+    if (x < 2.0) return (((x - 5.0) * x + 8.0) * x - 4.0) * a;
+    return 0.0;
+}
+
+/* Antialiased BICUBIC coefficients adapted from the already-vendored
+ * llama.cpp mtmd image path.  Keeping this local avoids a second image
+ * dependency while matching the Qwen processor's explicit resample mode. */
+static bool qwen4exp_resize_axis_build(int in_size, int out_size,
+                                       ds4_qwen_resize_axis *a) {
+    if (!a || in_size <= 0 || out_size <= 0) return false;
+    memset(a, 0, sizeof(*a));
+    const double scale = (double)in_size / (double)out_size;
+    const double filter_scale = scale < 1.0 ? 1.0 : scale;
+    const double support = 2.0 * filter_scale;
+    const int ksize = (int)ceil(support) * 2 + 1;
+    if (ksize <= 0 || (size_t)out_size > SIZE_MAX / 2u / sizeof(int) ||
+        (size_t)out_size > SIZE_MAX / (size_t)ksize / sizeof(int32_t))
+        return false;
+    a->bounds = xmalloc((size_t)out_size * 2u * sizeof(int));
+    a->weights = xmalloc(
+        (size_t)out_size * (size_t)ksize * sizeof(int32_t));
+    double *tmp = xmalloc((size_t)ksize * sizeof(double));
+    const double fixed_scale = ldexp(1.0, 22);
+    for (int dst = 0; dst < out_size; dst++) {
+        const double center = ((double)dst + 0.5) * scale;
+        int first = (int)(center - support + 0.5);
+        int last = (int)(center + support + 0.5);
+        if (first < 0) first = 0;
+        if (last > in_size) last = in_size;
+        const int count = last - first;
+        double sum = 0.0;
+        for (int k = 0; k < count; k++) {
+            tmp[k] = qwen4exp_bicubic_filter(
+                ((double)(first + k) - center + 0.5) / filter_scale);
+            sum += tmp[k];
+        }
+        a->bounds[2 * dst] = first;
+        a->bounds[2 * dst + 1] = count;
+        for (int k = 0; k < ksize; k++) {
+            const double normalized = k < count && sum != 0.0
+                ? tmp[k] / sum : 0.0;
+            double fixed = normalized * fixed_scale;
+            fixed += normalized < 0.0 ? -0.5 : 0.5;
+            if (fixed > INT32_MAX) fixed = INT32_MAX;
+            if (fixed < INT32_MIN) fixed = INT32_MIN;
+            a->weights[(size_t)dst * ksize + k] = (int32_t)round(fixed);
+        }
+    }
+    free(tmp);
+    a->ksize = ksize;
+    return true;
+}
+
+static uint8_t qwen4exp_clip_u8(int64_t value) {
+    value >>= 22;
+    if (value < 0) return 0;
+    if (value > 255) return 255;
+    return (uint8_t)value;
+}
+
+static uint8_t *qwen4exp_resize_rgb_pillow(
+        const uint8_t *src, uint32_t src_w, uint32_t src_h,
+        uint32_t dst_w, uint32_t dst_h) {
+    if (!src || !src_w || !src_h || !dst_w || !dst_h ||
+        (uint64_t)dst_w * dst_h > SIZE_MAX / 3u) return NULL;
+    if (src_w == dst_w && src_h == dst_h) {
+        const size_t bytes = (size_t)src_w * src_h * 3u;
+        uint8_t *copy = xmalloc(bytes);
+        memcpy(copy, src, bytes);
+        return copy;
+    }
+    ds4_qwen_resize_axis horizontal = {0}, vertical = {0};
+    if (!qwen4exp_resize_axis_build((int)src_w, (int)dst_w, &horizontal) ||
+        !qwen4exp_resize_axis_build((int)src_h, (int)dst_h, &vertical)) {
+        qwen4exp_resize_axis_free(&horizontal);
+        qwen4exp_resize_axis_free(&vertical);
+        return NULL;
+    }
+    if ((uint64_t)dst_w * src_h > SIZE_MAX / 3u ||
+        (uint64_t)dst_w * dst_h > SIZE_MAX / 3u) {
+        qwen4exp_resize_axis_free(&horizontal);
+        qwen4exp_resize_axis_free(&vertical);
+        return NULL;
+    }
+    uint8_t *tmp = xmalloc((size_t)dst_w * src_h * 3u);
+    uint8_t *dst = xmalloc((size_t)dst_w * dst_h * 3u);
+    for (uint32_t y = 0; y < src_h; y++) {
+        for (uint32_t x = 0; x < dst_w; x++) {
+            const int first = horizontal.bounds[2u * x];
+            const int count = horizontal.bounds[2u * x + 1u];
+            int64_t acc[3] = {1 << 21, 1 << 21, 1 << 21};
+            for (int k = 0; k < count; k++) {
+                const int32_t w = horizontal.weights[
+                    (size_t)x * horizontal.ksize + k];
+                const uint8_t *pixel = src +
+                    ((size_t)y * src_w + (uint32_t)(first + k)) * 3u;
+                for (uint32_t c = 0; c < 3u; c++)
+                    acc[c] += (int64_t)pixel[c] * w;
+            }
+            uint8_t *pixel = tmp + ((size_t)y * dst_w + x) * 3u;
+            for (uint32_t c = 0; c < 3u; c++)
+                pixel[c] = qwen4exp_clip_u8(acc[c]);
+        }
+    }
+    for (uint32_t y = 0; y < dst_h; y++) {
+        const int first = vertical.bounds[2u * y];
+        const int count = vertical.bounds[2u * y + 1u];
+        for (uint32_t x = 0; x < dst_w; x++) {
+            int64_t acc[3] = {1 << 21, 1 << 21, 1 << 21};
+            for (int k = 0; k < count; k++) {
+                const int32_t w = vertical.weights[
+                    (size_t)y * vertical.ksize + k];
+                const uint8_t *pixel = tmp +
+                    ((size_t)(first + k) * dst_w + x) * 3u;
+                for (uint32_t c = 0; c < 3u; c++)
+                    acc[c] += (int64_t)pixel[c] * w;
+            }
+            uint8_t *pixel = dst + ((size_t)y * dst_w + x) * 3u;
+            for (uint32_t c = 0; c < 3u; c++)
+                pixel[c] = qwen4exp_clip_u8(acc[c]);
+        }
+    }
+    free(tmp);
+    qwen4exp_resize_axis_free(&horizontal);
+    qwen4exp_resize_axis_free(&vertical);
+    return dst;
+}
+
+typedef struct {
+    uint32_t patch_rows;
+    uint32_t feature_rows;
+    float *patches;
+    int32_t *position_indices;
+    float *position_weights;
+    int32_t *height_positions;
+    int32_t *width_positions;
+    int32_t *segment_start;
+    int32_t *segment_end;
+} ds4_qwen_vision_host;
+
+static void qwen4exp_vision_host_free(ds4_qwen_vision_host *h) {
+    if (!h) return;
+    free(h->segment_end);
+    free(h->segment_start);
+    free(h->width_positions);
+    free(h->height_positions);
+    free(h->position_weights);
+    free(h->position_indices);
+    free(h->patches);
+    memset(h, 0, sizeof(*h));
+}
+
+static bool qwen4exp_vision_host_prepare(
+        const ds4_qwen_image_input *images, uint32_t image_count,
+        ds4_qwen_vision_host *host, char *error, size_t error_size) {
+    if (!images || image_count == 0u || image_count > 4u || !host) return false;
+    memset(host, 0, sizeof(*host));
+    ds4_qwen_image_info info[4];
+    uint64_t patch_rows = 0u, feature_rows = 0u;
+    for (uint32_t i = 0; i < image_count; i++) {
+        if (ds4_qwen_image_probe(images[i].data, images[i].data_len,
+                                 &info[i], error, error_size) != 0)
+            return false;
+        if (info[i].grid_h != images[i].grid_h ||
+            info[i].grid_w != images[i].grid_w) {
+            if (error && error_size)
+                snprintf(error, error_size, "image geometry changed after tokenization");
+            return false;
+        }
+        patch_rows += (uint64_t)info[i].grid_h * info[i].grid_w;
+        feature_rows += info[i].token_count;
+    }
+    if (patch_rows == 0u || patch_rows > UINT32_MAX ||
+        feature_rows == 0u || feature_rows > UINT32_MAX ||
+        patch_rows > SIZE_MAX / DS4_QWEN_VISION_PATCH_DIM / sizeof(float)) {
+        if (error && error_size) snprintf(error, error_size, "image patch buffer is too large");
+        return false;
+    }
+    host->patch_rows = (uint32_t)patch_rows;
+    host->feature_rows = (uint32_t)feature_rows;
+    host->patches = xmalloc((size_t)patch_rows *
+                            DS4_QWEN_VISION_PATCH_DIM * sizeof(float));
+    host->position_indices = xmalloc((size_t)patch_rows * 4u * sizeof(int32_t));
+    host->position_weights = xmalloc((size_t)patch_rows * 4u * sizeof(float));
+    host->height_positions = xmalloc((size_t)patch_rows * sizeof(int32_t));
+    host->width_positions = xmalloc((size_t)patch_rows * sizeof(int32_t));
+    host->segment_start = xmalloc((size_t)patch_rows * sizeof(int32_t));
+    host->segment_end = xmalloc((size_t)patch_rows * sizeof(int32_t));
+
+    uint32_t patch_base = 0u;
+    for (uint32_t image_i = 0; image_i < image_count; image_i++) {
+        int width = 0, height = 0, channels = 0;
+        uint8_t *decoded = stbi_load_from_memory(
+            images[image_i].data, (int)images[image_i].data_len,
+            &width, &height, &channels, 3);
+        if (!decoded || width != (int)info[image_i].source_width ||
+            height != (int)info[image_i].source_height) {
+            stbi_image_free(decoded);
+            if (error && error_size)
+                snprintf(error, error_size, "PNG/JPEG decode failed: %s",
+                         stbi_failure_reason() ? stbi_failure_reason() : "invalid image");
+            qwen4exp_vision_host_free(host);
+            return false;
+        }
+        uint8_t *resized = qwen4exp_resize_rgb_pillow(
+            decoded, info[image_i].source_width, info[image_i].source_height,
+            info[image_i].resized_width, info[image_i].resized_height);
+        stbi_image_free(decoded);
+        if (!resized) {
+            if (error && error_size) snprintf(error, error_size, "image resize failed");
+            qwen4exp_vision_host_free(host);
+            return false;
+        }
+        const uint32_t gh = info[image_i].grid_h;
+        const uint32_t gw = info[image_i].grid_w;
+        const uint32_t image_patches = gh * gw;
+        uint32_t local = 0u;
+        for (uint32_t block_h = 0; block_h < gh / 2u; block_h++) {
+            for (uint32_t block_w = 0; block_w < gw / 2u; block_w++) {
+                for (uint32_t inner_h = 0; inner_h < 2u; inner_h++) {
+                    for (uint32_t inner_w = 0; inner_w < 2u; inner_w++) {
+                        const uint32_t patch_h = 2u * block_h + inner_h;
+                        const uint32_t patch_w = 2u * block_w + inner_w;
+                        const uint32_t row = patch_base + local++;
+                        float *dst = host->patches +
+                            (size_t)row * DS4_QWEN_VISION_PATCH_DIM;
+                        for (uint32_t c = 0; c < 3u; c++) {
+                            for (uint32_t temporal = 0; temporal < 2u; temporal++) {
+                                (void)temporal;
+                                for (uint32_t py = 0; py < 16u; py++) {
+                                    const uint32_t y = patch_h * 16u + py;
+                                    for (uint32_t px = 0; px < 16u; px++) {
+                                        const uint32_t x = patch_w * 16u + px;
+                                        const uint8_t v = resized[
+                                            ((size_t)y * info[image_i].resized_width + x) * 3u + c];
+                                        *dst++ = (float)v * (2.0f / 255.0f) - 1.0f;
+                                    }
+                                }
+                            }
+                        }
+                        const double sy = gh > 1u
+                            ? (double)patch_h * 47.0 / (double)(gh - 1u) : 0.0;
+                        const double sx = gw > 1u
+                            ? (double)patch_w * 47.0 / (double)(gw - 1u) : 0.0;
+                        const int y0 = (int)floor(sy), x0 = (int)floor(sx);
+                        const int y1 = y0 < 47 ? y0 + 1 : 47;
+                        const int x1 = x0 < 47 ? x0 + 1 : 47;
+                        const float fy = (float)(sy - y0), fx = (float)(sx - x0);
+                        int32_t *indices = host->position_indices + 4u * row;
+                        float *weights = host->position_weights + 4u * row;
+                        indices[0] = 48 * y0 + x0;
+                        indices[1] = 48 * y0 + x1;
+                        indices[2] = 48 * y1 + x0;
+                        indices[3] = 48 * y1 + x1;
+                        weights[0] = (1.0f - fy) * (1.0f - fx);
+                        weights[1] = (1.0f - fy) * fx;
+                        weights[2] = fy * (1.0f - fx);
+                        weights[3] = fy * fx;
+                        host->height_positions[row] = (int32_t)patch_h;
+                        host->width_positions[row] = (int32_t)patch_w;
+                        host->segment_start[row] = (int32_t)patch_base;
+                        host->segment_end[row] = (int32_t)(patch_base + image_patches);
+                    }
+                }
+            }
+        }
+        free(resized);
+        patch_base += image_patches;
+    }
+    return patch_base == host->patch_rows;
+}
+
+typedef struct {
     uint32_t capacity;
     uint32_t context_cap;
     uint32_t length;
@@ -20964,6 +21513,23 @@ typedef struct {
     ds4_qwen_qsa_state qsa_state[DS4_MAX_LAYER];
     ds4_qwen_moe_ws moe_ws;
 
+    /* Image features are computed once at admission and copied over the
+     * corresponding image-pad token rows as chunked prefill reaches them. */
+    ds4_gpu_tensor *image_features;
+    ds4_gpu_tensor *mrope_positions; /* [context_cap, 3] int32 */
+    struct {
+        uint32_t token_offset;
+        uint32_t token_count;
+        uint32_t feature_offset;
+        uint32_t grid_h;
+        uint32_t grid_w;
+    } image[4];
+    uint32_t image_count;
+    uint32_t image_feature_rows;
+    uint32_t mrope_written;
+    int32_t mrope_delta;
+    bool mrope_active;
+
     /* The embedded one-layer MTP head is opt-in.  It shares the target
      * scratch sequentially, but owns its QSA history and one recurrent-state
      * rollback slot so a rejected two-row verify cannot advance the target. */
@@ -20974,11 +21540,25 @@ typedef struct {
     uint64_t mtp_target_backup_bytes;
     bool mtp_enabled;
     bool mtp_pending_valid;
+    bool mtp_suspended;
 } ds4_qwen_gpu_graph;
 
 static uint64_t qwen4exp_recurrent_checkpoint_bytes(
         const ds4_qwen_gpu_graph *g);
 static uint64_t ds4_mem_usable_beyond(uint64_t reserve);
+
+static void qwen4exp_graph_clear_multimodal(ds4_qwen_gpu_graph *graph) {
+    if (!graph) return;
+    ds4_gpu_tensor_free(graph->image_features);
+    graph->image_features = NULL;
+    memset(graph->image, 0, sizeof(graph->image));
+    graph->image_count = 0u;
+    graph->image_feature_rows = 0u;
+    graph->mrope_written = 0u;
+    graph->mrope_delta = 0;
+    graph->mrope_active = false;
+    graph->mtp_suspended = false;
+}
 
 static void qwen4exp_graph_free(ds4_qwen_gpu_graph *graph) {
     if (!graph) return;
@@ -20999,6 +21579,8 @@ static void qwen4exp_graph_free(ds4_qwen_gpu_graph *graph) {
     qwen4exp_gdn_ws_free(&graph->gdn_ws);
     qwen4exp_ple_ws_free(&graph->ple);
     qwen4exp_hc_ws_free(&graph->hc);
+    ds4_gpu_tensor_free(graph->mrope_positions);
+    qwen4exp_graph_clear_multimodal(graph);
     ds4_gpu_tensor_free(graph->logits);
     ds4_gpu_tensor_free(graph->block);
     ds4_gpu_tensor_free(graph->hidden[1]);
@@ -21022,6 +21604,7 @@ static bool qwen4exp_graph_reset(ds4_qwen_gpu_graph *graph,
     if (graph->mtp_enabled &&
         !qwen4exp_qsa_state_reset(&graph->mtp_qsa_state)) return false;
     graph->mtp_pending_valid = false;
+    qwen4exp_graph_clear_multimodal(graph);
     graph->length = 0u;
     return true;
 }
@@ -21104,6 +21687,366 @@ static bool qwen4exp_graph_alloc(ds4_qwen_gpu_graph *graph,
     return true;
 }
 
+static bool qwen4exp_graph_prepare_images(
+        ds4_qwen_gpu_graph *graph,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        const ds4_qwen_image_input *images,
+        uint32_t image_count,
+        const int *tokens,
+        uint32_t token_count,
+        char *error,
+        size_t error_size) {
+    if (!graph || !model || !weights || !images || !tokens ||
+        image_count == 0u || image_count > 4u || token_count == 0u ||
+        token_count > graph->context_cap || graph->length != 0u) {
+        if (error && error_size) snprintf(error, error_size, "invalid image admission");
+        return false;
+    }
+
+    ds4_qwen_vision_host host = {0};
+    ds4_gpu_tensor *patches = NULL, *hidden = NULL, *norm = NULL;
+    ds4_gpu_tensor *qkv = NULL, *ff = NULL;
+    ds4_gpu_tensor *pos_indices = NULL, *pos_weights = NULL;
+    ds4_gpu_tensor *height = NULL, *width = NULL;
+    ds4_gpu_tensor *segment_start = NULL, *segment_end = NULL;
+    ds4_gpu_tensor *projected = NULL;
+    bool ok = false;
+
+    uint64_t p = 0u, f = 0u, resize_peak = 0u;
+    uint32_t previous_end = 0u;
+    for (uint32_t i = 0; i < image_count; i++) {
+        ds4_qwen_image_info info = {0};
+        if (ds4_qwen_image_probe(images[i].data, images[i].data_len,
+                                 &info, error, error_size) != 0 ||
+            info.grid_h != images[i].grid_h ||
+            info.grid_w != images[i].grid_w) {
+            if (error && error_size && !error[0])
+                snprintf(error, error_size,
+                         "image geometry changed after tokenization");
+            goto done;
+        }
+        const uint64_t patches = (uint64_t)info.grid_h * info.grid_w;
+        const uint64_t count = info.token_count;
+        if (patches == 0u || patches > UINT32_MAX || count == 0u ||
+            images[i].token_offset < previous_end ||
+            images[i].token_offset > token_count ||
+            count > token_count - images[i].token_offset) {
+            if (error && error_size)
+                snprintf(error, error_size, "image token span is invalid");
+            goto done;
+        }
+        for (uint32_t row = 0; row < (uint32_t)count; row++) {
+            if (tokens[images[i].token_offset + row] !=
+                    DS4_QWEN_IMAGE_PAD_TOKEN_ID) {
+                if (error && error_size)
+                    snprintf(error, error_size, "image feature span is not image-pad tokens");
+                goto done;
+            }
+        }
+        graph->image[i].token_offset = images[i].token_offset;
+        graph->image[i].token_count = (uint32_t)count;
+        graph->image[i].feature_offset = (uint32_t)f;
+        graph->image[i].grid_h = images[i].grid_h;
+        graph->image[i].grid_w = images[i].grid_w;
+        p += patches;
+        f += count;
+        if (p > UINT32_MAX || f > UINT32_MAX) {
+            if (error && error_size)
+                snprintf(error, error_size, "image workspace is too large");
+            goto done;
+        }
+        const uint64_t source_pixels =
+            (uint64_t)info.source_width * info.source_height;
+        const uint64_t resized_pixels =
+            (uint64_t)info.resized_width * info.resized_height;
+        const uint64_t horizontal_pixels =
+            (uint64_t)info.resized_width * info.source_height;
+        const uint64_t axis_extent =
+            (uint64_t)info.source_width + info.source_height +
+            info.resized_width + info.resized_height;
+        const uint64_t resize_bytes =
+            6u * source_pixels + 3u * resized_pixels +
+            3u * horizontal_pixels + 32u * axis_extent;
+        if (resize_bytes > resize_peak) resize_peak = resize_bytes;
+        previous_end = images[i].token_offset + (uint32_t)count;
+    }
+
+    uint64_t transient = 0u;
+#define QWEN_VISION_CHARGE(values, type)                                     \
+    do {                                                                      \
+        const uint64_t qv_values_ = (uint64_t)(values);                       \
+        if (qv_values_ > UINT64_MAX / sizeof(type) ||                         \
+            transient > UINT64_MAX - qv_values_ * sizeof(type)) {             \
+            if (error && error_size) snprintf(error, error_size,              \
+                                                "image workspace overflow"); \
+            goto done;                                                        \
+        }                                                                     \
+        transient += qv_values_ * sizeof(type);                               \
+    } while (0)
+    /* Host patches/metadata remain live while their GPU copies run.  Decoder
+     * scratch is conservatively charged at its largest per-image peak. */
+    QWEN_VISION_CHARGE(2u * p * DS4_QWEN_VISION_PATCH_DIM, float);
+    QWEN_VISION_CHARGE(2u * p * DS4_QWEN_VISION_HIDDEN, float);
+    QWEN_VISION_CHARGE(p * 3u * DS4_QWEN_VISION_HIDDEN, float);
+    QWEN_VISION_CHARGE(p * DS4_QWEN_VISION_FF, float);
+    QWEN_VISION_CHARGE(24u * p, int32_t);
+    QWEN_VISION_CHARGE(f * DS4_N_EMBD, float);
+    QWEN_VISION_CHARGE(6u * token_count, int32_t);
+    QWEN_VISION_CHARGE(resize_peak, uint8_t);
+#undef QWEN_VISION_CHARGE
+    const uint64_t usable = ds4_mem_usable_beyond(0u);
+    if (usable != UINT64_MAX && transient > usable) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "image workspace needs %.1f MiB but only %.1f MiB is available",
+                     (double)transient / 1048576.0, (double)usable / 1048576.0);
+        goto done;
+    }
+
+    if (!qwen4exp_vision_host_prepare(
+            images, image_count, &host, error, error_size)) goto done;
+    if (host.patch_rows != p || host.feature_rows != f) {
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "image feature count does not match prompt");
+        goto done;
+    }
+
+#define QWEN_VISION_ALLOC(name, bytes)                                       \
+    do {                                                                      \
+        if (!((name) = ds4_gpu_tensor_alloc((uint64_t)(bytes)))) {            \
+            if (error && error_size) snprintf(error, error_size,              \
+                                                "image GPU allocation failed: %s", #name); \
+            goto done;                                                        \
+        }                                                                     \
+    } while (0)
+    QWEN_VISION_ALLOC(patches, p * DS4_QWEN_VISION_PATCH_DIM * sizeof(float));
+    QWEN_VISION_ALLOC(hidden, p * DS4_QWEN_VISION_HIDDEN * sizeof(float));
+    QWEN_VISION_ALLOC(norm, p * DS4_QWEN_VISION_HIDDEN * sizeof(float));
+    QWEN_VISION_ALLOC(qkv, p * 3u * DS4_QWEN_VISION_HIDDEN * sizeof(float));
+    QWEN_VISION_ALLOC(ff, p * DS4_QWEN_VISION_FF * sizeof(float));
+    QWEN_VISION_ALLOC(pos_indices, 4u * p * sizeof(int32_t));
+    QWEN_VISION_ALLOC(pos_weights, 4u * p * sizeof(float));
+    QWEN_VISION_ALLOC(height, p * sizeof(int32_t));
+    QWEN_VISION_ALLOC(width, p * sizeof(int32_t));
+    QWEN_VISION_ALLOC(segment_start, p * sizeof(int32_t));
+    QWEN_VISION_ALLOC(segment_end, p * sizeof(int32_t));
+    projected = ds4_gpu_tensor_alloc(f * DS4_N_EMBD * sizeof(float));
+    if (!projected) {
+        if (error && error_size) snprintf(error, error_size,
+                                           "image GPU allocation failed: features");
+        goto done;
+    }
+#undef QWEN_VISION_ALLOC
+
+    if (!ds4_gpu_tensor_write(patches, 0, host.patches,
+                              p * DS4_QWEN_VISION_PATCH_DIM * sizeof(float)) ||
+        !ds4_gpu_tensor_write(pos_indices, 0, host.position_indices,
+                              4u * p * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(pos_weights, 0, host.position_weights,
+                              4u * p * sizeof(float)) ||
+        !ds4_gpu_tensor_write(height, 0, host.height_positions,
+                              p * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(width, 0, host.width_positions,
+                              p * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(segment_start, 0, host.segment_start,
+                              p * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(segment_end, 0, host.segment_end,
+                              p * sizeof(int32_t))) {
+        if (error && error_size) snprintf(error, error_size, "image upload failed");
+        goto done;
+    }
+
+    const ds4_qwen_vision_weights *v = &weights->qwen_vision;
+    if (!plain_graph_matmul_tensor(
+            hidden, model, v->patch_weight,
+            DS4_QWEN_VISION_PATCH_DIM, DS4_QWEN_VISION_HIDDEN,
+            patches, p) ||
+        !ds4_gpu_qwen4exp_vision_patch_position_tensor(
+            hidden, model->map, model->size,
+            v->patch_bias->abs_offset, v->position_weight->abs_offset,
+            pos_indices, pos_weights, (uint32_t)p,
+            DS4_QWEN_VISION_HIDDEN)) {
+        if (error && error_size) snprintf(error, error_size,
+                                           "vision patch embedding failed");
+        goto done;
+    }
+    const uint64_t projected_row_bytes =
+        (uint64_t)DS4_QWEN_VISION_HIDDEN * sizeof(float);
+    ds4_gpu_tensor *layer_out = ds4_gpu_tensor_view(
+        qkv, 0u, p * projected_row_bytes);
+    if (!layer_out) goto done;
+    for (uint32_t il = 0u; il < DS4_QWEN_VISION_LAYER_COUNT; il++) {
+        const ds4_qwen_vision_layer_weights *l = &v->layer[il];
+        const bool layer_ok =
+            ds4_gpu_qwen4exp_vision_layernorm_tensor(
+                norm, hidden, model->map, model->size,
+                l->norm1_weight->abs_offset, l->norm1_bias->abs_offset,
+                (uint32_t)p, DS4_QWEN_VISION_HIDDEN, 1e-6f) &&
+            plain_graph_matmul_tensor(
+                qkv, model, l->qkv_weight,
+                DS4_QWEN_VISION_HIDDEN, 3u * DS4_QWEN_VISION_HIDDEN,
+                norm, p) &&
+            ds4_gpu_qwen4exp_vision_qkv_rope_tensor(
+                qkv, model->map, model->size, l->qkv_bias->abs_offset,
+                height, width, (uint32_t)p,
+                DS4_QWEN_VISION_HEADS, DS4_QWEN_VISION_HEAD_DIM, 10000.0f) &&
+            ds4_gpu_qwen4exp_vision_attention_tensor(
+                norm, qkv, segment_start, segment_end, (uint32_t)p,
+                DS4_QWEN_VISION_HEADS, DS4_QWEN_VISION_HEAD_DIM) &&
+            plain_graph_matmul_tensor(
+                layer_out, model, l->output_weight,
+                DS4_QWEN_VISION_HIDDEN, DS4_QWEN_VISION_HIDDEN,
+                norm, p) &&
+            ds4_gpu_qwen4exp_vision_bias_residual_tensor(
+                hidden, layer_out, model->map, model->size,
+                l->output_bias->abs_offset, (uint32_t)p,
+                DS4_QWEN_VISION_HIDDEN) &&
+            ds4_gpu_qwen4exp_vision_layernorm_tensor(
+                norm, hidden, model->map, model->size,
+                l->norm2_weight->abs_offset, l->norm2_bias->abs_offset,
+                (uint32_t)p, DS4_QWEN_VISION_HIDDEN, 1e-6f) &&
+            plain_graph_matmul_tensor(
+                ff, model, l->ffn_up_weight,
+                DS4_QWEN_VISION_HIDDEN, DS4_QWEN_VISION_FF, norm, p) &&
+            ds4_gpu_qwen4exp_vision_bias_gelu_tensor(
+                ff, model->map, model->size, l->ffn_up_bias->abs_offset,
+                (uint32_t)p, DS4_QWEN_VISION_FF, 1) &&
+            plain_graph_matmul_tensor(
+                layer_out, model, l->ffn_down_weight,
+                DS4_QWEN_VISION_FF, DS4_QWEN_VISION_HIDDEN, ff, p) &&
+            ds4_gpu_qwen4exp_vision_bias_residual_tensor(
+                hidden, layer_out, model->map, model->size,
+                l->ffn_down_bias->abs_offset, (uint32_t)p,
+                DS4_QWEN_VISION_HIDDEN);
+        if (!layer_ok) {
+            if (error && error_size)
+                snprintf(error, error_size, "vision transformer failed at layer %u", il);
+            ds4_gpu_tensor_free(layer_out);
+            layer_out = NULL;
+            goto done;
+        }
+    }
+    ds4_gpu_tensor_free(layer_out);
+    layer_out = NULL;
+    if (!ds4_gpu_qwen4exp_vision_layernorm_tensor(
+            norm, hidden, model->map, model->size,
+            v->merger_norm_weight->abs_offset,
+            v->merger_norm_bias->abs_offset,
+            (uint32_t)p, DS4_QWEN_VISION_HIDDEN, 1e-6f) ||
+        !plain_graph_matmul_tensor(
+            hidden, model, v->merger_up_weight,
+            DS4_QWEN_VISION_MERGED, DS4_QWEN_VISION_MERGED,
+            norm, f) ||
+        !ds4_gpu_qwen4exp_vision_bias_gelu_tensor(
+            hidden, model->map, model->size,
+            v->merger_up_bias->abs_offset, (uint32_t)f,
+            DS4_QWEN_VISION_MERGED, 0) ||
+        !plain_graph_matmul_tensor(
+            projected, model, v->merger_down_weight,
+            DS4_QWEN_VISION_MERGED, DS4_N_EMBD, hidden, f) ||
+        !ds4_gpu_qwen4exp_vision_bias_tensor(
+            projected, model->map, model->size,
+            v->merger_down_bias->abs_offset, (uint32_t)f, DS4_N_EMBD)) {
+        if (error && error_size) snprintf(error, error_size, "vision merger failed");
+        goto done;
+    }
+
+    /* Build the exact Qwen interleaved M-RoPE coordinates.  Text advances all
+     * three axes; each image occupies a 1 x (H/2) x (W/2) grid. */
+    int32_t *positions = xmalloc((size_t)token_count * 3u * sizeof(int32_t));
+    uint32_t cursor = 0u, image_i = 0u;
+    int64_t current_pos = 0;
+    while (cursor < token_count) {
+        if (image_i < image_count && cursor == images[image_i].token_offset) {
+            const uint32_t gh = images[image_i].grid_h / 2u;
+            const uint32_t gw = images[image_i].grid_w / 2u;
+            for (uint32_t y = 0u; y < gh; y++) {
+                for (uint32_t x = 0u; x < gw; x++) {
+                    const uint32_t row = cursor + y * gw + x;
+                    positions[3u * row] = (int32_t)current_pos;
+                    positions[3u * row + 1u] = (int32_t)(current_pos + y);
+                    positions[3u * row + 2u] = (int32_t)(current_pos + x);
+                }
+            }
+            cursor += gh * gw;
+            current_pos += gh > gw ? gh : gw;
+            image_i++;
+        } else {
+            positions[3u * cursor] = (int32_t)current_pos;
+            positions[3u * cursor + 1u] = (int32_t)current_pos;
+            positions[3u * cursor + 2u] = (int32_t)current_pos;
+            cursor++;
+            current_pos++;
+        }
+        if (current_pos > INT32_MAX) {
+            free(positions);
+            if (error && error_size) snprintf(error, error_size, "M-RoPE position overflow");
+            goto done;
+        }
+    }
+    if (image_i != image_count) {
+        free(positions);
+        if (error && error_size) snprintf(error, error_size, "image span ordering failed");
+        goto done;
+    }
+    ds4_gpu_tensor *mrope = graph->mrope_positions;
+    if (!mrope) mrope = ds4_gpu_tensor_reserve(
+        (uint64_t)graph->context_cap * 3u * sizeof(int32_t));
+    if (!mrope || !ds4_gpu_tensor_ensure(
+            mrope, 0u, (uint64_t)token_count * 3u * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(
+            mrope, 0u, positions,
+            (uint64_t)token_count * 3u * sizeof(int32_t))) {
+        if (mrope != graph->mrope_positions) ds4_gpu_tensor_free(mrope);
+        free(positions);
+        if (error && error_size) snprintf(error, error_size, "M-RoPE upload failed");
+        goto done;
+    }
+    free(positions);
+    if (graph->mtp_enabled) {
+        graph->mtp_pending_valid = false;
+        graph->mtp_suspended = true;
+        if (!qwen4exp_qsa_state_reset(&graph->mtp_qsa_state)) {
+            if (error && error_size) snprintf(error, error_size,
+                                               "MTP image-prefill reset failed");
+            if (mrope != graph->mrope_positions) ds4_gpu_tensor_free(mrope);
+            goto done;
+        }
+    }
+    graph->mrope_positions = mrope;
+    graph->mrope_delta = (int32_t)(current_pos - (int64_t)token_count);
+    graph->mrope_written = token_count;
+    graph->mrope_active = true;
+    graph->image_features = projected;
+    projected = NULL;
+    graph->image_count = image_count;
+    graph->image_feature_rows = host.feature_rows;
+    ok = true;
+    fprintf(stderr,
+            "ds4: Qwen vision ready: images=%u patches=%u features=%u "
+            "workspace=%.1f MiB mrope_delta=%d\n",
+            image_count, host.patch_rows, host.feature_rows,
+            (double)transient / 1048576.0, graph->mrope_delta);
+
+done:
+    ds4_gpu_tensor_free(projected);
+    ds4_gpu_tensor_free(segment_end);
+    ds4_gpu_tensor_free(segment_start);
+    ds4_gpu_tensor_free(width);
+    ds4_gpu_tensor_free(height);
+    ds4_gpu_tensor_free(pos_weights);
+    ds4_gpu_tensor_free(pos_indices);
+    ds4_gpu_tensor_free(ff);
+    ds4_gpu_tensor_free(qkv);
+    ds4_gpu_tensor_free(norm);
+    ds4_gpu_tensor_free(hidden);
+    ds4_gpu_tensor_free(patches);
+    qwen4exp_vision_host_free(&host);
+    return ok;
+}
+
 static bool qwen4exp_graph_mtp_enable(ds4_qwen_gpu_graph *graph) {
     if (!graph) return false;
     if (graph->mtp_enabled) return true;
@@ -21132,6 +22075,7 @@ static bool qwen4exp_graph_mtp_enable(ds4_qwen_gpu_graph *graph) {
     graph->mtp_target_backup_bytes = backup_bytes;
     graph->mtp_enabled = true;
     graph->mtp_pending_valid = false;
+    graph->mtp_suspended = false;
     fprintf(stderr,
             "ds4: Qwen embedded MTP ready: one QSA layer, "
             "rollback=%.2f MiB demand-mapped\n",
@@ -21277,7 +22221,7 @@ static bool qwen4exp_graph_mtp_step(
     QWEN_MTP_REQUIRE(qwen4exp_qsa_forward(
         &graph->qsa_ws, &graph->mtp_qsa_state, model,
         &layer->qwen_qsa, graph->hc.mixed, graph->block,
-        rows, graph->mtp_qsa_state.length), "qsa");
+        rows, graph->mtp_qsa_state.length, NULL), "qsa");
     QWEN_MTP_REQUIRE(qwen4exp_hc_finish(
         &graph->hc, current, graph->block, next, rows),
         "attention-hc-inject");
@@ -21345,6 +22289,7 @@ static void qwen4exp_graph_mtp_disable(
             reason ? reason : "runtime failure");
     graph->mtp_enabled = false;
     graph->mtp_pending_valid = false;
+    graph->mtp_suspended = false;
 }
 
 static bool qwen4exp_graph_forward_chunk(
@@ -21364,6 +22309,30 @@ static bool qwen4exp_graph_forward_chunk(
         logits_rows > rows || logits_rows > 2u ||
         ((logits_rows != 0u) != (logits != NULL)))
         return false;
+    if (graph->mrope_active && pos0 + rows > graph->mrope_written) {
+        const uint32_t first = graph->mrope_written;
+        const uint32_t count = pos0 + rows - first;
+        int32_t *positions = xmalloc((size_t)count * 3u * sizeof(int32_t));
+        bool valid = true;
+        for (uint32_t i = 0u; i < count; i++) {
+            const int64_t p = (int64_t)first + i + graph->mrope_delta;
+            if (p < 0 || p > INT32_MAX) {
+                valid = false;
+                break;
+            }
+            positions[3u * i] = (int32_t)p;
+            positions[3u * i + 1u] = (int32_t)p;
+            positions[3u * i + 2u] = (int32_t)p;
+        }
+        const uint64_t offset = (uint64_t)first * 3u * sizeof(int32_t);
+        const uint64_t bytes = (uint64_t)count * 3u * sizeof(int32_t);
+        const bool written = valid && graph->mrope_positions &&
+            ds4_gpu_tensor_ensure(graph->mrope_positions, offset, bytes) &&
+            ds4_gpu_tensor_write(graph->mrope_positions, offset, positions, bytes);
+        free(positions);
+        if (!written) return false;
+        graph->mrope_written = pos0 + rows;
+    }
     char ple_error[256] = {0};
     /* Submit SSD reads before token embedding and decoder layer 0; the PLE
      * rows are first consumed at layer 1, so those GPU stages hide I/O. */
@@ -21379,8 +22348,27 @@ static bool qwen4exp_graph_forward_chunk(
         !ds4_gpu_embed_tokens_quant_tensor(
             graph->embedding, graph->tokens, model->map, model->size,
             weights->token_embd->abs_offset, weights->token_embd->type,
-            DS4_N_VOCAB, rows, DS4_N_EMBD) ||
-        !ds4_gpu_repeat_hc_rows_tensor(
+            DS4_N_VOCAB, rows, DS4_N_EMBD)) return false;
+    if (graph->image_features) {
+        const uint32_t end = pos0 + rows;
+        const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+        for (uint32_t i = 0u; i < graph->image_count; i++) {
+            const uint32_t image_begin = graph->image[i].token_offset;
+            const uint32_t image_end = image_begin + graph->image[i].token_count;
+            const uint32_t begin = pos0 > image_begin ? pos0 : image_begin;
+            const uint32_t overlap_end = end < image_end ? end : image_end;
+            if (begin >= overlap_end) continue;
+            const uint32_t count = overlap_end - begin;
+            if (!ds4_gpu_tensor_copy(
+                    graph->embedding,
+                    (uint64_t)(begin - pos0) * row_bytes,
+                    graph->image_features,
+                    (uint64_t)(graph->image[i].feature_offset +
+                               begin - image_begin) * row_bytes,
+                    (uint64_t)count * row_bytes)) return false;
+        }
+    }
+    if (!ds4_gpu_repeat_hc_rows_tensor(
             graph->hidden[0], graph->embedding,
             DS4_N_EMBD, DS4_N_HC, rows)) return false;
 
@@ -21402,7 +22390,8 @@ static bool qwen4exp_graph_forward_chunk(
             ? qwen4exp_qsa_forward(
                 &graph->qsa_ws, &graph->qsa_state[il], model,
                 &layer->qwen_qsa, graph->hc.mixed, graph->block,
-                rows, pos0)
+                rows, pos0,
+                graph->mrope_active ? graph->mrope_positions : NULL)
             : qwen4exp_gdn_forward(
                 &graph->gdn_ws, &graph->gdn_state[il], model,
                 &layer->qwen_linear_attn, graph->hc.mixed,
@@ -32426,6 +33415,12 @@ static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, 
                                       ? vocab->im_start_id : -1},
         {"<|im_end|>",              DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP
                                       ? vocab->im_end_id : -1},
+        {"<|vision_start|>",         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP
+                                      ? DS4_QWEN_VISION_START_TOKEN_ID : -1},
+        {"<|vision_end|>",           DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP
+                                      ? DS4_QWEN_VISION_END_TOKEN_ID : -1},
+        {"<|image_pad|>",            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP
+                                      ? DS4_QWEN_IMAGE_PAD_TOKEN_ID : -1},
         {"<|endoftext|>",           vocab->eos_id},
         {"<|beginoftext|>",         vocab->bos_id},
         {"<|startofturn|>",         vocab->start_of_turn_id},
@@ -38823,6 +39818,24 @@ static bool qwen_batch_runtime_reset_bank(
     return qwen4exp_graph_reset(&rt->graph[bank], store);
 }
 
+static bool qwen_batch_runtime_prepare_images(
+        ds4_qwen_batch_runtime *rt, ds4_engine *e, uint32_t bank,
+        const ds4_qwen_image_input *images, uint32_t image_count,
+        const int *tokens, uint32_t token_count) {
+    if (!rt || !e || bank >= rt->max_seq || !images || image_count == 0u)
+        return false;
+    char error[256] = {0};
+    const uint64_t before = qwen_batch_census_live();
+    const bool ok = qwen4exp_graph_prepare_images(
+        &rt->graph[bank], &e->model, &e->weights,
+        images, image_count, tokens, token_count, error, sizeof(error));
+    qwen_batch_runtime_note_growth(rt, bank, before);
+    if (!ok)
+        fprintf(stderr, "ds4: Qwen image preparation failed: %s\n",
+                error[0] ? error : "unknown error");
+    return ok;
+}
+
 static bool qwen4exp_graph_copy_qsa_prefix(
         ds4_qwen_gpu_graph *dst, const ds4_qwen_gpu_graph *src,
         uint32_t tokens) {
@@ -38862,9 +39875,11 @@ static bool qwen4exp_graph_copy_state(
         ds4_qwen_gpu_graph *dst, const ds4_qwen_gpu_graph *src,
         uint32_t tokens) {
     if (!dst || !src || tokens == 0u || src->length != tokens ||
-        tokens > dst->context_cap || dst->context_cap != src->context_cap)
+        tokens > dst->context_cap || dst->context_cap != src->context_cap ||
+        src->mrope_active)
         return false;
 
+    qwen4exp_graph_clear_multimodal(dst);
     bool ok = true;
     const uint64_t ple_conv_bytes =
         (uint64_t)DS4_N_EMBD * DS4_N_HC * 9u * sizeof(float);
@@ -38943,14 +39958,27 @@ static bool qwen_batch_runtime_prefill(
         tokens, rows, pos,
         final ? 1u : 0u,
         final ? rt->bank_logits + (size_t)bank * DS4_N_VOCAB : NULL);
-    if (ok && rt->graph[bank].mtp_enabled &&
-        !qwen4exp_graph_mtp_feed_chunk(
-            &rt->graph[bank], &e->model, &e->weights, tokens, rows)) {
-        qwen4exp_graph_mtp_disable(
-            &rt->graph[bank], "bank prefill state update failed");
+    if (ok && rt->graph[bank].mtp_enabled) {
+        ds4_qwen_gpu_graph *g = &rt->graph[bank];
+        if (g->mtp_suspended && final) {
+            g->mtp_suspended = false;
+            g->mtp_pending_valid = false;
+            if (!qwen4exp_qsa_state_reset(&g->mtp_qsa_state))
+                qwen4exp_graph_mtp_disable(g, "post-image prefill reset failed");
+        } else if (!g->mtp_suspended &&
+                   !qwen4exp_graph_mtp_feed_chunk(
+                       g, &e->model, &e->weights, tokens, rows)) {
+            qwen4exp_graph_mtp_disable(
+                g, "bank prefill state update failed");
+        }
     }
     qwen_batch_runtime_note_growth(rt, bank, before);
-    if (ok && final) rt->bank_logits_valid[bank] = 1u;
+    if (ok && final) {
+        rt->bank_logits_valid[bank] = 1u;
+        ds4_gpu_tensor_free(rt->graph[bank].image_features);
+        rt->graph[bank].image_features = NULL;
+        rt->graph[bank].image_feature_rows = 0u;
+    }
     return ok;
 }
 
@@ -41225,7 +42253,8 @@ static bool qwen_batch_runtime_capture_checkpoint(
         ds4_qwen_batch_runtime *rt, uint32_t bank, uint32_t pos,
         bool logits_valid, uint64_t reserve) {
     if (!rt || !rt->checkpoint_slab || !rt->checkpoint_logits ||
-        bank >= rt->max_seq || pos == 0u || rt->graph[bank].length != pos) {
+        bank >= rt->max_seq || pos == 0u || rt->graph[bank].length != pos ||
+        rt->graph[bank].mrope_active) {
         return false;
     }
     for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
@@ -41298,12 +42327,14 @@ static bool qwen_batch_runtime_restore_checkpoint(
     }
     ds4_partial_checkpoint *cp = &rt->checkpoint[slot];
     const uint32_t pos = cp->pos;
-    if (pos == 0u || pos > cut || !partial_checkpoint_ref(cp, src) ||
-        !qwen_checkpoint_state_copy(rt, dst, slot, false)) {
-        return false;
-    }
     ds4_qwen_gpu_graph *dst_graph = &rt->graph[dst];
     const ds4_qwen_gpu_graph *src_graph = &rt->graph[src];
+    if (pos == 0u || pos > cut || !partial_checkpoint_ref(cp, src) ||
+        src_graph->mrope_active) {
+        return false;
+    }
+    qwen4exp_graph_clear_multimodal(dst_graph);
+    if (!qwen_checkpoint_state_copy(rt, dst, slot, false)) return false;
     if (src != dst) {
         const uint64_t before = qwen_batch_census_live();
         const bool copied =
@@ -52842,6 +53873,12 @@ int ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank, const int *
     return (int)ctx->bank_hist_len[bank];
 }
 
+bool ds4_batch_ctx_bank_multimodal(const ds4_batch_ctx *ctx, int bank) {
+    return ctx && ctx->qwen && bank >= 0 &&
+           (uint32_t)bank < ctx->qwen->max_seq &&
+           ctx->qwen->graph[bank].mrope_active;
+}
+
 uint64_t ds4_batch_ctx_bank_generation(const ds4_batch_ctx *ctx, int bank) {
     if (!ctx || bank < 0 || (uint32_t)bank >= ctx->max_seq || !ctx->bank_gen)
         return 0u;
@@ -53921,6 +54958,7 @@ static int solar_engine_continuous_generate(
             bool partial = false;
             bool warm = false;
             const uint32_t requested_cached =
+                req.image_count == 0u &&
                 req.n_cached > 0 && req.n_cached <= req.n
                     ? (uint32_t)req.n_cached : 0u;
 
@@ -54526,6 +55564,7 @@ static int family_banked_engine_continuous_generate(
             bool partial = false;
             bool warm = false;
             const uint32_t requested_cached =
+                req.image_count == 0u &&
                 req.n_cached > 0 && req.n_cached <= req.n
                     ? (uint32_t)req.n_cached : 0u;
             if (src >= 0 && requested_cached != 0u) {
@@ -54657,6 +55696,17 @@ static int family_banked_engine_continuous_generate(
                 bank_hist_reset(ctx, b);
                 family_banked_reset(ctx, b);
                 ds4_metric_add(&ds4_metrics_get()->admits_cold, 1u);
+            }
+            if (req.image_count != 0u &&
+                (!ctx->qwen || req.image_count > 4u ||
+                 !qwen_batch_runtime_prepare_images(
+                     ctx->qwen, ctx->e, b, req.images, req.image_count,
+                     req.tokens, (uint32_t)req.n))) {
+                ctx->bank_gen[b]++;
+                ctx->bank_hist_valid[b] = 0u;
+                ds4_metric_add(&ds4_metrics_get()->cont_admit_rejects, 1u);
+                on_done(ud, req.user, NULL, 0, 0);
+                continue;
             }
 
             ds4_family_cont_bank *cb = &bank[b];
@@ -58120,6 +59170,10 @@ int ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank, const int *
     (void)ctx; (void)bank;
     if (toks) *toks = NULL;
     return 0;
+}
+bool ds4_batch_ctx_bank_multimodal(const ds4_batch_ctx *ctx, int bank) {
+    (void)ctx; (void)bank;
+    return false;
 }
 int ds4_cont_last_done_stats(const ds4_batch_ctx *ctx, ds4_cont_seq_stats *out) {
     (void)ctx; (void)out;

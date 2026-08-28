@@ -73,6 +73,29 @@ typedef struct {
 } ds4_tokens;
 
 typedef struct {
+    const uint8_t *data;
+    size_t data_len;
+    uint32_t token_offset;
+    uint32_t grid_h;
+    uint32_t grid_w;
+} ds4_qwen_image_input;
+
+/* Official Qwen3.8-Flash-Next multimodal special-token ids. */
+#define DS4_QWEN_VISION_START_TOKEN_ID 248053
+#define DS4_QWEN_VISION_END_TOKEN_ID   248054
+#define DS4_QWEN_IMAGE_PAD_TOKEN_ID    248056
+
+typedef struct {
+    uint32_t source_width;
+    uint32_t source_height;
+    uint32_t resized_width;
+    uint32_t resized_height;
+    uint32_t grid_h;
+    uint32_t grid_w;
+    uint32_t token_count;
+} ds4_qwen_image_info;
+
+typedef struct {
     int id;
     float logit;
     float logprob;
@@ -572,6 +595,8 @@ int  ds4_engine_batched_generate_ctx(ds4_batch_ctx *ctx, const ds4_tokens *promp
 typedef struct {
     const int *tokens;   /* prompt tokens (caller-owned; must outlive the admit) */
     int        n;        /* prompt length (>0, <= ctx raw_cap) */
+    ds4_qwen_image_input images[4]; /* Qwen image payloads; zero count = text */
+    uint32_t   image_count;
     int        max_new;  /* per-seq decode budget (>=1) */
     int        eos;      /* per-seq EOS token; <0 => engine default */
     void      *user;     /* opaque handle echoed back to on_done */
@@ -658,6 +683,9 @@ typedef struct {
  * static-path reuse of the slabs, deferred-commit MTP path). */
 int  ds4_batch_ctx_bank_committed(const ds4_batch_ctx *ctx, int bank,
                                   const int **toks);
+/* True when a Qwen bank's positional state depends on image geometry.  Such
+ * a bank is live-reusable but must not be keyed/persisted by text alone. */
+bool ds4_batch_ctx_bank_multimodal(const ds4_batch_ctx *ctx, int bank);
 /* v0.5.6 Inc 5a (continuation registry, plan §4.6): engine-authoritative bank
  * lineage generation.  Advances on every event after which previously
  * committed bank content may no longer be what a past reader saw: lineage
@@ -1192,6 +1220,12 @@ void ds4_session_report_progress(ds4_session *s, const char *event, int current,
 /* Distributed coordinator sessions return 1 when the full layer route is
  * available, 0 when it is still incomplete, and -1 for a local API error. */
 int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen);
+
+/* Probe a bounded PNG/JPEG and derive the pinned Qwen4Exp patch geometry
+ * without decoding its full pixel payload. */
+int ds4_qwen_image_probe(const uint8_t *data, size_t data_len,
+                         ds4_qwen_image_info *info,
+                         char *err, size_t errlen);
 
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,
