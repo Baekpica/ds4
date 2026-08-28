@@ -68,7 +68,10 @@ The server exposes OpenAI Chat Completions, OpenAI Completions, OpenAI
 Responses, and Anthropic Messages at `/v1/chat/completions`,
 `/v1/completions`, `/v1/responses`, and `/v1/messages`. Model-specific
 tokenization, chat rendering, tool syntax, stop tokens, and recurrent/KV state
-stay behind this common surface. External MTP and DSpark support GGUFs remain
+stay behind this common surface. A model-family integration is not complete
+until Chat Completions, Responses, and Anthropic Messages pass their native
+response-shape and tool-continuation gates; loading the GGUF alone is not that
+acceptance. External MTP and DSpark support GGUFs remain
 DeepSeek-only and are rejected for every other family. Qwen instead uses the
 MTP block embedded in its main GGUF when `--mtp-draft 2` is selected; that
 target-verified path currently applies to greedy scalar/session decode, while
@@ -88,6 +91,18 @@ with no failures, including a three-request continuous epoch with
 `served=3 fallback=0`; this was a configured-context serving check, not a
 196,608-token prompt run. Qwen batching remains opt-in with
 `DS4_QWEN_BATCH=1` and is capped at two banks.
+
+The Q5 artifact was subsequently served at a 262,144-token context with two
+banks, 8,192-token prefill chunks, partial-prefix reuse, and a 32 GiB disk-KV
+budget. Concurrent Chat Completions and Anthropic Messages requests returned
+their native HTTP 200 shapes, and a high-reasoning Responses function call plus
+`function_call_output` continuation completed through the serial fallback with
+377 cached tokens, zero serial refusals, zero request failures, and zero memory
+faults. Agent/tool deployments must therefore leave the serial lane enabled:
+`--no-serial` intentionally returns typed 503 responses when a live reasoning
+or tool frontier requires that lane. A three-bank 262K trial was not retained
+on the 128 GiB reference host because the same serial continuation reduced
+`MemAvailable` to 1.12 GiB; two banks are the guarded production setting.
 
 Motif-3 also completed a strict OpenAI Chat gate at the 262,144-token context
 limit: 262,080 prompt tokens at 175.61 tok/s followed by 43 decoded tokens at
