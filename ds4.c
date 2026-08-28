@@ -38618,6 +38618,12 @@ typedef struct ds4_qwen_batch_runtime {
     uint64_t graph_bytes[DS4_QWEN_BANK_MAX];
     float *bank_logits;
     uint8_t *bank_logits_valid;
+    float *mtp_logits;
+    double mtp_baseline_ms[DS4_QWEN_BANK_MAX];
+    double mtp_speculative_ms[DS4_QWEN_BANK_MAX];
+    uint32_t mtp_verify_cycles[DS4_QWEN_BANK_MAX];
+    uint32_t mtp_accepted_drafts[DS4_QWEN_BANK_MAX];
+    uint8_t mtp_quenched[DS4_QWEN_BANK_MAX];
 
     /* QSA history is append-only and copies from the source bank.  Only PLE
      * convolution plus GDN conv/recurrent state needs a checkpoint. */
@@ -38680,6 +38686,7 @@ static void qwen_batch_runtime_free(ds4_qwen_batch_runtime *rt) {
     free(rt->graph);
     ds4_gpu_tensor_free(rt->checkpoint_slab);
     free(rt->checkpoint_logits);
+    free(rt->mtp_logits);
     free(rt->bank_logits);
     free(rt->bank_logits_valid);
     free(rt);
@@ -38699,6 +38706,10 @@ static ds4_qwen_batch_runtime *qwen_batch_runtime_create(
         (size_t)max_seq * DS4_N_VOCAB, sizeof(*rt->bank_logits));
     rt->bank_logits_valid = xcalloc(
         max_seq, sizeof(*rt->bank_logits_valid));
+    if (ds4_engine_has_mtp(e)) {
+        rt->mtp_logits = xcalloc(
+            2u * (size_t)DS4_N_VOCAB, sizeof(*rt->mtp_logits));
+    }
     if (!rt->graph || !rt->bank_logits || !rt->bank_logits_valid) {
         qwen_batch_runtime_free(rt);
         return NULL;
@@ -38709,7 +38720,9 @@ static ds4_qwen_batch_runtime *qwen_batch_runtime_create(
                 e->backend, ctx_size, prefill_cap, true, NULL) ||
             !qwen4exp_graph_alloc(
                 &rt->graph[b], &e->weights, e->qwen_ple_store,
-                ctx_size, prefill_cap)) {
+                ctx_size, prefill_cap) ||
+            (rt->mtp_logits &&
+             !qwen4exp_graph_mtp_enable(&rt->graph[b]))) {
             qwen_batch_runtime_free(rt);
             return NULL;
         }
@@ -38781,9 +38794,13 @@ static bool qwen_batch_runtime_ensure_graph(
     ds4_gpu_mem_scope_begin(DS4_MEMC_BATCH_BANK);
     const bool ok = qwen4exp_graph_alloc(
         &rt->graph[bank], &e->weights, e->qwen_ple_store,
-        rt->ctx_size, rt->prefill_cap);
+        rt->ctx_size, rt->prefill_cap) &&
+        (!rt->mtp_logits || qwen4exp_graph_mtp_enable(&rt->graph[bank]));
     ds4_gpu_mem_scope_end();
-    if (!ok) return false;
+    if (!ok) {
+        qwen4exp_graph_free(&rt->graph[bank]);
+        return false;
+    }
     const uint64_t after = qwen_batch_census_live();
     rt->graph_bytes[bank] = after > before
         ? after - before
@@ -38798,6 +38815,11 @@ static bool qwen_batch_runtime_reset_bank(
         ds4_qwen_batch_runtime *rt, ds4_ple_store *store, uint32_t bank) {
     if (!rt || bank >= rt->max_seq) return false;
     rt->bank_logits_valid[bank] = 0u;
+    rt->mtp_baseline_ms[bank] = 0.0;
+    rt->mtp_speculative_ms[bank] = 0.0;
+    rt->mtp_verify_cycles[bank] = 0u;
+    rt->mtp_accepted_drafts[bank] = 0u;
+    rt->mtp_quenched[bank] = 0u;
     return qwen4exp_graph_reset(&rt->graph[bank], store);
 }
 
@@ -38886,6 +38908,17 @@ static bool qwen_batch_runtime_copy_bank(
             rt->bank_logits_valid[dst] = 0u;
             return false;
         }
+        if (rt->graph[dst].mtp_enabled &&
+            !qwen4exp_qsa_state_reset(&rt->graph[dst].mtp_qsa_state)) {
+            rt->bank_logits_valid[dst] = 0u;
+            return false;
+        }
+        rt->graph[dst].mtp_pending_valid = false;
+        rt->mtp_baseline_ms[dst] = 0.0;
+        rt->mtp_speculative_ms[dst] = 0.0;
+        rt->mtp_verify_cycles[dst] = 0u;
+        rt->mtp_accepted_drafts[dst] = 0u;
+        rt->mtp_quenched[dst] = 0u;
     }
     if (rt->bank_logits_valid[src]) {
         memcpy(rt->bank_logits + (size_t)dst * DS4_N_VOCAB,
@@ -38910,6 +38943,12 @@ static bool qwen_batch_runtime_prefill(
         tokens, rows, pos,
         final ? 1u : 0u,
         final ? rt->bank_logits + (size_t)bank * DS4_N_VOCAB : NULL);
+    if (ok && rt->graph[bank].mtp_enabled &&
+        !qwen4exp_graph_mtp_feed_chunk(
+            &rt->graph[bank], &e->model, &e->weights, tokens, rows)) {
+        qwen4exp_graph_mtp_disable(
+            &rt->graph[bank], "bank prefill state update failed");
+    }
     qwen_batch_runtime_note_growth(rt, bank, before);
     if (ok && final) rt->bank_logits_valid[bank] = 1u;
     return ok;
@@ -38932,9 +38971,141 @@ static bool qwen_batch_runtime_decode(
                 &tokens[i], 1u, positions[i],
                 1u,
                 rt->bank_logits + (size_t)bank * DS4_N_VOCAB);
+        if (ok && rt->graph[bank].mtp_enabled &&
+            !qwen4exp_graph_mtp_feed_chunk(
+                &rt->graph[bank], &e->model, &e->weights,
+                &tokens[i], 1u)) {
+            qwen4exp_graph_mtp_disable(
+                &rt->graph[bank], "bank decode state update failed");
+        }
         qwen_batch_runtime_note_growth(rt, bank, before);
         if (!ok) return false;
         rt->bank_logits_valid[bank] = 1u;
+    }
+    return true;
+}
+
+/* Commit one already-emitted bank token and sample its genuine successor.
+ * When the embedded one-layer drafter is warm, verify [token, draft] in one
+ * target call; a miss restores recurrent state and replays only token. */
+static bool qwen_batch_runtime_decode_next(
+        ds4_qwen_batch_runtime *rt, ds4_engine *e, uint32_t bank,
+        int token, uint32_t pos, float temperature, int top_k,
+        float top_p, float min_p, uint64_t *rng, int override,
+        int *next_token, uint32_t *committed, bool *drafted, bool *hit) {
+    if (!rt || !e || !rng || !next_token || !committed || !drafted || !hit ||
+        bank >= rt->max_seq) return false;
+    ds4_qwen_gpu_graph *g = &rt->graph[bank];
+    float *logits = rt->bank_logits + (size_t)bank * DS4_N_VOCAB;
+    *committed = 1u;
+    *drafted = false;
+    *hit = false;
+    const bool can_verify = rt->mtp_logits && g->mtp_enabled &&
+        g->mtp_pending_valid && rt->mtp_baseline_ms[bank] > 0.0 &&
+        !rt->mtp_quenched[bank] && pos + 2u <= g->context_cap;
+    if (!can_verify) {
+        const double t0 = now_sec();
+        if (!qwen_batch_runtime_decode(
+                rt, e, &bank, &token, &pos, 1u)) return false;
+        const double elapsed_ms = (now_sec() - t0) * 1000.0;
+        if (rt->mtp_baseline_ms[bank] == 0.0 && elapsed_ms > 0.0)
+            rt->mtp_baseline_ms[bank] = elapsed_ms;
+        *next_token = sample_top_p_min_p_override(
+            logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p,
+            rng, override);
+        return true;
+    }
+
+    const uint64_t before = qwen_batch_census_live();
+    const double cycle_t0 = now_sec();
+    if (!qwen4exp_graph_mtp_step(
+            g, &e->model, &e->weights, g->mtp_pending_hc,
+            &token, 1u, rt->mtp_logits)) {
+        qwen4exp_graph_mtp_disable(g, "bank draft step failed");
+        return qwen_batch_runtime_decode_next(
+            rt, e, bank, token, pos, temperature, top_k, top_p, min_p,
+            rng, override, next_token, committed, drafted, hit);
+    }
+    const int draft = sample_argmax(rt->mtp_logits, DS4_N_VOCAB);
+    *drafted = true;
+    const ds4_ple_hash_state saved_hash = g->ple.hash_state;
+    if (!qwen4exp_graph_mtp_backup_target(g)) {
+        qwen4exp_graph_mtp_disable(g, "bank rollback reservation failed");
+        return qwen_batch_runtime_decode_next(
+            rt, e, bank, token, pos, temperature, top_k, top_p, min_p,
+            rng, override, next_token, committed, drafted, hit);
+    }
+
+    const int verify_tokens[2] = {token, draft};
+    if (!qwen4exp_graph_forward_chunk(
+            g, &e->model, &e->weights,
+            e->qwen_ple_store, e->qwen_ple_cuda,
+            verify_tokens, 2u, pos, 2u, rt->mtp_logits)) {
+        if (!qwen4exp_graph_mtp_restore_target(g, pos, saved_hash))
+            return false;
+        qwen4exp_graph_mtp_disable(g, "bank two-row target verify failed");
+        return qwen_batch_runtime_decode_next(
+            rt, e, bank, token, pos, temperature, top_k, top_p, min_p,
+            rng, override, next_token, committed, drafted, hit);
+    }
+
+    const uint64_t rng_before_verify = *rng;
+    *next_token = sample_top_p_min_p_override(
+        rt->mtp_logits, DS4_N_VOCAB,
+        temperature, top_k, top_p, min_p, rng, override);
+    if (*next_token == draft) {
+        memcpy(logits, rt->mtp_logits + DS4_N_VOCAB,
+               (size_t)DS4_N_VOCAB * sizeof(*logits));
+        *committed = 2u;
+        *hit = true;
+        const uint64_t row_bytes =
+            (uint64_t)DS4_N_EMBD * DS4_N_HC * sizeof(float);
+        ds4_gpu_tensor *row0 = ds4_gpu_tensor_view(
+            g->hidden[0], 0u, row_bytes);
+        const bool caught_up = row0 && qwen4exp_graph_mtp_step(
+            g, &e->model, &e->weights, row0, &draft, 1u, NULL) &&
+            qwen4exp_graph_mtp_save_pending(g, 1u);
+        ds4_gpu_tensor_free(row0);
+        if (!caught_up)
+            qwen4exp_graph_mtp_disable(
+                g, "bank accepted-prefix catch-up failed");
+    } else {
+        if (!qwen4exp_graph_mtp_restore_target(g, pos, saved_hash) ||
+            !qwen4exp_graph_forward_chunk(
+                g, &e->model, &e->weights,
+                e->qwen_ple_store, e->qwen_ple_cuda,
+                &token, 1u, pos, 1u, logits)) {
+            return false;
+        }
+        *rng = rng_before_verify;
+        *next_token = sample_top_p_min_p_override(
+            logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p,
+            rng, override);
+        if (!qwen4exp_graph_mtp_save_pending(g, 0u))
+            qwen4exp_graph_mtp_disable(
+                g, "bank rejected-prefix catch-up failed");
+    }
+    rt->bank_logits_valid[bank] = 1u;
+    qwen_batch_runtime_note_growth(rt, bank, before);
+
+    rt->mtp_verify_cycles[bank]++;
+    rt->mtp_accepted_drafts[bank] += *hit ? 1u : 0u;
+    rt->mtp_speculative_ms[bank] += (now_sec() - cycle_t0) * 1000.0;
+    if (rt->mtp_verify_cycles[bank] >= 12u) {
+        const uint32_t n = rt->mtp_verify_cycles[bank] +
+            rt->mtp_accepted_drafts[bank];
+        if (rt->mtp_speculative_ms[bank] >
+            rt->mtp_baseline_ms[bank] * n * 1.03) {
+            rt->mtp_quenched[bank] = 1u;
+            ds4_metric_add(&ds4_metrics_get()->spec_quench, 1u);
+            fprintf(stderr,
+                    "ds4: Qwen bank %u MTP quenched after %u cycles: "
+                    "accepted=%u speculative=%.3f ms baseline=%.3f ms/token\n",
+                    bank, rt->mtp_verify_cycles[bank],
+                    rt->mtp_accepted_drafts[bank],
+                    rt->mtp_speculative_ms[bank],
+                    rt->mtp_baseline_ms[bank]);
+        }
     }
     return true;
 }
@@ -41156,6 +41327,16 @@ static bool qwen_batch_runtime_restore_checkpoint(
     dst_graph->ple.hash_state.previous[1] = source_tokens[pos - 1u];
     dst_graph->ple.prepared_rows = 0u;
     dst_graph->length = pos;
+    if (dst_graph->mtp_enabled &&
+        !qwen4exp_qsa_state_reset(&dst_graph->mtp_qsa_state)) {
+        return false;
+    }
+    dst_graph->mtp_pending_valid = false;
+    rt->mtp_baseline_ms[dst] = 0.0;
+    rt->mtp_speculative_ms[dst] = 0.0;
+    rt->mtp_verify_cycles[dst] = 0u;
+    rt->mtp_accepted_drafts[dst] = 0u;
+    rt->mtp_quenched[dst] = 0u;
     if (cp->logits_valid) {
         memcpy(rt->bank_logits + (size_t)dst * DS4_N_VOCAB,
                rt->checkpoint_logits + (size_t)slot * DS4_N_VOCAB,
@@ -54603,6 +54784,10 @@ static int family_banked_engine_continuous_generate(
         uint32_t decode_banks[DS4_MULTISEQ_MAX_SEQ];
         uint32_t decode_positions[DS4_MULTISEQ_MAX_SEQ];
         int decode_tokens[DS4_MULTISEQ_MAX_SEQ];
+        int decode_next[DS4_MULTISEQ_MAX_SEQ];
+        uint32_t decode_committed[DS4_MULTISEQ_MAX_SEQ] = {0};
+        bool decode_drafted[DS4_MULTISEQ_MAX_SEQ] = {0};
+        bool decode_hit[DS4_MULTISEQ_MAX_SEQ] = {0};
         uint32_t decode_count = 0u;
         for (uint32_t b = 0; b < MS; b++) {
             ds4_family_cont_bank *cb = &bank[b];
@@ -54625,28 +54810,54 @@ static int family_banked_engine_continuous_generate(
         const uint32_t decode_cap =
             family_cap < DS4_MULTISEQ_MAX_SEQ
                 ? family_cap : DS4_MULTISEQ_MAX_SEQ;
-        for (uint32_t off = 0u; ok && off < decode_count;) {
-            uint32_t n = decode_count - off;
-            if (n > decode_cap) n = decode_cap;
-            if (n == 0u || !family_banked_decode(
-                    ctx,
-                    decode_banks + off, decode_tokens + off,
-                    decode_positions + off, n)) {
-                const uint32_t b = decode_banks[off];
-                ctx->bank_gen[b]++;
-                ctx->bank_hist_valid[b] = 0u;
-                FCG_ERR("continuous_generate: family bank decode failed "
-                        "rows=%u first_bank=%u pos=%u", n, b,
-                        decode_positions[off]);
-                ok = false;
-                break;
+        const bool qwen_mtp = ctx->qwen && ctx->qwen->mtp_logits;
+        if (qwen_mtp) {
+            for (uint32_t row = 0u; ok && row < decode_count; row++) {
+                const uint32_t b = decode_banks[row];
+                ds4_family_cont_bank *cb = &bank[b];
+                const int override = cb->sample_override
+                    ? cb->sample_override(ud, cb->user)
+                    : DS4_SAMPLE_OVERRIDE_NONE;
+                if (!qwen_batch_runtime_decode_next(
+                        ctx->qwen, ctx->e, b, decode_tokens[row],
+                        decode_positions[row], cb->temperature, cb->top_k,
+                        cb->top_p, cb->min_p, &cb->rng, override,
+                        &decode_next[row], &decode_committed[row],
+                        &decode_drafted[row], &decode_hit[row])) {
+                    ctx->bank_gen[b]++;
+                    ctx->bank_hist_valid[b] = 0u;
+                    FCG_ERR("continuous_generate: Qwen bank MTP decode "
+                            "failed bank=%u pos=%u", b,
+                            decode_positions[row]);
+                    ok = false;
+                }
             }
-            off += n;
+        } else {
+            for (uint32_t off = 0u; ok && off < decode_count;) {
+                uint32_t n = decode_count - off;
+                if (n > decode_cap) n = decode_cap;
+                if (n == 0u || !family_banked_decode(
+                        ctx,
+                        decode_banks + off, decode_tokens + off,
+                        decode_positions + off, n)) {
+                    const uint32_t b = decode_banks[off];
+                    ctx->bank_gen[b]++;
+                    ctx->bank_hist_valid[b] = 0u;
+                    FCG_ERR("continuous_generate: family bank decode failed "
+                            "rows=%u first_bank=%u pos=%u", n, b,
+                            decode_positions[off]);
+                    ok = false;
+                    break;
+                }
+                off += n;
+            }
         }
         for (uint32_t row = 0u; ok && row < decode_count; row++) {
             const uint32_t b = decode_banks[row];
             ds4_family_cont_bank *cb = &bank[b];
             bank_hist_append(ctx, b, cb->current);
+            if (qwen_mtp && decode_committed[row] == 2u)
+                bank_hist_append(ctx, b, decode_next[row]);
             /* Decode-side periodic snapshot; the fresh step logits make it
              * usable even for a zero-suffix cut at exactly this frontier. */
             if (family_banked_checkpoint_due(
@@ -54655,13 +54866,22 @@ static int family_banked_engine_continuous_generate(
                     ctx, b, ctx->bank_hist_len[b], true);
             cb->stats.decode_steps++;
             ds4_metric_add(&ds4_metrics_get()->decode_steps, 1u);
-            const int override = cb->sample_override
+            if (decode_drafted[row]) {
+                cb->stats.spec_drafts++;
+                ds4_metric_add(&ds4_metrics_get()->spec_drafts, 1u);
+            }
+            if (decode_hit[row]) {
+                cb->stats.spec_hits++;
+                ds4_metric_add(&ds4_metrics_get()->spec_hits, 1u);
+            }
+            const int override = !qwen_mtp && cb->sample_override
                 ? cb->sample_override(ud, cb->user)
                 : DS4_SAMPLE_OVERRIDE_NONE;
-            const int token = sample_top_p_min_p_override(
-                family_banked_logits(ctx, b),
-                DS4_N_VOCAB, cb->temperature, cb->top_k,
-                cb->top_p, cb->min_p, &cb->rng, override);
+            int token = qwen_mtp ? decode_next[row]
+                : sample_top_p_min_p_override(
+                    family_banked_logits(ctx, b),
+                    DS4_N_VOCAB, cb->temperature, cb->top_k,
+                    cb->top_p, cb->min_p, &cb->rng, override);
             cb->generated[cb->generated_len++] = token;
             cb->current = token;
             ds4_metric_add(&ds4_metrics_get()->tokens_decoded, 1u);
@@ -54672,6 +54892,28 @@ static int family_banked_engine_continuous_generate(
             if (hit_eos || cb->generated_len >= cb->max_new || aborted) {
                 family_cont_publish_generated(
                     ctx, bank, b, hit_eos ? 1 : 0, on_done, ud);
+                continue;
+            }
+            if (qwen_mtp && decode_hit[row]) {
+                const int next_override = cb->sample_override
+                    ? cb->sample_override(ud, cb->user)
+                    : DS4_SAMPLE_OVERRIDE_NONE;
+                token = sample_top_p_min_p_override(
+                    family_banked_logits(ctx, b),
+                    DS4_N_VOCAB, cb->temperature, cb->top_k,
+                    cb->top_p, cb->min_p, &cb->rng, next_override);
+                cb->generated[cb->generated_len++] = token;
+                cb->current = token;
+                ds4_metric_add(&ds4_metrics_get()->tokens_decoded, 1u);
+                ds4_metrics_window_add(1u, 0u, 0u);
+                const bool next_eos = token == cb->eos;
+                const bool next_aborted = !next_eos && on_token &&
+                    !on_token(ud, cb->user, token);
+                if (next_eos || cb->generated_len >= cb->max_new ||
+                    next_aborted) {
+                    family_cont_publish_generated(
+                        ctx, bank, b, next_eos ? 1 : 0, on_done, ud);
+                }
             }
         }
 

@@ -51,7 +51,7 @@ only the explicitly validated model families below:
 | K-EXAONE 236B A23B | `exaone-moe` | LLLG persistent banks with shared prefill scratch; disk KV and exact-frontier reuse; plain decode |
 | Motif-3 | `motif3` | Latent-KV persistent banks; disk KV and live partial-prefix forks; plain decode |
 | dots3-note Preview | `dots3-note` | Dual-geometry latent serial sessions and disk KV; embedded MTP is validation-only |
-| Qwen3.8-Flash-Next SSD-PLE | `qwen4exp` | CUDA serial or opt-in two-bank serving; bounded SSD-PLE, recurrent disk KV, live partial-prefix forks, and scalar target-verified embedded MTP |
+| Qwen3.8-Flash-Next SSD-PLE | `qwen4exp` | CUDA serial or opt-in two-bank serving; bounded SSD-PLE, recurrent disk KV, live partial-prefix forks, and target-verified embedded MTP |
 
 The serving command and HTTP contract do not change with the family; only the
 GGUF path and the matching weight-owner manifest change:
@@ -74,8 +74,8 @@ response-shape and tool-continuation gates; loading the GGUF alone is not that
 acceptance. External MTP and DSpark support GGUFs remain
 DeepSeek-only and are rejected for every other family. Qwen instead uses the
 MTP block embedded in its main GGUF when `--mtp-draft 2` is selected; that
-target-verified path currently applies to greedy scalar/session decode, while
-the opt-in two-bank lane still uses plain decode. Serial checkpoints, and idle
+target-verified path applies to greedy scalar/session decode and the opt-in
+two-bank lane. Serial checkpoints, and idle
 continuous banks for families that have them, can be saved to the same disk-KV
 service and restored after an inference-worker restart. Disk persistence avoids
 repeated prefill; it does not reduce the resident memory required by each active
@@ -103,6 +103,16 @@ faults. Agent/tool deployments must therefore leave the serial lane enabled:
 or tool frontier requires that lane. A three-bank 262K trial was not retained
 on the 128 GiB reference host because the same serial continuation reduced
 `MemAvailable` to 1.12 GiB; two banks are the guarded production setting.
+
+The two-bank MTP path was checked on the same Q5 artifact with four fixed cold
+API prompts. Plain decode averaged 23.65 tok/s; `--mtp-draft 2` averaged
+28.65 tok/s (**+21.1%**) with an 84.98% draft acceptance rate. Mean TTFT was
+260.7 versus 261.1 ms and prefill was 225.38 versus 223.35 tok/s. Device-live
+memory increased by about 0.98 GiB. A synchronized two-request run and Chat,
+Responses, and Anthropic Messages smokes completed with zero request or
+governor failures. This establishes target-verified two-bank operation, not
+true row-batched kernel throughput; acceptance and speed remain content
+dependent.
 
 Motif-3 also completed a strict OpenAI Chat gate at the 262,144-token context
 limit: 262,080 prompt tokens at 175.61 tok/s followed by 43 decoded tokens at
@@ -695,7 +705,7 @@ than refusing). The knobs:
 | `DS4_MEM_RECONCILE_TOL_MB` | `256` | When idle, the server reconciles the box's available-memory drop since boot against what its own allocation ledger explains and logs the residual (`mem reconcile:` line, also on `/v1/stats` and `/metrics`); a residual beyond this many MiB is marked `FLAGGED`. `DS4_MEM_RECONCILE_STRICT=1` adds a distinct `mem reconcile STRICT` line for gate scripts to assert on; `DS4_MEM_RECONCILE_WARMUP_MB` pins the named one-time warmup charge instead of letting the first idle pass self-calibrate it. Pure reporting — no admission decision reads it. |
 | `DS4_CONT_PREFILL_CHUNK` / `DS4_CONT_PREFILL_CHUNK_LIVE` | `4096` / `512` | Long prompts are ingested this many tokens at a time so a big admission never blocks the server. The `_LIVE` value applies while other requests are actively decoding: smaller keeps live decode smoother, larger ingests faster. |
 | `DS4_SERVER_FORK_PARTIAL` | `1` | Reuse the longest safe prefix when a prompt diverges inside a retained conversation. Set to `0` for a true cold-control path: Solar then reserves no KDA checkpoints, Motif-3 no SWA-window checkpoints, and Qwen no recurrent-state checkpoints. `DS4_SERVER_FORK_PARTIAL_MIN` (default 192 tokens, floor 136) skips tiny partial matches. |
-| `DS4_QWEN_BATCH` | unset (off) | Set to `1` to enable Qwen's persistent two-bank lane. It supports exact-frontier and partial-prefix forks plus bank disk-KV persistence; its decode loop is still non-MTP and does not claim row-batched kernel throughput. |
+| `DS4_QWEN_BATCH` | unset (off) | Set to `1` to enable Qwen's persistent two-bank lane. It supports exact-frontier and partial-prefix forks, bank disk-KV persistence, and target-verified embedded MTP with `--mtp-draft 2`; it does not claim row-batched kernel throughput. |
 | `DS4_QWEN_PREFILL_CHUNK` | `256` (range 1..16384) | Qwen serial and bank prefill width. `8192` is the production serving setting used for the published Spark results; larger values need enough graph memory. |
 | `DS4_QWEN_PLE_CACHE_MB` | `2048` (allowed: 512, 1024, 2048) | Bound for Qwen's pinned SSD-PLE page cache. The full 95.37 GiB sidecar remains outside the unified-memory resident set. |
 | `DS4_SERVER_CONTINUOUS` | `1` (continuous batching on) | Set to `0` to serve one request at a time on the old serial path. Only worth considering for single-user, latency-critical setups. |

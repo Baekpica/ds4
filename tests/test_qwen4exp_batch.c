@@ -156,6 +156,49 @@ static void fork_done(void *ud, void *user, const int *tokens,
     test->token = tokens[0];
 }
 
+typedef struct {
+    ds4_batch_ctx *ctx;
+    const ds4_tokens *prompts;
+    int next;
+    int tokens[2][12];
+    int n[2];
+    int completed;
+    int failed;
+    ds4_cont_seq_stats stats[2];
+} bank_mtp_case;
+
+static int bank_mtp_admit(void *ud, ds4_cont_request *req) {
+    bank_mtp_case *test = ud;
+    if (test->next >= 2) return 0;
+    const int i = test->next++;
+    memset(req, 0, sizeof(*req));
+    req->tokens = test->prompts[i].v;
+    req->n = test->prompts[i].len;
+    req->max_new = 12;
+    req->eos = -1;
+    req->user = (void *)(uintptr_t)(i + 1);
+    return 1;
+}
+
+static void bank_mtp_done(void *ud, void *user, const int *tokens,
+                          int n, int finish) {
+    (void)finish;
+    bank_mtp_case *test = ud;
+    const int i = (int)(uintptr_t)user - 1;
+    if (i < 0 || i >= 2) {
+        test->failed = 1;
+        return;
+    }
+    if (!tokens || n != 12 ||
+        !ds4_cont_last_done_stats(test->ctx, &test->stats[i])) {
+        test->failed = 1;
+        return;
+    }
+    memcpy(test->tokens[i], tokens, sizeof(test->tokens[i]));
+    test->n[i] = n;
+    test->completed++;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "usage: %s <first-model-shard.gguf>\n", argv[0]);
@@ -211,20 +254,26 @@ int main(int argc, char **argv) {
         }
     }
     enum { MTP_BUDGET = 12 };
-    int mtp_oracle[MTP_BUDGET] = {0};
-    int mtp_got[MTP_BUDGET] = {0};
-    int mtp_multi_accepts = 0;
+    int mtp_oracle[2][MTP_BUDGET] = {{0}};
+    int mtp_got[2][MTP_BUDGET] = {{0}};
+    int mtp_multi_accepts[2] = {0};
     if (serial_greedy(
-            engine, &prompt[0], MTP_BUDGET, mtp_oracle,
+            engine, &prompt[0], MTP_BUDGET, mtp_oracle[0],
+            err, sizeof(err)) != 0 ||
+        serial_greedy(
+            engine, &prompt[1], MTP_BUDGET, mtp_oracle[1],
             err, sizeof(err)) != 0 ||
         speculative_greedy(
-            engine, &prompt[0], MTP_BUDGET, mtp_got,
-            &mtp_multi_accepts, err, sizeof(err)) != 0 ||
-        memcmp(mtp_got, mtp_oracle, sizeof(mtp_got)) != 0 ||
-        mtp_multi_accepts == 0) {
+            engine, &prompt[0], MTP_BUDGET, mtp_got[0],
+            &mtp_multi_accepts[0], err, sizeof(err)) != 0 ||
+        speculative_greedy(
+            engine, &prompt[1], MTP_BUDGET, mtp_got[1],
+            &mtp_multi_accepts[1], err, sizeof(err)) != 0 ||
+        memcmp(mtp_got[0], mtp_oracle[0], sizeof(mtp_got[0])) != 0 ||
+        mtp_multi_accepts[0] == 0 || mtp_multi_accepts[1] == 0) {
         fprintf(stderr,
-                "Qwen target-verified MTP failed: %s multi_accepts=%d\n",
-                err, mtp_multi_accepts);
+                "Qwen target-verified MTP failed: %s multi_accepts=%d/%d\n",
+                err, mtp_multi_accepts[0], mtp_multi_accepts[1]);
         failed = 1;
         goto cleanup;
     }
@@ -240,6 +289,43 @@ int main(int argc, char **argv) {
         !ctx || ds4_batch_ctx_max_seq(ctx) != 2 ||
         !ds4_batch_ctx_supports_partial_reuse(ctx)) {
         fprintf(stderr, "Qwen batch context failed: %s\n", err);
+        failed = 1;
+        goto cleanup;
+    }
+
+    bank_mtp_case bank_mtp = {
+        .ctx = ctx,
+        .prompts = prompt,
+    };
+    err[0] = '\0';
+    if (ds4_engine_continuous_generate(
+            ctx, bank_mtp_admit, NULL, bank_mtp_done, &bank_mtp,
+            err, sizeof(err)) != 0 || bank_mtp.failed ||
+        bank_mtp.completed != 2 ||
+        bank_mtp.n[0] != MTP_BUDGET || bank_mtp.n[1] != MTP_BUDGET ||
+        memcmp(bank_mtp.tokens, mtp_got, sizeof(mtp_got)) != 0 ||
+        bank_mtp.stats[0].spec_drafts == 0u ||
+        bank_mtp.stats[1].spec_drafts == 0u ||
+        bank_mtp.stats[0].spec_hits + bank_mtp.stats[1].spec_hits == 0u) {
+        fprintf(stderr,
+                "Qwen bank MTP failed: %s completed=%d "
+                "tokens=%d/%d drafts=%llu/%llu hits=%llu/%llu\n",
+                err, bank_mtp.completed, bank_mtp.n[0], bank_mtp.n[1],
+                (unsigned long long)bank_mtp.stats[0].spec_drafts,
+                (unsigned long long)bank_mtp.stats[1].spec_drafts,
+                (unsigned long long)bank_mtp.stats[0].spec_hits,
+                (unsigned long long)bank_mtp.stats[1].spec_hits);
+        for (int i = 0; i < 2; i++) {
+            for (int j = 0; j < MTP_BUDGET; j++) {
+                if (bank_mtp.tokens[i][j] != mtp_got[i][j]) {
+                    fprintf(stderr,
+                            "Qwen bank MTP row %d first mismatch at %d: "
+                            "got=%d want=%d\n",
+                            i, j, bank_mtp.tokens[i][j], mtp_got[i][j]);
+                    break;
+                }
+            }
+        }
         failed = 1;
         goto cleanup;
     }
@@ -492,6 +578,10 @@ cleanup:
     ds4_engine_close(engine);
     if (!failed)
         printf("Qwen3.8 two-bank parity, disk KV, partial fork, and graph "
-               "lifecycle: PASS\n");
+               "lifecycle: PASS (MTP drafts=%llu/%llu hits=%llu/%llu)\n",
+               (unsigned long long)bank_mtp.stats[0].spec_drafts,
+               (unsigned long long)bank_mtp.stats[1].spec_drafts,
+               (unsigned long long)bank_mtp.stats[0].spec_hits,
+               (unsigned long long)bank_mtp.stats[1].spec_hits);
     return failed;
 }
