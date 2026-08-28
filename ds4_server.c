@@ -11069,6 +11069,12 @@ struct server {
     struct {
         char    *text;
         size_t   len;
+        /* A tools-armed prose turn may be replayed either with the emitted
+         * reasoning field or with only the visible assistant content.  Keep
+         * the sampled/raw spelling as an in-memory alias while `text` stays
+         * the client-visible key persisted to disk. */
+        char    *exact_text;
+        size_t   exact_len;
         uint64_t last_use;
         bool     valid;
         /* A client/semantic cut or split think-close can leave a key shorter
@@ -13647,12 +13653,12 @@ static int responses_live_visible_prefix_prompt(server *s, const request *req,
     return live_tokens->len;
 }
 
-/* Tool-less thinking continuation.
+/* Visible-history thinking continuation.
  *
  * Chat/completions and Anthropic do not have a previous_response_id object that
  * binds a later request to the last sampled turn.  Still, after a normal
- * tool-less thinking answer, the next prompt renderer intentionally omits that
- * hidden reasoning.  The live KV state is richer than the visible transcript.
+ * thinking answer without an emitted tool call, a client may omit that hidden
+ * reasoning on replay.  The live KV state is richer than the visible transcript.
  *
  * Remembering the visible transcript as a key lets us keep the sampled hidden
  * KV when the next request clearly extends that same visible history.  This is
@@ -14606,8 +14612,7 @@ static bool continue_after_invalid_tool_call(server *s, const request *r,
 static bool should_remember_thinking_checkpoint(const request *r,
                                                 const thinking_state *thinking,
                                                 const char *finish) {
-    if (!r || r->kind != REQ_CHAT || r->has_tools) return false;
-    if (r->prompt_preserves_reasoning) return false;
+    if (!r || r->kind != REQ_CHAT) return false;
     if (!ds4_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
@@ -14937,10 +14942,10 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     return buf_take(&suffix);
 }
 
-/* In thinking mode without tools, old assistant reasoning is intentionally not
- * rendered back into later prompts.  The sampled live graph still contains the
- * reasoning bytes, so the next request would miss the session cache even though
- * the visible conversation prefix is logically the same.
+/* When a client omits old assistant reasoning from a later prompt, the sampled
+ * live graph still contains those bytes.  The next request would miss the
+ * session cache even though the visible conversation prefix is logically the
+ * same.  This also covers tools-armed turns that emitted ordinary prose.
  *
  *   DSML:  prompt-without-final-<think> + </think> + visible-content + eos
  *   Solar: prompt-with-<|think:start|> + <|think:end|> + content + eos
@@ -18060,6 +18065,7 @@ typedef struct {
 /* Defined after struct cont_stream; retirement only needs its semantic verdict
  * and transport-failure bit, so keep the state layout private there. */
 static bool cont_stream_requires_partial_rewind(const job *j);
+static bool cont_stream_saw_tool_start(const job *j);
 
 /* ---- A2a: per-bank warm start (retirement records + matching + placement).
  * All of this runs on the worker thread under gen_mu.  The matching is
@@ -18080,8 +18086,11 @@ static void warm_records_gauge_refresh(const server *s) {
 static void warm_rec_invalidate(server *s, int bank) {
     if (!s->warm || bank < 0 || bank >= s->batch_ctx_max_seq) return;
     free(s->warm[bank].text);
+    free(s->warm[bank].exact_text);
     s->warm[bank].text = NULL;
+    s->warm[bank].exact_text = NULL;
     s->warm[bank].len = 0;
+    s->warm[bank].exact_len = 0;
     s->warm[bank].valid = false;
     s->warm[bank].partial_only = false;
     warm_records_gauge_refresh(s);
@@ -18096,6 +18105,23 @@ static void cont_append_committed_text(server *s, buf *b, const int *tokens, int
     }
 }
 
+static size_t warm_rec_full_prefix_len(const server *s, int bank,
+                                       const char *text, size_t len) {
+    if (!s || !s->warm || bank < 0 || bank >= s->batch_ctx_max_seq ||
+        !s->warm[bank].valid || s->warm[bank].partial_only || !text)
+        return 0;
+
+    size_t matched = 0;
+    if (s->warm[bank].len > 0 && s->warm[bank].len < len &&
+        byte_prefix_match(text, len, s->warm[bank].text, s->warm[bank].len))
+        matched = s->warm[bank].len;
+    if (s->warm[bank].exact_len > matched && s->warm[bank].exact_len < len &&
+        byte_prefix_match(text, len, s->warm[bank].exact_text,
+                          s->warm[bank].exact_len))
+        matched = s->warm[bank].exact_len;
+    return matched;
+}
+
 /* Retire job j's bank at on_done: rebuild the record a follow-up request
  * extending this conversation will byte-prefix-match.  The engine never
  * forwards the final sample, so the committed generation is tokens[0..n-2]
@@ -18104,15 +18130,13 @@ static void cont_append_committed_text(server *s, buf *b, const int *tokens, int
  * verbatim.  Stop-finish rows build records that simply never match
  * (committed post-stop tokens) -- harmless.
  *
- * Thinking rows need a key the NEXT rendering will actually reproduce, and
- * prompt_preserves_reasoning already says which one that is:
- *
- *   - preserved (the history carries tool context, so render_chat_prompt_text
- *     replays the reasoning): the raw key is what comes back, retire normally.
- *   - otherwise: key on the VISIBLE transcript, as the session path already
- *     does (build_toolless_thinking_visible_text).  The payload stays the
- *     bank's committed frontier, which cont_warm_pick pairs with a tokenized
- *     suffix, so hidden reasoning stays in KV and is never re-prefilled.
+ * Thinking rows need a key the NEXT rendering will actually reproduce.  With
+ * no emitted tool call, key on the VISIBLE transcript as the session path does
+ * (build_toolless_thinking_visible_text).  A tools-armed client may or may not
+ * replay the non-standard reasoning field, so those rows retain the raw key as
+ * an in-memory alias.  The payload stays the bank's committed frontier, which
+ * cont_warm_pick pairs with a tokenized suffix, so hidden reasoning stays in KV
+ * and is never re-prefilled.  Actual tool turns keep their established raw key.
  *
  * A completed/length-limited tool-less row records only a key whose suffix can
  * be appended to the actual committed frontier.  Transport/semantic cuts, and
@@ -18168,11 +18192,41 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
     if (!j->req.prompt_text || !j->req.prompt_text[0]) return;
 
     buf tb = {0};
+    char *exact_text = NULL;
+    size_t exact_len = 0;
     if (!ds4_think_mode_enabled(j->req.think_mode) ||
         j->req.prompt_preserves_reasoning)
     {
+        buf gen = {0};
         buf_puts(&tb, j->req.prompt_text);
-        cont_append_committed_text(s, &tb, tokens, n);
+        cont_append_committed_text(s, &gen, tokens, n);
+        if (gen.len) buf_append(&tb, gen.ptr, gen.len);
+
+        /* Tool schemas do not prove that the client will resend our
+         * non-standard reasoning field.  For a clean prose answer, persist
+         * the visible replay key and retain the reasoning-aware raw key as an
+         * in-memory alias; an actual tool marker keeps the established raw
+         * tool replay path. */
+        if (finish && j->req.kind == REQ_CHAT && j->req.has_tools &&
+            ds4_think_mode_enabled(j->req.think_mode) &&
+            !cont_stream_saw_tool_start(j)) {
+            const char *think_close = chat_think_end(j->req.chat_format);
+            const char *close = gen.ptr ? strstr(gen.ptr, think_close) : NULL;
+            char *visible = close ? build_cont_toolless_thinking_visible_key(
+                                        &j->req, close + strlen(think_close))
+                                  : NULL;
+            if (visible) {
+                exact_text = tb.ptr;
+                exact_len = tb.len;
+                tb.ptr = visible;
+                tb.len = strlen(visible);
+                tb.cap = tb.len + 1;
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: tools-armed prose bank=%d keeps visible replay key and reasoning alias",
+                           bank);
+            }
+        }
+        buf_free(&gen);
     } else if (!finish) {
         /* v0.5.4 (378855/41): an ABORTED thinking row (dead client, budget)
          * retired without a record, so an identical retry re-paid the whole
@@ -18231,7 +18285,8 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
         }
         s->warm[bank].partial_only = partial_only;
     } else {
-        if (j->req.kind != REQ_CHAT || j->req.has_tools) return;
+        if (j->req.kind != REQ_CHAT ||
+            (j->req.has_tools && cont_stream_saw_tool_start(j))) return;
         buf gen = {0};
         cont_append_committed_text(s, &gen, tokens, n);
         const char *think_close = chat_think_end(j->req.chat_format);
@@ -18246,6 +18301,8 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
     }
     s->warm[bank].text = tb.ptr;
     s->warm[bank].len = tb.len;
+    s->warm[bank].exact_text = exact_text;
+    s->warm[bank].exact_len = exact_len;
     s->warm[bank].valid = true;
     warm_records_gauge_refresh(s);
     /* v0.5.1 inc3b: warm banks extend committed history every retire but
@@ -18425,12 +18482,11 @@ static bool cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
     int best = -1;
     size_t best_len = 0;
     for (int b = 0; b < s->batch_ctx_max_seq; b++) {
-        if (occ[b] || !s->warm[b].valid || s->warm[b].partial_only) continue;
-        if (plen && s->warm[b].len > 0 && s->warm[b].len < plen &&
-            s->warm[b].len > best_len &&
-            byte_prefix_match(ptext, plen, s->warm[b].text, s->warm[b].len)) {
+        if (occ[b]) continue;
+        const size_t matched = warm_rec_full_prefix_len(s, b, ptext, plen);
+        if (matched > best_len) {
             best = b;
-            best_len = s->warm[b].len;
+            best_len = matched;
         }
     }
     /* #10 (2026-08-04): an equal-length record can never win the full scan
@@ -19094,6 +19150,10 @@ struct cont_stream {
 static bool cont_stream_requires_partial_rewind(const job *j) {
     return j && j->cstream &&
            (j->cstream->failed || j->cstream->acc.verdict != NULL);
+}
+
+static bool cont_stream_saw_tool_start(const job *j) {
+    return j && j->cstream && j->cstream->acc.saw_tool_start;
 }
 
 /* A1: does this row need host-side text (stream projection or stop/tool scan)?
@@ -25600,6 +25660,52 @@ static void test_qwen4exp_native_chat_protocol(void) {
         "\"days\":{\"type\":\"integer\"}}}}";
     tool_schema_orders orders = {0};
     tool_schema_orders_add_json(&orders, schemas);
+
+    /* LibreChat-style replay keeps the tool schemas and visible assistant
+     * content but omits the non-standard reasoning field. */
+    chat_msgs prose = {0};
+    chat_msg prose_user = {.role = xstrdup("user"),
+                           .content = xstrdup("Introduce yourself.")};
+    chat_msgs_push(&prose, prose_user);
+    char *prose_prompt = render_chat_prompt_text_choice_format(
+        &prose, schemas, &orders, DS4_THINK_LOW, TOOL_CHOICE_AUTO,
+        DS4_CHAT_FORMAT_QWEN4EXP);
+    request prose_req;
+    request_init(&prose_req, REQ_CHAT, 128);
+    prose_req.chat_format = DS4_CHAT_FORMAT_QWEN4EXP;
+    prose_req.think_mode = DS4_THINK_LOW;
+    prose_req.has_tools = true;
+    prose_req.prompt_preserves_reasoning = true;
+    prose_req.prompt_text = xstrdup(prose_prompt);
+    char *visible_key = build_toolless_thinking_visible_text(
+        &prose_req, "I am Qwen.");
+    char *bank_key = build_cont_toolless_thinking_visible_key(
+        &prose_req, "I am Qwen.");
+
+    chat_msg prose_assistant = {.role = xstrdup("assistant"),
+                                .content = xstrdup("I am Qwen.")};
+    chat_msgs_push(&prose, prose_assistant);
+    chat_msg prose_next = {.role = xstrdup("user"),
+                           .content = xstrdup("Thanks.")};
+    chat_msgs_push(&prose, prose_next);
+    char *prose_future = render_chat_prompt_text_choice_format(
+        &prose, schemas, &orders, DS4_THINK_LOW, TOOL_CHOICE_AUTO,
+        DS4_CHAT_FORMAT_QWEN4EXP);
+    TEST_ASSERT(visible_key && strlen(prose_future) > strlen(visible_key) &&
+                !memcmp(prose_future, visible_key, strlen(visible_key)));
+    TEST_ASSERT(bank_key && strlen(prose_future) > strlen(bank_key) &&
+                !memcmp(prose_future, bank_key, strlen(bank_key)));
+    thinking_state prose_thinking = {.inside = false};
+    TEST_ASSERT(should_remember_thinking_checkpoint(
+        &prose_req, &prose_thinking, "stop"));
+
+    free(prose_future);
+    free(bank_key);
+    free(visible_key);
+    free(prose_prompt);
+    request_free(&prose_req);
+    chat_msgs_free(&prose);
+
     const char *generated =
         "<think>\nNeed weather.\n</think>\n\n"
         "<tool_call>\n<function=weather>\n"
@@ -29052,6 +29158,31 @@ static void test_rewind_only_record_cannot_supersede_exact_record(void) {
     free(s.warm);
 }
 
+static void test_warm_record_accepts_visible_and_reasoning_replay(void) {
+    server s = {0};
+    s.batch_ctx_max_seq = 1;
+    s.warm = xmalloc(sizeof(*s.warm));
+    memset(s.warm, 0, sizeof(*s.warm));
+    s.warm[0].valid = true;
+    s.warm[0].text = xstrdup("visible assistant answer");
+    s.warm[0].len = strlen(s.warm[0].text);
+    s.warm[0].exact_text = xstrdup("hidden reasoning assistant answer");
+    s.warm[0].exact_len = strlen(s.warm[0].exact_text);
+
+    const char *visible_replay = "visible assistant answer next user";
+    const char *reasoning_replay = "hidden reasoning assistant answer next user";
+    TEST_ASSERT(warm_rec_full_prefix_len(
+                    &s, 0, visible_replay, strlen(visible_replay)) ==
+                s.warm[0].len);
+    TEST_ASSERT(warm_rec_full_prefix_len(
+                    &s, 0, reasoning_replay, strlen(reasoning_replay)) ==
+                s.warm[0].exact_len);
+
+    free(s.warm[0].text);
+    free(s.warm[0].exact_text);
+    free(s.warm);
+}
+
 static void test_client_socket_nonblocking_flag(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -29105,10 +29236,10 @@ static void test_thinking_checkpoint_remember_gate(void) {
     TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
 
     r.prompt_preserves_reasoning = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.prompt_preserves_reasoning = false;
     r.has_tools = true;
-    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.has_tools = false;
     r.think_mode = DS4_THINK_NONE;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
@@ -30321,10 +30452,9 @@ static void test_thinking_canonical_multi_turn(void) {
 }
 
 static void test_thinking_canonical_with_tools_preserves_reasoning(void) {
-    /* When tools ARE present, reasoning is preserved in re-render.
-     * The toolless thinking live binding should NOT fire (has_tools gate),
-     * and the tool-call replay path handles it.  Verify the template
-     * preserves reasoning when tool_context is true. */
+    /* When tools ARE present and the client supplies reasoning, re-rendering
+     * preserves it.  The visible checkpoint is only an alternate replay key
+     * for clients that omit this field. */
     const char *tool_schemas = "{\"name\":\"bash\"}";
 
     chat_msgs msgs = {0};
@@ -35266,6 +35396,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_skip_has_nesting_limit();
     test_model_metadata_clamps_completion_to_context();
     test_client_socket_nonblocking_flag();
+    test_warm_record_accepts_visible_and_reasoning_replay();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();
     test_tool_marker_state_ignores_orphan_end();
