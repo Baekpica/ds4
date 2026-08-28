@@ -541,7 +541,7 @@ typedef struct {
     uint32_t name_len;
     uint32_t type;
     uint32_t ndim;
-    uint64_t dims[4];
+    uint64_t dims[8];
     uint64_t offset;
     uint64_t bytes;
 } ds4_gpu_tensor_record;

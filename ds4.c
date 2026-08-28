@@ -59860,7 +59860,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                         records[i].name_len = (uint32_t)t->name.len;
                         records[i].type = t->type;
                         records[i].ndim = t->ndim;
-                        for (uint32_t d = 0; d < t->ndim && d < 4u; d++) {
+                        for (uint32_t d = 0; d < t->ndim && d < 8u; d++) {
                             records[i].dims[d] = t->dim[d];
                         }
                         records[i].offset = t->abs_offset;

@@ -142,6 +142,17 @@ static int test_q8_candidate_shapes() {
         return fail("tiny K=128 Q8 tensor should not allocate an artifact");
     }
 
+    ds4_repack_tensor qwen_shared = kda;
+    qwen_shared.name = "blk.1.ffn_gate_shexp.weight";
+    qwen_shared.dims[0] = 2560u;
+    qwen_shared.dims[1] = 640u;
+    qwen_shared.elements = qwen_shared.dims[0] * qwen_shared.dims[1];
+    qwen_shared.bytes = (qwen_shared.dims[0] / 32u) *
+                        qwen_shared.dims[1] * 34u;
+    if (!ds4_repack_q8_candidate(qwen_shared)) {
+        return fail("Qwen shared-expert Q8 pair was not an aligned candidate");
+    }
+
     ds4_repack_tensor kv_b;
     kv_b.name = "blk.1.attn_kv_b.weight";
     kv_b.type = 8u;

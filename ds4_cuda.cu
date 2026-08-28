@@ -5949,7 +5949,7 @@ typedef struct {
     uint32_t name_len;
     uint32_t type;
     uint32_t ndim;
-    uint64_t dims[4];
+    uint64_t dims[8];
     uint64_t offset;
     uint64_t bytes;
 } ds4_gpu_tensor_record;
@@ -6175,7 +6175,7 @@ extern "C" int ds4_gpu_build_derived_artifacts_from_records(
     records.reserve(count);
     for (uint32_t i = 0; i < count; i++) {
         const ds4_gpu_tensor_record &r = records_in[i];
-        if (!r.name || r.name_len == 0 || r.ndim == 0 || r.ndim > 4u ||
+        if (!r.name || r.name_len == 0 || r.ndim == 0 || r.ndim > 8u ||
             r.offset > model_size || r.bytes > model_size - r.offset) {
             g_derived_artifact_none_reason =
                 "merged GGUF catalog has an invalid tensor record";
@@ -6186,7 +6186,7 @@ extern "C" int ds4_gpu_build_derived_artifacts_from_records(
         t.type = r.type;
         t.ndim = r.ndim;
         t.elements = 1;
-        for (uint32_t d = 0; d < r.ndim && d < 4u; d++) {
+        for (uint32_t d = 0; d < r.ndim && d < 8u; d++) {
             t.dims[d] = r.dims[d];
             if (r.dims[d] != 0 && t.elements > UINT64_MAX / r.dims[d]) {
                 g_derived_artifact_none_reason = "merged GGUF catalog dimension overflow";
@@ -23335,7 +23335,12 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
         if (q8_aligned_nc_en < 0)
             q8_aligned_nc_en = getenv("DS4_CUDA_NO_Q8_ALIGNED_NC") == NULL;
         int rc = -1;
-        if ((n_tok == 1u || (n_tok <= 8u && q8_aligned_nc_en)) &&
+        /* Qwen recurrent-state replay requires the N=2..8 continuation to
+         * use the same raw MMVQ arithmetic as its cold serial oracle. */
+        const bool qwen_replay_nc =
+            n_tok > 1u && in_dim == 6144u && out_dim == 2560u;
+        if ((n_tok == 1u ||
+             (n_tok <= 8u && q8_aligned_nc_en && !qwen_replay_nc)) &&
             in_dim % 1024u == 0 && cuda_q8_aligned_enabled()) {
             const uint64_t q8_al_bytes = ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim);
             const char *w_aligned = q8_al_bytes != 0
@@ -24148,7 +24153,11 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
          * (raw q8 stays served — additive artifacts, safe fallback). */
         const char *w0_al = NULL;
         const char *w1_al = NULL;
-        if (in_dim % 1024u == 0 && cuda_q8_aligned_enabled()) {
+        const bool qwen_shared_pair =
+            in_dim == 2560u && out0_dim == 640u && out1_dim == 640u;
+        if ((in_dim % 1024u == 0 || qwen_shared_pair) &&
+            cuda_q8_aligned_enabled() &&
+            getenv("DS4_CUDA_NO_Q8_PAIR_ALIGNED") == NULL) {
             const uint64_t b0 = ds4_mmq_q8_0_aligned_bytes((int)out0_dim, (int)in_dim);
             const uint64_t b1 = ds4_mmq_q8_0_aligned_bytes((int)out1_dim, (int)in_dim);
             if (b0 != 0 && b1 != 0) {
@@ -24199,7 +24208,11 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         dim3 grid(((unsigned)max_out + 7u) / 8u, (unsigned)n_tok, 1);
         const char *w0_al = NULL;
         const char *w1_al = NULL;
-        if (in_dim % 1024u == 0 && cuda_q8_aligned_enabled()) {
+        const bool qwen_shared_pair =
+            in_dim == 2560u && out0_dim == 640u && out1_dim == 640u;
+        if ((in_dim % 1024u == 0 || qwen_shared_pair) &&
+            cuda_q8_aligned_enabled() &&
+            getenv("DS4_CUDA_NO_Q8_PAIR_ALIGNED") == NULL) {
             const uint64_t b0 = ds4_mmq_q8_0_aligned_bytes((int)out0_dim, (int)in_dim);
             const uint64_t b1 = ds4_mmq_q8_0_aligned_bytes((int)out1_dim, (int)in_dim);
             if (b0 != 0 && b1 != 0) {
@@ -24219,6 +24232,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
             const int force_coalesced =
                 getenv("DS4_CUDA_FORCE_Q8_PAIR_COALESCED") != NULL;
             if (getenv("DS4_CUDA_NO_Q8_PAIR_COALESCED") == NULL &&
+                blocks % 32u == 0 &&
                 (max_out <= 2048u || force_coalesced)) {
                 matmul_q8_0_pair_preq_batch_aligned_coalesced_warp8_kernel<<<
                     grid, 256, 0, ds4_current_stream()>>>(
