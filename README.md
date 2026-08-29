@@ -145,11 +145,11 @@ state-safe row batching, not a claim that the complete Qwen graph is batched.
 
 Two later increments pair the independent Gated DeltaNet recurrent updates in
 one two-dimensional CUDA grid and run the final Q8 output projection through
-the existing two-row aligned kernel. The same-process 3-by-3 real-Q5 checks
+the existing two-row dense path. The same-process 3-by-3 real-Q5 checks
 measured 23.24 versus 22.80 tok/s for the recurrent update (+1.96%), then
-23.70 versus 23.15 tok/s for the output projection (+2.35%). The aligned and
-raw Q8 kernels matched two one-row calls bit-for-bit at the production 6,144
-input width, and the full two-bank MTP/disk-KV/partial-fork regression retained
+23.70 versus 23.15 tok/s for the output projection (+2.35%). The raw Q8 path
+matched two one-row calls bit-for-bit at the production 2,560 input width, and
+the full two-bank MTP/disk-KV/partial-fork regression retained
 its exact target token streams. PLE, QSA, routed MoE, and the remaining GDN
 stages are still bank-owned.
 

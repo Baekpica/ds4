@@ -677,75 +677,43 @@ bool run_q8_0_dense_vec_row2(int M, int K, uint32_t seed) {
         quantize_row_q8_0_cpu(&W_src[(size_t)row * K],
                               &W_blk[(size_t)row * blocks_per_row], K);
 
-    const size_t dq_bytes = (nblocks * sizeof(uint16_t) + 63u) & ~63u;
-    std::vector<uint8_t> W_aligned(
-        ds4_mmq_q8_0_aligned_bytes(M, K), 0u);
-    for (size_t b = 0; b < nblocks; b++) {
-        std::memcpy(W_aligned.data() + b * sizeof(uint16_t),
-                    &W_blk[b].d, sizeof(uint16_t));
-        std::memcpy(W_aligned.data() + dq_bytes + b * QK8_0,
-                    W_blk[b].qs, QK8_0);
-    }
-
     std::vector<float> X((size_t)2 * K);
     for (auto &v : X) v = nd(rng);
     cudaStream_t stream;
     cudaStreamCreate(&stream);
-    void *dW = nullptr, *dWRaw = nullptr;
+    void *dW = nullptr;
     float *dX = nullptr, *dPair = nullptr, *dSingle = nullptr;
-    cudaMalloc(&dW, W_aligned.size());
-    cudaMalloc(&dWRaw, W_blk.size() * sizeof(cpu_block_q8_0));
+    cudaMalloc(&dW, W_blk.size() * sizeof(cpu_block_q8_0));
     cudaMalloc(&dX, X.size() * sizeof(float));
     cudaMalloc(&dPair, (size_t)2 * M * sizeof(float));
     cudaMalloc(&dSingle, (size_t)2 * M * sizeof(float));
-    cudaMemcpyAsync(dW, W_aligned.data(), W_aligned.size(),
-                    cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(dWRaw, W_blk.data(),
+    cudaMemcpyAsync(dW, W_blk.data(),
                     W_blk.size() * sizeof(cpu_block_q8_0),
                     cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(dX, X.data(), X.size() * sizeof(float),
                     cudaMemcpyHostToDevice, stream);
 
-    const int pair_rc = ds4_mmq_q8_0_aligned_dense_vec(
+    const int pair_rc = ds4_mmq_q8_0_dense_vec(
         dW, dX, dPair, M, 2, K, stream);
-    const int row0_rc = ds4_mmq_q8_0_aligned_dense_vec(
+    const int row0_rc = ds4_mmq_q8_0_dense_vec(
         dW, dX, dSingle, M, 1, K, stream);
-    const int row1_rc = ds4_mmq_q8_0_aligned_dense_vec(
+    const int row1_rc = ds4_mmq_q8_0_dense_vec(
         dW, dX + K, dSingle + M, M, 1, K, stream);
 
     std::vector<float> pair((size_t)2 * M), single((size_t)2 * M);
-    std::vector<float> raw_pair((size_t)2 * M), raw_single((size_t)2 * M);
     cudaMemcpyAsync(pair.data(), dPair, pair.size() * sizeof(float),
                     cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(single.data(), dSingle, single.size() * sizeof(float),
                     cudaMemcpyDeviceToHost, stream);
-
-    const int raw_pair_rc = ds4_mmq_q8_0_dense_vec(
-        dWRaw, dX, dPair, M, 2, K, stream);
-    const int raw_row0_rc = ds4_mmq_q8_0_dense_vec(
-        dWRaw, dX, dSingle, M, 1, K, stream);
-    const int raw_row1_rc = ds4_mmq_q8_0_dense_vec(
-        dWRaw, dX + K, dSingle + M, M, 1, K, stream);
-    cudaMemcpyAsync(raw_pair.data(), dPair,
-                    raw_pair.size() * sizeof(float),
-                    cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(raw_single.data(), dSingle,
-                    raw_single.size() * sizeof(float),
-                    cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
     cudaFree(dW);
-    cudaFree(dWRaw);
     cudaFree(dX);
     cudaFree(dPair);
     cudaFree(dSingle);
     cudaStreamDestroy(stream);
 
-    const bool aligned_ok = pair_rc == 0 && row0_rc == 0 && row1_rc == 0 &&
-                            check_close(pair, single, 0.0f, 0.0f);
-    const bool raw_ok = raw_pair_rc == 0 && raw_row0_rc == 0 &&
-                        raw_row1_rc == 0 &&
-                        check_close(raw_pair, raw_single, 0.0f, 0.0f);
-    const bool ok = aligned_ok && raw_ok;
+    const bool ok = pair_rc == 0 && row0_rc == 0 && row1_rc == 0 &&
+                    check_close(pair, single, 0.0f, 0.0f);
     fprintf(stderr, "%s\n\n", ok ? "PASS" : "FAIL");
     return ok;
 }
@@ -1749,7 +1717,7 @@ int main(int argc, char ** argv) {
     all_ok &= run_q8_0_dense_d2r(
         /*M=*/128, /*N=*/4, /*K=*/128, 0xD2A00004);
     all_ok &= run_q8_0_dense_vec_row2(
-        /*M=*/257, /*K=*/6144, 0xA11E0002);
+        /*M=*/257, /*K=*/2560, 0xA11E0002);
 
     // Q2_K - V4 Flash ffn_down_exps per-expert shape is (K=2048, N=4096).
     all_ok &= run_q2_K(/*M=*/64,   /*N=*/4,   /*K=*/256,  0x02C0FFEE);
