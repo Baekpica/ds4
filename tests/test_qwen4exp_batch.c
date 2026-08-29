@@ -356,7 +356,13 @@ int main(int argc, char **argv) {
 
     const char *row_bench = getenv("DS4_QWEN_ROW_BENCH");
     if (row_bench) {
-        const int gdn_only = strcmp(row_bench, "gdn-recurrent") == 0;
+        const int gdn_recurrent = strcmp(row_bench, "gdn-recurrent") == 0;
+        const int output_only = strcmp(row_bench, "output") == 0;
+        const char *isolated_toggle = gdn_recurrent
+            ? "DS4_QWEN_NO_GDN_RECURRENT_BANK2"
+            : (output_only ? "DS4_QWEN_NO_OUTPUT_ROW_BATCH" : NULL);
+        const char *fast_label = gdn_recurrent ? "bank2" :
+            (output_only ? "row2" : "row");
         double row_seconds[3] = {0.0};
         double scalar_seconds[3] = {0.0};
         const int order[3][2] = {{1, 0}, {0, 1}, {1, 0}};
@@ -365,10 +371,10 @@ int main(int argc, char **argv) {
         for (int round = 0; round < 3; round++) {
             for (int pass = 0; pass < 2; pass++) {
                 const int row_batch = order[round][pass];
-                const char *toggle = gdn_only
-                    ? "DS4_QWEN_NO_GDN_RECURRENT_BANK2"
-                    : "DS4_QWEN_NO_ROW_BATCH";
-                if ((gdn_only && unsetenv("DS4_QWEN_NO_ROW_BATCH") != 0) ||
+                const char *toggle = isolated_toggle
+                    ? isolated_toggle : "DS4_QWEN_NO_ROW_BATCH";
+                if ((isolated_toggle &&
+                     unsetenv("DS4_QWEN_NO_ROW_BATCH") != 0) ||
                     (row_batch ? unsetenv(toggle)
                                : setenv(toggle, "1", 1)) != 0) {
                     perror("row batch benchmark environment");
@@ -402,6 +408,7 @@ int main(int argc, char **argv) {
         }
         unsetenv("DS4_QWEN_NO_ROW_BATCH");
         unsetenv("DS4_QWEN_NO_GDN_RECURRENT_BANK2");
+        unsetenv("DS4_QWEN_NO_OUTPUT_ROW_BATCH");
         double row_total = 0.0, scalar_total = 0.0;
         for (int i = 0; i < 3; i++) {
             row_total += row_seconds[i];
@@ -410,8 +417,9 @@ int main(int argc, char **argv) {
         const double tokens = 2.0 * MTP_BUDGET * 3.0;
         printf("Qwen %s A/B: %s %.2f tok/s [%.3f %.3f %.3f s], "
                "scalar %.2f tok/s [%.3f %.3f %.3f s], speedup %.2f%%\n",
-               gdn_only ? "GDN recurrent" : "row",
-               gdn_only ? "bank2" : "row",
+               gdn_recurrent ? "GDN recurrent" :
+                   (output_only ? "output" : "row"),
+               fast_label,
                tokens / row_total,
                row_seconds[0], row_seconds[1], row_seconds[2],
                tokens / scalar_total,

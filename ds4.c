@@ -22500,8 +22500,9 @@ static bool qwen4exp_graph_forward_chunk(
 }
 
 /* Decode independent sessions through one row matrix.  GDN recurrent state
- * updates share one grid while preserving one block row per bank; PLE/QSA,
- * MoE, output, and the remaining GDN stages keep bank-owned arithmetic. */
+ * updates share one grid while preserving one block row per bank, and the Q8
+ * output uses the bit-identical two-row dense path.  PLE/QSA, MoE, and the
+ * remaining GDN stages keep bank-owned arithmetic. */
 static bool qwen4exp_graph_forward_decode_rows(
         ds4_qwen_gpu_graph *const *graphs,
         const ds4_model *model,
@@ -22648,20 +22649,31 @@ static bool qwen4exp_graph_forward_decode_rows(
     if (!qwen4exp_hc_begin(
             &scratch->hc, model, &weights->qwen_input_hc,
             current, rows, true)) return false;
-    for (uint32_t r = 0u; r < rows; r++) {
-        ds4_gpu_tensor *input = ds4_gpu_tensor_view(
-            scratch->hc.mixed,
-            (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
-        ds4_gpu_tensor *output = ds4_gpu_tensor_view(
-            scratch->logits,
-            (uint64_t)r * DS4_N_VOCAB * sizeof(float),
-            (uint64_t)DS4_N_VOCAB * sizeof(float));
-        const bool ok = input && output && plain_graph_matmul_tensor(
-            output, model, weights->output,
-            DS4_N_EMBD, DS4_N_VOCAB, input, 1u);
-        ds4_gpu_tensor_free(output);
-        ds4_gpu_tensor_free(input);
-        if (!ok) return false;
+    const char *no_output_rows = getenv("DS4_QWEN_NO_OUTPUT_ROW_BATCH");
+    const bool output_rows = weights->output->type == DS4_TENSOR_Q8_0 &&
+        !(no_output_rows && no_output_rows[0] &&
+          !(no_output_rows[0] == '0' && no_output_rows[1] == '\0'));
+    if (output_rows) {
+        if (!plain_graph_matmul_tensor(
+                scratch->logits, model, weights->output,
+                DS4_N_EMBD, DS4_N_VOCAB, scratch->hc.mixed, rows))
+            return false;
+    } else {
+        for (uint32_t r = 0u; r < rows; r++) {
+            ds4_gpu_tensor *input = ds4_gpu_tensor_view(
+                scratch->hc.mixed,
+                (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
+            ds4_gpu_tensor *output = ds4_gpu_tensor_view(
+                scratch->logits,
+                (uint64_t)r * DS4_N_VOCAB * sizeof(float),
+                (uint64_t)DS4_N_VOCAB * sizeof(float));
+            const bool ok = input && output && plain_graph_matmul_tensor(
+                output, model, weights->output,
+                DS4_N_EMBD, DS4_N_VOCAB, input, 1u);
+            ds4_gpu_tensor_free(output);
+            ds4_gpu_tensor_free(input);
+            if (!ok) return false;
+        }
     }
     if (!ds4_gpu_tensor_read(
             scratch->logits, 0u, logits,
@@ -39834,12 +39846,12 @@ static uint64_t batch_span_need(const ds4_gpu_tensor *tensor,
 }
 
 /* Qwen keeps two bank-owned recurrent/cache states.  Decode shares the carrier
- * graph's embedding and HC scratch as one two-row batch; independent GDN
- * recurrent states share one two-dimensional grid.  MoE and output stay on
- * scalar arithmetic because their multi-row kernels change token selection or
+ * graph's embedding, HC, and exact Q8 output scratch as one two-row batch;
+ * independent GDN recurrent states share one two-dimensional grid.  MoE stays
+ * on scalar arithmetic because its multi-row kernels change token selection or
  * the recurrent trajectory when a surviving bank returns to one-row MTP.
  * ponytail: keep the first state-safe implementation at two banks; lift it only
- * after the remaining stateful PLE/GDN/QSA fronts take descriptor arrays. */
+ * after PLE/QSA/MoE and the remaining GDN stages take descriptor arrays. */
 enum { DS4_QWEN_BANK_MAX = 2 };
 
 typedef struct ds4_qwen_batch_runtime {
@@ -40276,9 +40288,9 @@ static bool qwen_batch_runtime_decode(
         }
         if (rt->row_batch_calls++ == 0u)
             fprintf(stderr,
-                    "ds4: Qwen true row batch active: two-row embedding/HC "
-                    "and paired GDN recurrent; bank-owned "
-                    "PLE/QSA/MoE/output\n");
+                    "ds4: Qwen true row batch active: two-row "
+                    "embedding/HC/Q8 output and paired GDN recurrent; "
+                    "bank-owned PLE/QSA/MoE\n");
         return true;
     }
     for (uint32_t i = 0; i < rows; i++) {

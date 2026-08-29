@@ -135,12 +135,23 @@ dependent.
 
 The later Qwen decode path performs one actual two-row token-embedding and
 Hyper-Connection operation whenever both banks are ready. Stateful PLE, Gated
-DeltaNet, QSA, routed MoE, and output projection work remains per bank. The
-real-Q5 regression covered a two-row-to-one-row transition and retained exact
-MTP target verification; a same-process 3-by-3 short-generation A/B measured
+DeltaNet, QSA, routed MoE, and output projection work initially remained per
+bank. The real-Q5 regression covered a two-row-to-one-row transition and
+retained exact MTP target verification; a same-process 3-by-3
+short-generation A/B measured
 22.67 tok/s with the row path versus 20.86 tok/s with scalar bank calls
 (+8.65%). `DS4_QWEN_NO_ROW_BATCH=1` restores the scalar path. This is bounded,
 state-safe row batching, not a claim that the complete Qwen graph is batched.
+
+Two later increments pair the independent Gated DeltaNet recurrent updates in
+one two-dimensional CUDA grid and run the final Q8 output projection through
+the existing two-row aligned kernel. The same-process 3-by-3 real-Q5 checks
+measured 23.24 versus 22.80 tok/s for the recurrent update (+1.96%), then
+23.70 versus 23.15 tok/s for the output projection (+2.35%). The aligned and
+raw Q8 kernels matched two one-row calls bit-for-bit at the production 6,144
+input width, and the full two-bank MTP/disk-KV/partial-fork regression retained
+its exact target token streams. PLE, QSA, routed MoE, and the remaining GDN
+stages are still bank-owned.
 
 The same Q5 artifact then passed guarded still-image serving at a configured
 262,144-token context with 8,192-token prefill chunks. Chat Completions,
@@ -854,7 +865,7 @@ than refusing). The knobs:
 | `DS4_MEM_RECONCILE_TOL_MB` | `256` | When idle, the server reconciles the box's available-memory drop since boot against what its own allocation ledger explains and logs the residual (`mem reconcile:` line, also on `/v1/stats` and `/metrics`); a residual beyond this many MiB is marked `FLAGGED`. `DS4_MEM_RECONCILE_STRICT=1` adds a distinct `mem reconcile STRICT` line for gate scripts to assert on; `DS4_MEM_RECONCILE_WARMUP_MB` pins the named one-time warmup charge instead of letting the first idle pass self-calibrate it. Pure reporting — no admission decision reads it. |
 | `DS4_CONT_PREFILL_CHUNK` / `DS4_CONT_PREFILL_CHUNK_LIVE` | `4096` / `512` | Long prompts are ingested this many tokens at a time so a big admission never blocks the server. The `_LIVE` value applies while other requests are actively decoding: smaller keeps live decode smoother, larger ingests faster. |
 | `DS4_SERVER_FORK_PARTIAL` | `1` | Reuse the longest safe prefix when a prompt diverges inside a retained conversation. Set to `0` for a true cold-control path: Solar then reserves no KDA checkpoints, Motif-3 no SWA-window checkpoints, and Qwen no recurrent-state checkpoints. `DS4_SERVER_FORK_PARTIAL_MIN` (default 192 tokens, floor 136) skips tiny partial matches. |
-| `DS4_QWEN_BATCH` | unset (off) | Set to `1` to enable Qwen's persistent two-bank lane. It supports exact-frontier and partial-prefix forks, bank disk-KV persistence, target-verified embedded MTP with `--mtp-draft 2`, image requests with decoded-pixel cache identity, and bounded two-row token-embedding/Hyper-Connection decode. The stateful PLE/GDN/QSA/MoE/output work remains per bank. |
+| `DS4_QWEN_BATCH` | unset (off) | Set to `1` to enable Qwen's persistent two-bank lane. It supports exact-frontier and partial-prefix forks, bank disk-KV persistence, target-verified embedded MTP with `--mtp-draft 2`, image requests with decoded-pixel cache identity, bounded two-row token-embedding/Hyper-Connection/Q8-output decode, and paired GDN recurrent updates. PLE, QSA, routed MoE, and the remaining GDN stages stay bank-owned. |
 | `DS4_QWEN_PREFILL_CHUNK` | `256` (range 1..16384) | Qwen serial and bank prefill width. `8192` is the production serving setting used for the published Spark results; larger values need enough graph memory. |
 | `DS4_QWEN_PLE_CACHE_MB` | `2048` (allowed: 512, 1024, 2048) | Bound for Qwen's pinned SSD-PLE page cache. The full 95.37 GiB sidecar remains outside the unified-memory resident set. |
 | `DS4_QWEN_PLE_WORKERS` | `32` (range 1..64) | Asynchronous SSD-PLE page-read workers. On the reference DGX Spark, 32 retained nearly all of 64 workers' 8K prefill gain with less host submission overhead. |
