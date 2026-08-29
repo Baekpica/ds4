@@ -20357,7 +20357,8 @@ static bool qwen4exp_gdn_prepare(
         const ds4_model                    *model,
         const ds4_qwen_linear_attention_weights *weights,
         const ds4_gpu_tensor               *input,
-        uint32_t                            n_tokens) {
+        uint32_t                            n_tokens,
+        bool                                projected) {
     if (!ws || !state || !model || !weights || !input || n_tokens == 0u ||
         n_tokens > ws->capacity ||
         !weights->a_log || !weights->conv || !weights->dt_bias ||
@@ -20393,22 +20394,22 @@ static bool qwen4exp_gdn_prepare(
         weights->out->dim[1] != hidden) {
         return false;
     }
-    return plain_graph_matmul_tensor(
+    return (projected || plain_graph_matmul_tensor(
                ws->qkv_raw, model, weights->qkv,
-               hidden, conv_dim, input, n_tokens) &&
+               hidden, conv_dim, input, n_tokens)) &&
            ds4_gpu_qwen4exp_gdn_conv_tensor(
                ws->qkv, state->conv, ws->qkv_raw,
                model->map, model->size, weights->conv->abs_offset,
                n_tokens, conv_dim, DS4_N_SSM_CONV) != 0 &&
-           plain_graph_matmul_tensor(
+           (projected || plain_graph_matmul_tensor(
                ws->z, model, weights->z,
-               hidden, value_dim, input, n_tokens) &&
-           plain_graph_matmul_tensor(
+               hidden, value_dim, input, n_tokens)) &&
+           (projected || plain_graph_matmul_tensor(
                ws->b, model, weights->in_b,
-               hidden, value_heads, input, n_tokens) &&
-           plain_graph_matmul_tensor(
+               hidden, value_heads, input, n_tokens)) &&
+           (projected || plain_graph_matmul_tensor(
                ws->a, model, weights->in_a,
-               hidden, value_heads, input, n_tokens) &&
+               hidden, value_heads, input, n_tokens)) &&
            ds4_gpu_qwen4exp_gdn_controls_tensor(
                ws->beta, ws->g, ws->b, ws->a,
                model->map, model->size,
@@ -20441,11 +20442,47 @@ static bool qwen4exp_gdn_forward(
         uint32_t                            n_tokens) {
     return output && input &&
            ds4_gpu_tensor_ptr(input) != ds4_gpu_tensor_ptr(output) &&
-           qwen4exp_gdn_prepare(ws, state, model, weights, input, n_tokens) &&
+           qwen4exp_gdn_prepare(
+               ws, state, model, weights, input, n_tokens, false) &&
            ds4_gpu_qwen4exp_gdn_recurrent_tensor(
                ws->core, state->recurrent, ws->qkv, ws->beta, ws->g,
                n_tokens, ws->key_heads, ws->value_heads, ws->head_dim) != 0 &&
            qwen4exp_gdn_finish(ws, model, weights, output, n_tokens);
+}
+
+static bool qwen4exp_gdn_project_bank2(
+        ds4_qwen_gdn_ws *const ws[2],
+        const ds4_model *model,
+        const ds4_qwen_linear_attention_weights *weights,
+        const ds4_gpu_tensor *row_input) {
+    const uint64_t input_bytes =
+        2u * (uint64_t)ws[0]->hidden_size * sizeof(float);
+    const uint64_t qkv_bytes = (uint64_t)ws[0]->conv_dim * sizeof(float);
+    const uint64_t value_bytes =
+        (uint64_t)ws[0]->value_dim * sizeof(float);
+    const uint64_t control_bytes =
+        (uint64_t)ws[0]->value_heads * sizeof(float);
+    return ds4_gpu_tensor_bytes(row_input) >= input_bytes &&
+           plain_graph_matmul_tensor(
+               ws[0]->qkv_raw, model, weights->qkv,
+               ws[0]->hidden_size, ws[0]->conv_dim, row_input, 2u) &&
+           ds4_gpu_tensor_copy(
+               ws[1]->qkv_raw, 0u, ws[0]->qkv_raw, qkv_bytes, qkv_bytes) &&
+           plain_graph_matmul_tensor(
+               ws[0]->z, model, weights->z,
+               ws[0]->hidden_size, ws[0]->value_dim, row_input, 2u) &&
+           ds4_gpu_tensor_copy(
+               ws[1]->z, 0u, ws[0]->z, value_bytes, value_bytes) &&
+           plain_graph_matmul_tensor(
+               ws[0]->b, model, weights->in_b,
+               ws[0]->hidden_size, ws[0]->value_heads, row_input, 2u) &&
+           ds4_gpu_tensor_copy(
+               ws[1]->b, 0u, ws[0]->b, control_bytes, control_bytes) &&
+           plain_graph_matmul_tensor(
+               ws[0]->a, model, weights->in_a,
+               ws[0]->hidden_size, ws[0]->value_heads, row_input, 2u) &&
+           ds4_gpu_tensor_copy(
+               ws[1]->a, 0u, ws[0]->a, control_bytes, control_bytes);
 }
 
 static bool qwen4exp_gdn_forward_bank2(
@@ -20454,9 +20491,11 @@ static bool qwen4exp_gdn_forward_bank2(
         const ds4_model *model,
         const ds4_qwen_linear_attention_weights *weights,
         ds4_gpu_tensor *const input[2],
+        const ds4_gpu_tensor *row_input,
         ds4_gpu_tensor *const output[2],
         uint32_t n_tokens) {
-    if (!ws || !state || !input || !output || !ws[0] || !ws[1] ||
+    if (!ws || !state || !model || !weights || !input || !row_input ||
+        !output || !ws[0] || !ws[1] ||
         !state[0] || !state[1] ||
         ws[0]->key_heads != ws[1]->key_heads ||
         ws[0]->value_heads != ws[1]->value_heads ||
@@ -20471,13 +20510,29 @@ static bool qwen4exp_gdn_forward_bank2(
                    ws[1], state[1], model, weights,
                    input[1], output[1], n_tokens);
     }
+    const char *project_disabled = getenv("DS4_QWEN_NO_GDN_PROJ_BANK2");
+    const bool project_bank2 =
+        !(project_disabled && project_disabled[0] &&
+          !(project_disabled[0] == '0' && project_disabled[1] == '\0')) &&
+        n_tokens == 1u && ws[0]->capacity >= 2u &&
+        ws[0]->hidden_size == ws[1]->hidden_size &&
+        ws[0]->conv_dim == ws[1]->conv_dim &&
+        ws[0]->value_dim == ws[1]->value_dim &&
+        weights->qkv && weights->qkv->type == DS4_TENSOR_Q8_0 &&
+        weights->z && weights->z->type == DS4_TENSOR_Q8_0 &&
+        weights->in_b && weights->in_b->type == DS4_TENSOR_Q8_0 &&
+        weights->in_a && weights->in_a->type == DS4_TENSOR_Q8_0;
     return output[0] && output[1] && input[0] && input[1] &&
            ds4_gpu_tensor_ptr(input[0]) != ds4_gpu_tensor_ptr(output[0]) &&
            ds4_gpu_tensor_ptr(input[1]) != ds4_gpu_tensor_ptr(output[1]) &&
+           (!project_bank2 ||
+            qwen4exp_gdn_project_bank2(ws, model, weights, row_input)) &&
            qwen4exp_gdn_prepare(
-               ws[0], state[0], model, weights, input[0], n_tokens) &&
+               ws[0], state[0], model, weights, input[0], n_tokens,
+               project_bank2) &&
            qwen4exp_gdn_prepare(
-               ws[1], state[1], model, weights, input[1], n_tokens) &&
+               ws[1], state[1], model, weights, input[1], n_tokens,
+               project_bank2) &&
            ds4_gpu_qwen4exp_gdn_recurrent_bank2_tensor(
                ws[0]->core, state[0]->recurrent,
                ws[0]->qkv, ws[0]->beta, ws[0]->g,
@@ -22916,7 +22971,7 @@ static bool qwen4exp_graph_forward_decode_rows(
             const bool ok = input[0] && input[1] && output[0] && output[1] &&
                 qwen4exp_gdn_forward_bank2(
                     gdn_ws, gdn_state, model, &layer->qwen_linear_attn,
-                    input, output, 1u);
+                    input, scratch->hc.mixed, output, 1u);
             for (uint32_t r = 0u; r < rows; r++) {
                 ds4_gpu_tensor_free(output[r]);
                 ds4_gpu_tensor_free(input[r]);
@@ -40613,9 +40668,9 @@ static bool qwen_batch_runtime_decode(
         if (rt->row_batch_calls++ == 0u)
             fprintf(stderr,
                     "ds4: Qwen true row batch active: two-row "
-                    "embedding/HC/Q8 output/PLE gather and paired GDN "
-                    "recurrent/QSA Q-gate/MoE top-k/Q5 routed-main/Q5 tail; other "
-                    "PLE/QSA/MoE work bank-owned\n");
+                    "embedding/HC/Q8 output/PLE gather/GDN Q8 projections "
+                    "and paired GDN recurrent/QSA Q-gate/MoE top-k/Q5 "
+                    "routed-main/Q5 tail; other PLE/QSA/MoE work bank-owned\n");
         return true;
     }
     for (uint32_t i = 0; i < rows; i++) {

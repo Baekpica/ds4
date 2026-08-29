@@ -490,6 +490,82 @@ int main(int argc, char **argv) {
     gdn_compare("real GDN one-token decode parity", chunk_output, gpu_output,
                 input_count, 1.0e-7, 1.0e-7, 1.0e-6f);
 
+    const uint64_t bank_output_bytes =
+        2u * (uint64_t)TEST_HIDDEN * sizeof(float);
+    ds4_qwen_gdn_ws bank_ws;
+    ds4_qwen_gdn_state bank_state;
+    REQUIRE(qwen4exp_gdn_ws_alloc(
+                &bank_ws, 2u, TEST_HIDDEN, TEST_KEY_HEADS,
+                TEST_VALUE_HEADS, TEST_HEAD_DIM),
+            "allocate second-bank GDN workspace");
+    REQUIRE(qwen4exp_gdn_state_alloc(
+                &bank_state, TEST_CONV_DIM, TEST_CONV_KERNEL,
+                TEST_VALUE_HEADS, TEST_HEAD_DIM),
+            "allocate second-bank GDN state");
+    ds4_gpu_tensor *scalar_output =
+        ds4_gpu_tensor_alloc(bank_output_bytes);
+    ds4_gpu_tensor *bank_output =
+        ds4_gpu_tensor_alloc(bank_output_bytes);
+    ds4_gpu_tensor *bank_input[2] = {
+        ds4_gpu_tensor_view(
+            dinput, 0u, (uint64_t)TEST_HIDDEN * sizeof(float)),
+        ds4_gpu_tensor_view(
+            dinput, (uint64_t)TEST_HIDDEN * sizeof(float),
+            (uint64_t)TEST_HIDDEN * sizeof(float)),
+    };
+    ds4_gpu_tensor *scalar_rows[2] = {
+        ds4_gpu_tensor_view(
+            scalar_output, 0u, (uint64_t)TEST_HIDDEN * sizeof(float)),
+        ds4_gpu_tensor_view(
+            scalar_output, (uint64_t)TEST_HIDDEN * sizeof(float),
+            (uint64_t)TEST_HIDDEN * sizeof(float)),
+    };
+    ds4_gpu_tensor *bank_rows[2] = {
+        ds4_gpu_tensor_view(
+            bank_output, 0u, (uint64_t)TEST_HIDDEN * sizeof(float)),
+        ds4_gpu_tensor_view(
+            bank_output, (uint64_t)TEST_HIDDEN * sizeof(float),
+            (uint64_t)TEST_HIDDEN * sizeof(float)),
+    };
+    REQUIRE(scalar_output && bank_output && bank_input[0] && bank_input[1] &&
+            scalar_rows[0] && scalar_rows[1] && bank_rows[0] && bank_rows[1],
+            "real GDN bank IO allocation");
+    REQUIRE(qwen4exp_gdn_state_reset(&state) &&
+            qwen4exp_gdn_forward(
+                &ws, &state, &compact, &weights,
+                bank_input[0], scalar_rows[0], 1u) &&
+            qwen4exp_gdn_state_reset(&state) &&
+            qwen4exp_gdn_forward(
+                &ws, &state, &compact, &weights,
+                bank_input[1], scalar_rows[1], 1u) &&
+            qwen4exp_gdn_state_reset(&state) &&
+            qwen4exp_gdn_state_reset(&bank_state),
+            "real GDN scalar-bank reference");
+    ds4_qwen_gdn_ws *bank_workspaces[2] = {&ws, &bank_ws};
+    ds4_qwen_gdn_state *bank_states[2] = {&state, &bank_state};
+    REQUIRE(qwen4exp_gdn_forward_bank2(
+                bank_workspaces, bank_states, &compact, &weights,
+                bank_input, dinput, bank_rows, 1u),
+            "real GDN two-bank forward");
+    REQUIRE(ds4_gpu_tensor_read(
+                scalar_output, 0u, gpu_output, bank_output_bytes) &&
+            ds4_gpu_tensor_read(
+                bank_output, 0u, chunk_output, bank_output_bytes),
+            "real GDN bank output readback");
+    REQUIRE(memcmp(gpu_output, chunk_output, bank_output_bytes) == 0,
+            "real GDN two-bank bit-exact output parity");
+    puts("real GDN two-bank output parity: bit-exact");
+
+    for (uint32_t i = 0u; i < 2u; i++) {
+        ds4_gpu_tensor_free(bank_rows[i]);
+        ds4_gpu_tensor_free(scalar_rows[i]);
+        ds4_gpu_tensor_free(bank_input[i]);
+    }
+    ds4_gpu_tensor_free(bank_output);
+    ds4_gpu_tensor_free(scalar_output);
+    qwen4exp_gdn_state_free(&bank_state);
+    qwen4exp_gdn_ws_free(&bank_ws);
+
     struct rusage usage;
     memset(&usage, 0, sizeof(usage));
     REQUIRE(getrusage(RUSAGE_SELF, &usage) == 0, "read real GDN RSS");

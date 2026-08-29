@@ -357,6 +357,7 @@ int main(int argc, char **argv) {
     const char *row_bench = getenv("DS4_QWEN_ROW_BENCH");
     if (row_bench) {
         const int gdn_recurrent = strcmp(row_bench, "gdn-recurrent") == 0;
+        const int gdn_projection = strcmp(row_bench, "gdn-proj") == 0;
         const int output_only = strcmp(row_bench, "output") == 0;
         const int ple_gather = strcmp(row_bench, "ple-gather") == 0;
         const int qsa_qproj = strcmp(row_bench, "qsa-qproj") == 0;
@@ -365,13 +366,14 @@ int main(int argc, char **argv) {
         const int moe_topk = strcmp(row_bench, "moe-topk") == 0;
         const char *isolated_toggle = gdn_recurrent
             ? "DS4_QWEN_NO_GDN_RECURRENT_BANK2"
-            : (output_only ? "DS4_QWEN_NO_OUTPUT_ROW_BATCH" :
-               (ple_gather ? "DS4_QWEN_NO_PLE_GATHER_BANK2" :
-                (qsa_qproj ? "DS4_QWEN_NO_QSA_QPROJ_BANK2" :
-                 (q5_tail ? "DS4_QWEN_NO_Q5_TAIL_BANK2" :
-                  (moe_main ? "DS4_QWEN_NO_MOE_MAIN_BANK2" :
-                   (moe_topk ? "DS4_QWEN_NO_MOE_TOPK_BANK2" : NULL))))));
-        const char *fast_label = gdn_recurrent ? "bank2" :
+            : (gdn_projection ? "DS4_QWEN_NO_GDN_PROJ_BANK2" :
+               (output_only ? "DS4_QWEN_NO_OUTPUT_ROW_BATCH" :
+                (ple_gather ? "DS4_QWEN_NO_PLE_GATHER_BANK2" :
+                 (qsa_qproj ? "DS4_QWEN_NO_QSA_QPROJ_BANK2" :
+                  (q5_tail ? "DS4_QWEN_NO_Q5_TAIL_BANK2" :
+                   (moe_main ? "DS4_QWEN_NO_MOE_MAIN_BANK2" :
+                    (moe_topk ? "DS4_QWEN_NO_MOE_TOPK_BANK2" : NULL)))))));
+        const char *fast_label = (gdn_recurrent || gdn_projection) ? "bank2" :
             ((output_only || ple_gather || qsa_qproj) ? "row2" :
              ((q5_tail || moe_main || moe_topk) ? "bank2" : "row"));
         double row_seconds[3] = {0.0};
@@ -419,6 +421,7 @@ int main(int argc, char **argv) {
         }
         unsetenv("DS4_QWEN_NO_ROW_BATCH");
         unsetenv("DS4_QWEN_NO_GDN_RECURRENT_BANK2");
+        unsetenv("DS4_QWEN_NO_GDN_PROJ_BANK2");
         unsetenv("DS4_QWEN_NO_OUTPUT_ROW_BATCH");
         unsetenv("DS4_QWEN_NO_PLE_GATHER_BANK2");
         unsetenv("DS4_QWEN_NO_QSA_QPROJ_BANK2");
@@ -434,12 +437,13 @@ int main(int argc, char **argv) {
         printf("Qwen %s A/B: %s %.2f tok/s [%.3f %.3f %.3f s], "
                "scalar %.2f tok/s [%.3f %.3f %.3f s], speedup %.2f%%\n",
                gdn_recurrent ? "GDN recurrent" :
-                   (output_only ? "output" :
-                    (ple_gather ? "PLE gather" :
-                     (qsa_qproj ? "QSA Q/gate projection" :
-                      (q5_tail ? "Q5 tail" :
-                       (moe_main ? "MoE routed main" :
-                        (moe_topk ? "MoE top-k" : "row")))))),
+                   (gdn_projection ? "GDN projection" :
+                    (output_only ? "output" :
+                     (ple_gather ? "PLE gather" :
+                      (qsa_qproj ? "QSA Q/gate projection" :
+                       (q5_tail ? "Q5 tail" :
+                        (moe_main ? "MoE routed main" :
+                         (moe_topk ? "MoE top-k" : "row"))))))),
                fast_label,
                tokens / row_total,
                row_seconds[0], row_seconds[1], row_seconds[2],
