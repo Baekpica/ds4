@@ -1,6 +1,7 @@
 # Qwen3.8 image-input implementation specification
 
-Status: implemented and real-artifact verified on 2026-08-28
+Status: V1 image inference verified on 2026-08-28; V2 cache identity and reuse
+verified on 2026-08-29
 
 ## Objective
 
@@ -36,10 +37,10 @@ serving must keep their current behavior.
   patch 16, temporal patch 2, spatial merge 2, factor 32, 65,536 minimum
   pixels, and 16,777,216 maximum pixels. A still frame is duplicated for the
   temporal patch exactly as in the reference processor.
-- No image-derived state is written to disk-KV or a live prefix record in V1.
-  Token-only entries cannot prove image identity, so every image request is
-  cold-placed before server-side live/disk matching. Text-only warm, partial,
-  and disk reuse remain enabled.
+- V1 did not write image-derived state to disk-KV or a live prefix record.
+  `<|image_pad|>` token IDs describe only geometry and cannot identify the
+  pixels. That cold-only cache boundary is superseded by the V2 identity
+  extension below; the public image API and geometry remain unchanged.
 - MTP is disabled for the image-bearing prefill and re-enabled only after the
   target graph has reached the text decode frontier. This avoids teaching the
   embedded drafter a second multimodal input contract in the first version.
@@ -139,6 +140,36 @@ family and one media kind.
   and 109 GiB reclaim threshold remained active; the post-gate observation was
   101.12 GiB device-live with 10.89 GiB system memory available.
 
+## V2 decoded-pixel cache identity
+
+V2 keeps the model-visible prompt unchanged and inserts one fixed-width marker
+after each image placeholder only in the server's internal replay key. The
+marker contains a hash of decoded RGB pixels plus source geometry, the derived
+grid, and projected-token count. Container-only PNG/JPEG byte differences that
+decode to the same pixels share an identity; different pixels do not, even
+when their image-pad tokens and geometry are identical.
+
+Live and disk matching compare image-bearing records only with image-bearing
+requests. If a byte-LCP ends inside an image marker, token reuse is capped at
+that image's first token so identical image-pad IDs cannot cross a pixel
+mismatch. M-RoPE positions are rebuilt from the current request after a state
+copy or recurrent-checkpoint restore. The vision tower is skipped only when
+every image span lies below the restored frontier.
+
+The 2026-08-29 guarded DGX Spark gate established:
+
+- same-image exact continuation: 90/110 prompt tokens reused;
+- same geometry with different pixels: cold placement and vision recompute;
+- cross-worker disk restore: 1,890/1,909 prompt tokens reused;
+- same-image divergent partial reuse: a 20,087-token request restored the
+  16,384-token recurrent checkpoint and computed 3,703 tokens;
+- zero request, continuous-batch, memory-census, or governor failures after
+  the gate under the external 109/115 GiB reclaim/hard guard.
+
+The disk exact path was exercised across a worker restart. Disk partial lookup
+and image/text identity segregation are covered by the focused server/KV-store
+test; no cross-restart divergent-partial performance claim is made.
+
 This establishes source-matched operator order, semantic real-image behavior,
 chunk/bank/API integration, and bounded serving on the released GGUF. It does
 not claim a cross-runtime hidden-state/logit numeric comparison: the exact
@@ -146,6 +177,6 @@ original BF16 checkpoint was not loaded alongside ds4 for this gate. Large
 images use a correctness-first O(P^2) online attention kernel; replace it with
 tiled FlashAttention only if large-image profiling makes that path relevant.
 
-The intentionally small V1 remains base64 PNG/JPEG only, with no URL fetch and
-no image checkpoint persistence. Those are additive changes only after image
-identity becomes part of the cache key.
+The public interface remains intentionally small: base64 PNG/JPEG only, with
+no URL fetch. Large-image attention remains the next vision-specific kernel
+target; V2 changes cache identity and state reuse, not that O(P^2) kernel.

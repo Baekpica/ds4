@@ -20,6 +20,8 @@
  * bank files do not carry this bit and must never enter automatic bank restore:
  * an old prompt-only key can name a longer unfinished-thinking frontier. */
 #define DS4_KVSTORE_EXT_BANK_REPLAY_V1     (1u << 4)
+/* Bank replay text contains fixed-width decoded-pixel identity markers. */
+#define DS4_KVSTORE_EXT_IMAGE_PIXELS_V2    (1u << 5)
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -183,6 +185,11 @@ int ds4_kvstore_find_bank_text_prefix(ds4_kvstore *kc,
                                       const char *prompt_text,
                                       int model_id, int quant_bits,
                                       int ctx_size);
+int ds4_kvstore_find_bank_text_prefix_identity(ds4_kvstore *kc,
+                                               const char *prompt_text,
+                                               int model_id, int quant_bits,
+                                               int ctx_size,
+                                               uint8_t identity_flags);
 /* v0.5.1: the disk twin of the server's P1 partial ranking -- best stored
  * record by byte-LCP against the prompt (>= min_lcp, and the salvage must
  * cover at least 1/8 of the record so a near-useless deep record never pays
@@ -190,6 +197,12 @@ int ds4_kvstore_find_bank_text_prefix(ds4_kvstore *kc,
 int ds4_kvstore_find_text_lcp(ds4_kvstore *kc, const char *prompt_text,
                               int model_id, int quant_bits, int ctx_size,
                               size_t min_lcp, size_t *lcp_out);
+int ds4_kvstore_find_text_lcp_identity(ds4_kvstore *kc,
+                                       const char *prompt_text,
+                                       int model_id, int quant_bits,
+                                       int ctx_size, size_t min_lcp,
+                                       uint8_t identity_flags,
+                                       size_t *lcp_out);
 /* v0.5.1: paced bank re-persist decision -- true when committed history has
  * grown one aligned continued-interval past the last stored length
  * (stored_tokens = 0 means never stored). */

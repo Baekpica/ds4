@@ -174,6 +174,38 @@ int ds4_qwen_image_probe(const uint8_t *data, size_t data_len,
     return 0;
 }
 
+int ds4_qwen_image_pixel_hash(const uint8_t *data, size_t data_len,
+                              uint64_t *hash,
+                              char *err, size_t errlen) {
+    ds4_qwen_image_info info = {0};
+    if (!hash || ds4_qwen_image_probe(
+            data, data_len, &info, err, errlen) != 0) return 1;
+    int width = 0, height = 0, channels = 0;
+    uint8_t *rgb = stbi_load_from_memory(
+        data, (int)data_len, &width, &height, &channels, 3);
+    if (!rgb || width != (int)info.source_width ||
+        height != (int)info.source_height) {
+        stbi_image_free(rgb);
+        if (err && errlen)
+            snprintf(err, errlen, "PNG/JPEG pixel decode failed: %s",
+                     stbi_failure_reason() ? stbi_failure_reason() :
+                                             "invalid image");
+        return 1;
+    }
+    uint64_t h = UINT64_C(1469598103934665603);
+#define QWEN_PIXEL_HASH_BYTE(v) do { h ^= (uint8_t)(v); h *= UINT64_C(1099511628211); } while (0)
+    for (uint32_t shift = 0u; shift < 32u; shift += 8u)
+        QWEN_PIXEL_HASH_BYTE(info.source_width >> shift);
+    for (uint32_t shift = 0u; shift < 32u; shift += 8u)
+        QWEN_PIXEL_HASH_BYTE(info.source_height >> shift);
+    const size_t bytes = (size_t)info.source_width * info.source_height * 3u;
+    for (size_t i = 0u; i < bytes; i++) QWEN_PIXEL_HASH_BYTE(rgb[i]);
+#undef QWEN_PIXEL_HASH_BYTE
+    stbi_image_free(rgb);
+    *hash = h;
+    return 0;
+}
+
 /* Reasoning-effort prefixes, verbatim from the DeepSeek-V4-Flash-0731 reference
  * encoder (encoding/encoding_dsv4.py, REASONING_EFFORT_PROMPTS).  Upstream's
  * "low" is the empty string, so it needs no constant here.  Both are injected
@@ -21699,10 +21731,12 @@ static bool qwen4exp_graph_prepare_images(
         size_t error_size) {
     if (!graph || !model || !weights || !images || !tokens ||
         image_count == 0u || image_count > 4u || token_count == 0u ||
-        token_count > graph->context_cap || graph->length != 0u) {
+        token_count > graph->context_cap || graph->length > token_count) {
         if (error && error_size) snprintf(error, error_size, "invalid image admission");
         return false;
     }
+    const uint32_t cached = graph->length;
+    qwen4exp_graph_clear_multimodal(graph);
 
     ds4_qwen_vision_host host = {0};
     ds4_gpu_tensor *patches = NULL, *hidden = NULL, *norm = NULL;
@@ -21714,6 +21748,7 @@ static bool qwen4exp_graph_prepare_images(
     bool ok = false;
 
     uint64_t p = 0u, f = 0u, resize_peak = 0u;
+    bool need_vision = false;
     uint32_t previous_end = 0u;
     for (uint32_t i = 0; i < image_count; i++) {
         ds4_qwen_image_info info = {0};
@@ -21770,9 +21805,23 @@ static bool qwen4exp_graph_prepare_images(
             3u * horizontal_pixels + 32u * axis_extent;
         if (resize_bytes > resize_peak) resize_peak = resize_bytes;
         previous_end = images[i].token_offset + (uint32_t)count;
+        if (previous_end > cached) need_vision = true;
     }
 
     uint64_t transient = 0u;
+    if (!need_vision) {
+        transient = 6u * (uint64_t)token_count * sizeof(int32_t);
+        const uint64_t usable = ds4_mem_usable_beyond(0u);
+        if (usable != UINT64_MAX && transient > usable) {
+            if (error && error_size)
+                snprintf(error, error_size,
+                         "M-RoPE workspace needs %.1f MiB but only %.1f MiB is available",
+                         (double)transient / 1048576.0,
+                         (double)usable / 1048576.0);
+            goto done;
+        }
+        goto build_mrope;
+    }
 #define QWEN_VISION_CHARGE(values, type)                                     \
     do {                                                                      \
         const uint64_t qv_values_ = (uint64_t)(values);                       \
@@ -21953,6 +22002,7 @@ static bool qwen4exp_graph_prepare_images(
         goto done;
     }
 
+build_mrope:;
     /* Build the exact Qwen interleaved M-RoPE coordinates.  Text advances all
      * three axes; each image occupies a 1 x (H/2) x (W/2) grid. */
     int32_t *positions = xmalloc((size_t)token_count * 3u * sizeof(int32_t));
@@ -22022,12 +22072,13 @@ static bool qwen4exp_graph_prepare_images(
     graph->image_features = projected;
     projected = NULL;
     graph->image_count = image_count;
-    graph->image_feature_rows = host.feature_rows;
+    graph->image_feature_rows = (uint32_t)f;
     ok = true;
     fprintf(stderr,
-            "ds4: Qwen vision ready: images=%u patches=%u features=%u "
+            "ds4: Qwen vision ready: images=%u patches=%u features=%u %s "
             "workspace=%.1f MiB mrope_delta=%d\n",
-            image_count, host.patch_rows, host.feature_rows,
+            image_count, (uint32_t)p, (uint32_t)f,
+            need_vision ? "computed" : "cached",
             (double)transient / 1048576.0, graph->mrope_delta);
 
 done:
@@ -39875,8 +39926,7 @@ static bool qwen4exp_graph_copy_state(
         ds4_qwen_gpu_graph *dst, const ds4_qwen_gpu_graph *src,
         uint32_t tokens) {
     if (!dst || !src || tokens == 0u || src->length != tokens ||
-        tokens > dst->context_cap || dst->context_cap != src->context_cap ||
-        src->mrope_active)
+        tokens > dst->context_cap || dst->context_cap != src->context_cap)
         return false;
 
     qwen4exp_graph_clear_multimodal(dst);
@@ -42253,8 +42303,7 @@ static bool qwen_batch_runtime_capture_checkpoint(
         ds4_qwen_batch_runtime *rt, uint32_t bank, uint32_t pos,
         bool logits_valid, uint64_t reserve) {
     if (!rt || !rt->checkpoint_slab || !rt->checkpoint_logits ||
-        bank >= rt->max_seq || pos == 0u || rt->graph[bank].length != pos ||
-        rt->graph[bank].mrope_active) {
+        bank >= rt->max_seq || pos == 0u || rt->graph[bank].length != pos) {
         return false;
     }
     for (uint32_t i = 0; i < DS4_PARTIAL_CHECKPOINT_SLOTS; i++) {
@@ -42329,8 +42378,7 @@ static bool qwen_batch_runtime_restore_checkpoint(
     const uint32_t pos = cp->pos;
     ds4_qwen_gpu_graph *dst_graph = &rt->graph[dst];
     const ds4_qwen_gpu_graph *src_graph = &rt->graph[src];
-    if (pos == 0u || pos > cut || !partial_checkpoint_ref(cp, src) ||
-        src_graph->mrope_active) {
+    if (pos == 0u || pos > cut || !partial_checkpoint_ref(cp, src)) {
         return false;
     }
     qwen4exp_graph_clear_multimodal(dst_graph);
@@ -55564,7 +55612,7 @@ static int family_banked_engine_continuous_generate(
             bool partial = false;
             bool warm = false;
             const uint32_t requested_cached =
-                req.image_count == 0u &&
+                (req.image_count == 0u || ctx->qwen) &&
                 req.n_cached > 0 && req.n_cached <= req.n
                     ? (uint32_t)req.n_cached : 0u;
             if (src >= 0 && requested_cached != 0u) {

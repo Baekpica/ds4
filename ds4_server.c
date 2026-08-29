@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <float.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
@@ -626,6 +627,9 @@ typedef struct {
     size_t len;
     ds4_qwen_image_info info;
     uint32_t token_offset;
+    uint64_t pixel_hash;
+    size_t cache_marker_start;
+    size_t cache_marker_end;
 } chat_image;
 
 typedef struct {
@@ -724,6 +728,9 @@ typedef struct {
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+    /* Internal-only replay key: prompt_text with decoded-pixel identities
+     * inserted after each image placeholder.  It is never tokenized. */
+    char *prompt_cache_text;
     tool_schema_orders tool_orders;
     int max_tokens;
     /* Inc 0b: did the CLIENT send a budget?  Parsers preload max_tokens with
@@ -1077,6 +1084,93 @@ static bool chat_msgs_validate_images(const chat_msgs *msgs,
     return true;
 }
 
+/* Invalid UTF-8 sentinels keep this internal key namespace disjoint from a
+ * valid JSON transcript.  The marker is fixed-width so disk records can be
+ * converted back to their model-visible text without storing a second copy. */
+static const char QWEN_IMAGE_CACHE_PREFIX[] = "\xff" "DS4IMG2:";
+enum { QWEN_IMAGE_CACHE_MARKER_LEN = 53 };
+
+static bool qwen_image_cache_marker_at(const char *p, size_t left) {
+    const size_t prefix = sizeof(QWEN_IMAGE_CACHE_PREFIX) - 1u;
+    if (!p || left < QWEN_IMAGE_CACHE_MARKER_LEN ||
+        memcmp(p, QWEN_IMAGE_CACHE_PREFIX, prefix) ||
+        p[25] != ':' || p[34] != ':' || p[43] != ':' ||
+        (unsigned char)p[52] != 0xfeu) return false;
+    for (size_t i = prefix; i < 52u; i++) {
+        if (i == 25u || i == 34u || i == 43u) continue;
+        if (!isxdigit((unsigned char)p[i])) return false;
+    }
+    return true;
+}
+
+static char *qwen_image_cache_text_build(
+        const char *text, chat_image *images, int image_count,
+        char *err, size_t errlen) {
+    if (!text || !images || image_count <= 0 ||
+        image_count > CHAT_IMAGE_MAX_COUNT) return NULL;
+    const size_t pad_len = strlen(DS4_QWEN_IMAGE_PAD);
+    const char *cursor = text;
+    buf key = {0};
+    for (int i = 0; i < image_count; i++) {
+        const char *pad = strstr(cursor, DS4_QWEN_IMAGE_PAD);
+        if (!pad || (images[i].pixel_hash == 0u &&
+                     ds4_qwen_image_pixel_hash(
+                         images[i].data, images[i].len,
+                         &images[i].pixel_hash, err, errlen) != 0)) {
+            if (!pad && err && errlen)
+                snprintf(err, errlen,
+                         "image cache key is missing an image placeholder");
+            buf_free(&key);
+            return NULL;
+        }
+        const size_t through_pad = (size_t)(pad - cursor) + pad_len;
+        buf_append(&key, cursor, through_pad);
+        images[i].cache_marker_start = key.len;
+        char marker[QWEN_IMAGE_CACHE_MARKER_LEN + 1u];
+        const int n = snprintf(
+            marker, sizeof(marker), "%s%016" PRIx64 ":%08x:%08x:%08x%c",
+            QWEN_IMAGE_CACHE_PREFIX, images[i].pixel_hash,
+            images[i].info.grid_h, images[i].info.grid_w,
+            images[i].info.token_count, (char)0xfe);
+        if (n != QWEN_IMAGE_CACHE_MARKER_LEN) {
+            if (err && errlen) snprintf(err, errlen, "image cache key overflow");
+            buf_free(&key);
+            return NULL;
+        }
+        buf_append(&key, marker, (size_t)n);
+        images[i].cache_marker_end = key.len;
+        cursor = pad + pad_len;
+    }
+    buf_puts(&key, cursor);
+    return buf_take(&key);
+}
+
+static char *qwen_image_cache_text_strip(const char *key) {
+    if (!key) return NULL;
+    const size_t len = strlen(key);
+    buf text = {0};
+    for (size_t i = 0u; i < len;) {
+        if (qwen_image_cache_marker_at(key + i, len - i)) {
+            i += QWEN_IMAGE_CACHE_MARKER_LEN;
+        } else {
+            buf_putc(&text, key[i++]);
+        }
+    }
+    return buf_take(&text);
+}
+
+/* A byte LCP ending inside a marker proves only the text before that image.
+ * Never let the token-LCP (all image-pad ids are equal) cross its pixels. */
+static int qwen_image_cache_token_cap(
+        const chat_image *images, int image_count, size_t cache_lcp) {
+    for (int i = 0; images && i < image_count; i++) {
+        if (cache_lcp >= images[i].cache_marker_start &&
+            cache_lcp < images[i].cache_marker_end)
+            return (int)images[i].token_offset;
+    }
+    return INT_MAX;
+}
+
 static bool request_expand_qwen_image_tokens(request *r,
                                              char *err, size_t errlen) {
     if (!r || r->images.len == 0) return true;
@@ -1121,6 +1215,9 @@ static bool request_expand_qwen_image_tokens(request *r,
     r->prompt.v = tokens;
     r->prompt.len = (int)out;
     r->prompt.cap = (int)out;
+    r->prompt_cache_text = qwen_image_cache_text_build(
+        r->prompt_text, r->images.v, r->images.len, err, errlen);
+    if (!r->prompt_cache_text) return false;
     return true;
 }
 
@@ -1267,6 +1364,7 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    free(r->prompt_cache_text);
     ds4_tokens_free(&r->required_tool_prefix);
     ds4_tokens_free(&r->required_think_end_prefix);
     stop_list_clear(&r->responses_live_call_ids);
@@ -11776,12 +11874,18 @@ struct server {
     struct {
         char    *text;
         size_t   len;
+        /* Image-aware identity key parallel to model-visible text.  NULL for
+         * text-only records; never passed to the tokenizer. */
+        char    *cache_text;
+        size_t   cache_len;
         /* A tools-armed prose turn may be replayed either with the emitted
          * reasoning field or with only the visible assistant content.  Keep
          * the sampled/raw spelling as an in-memory alias while `text` stays
          * the client-visible key persisted to disk. */
         char    *exact_text;
         size_t   exact_len;
+        char    *exact_cache_text;
+        size_t   exact_cache_len;
         uint64_t last_use;
         bool     valid;
         /* A client/semantic cut or split think-close can leave a key shorter
@@ -14083,7 +14187,7 @@ static void kv_cache_store_current(server *s, const char *reason) {
  * <= 0 disables the call site's tier.  The record's rendered text is the
  * store key, so a later request byte-prefix-matches it exactly like a live
  * warm record; the payload restores through
- * ds4_kvstore_try_restore_bank_text at admission.  Runs on the worker
+ * the verified bank-entry restore path at admission.  Runs on the worker
  * thread under gen_mu (evict sites) or after client drain (shutdown) --
  * the bank is idle by construction at both. */
 static void kv_cache_store_bank(server *s, int bank, const char *reason,
@@ -14091,7 +14195,6 @@ static void kv_cache_store_bank(server *s, int bank, const char *reason,
     if (min_committed <= 0) return;
     if (!s->kv.enabled || !s->batch_ctx || !s->warm) return;
     if (bank < 0 || bank >= s->batch_ctx_max_seq || !s->warm[bank].valid) return;
-    if (ds4_batch_ctx_bank_multimodal(s->batch_ctx, bank)) return;
     if (s->warm[bank].partial_only) return;
     if (!s->warm[bank].text || s->warm[bank].len == 0) return;
     const int *htok = NULL;
@@ -14108,14 +14211,19 @@ static void kv_cache_store_bank(server *s, int bank, const char *reason,
     }
     ds4_tokens tokens = { (int *)htok, (int)hl, (int)hl };
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    const bool image_key = s->warm[bank].cache_text != NULL;
+    const char *cache_key = image_key ? s->warm[bank].cache_text
+                                      : s->warm[bank].text;
+    const uint8_t cache_flags = DS4_KVSTORE_EXT_BANK_REPLAY_V1 |
+        (image_key ? DS4_KVSTORE_EXT_IMAGE_PIXELS_V2 : 0u);
     /* Bank-tier record: keyed by the SERVING ctx (the bank's geometry),
      * never the serial session's -- v0.5.2 right-sizing can shrink that
      * session, and a bank record must keep restoring across boots at -c. */
     const bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                         s->session, s->serial_boot_ctx,
                         &tokens, (int)hl, reason,
-                        s->warm[bank].text,
-                        DS4_KVSTORE_EXT_BANK_REPLAY_V1, "bank",
+                        cache_key, cache_flags,
+                        image_key ? "bank-image" : "bank",
                         &hooks, &staged, err, sizeof(err));
     ds4_session_payload_file_free(&staged);
     if (ok) {
@@ -18802,11 +18910,17 @@ static void warm_records_gauge_refresh(const server *s) {
 static void warm_rec_invalidate(server *s, int bank) {
     if (!s->warm || bank < 0 || bank >= s->batch_ctx_max_seq) return;
     free(s->warm[bank].text);
+    free(s->warm[bank].cache_text);
     free(s->warm[bank].exact_text);
+    free(s->warm[bank].exact_cache_text);
     s->warm[bank].text = NULL;
+    s->warm[bank].cache_text = NULL;
     s->warm[bank].exact_text = NULL;
+    s->warm[bank].exact_cache_text = NULL;
     s->warm[bank].len = 0;
+    s->warm[bank].cache_len = 0;
     s->warm[bank].exact_len = 0;
+    s->warm[bank].exact_cache_len = 0;
     s->warm[bank].valid = false;
     s->warm[bank].partial_only = false;
     warm_records_gauge_refresh(s);
@@ -18821,21 +18935,42 @@ static void cont_append_committed_text(server *s, buf *b, const int *tokens, int
     }
 }
 
-static size_t warm_rec_full_prefix_len(const server *s, int bank,
-                                       const char *text, size_t len) {
-    if (!s || !s->warm || bank < 0 || bank >= s->batch_ctx_max_seq ||
-        !s->warm[bank].valid || s->warm[bank].partial_only || !text)
-        return 0;
+typedef struct {
+    size_t key_len;
+    size_t text_len;
+} warm_prefix_match;
 
-    size_t matched = 0;
-    if (s->warm[bank].len > 0 && s->warm[bank].len < len &&
-        byte_prefix_match(text, len, s->warm[bank].text, s->warm[bank].len))
-        matched = s->warm[bank].len;
-    if (s->warm[bank].exact_len > matched && s->warm[bank].exact_len < len &&
-        byte_prefix_match(text, len, s->warm[bank].exact_text,
-                          s->warm[bank].exact_len))
-        matched = s->warm[bank].exact_len;
-    return matched;
+static warm_prefix_match warm_rec_full_prefix(
+        const server *s, int bank, const request *r) {
+    warm_prefix_match match = {0};
+    if (!s || !s->warm || bank < 0 || bank >= s->batch_ctx_max_seq ||
+        !s->warm[bank].valid || s->warm[bank].partial_only || !r ||
+        !r->prompt_text) return match;
+
+    const bool image_key = s->warm[bank].cache_text != NULL;
+    if (image_key != (r->prompt_cache_text != NULL)) return match;
+    const char *text = image_key ? r->prompt_cache_text : r->prompt_text;
+    const size_t len = strlen(text);
+    const char *key = image_key ? s->warm[bank].cache_text
+                                : s->warm[bank].text;
+    const size_t key_len = image_key ? s->warm[bank].cache_len
+                                     : s->warm[bank].len;
+    if (key_len > 0 && key_len < len &&
+        byte_prefix_match(text, len, key, key_len)) {
+        match.key_len = key_len;
+        match.text_len = s->warm[bank].len;
+    }
+
+    const char *exact_key = image_key ? s->warm[bank].exact_cache_text
+                                      : s->warm[bank].exact_text;
+    const size_t exact_key_len = image_key ? s->warm[bank].exact_cache_len
+                                           : s->warm[bank].exact_len;
+    if (exact_key && exact_key_len > match.key_len && exact_key_len < len &&
+        byte_prefix_match(text, len, exact_key, exact_key_len)) {
+        match.key_len = exact_key_len;
+        match.text_len = s->warm[bank].exact_len;
+    }
+    return match;
 }
 
 /* Retire job j's bank at on_done: rebuild the record a follow-up request
@@ -18862,13 +18997,13 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
                              int finish) {
     if (!s->warm || j->cont_bank < 0 || j->cont_bank >= s->batch_ctx_max_seq) return;
     const int bank = j->cont_bank;
-    /* Image-pad tokens do not identify the pixels.  Until disk/warm records
-     * carry an image digest, never reuse or persist an image bank by text. */
-    if (ds4_batch_ctx_bank_multimodal(s->batch_ctx, bank)) {
-        warm_rec_invalidate(s, bank);
-        return;
-    }
     if (!tokens || n <= 0) {
+        /* A partial image admission cannot reconstruct a canonical single-pad
+         * replay key from repeated committed image-pad tokens. */
+        if (j->req.prompt_cache_text) {
+            warm_rec_invalidate(s, bank);
+            return;
+        }
         /* v0.5.4 (376884 posts 126-127): an aborted/failed admission leaves
          * the bank at its chunk watermark -- a valid, SHORTER committed
          * sequence.  A fork/partial dst bank has no record of its own
@@ -19021,10 +19156,37 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
         buf_puts(&tb, visible);
         free(visible);
     }
+    char *cache_text = NULL;
+    char *exact_cache_text = NULL;
+    if (j->req.prompt_cache_text) {
+        char key_err[160] = {0};
+        cache_text = qwen_image_cache_text_build(
+            tb.ptr, j->req.images.v, j->req.images.len,
+            key_err, sizeof(key_err));
+        if (exact_text)
+            exact_cache_text = qwen_image_cache_text_build(
+                exact_text, j->req.images.v, j->req.images.len,
+                key_err, sizeof(key_err));
+        if (!cache_text || (exact_text && !exact_cache_text)) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: image warm record dropped: %s",
+                       key_err[0] ? key_err : "cache-key reconstruction failed");
+            free(exact_cache_text);
+            free(cache_text);
+            free(exact_text);
+            buf_free(&tb);
+            return;
+        }
+    }
     s->warm[bank].text = tb.ptr;
     s->warm[bank].len = tb.len;
+    s->warm[bank].cache_text = cache_text;
+    s->warm[bank].cache_len = cache_text ? strlen(cache_text) : 0u;
     s->warm[bank].exact_text = exact_text;
     s->warm[bank].exact_len = exact_len;
+    s->warm[bank].exact_cache_text = exact_cache_text;
+    s->warm[bank].exact_cache_len = exact_cache_text
+        ? strlen(exact_cache_text) : 0u;
     s->warm[bank].valid = true;
     warm_records_gauge_refresh(s);
     /* v0.5.1 inc3b: warm banks extend committed history every retire but
@@ -19055,11 +19217,20 @@ static void cont_warm_retire(server *s, job *j, const int *tokens, int n,
  * fan-out (siblings extend the TRUNK, not each other's retirements). */
 static bool warm_rec_superseded(const server *s, const bool *occ, int b) {
     if (s->warm[b].len == 0) return false;
+    const char *bkey = s->warm[b].cache_text
+        ? s->warm[b].cache_text : s->warm[b].text;
+    const size_t blen = s->warm[b].cache_text
+        ? s->warm[b].cache_len : s->warm[b].len;
     for (int o = 0; o < s->batch_ctx_max_seq; o++) {
         if (o == b || occ[o] || !s->warm[o].valid ||
             s->warm[o].partial_only) continue;
-        if (byte_prefix_match(s->warm[o].text, s->warm[o].len,
-                              s->warm[b].text, s->warm[b].len))
+        if ((s->warm[o].cache_text != NULL) !=
+            (s->warm[b].cache_text != NULL)) continue;
+        const char *okey = s->warm[o].cache_text
+            ? s->warm[o].cache_text : s->warm[o].text;
+        const size_t olen = s->warm[o].cache_text
+            ? s->warm[o].cache_len : s->warm[o].len;
+        if (byte_prefix_match(okey, olen, bkey, blen))
             return true;
     }
     return false;
@@ -19176,6 +19347,30 @@ static int cont_disk_victim_pick(server *s, const bool *occ,
     return rb;
 }
 
+/* Install one verified disk key as a live warm record.  Image records keep
+ * the pixel-bearing key for matching and a stripped copy for suffix replay. */
+static bool warm_rec_install_disk(server *s, int bank, char *record_key,
+                                  size_t key_len, int tokens,
+                                  bool image_key) {
+    if (!s || !record_key || key_len == 0u) return false;
+    char *visible = image_key ? qwen_image_cache_text_strip(record_key)
+                              : record_key;
+    if (!visible) return false;
+    warm_rec_invalidate(s, bank);
+    s->warm[bank].text = visible;
+    s->warm[bank].len = strlen(visible);
+    if (image_key) {
+        s->warm[bank].cache_text = record_key;
+        s->warm[bank].cache_len = key_len;
+    }
+    s->warm[bank].valid = true;
+    s->warm[bank].partial_only = false;
+    s->warm[bank].last_use = ++s->warm_clock;
+    s->warm[bank].stored_tokens = tokens;
+    warm_records_gauge_refresh(s);
+    return true;
+}
+
 /* Placement (and warm-continuation) pick for job j's admit.  On a record match
  * the effective prompt = the bank's EXACT committed token history + the
  * tokenized text suffix (BPE can merge across the byte boundary, so canonical
@@ -19199,19 +19394,22 @@ static bool cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
         if (o && o != j && o->cont_bank >= 0 && o->cont_bank < s->batch_ctx_max_seq)
             occ[o->cont_bank] = true;
     }
-    /* Image-pad text does not identify pixels.  Keep multimodal requests out
-     * of live/disk prefix matching and let the common cold-placement tail
-     * select their bank. */
-    const char *ptext = j->req.images.len ? NULL : j->req.prompt_text;
-    const size_t plen = ptext ? strlen(ptext) : 0;
+    const char *ptext = j->req.prompt_text;
+    const char *mtext = j->req.prompt_cache_text
+        ? j->req.prompt_cache_text : ptext;
+    const size_t mlen = mtext ? strlen(mtext) : 0;
+    const uint8_t identity_flags = j->req.prompt_cache_text
+        ? DS4_KVSTORE_EXT_IMAGE_PIXELS_V2 : 0u;
     int best = -1;
-    size_t best_len = 0;
+    size_t best_key_len = 0;
+    size_t best_text_len = 0;
     for (int b = 0; b < s->batch_ctx_max_seq; b++) {
         if (occ[b]) continue;
-        const size_t matched = warm_rec_full_prefix_len(s, b, ptext, plen);
-        if (matched > best_len) {
+        const warm_prefix_match matched = warm_rec_full_prefix(s, b, &j->req);
+        if (matched.key_len > best_key_len) {
             best = b;
-            best_len = matched;
+            best_key_len = matched.key_len;
+            best_text_len = matched.text_len;
         }
     }
     /* #10 (2026-08-04): an equal-length record can never win the full scan
@@ -19231,22 +19429,30 @@ static bool cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
      * delivers more.  If the partial path cannot take it after all, fall
      * back to the full match below. */
     bool full_deferred = false;
-    if (s->warm_fork_partial && plen && best >= 0) {
+    if (s->warm_fork_partial && mlen && best >= 0) {
         size_t plcp_max = 0;
         int pb0 = -1;
         for (int b2 = 0; b2 < s->batch_ctx_max_seq; b2++) {
             if (occ[b2] || !s->warm[b2].valid || s->warm[b2].len == 0) continue;
-            const size_t l = byte_common_prefix(ptext, plen,
-                                                s->warm[b2].text, s->warm[b2].len);
+            if ((s->warm[b2].cache_text != NULL) !=
+                (j->req.prompt_cache_text != NULL)) continue;
+            const char *rkey = s->warm[b2].cache_text
+                ? s->warm[b2].cache_text : s->warm[b2].text;
+            const size_t rlen = s->warm[b2].cache_text
+                ? s->warm[b2].cache_len : s->warm[b2].len;
+            const size_t l = byte_common_prefix(mtext, mlen, rkey, rlen);
             if (l > plcp_max) { plcp_max = l; pb0 = b2; }
         }
-        if (pb0 >= 0 && plcp_max > best_len &&
+        if (pb0 >= 0 && plcp_max > best_key_len &&
             plcp_max >= (size_t)s->warm_partial_min) {
             const int hl_full = ds4_batch_ctx_bank_committed(s->batch_ctx, best, NULL);
             const int *ptok2 = NULL;
             const int hl_part = ds4_batch_ctx_bank_committed(s->batch_ctx, pb0, &ptok2);
-            const int pcap2 = j->req.prompt.len - 1 < hl_part ? j->req.prompt.len - 1
-                                                              : hl_part;
+            int pcap2 = j->req.prompt.len - 1 < hl_part ? j->req.prompt.len - 1
+                                                        : hl_part;
+            const int image_cap = qwen_image_cache_token_cap(
+                j->req.images.v, j->req.images.len, plcp_max);
+            if (pcap2 > image_cap) pcap2 = image_cap;
             int cut2 = 0;
             if (ptok2)
                 while (cut2 < pcap2 && ptok2[cut2] == j->req.prompt.v[cut2]) cut2++;
@@ -19267,37 +19473,36 @@ static bool cont_warm_pick(server *s, cont_sched *cs, job *j, ds4_cont_request *
      * The restored text becomes the bank's warm record, so the normal
      * placement below and the engine's frontier validation treat it
      * exactly like a live retirement. */
-    if (best < 0 && plen && s->kv.enabled) {
+    if (best < 0 && mlen && s->kv.enabled) {
         int rb = -1;
-        const int didx = ds4_kvstore_find_bank_text_prefix(
-                             &s->kv, ptext,
-                             ds4_engine_model_id(s->engine),
-                             ds4_engine_routed_quant_bits(s->engine),
-                             s->serial_boot_ctx);   /* bank tier: serving ctx */
+        const int didx = ds4_kvstore_find_bank_text_prefix_identity(
+            &s->kv, mtext, ds4_engine_model_id(s->engine),
+            ds4_engine_routed_quant_bits(s->engine), s->serial_boot_ctx,
+            identity_flags);   /* bank tier: serving ctx */
         if (didx >= 0)
             rb = cont_disk_victim_pick(s, occ, s->kv.entry[didx].tokens);
         if (rb >= 0) {
             char *rtext = NULL;
             size_t rlen = 0;
-            const int rtok = ds4_kvstore_try_restore_bank_text(&s->kv,
-                                 s->engine, s->serial_boot_ctx, s->batch_ctx,
-                                 (uint32_t)rb, ptext, &rtext, &rlen);
+            const int rtok = ds4_kvstore_try_restore_bank_entry(
+                &s->kv, s->batch_ctx, (uint32_t)rb, didx, &rtext, &rlen);
             if (rtok > 0) {
-                warm_rec_invalidate(s, rb);
-                s->warm[rb].text = rtext;
-                s->warm[rb].len = rlen;
-                s->warm[rb].valid = true;
-                s->warm[rb].partial_only = false;
-                s->warm[rb].last_use = ++s->warm_clock;
-                s->warm[rb].stored_tokens = rtok;   /* it IS the disk record */
-                warm_records_gauge_refresh(s);
+                const bool image_key =
+                    (s->kv.entry[didx].ext_flags &
+                     DS4_KVSTORE_EXT_IMAGE_PIXELS_V2) != 0u;
+                if (!warm_rec_install_disk(
+                        s, rb, rtext, rlen, rtok, image_key)) {
+                    free(rtext);
+                    rtext = NULL;
+                }
                 server_log(DS4_LOG_GENERATION,
                            "ds4-server: bank restore admit bank=%d bytes=%zu",
                            rb, rlen);
-                if (rlen > 0 && rlen < plen &&
-                    byte_prefix_match(ptext, plen, rtext, rlen)) {
+                if (rtext && rlen > 0 && rlen < mlen &&
+                    byte_prefix_match(mtext, mlen, rtext, rlen)) {
                     best = rb;
-                    best_len = rlen;
+                    best_key_len = rlen;
+                    best_text_len = s->warm[rb].len;
                 }
             }
         }
@@ -19309,7 +19514,7 @@ full_commit:
         if (hl > 0 && htok) {
             ds4_tokens exact = { (int *)htok, hl, hl };
             build_prompt_from_exact_prefix_and_text_suffix(s->engine, &exact,
-                                                           ptext + best_len,
+                                                           ptext + best_text_len,
                                                            &j->warm_prompt);
             if (j->warm_prompt.len > hl &&
                 j->warm_prompt.len <= ds4_batch_ctx_seq_cap(s->batch_ctx)) {
@@ -19393,13 +19598,18 @@ warm_full_skipped:
      * engine's prefix memcmp validates it directly.  The engine then chooses
      * its safe model-specific replay base at or below the proposed cut.  The
      * trunk record survives a fork, so siblings keep matching it. */
-    if (s->warm_fork_partial && plen) {
+    if (s->warm_fork_partial && mlen) {
         int pb = -1;
         size_t plcp = 0;
         for (int b2 = 0; b2 < s->batch_ctx_max_seq; b2++) {
             if (occ[b2] || !s->warm[b2].valid || s->warm[b2].len == 0) continue;
-            const size_t l = byte_common_prefix(ptext, plen,
-                                                s->warm[b2].text, s->warm[b2].len);
+            if ((s->warm[b2].cache_text != NULL) !=
+                (j->req.prompt_cache_text != NULL)) continue;
+            const char *rkey = s->warm[b2].cache_text
+                ? s->warm[b2].cache_text : s->warm[b2].text;
+            const size_t rlen = s->warm[b2].cache_text
+                ? s->warm[b2].cache_len : s->warm[b2].len;
+            const size_t l = byte_common_prefix(mtext, mlen, rkey, rlen);
             if (l > plcp) { plcp = l; pb = b2; }
         }
         /* v0.5.1 inc3a: the disk tier gets the same partial path.  Probe it
@@ -19413,10 +19623,10 @@ warm_full_skipped:
             const size_t dfloor = plcp + 1 > (size_t)s->warm_partial_min
                                       ? plcp + 1 : (size_t)s->warm_partial_min;
             size_t dlcp = 0;
-            const int didx = ds4_kvstore_find_text_lcp(&s->kv, ptext,
-                                 ds4_engine_model_id(s->engine),
-                                 ds4_engine_routed_quant_bits(s->engine),
-                                 s->serial_boot_ctx, dfloor, &dlcp);
+            const int didx = ds4_kvstore_find_text_lcp_identity(
+                &s->kv, mtext, ds4_engine_model_id(s->engine),
+                ds4_engine_routed_quant_bits(s->engine),
+                s->serial_boot_ctx, dfloor, identity_flags, &dlcp);
             if (didx >= 0) {
                 const int rb = cont_disk_victim_pick(s, occ,
                                    s->kv.entry[didx].tokens);
@@ -19427,19 +19637,21 @@ warm_full_skipped:
                                          s->batch_ctx, (uint32_t)rb, didx,
                                          &rtext, &rlen);
                     if (rtok > 0) {
-                        warm_rec_invalidate(s, rb);
-                        s->warm[rb].text = rtext;
-                        s->warm[rb].len = rlen;
-                        s->warm[rb].valid = true;
-                        s->warm[rb].partial_only = false;
-                        s->warm[rb].last_use = ++s->warm_clock;
-                        s->warm[rb].stored_tokens = rtok;
-                        warm_records_gauge_refresh(s);
+                        const bool image_key =
+                            (s->kv.entry[didx].ext_flags &
+                             DS4_KVSTORE_EXT_IMAGE_PIXELS_V2) != 0u;
+                        if (!warm_rec_install_disk(
+                                s, rb, rtext, rlen, rtok, image_key)) {
+                            free(rtext);
+                            rtext = NULL;
+                        }
                         server_log(DS4_LOG_GENERATION,
                                    "ds4-server: bank restore admit bank=%d bytes=%zu lcp=%zu partial=1",
                                    rb, rlen, dlcp);
-                        pb = rb;
-                        plcp = dlcp;
+                        if (rtext) {
+                            pb = rb;
+                            plcp = dlcp;
+                        }
                     }
                 }
             }
@@ -19449,7 +19661,10 @@ warm_full_skipped:
         if (pb >= 0 && plcp >= (size_t)s->warm_partial_min) {
             const int *htok = NULL;
             const int hl = ds4_batch_ctx_bank_committed(s->batch_ctx, pb, &htok);
-            const int pcap = j->req.prompt.len - 1 < hl ? j->req.prompt.len - 1 : hl;
+            int pcap = j->req.prompt.len - 1 < hl ? j->req.prompt.len - 1 : hl;
+            const int image_cap = qwen_image_cache_token_cap(
+                j->req.images.v, j->req.images.len, plcp);
+            if (pcap > image_cap) pcap = image_cap;
             int cut = 0;
             if (htok)
                 while (cut < pcap && htok[cut] == j->req.prompt.v[cut]) cut++;
@@ -26512,6 +26727,11 @@ static void test_qwen4exp_image_api_normalization(void) {
     static const char png_b64[] =
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mP8"
         "z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+    static const char blue_png_b64[] =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQMAAAAl21bKAAAAIGNIUk0AAHomAACAhAAA"
+        "+gAAAIDoAAB1MAAA6mAAADqYAAAXcJy6UTwAAAAGUExURQAA/////3vcmSwAAAABYktH"
+        "RAH/Ai3eAAAAB3RJTUUH6ggdACorKt9jrwAAAApJREFUCNdjYAAAAAIAAeIhvDMAAAAA"
+        "SUVORK5CYII=";
     char chat_json[1024];
     char responses_json[1024];
     char anthropic_json[1024];
@@ -26572,12 +26792,61 @@ static void test_qwen4exp_image_api_normalization(void) {
     TEST_ASSERT(info.grid_w == 16u && info.grid_h == 16u &&
                 info.token_count == 64u);
 
+    /* Cache identity is over decoded RGB pixels, not PNG container bytes. */
+    uint8_t *same_pixels = xmalloc(images[0].v[0].len + 4u);
+    memcpy(same_pixels, images[0].v[0].data, images[0].v[0].len);
+    memset(same_pixels + images[0].v[0].len, 0xa5, 4u);
+    uint8_t *blue_pixels = NULL;
+    size_t blue_len = 0u;
+    TEST_ASSERT(base64_decode_image(
+        blue_png_b64, CHAT_IMAGE_TOTAL_MAX, &blue_pixels, &blue_len,
+        err, sizeof(err)));
+    uint64_t hash0 = 0u, hash1 = 0u, hash2 = 0u;
+    TEST_ASSERT(ds4_qwen_image_pixel_hash(
+        images[0].v[0].data, images[0].v[0].len,
+        &hash0, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_qwen_image_pixel_hash(
+        same_pixels, images[0].v[0].len + 4u,
+        &hash1, err, sizeof(err)) == 0);
+    TEST_ASSERT(ds4_qwen_image_pixel_hash(
+        blue_pixels, blue_len, &hash2, err, sizeof(err)) == 0);
+    TEST_ASSERT(hash0 == hash1 && hash0 != hash2);
+
     char *prompt = render_chat_prompt_text_choice_format(
         &msgs[0], NULL, NULL, DS4_THINK_NONE, TOOL_CHOICE_AUTO,
         DS4_CHAT_FORMAT_QWEN4EXP);
     TEST_ASSERT(prompt && strstr(prompt,
         "before<|vision_start|><|image_pad|><|vision_end|>after") != NULL);
+    chat_image same_image = images[0].v[0];
+    same_image.data = same_pixels;
+    same_image.len += 4u;
+    same_image.token_offset = 17u;
+    chat_image blue_image = images[0].v[0];
+    blue_image.data = blue_pixels;
+    blue_image.len = blue_len;
+    blue_image.token_offset = 17u;
+    images[0].v[0].token_offset = 17u;
+    char *key0 = qwen_image_cache_text_build(
+        prompt, images[0].v, 1, err, sizeof(err));
+    char *key1 = qwen_image_cache_text_build(
+        prompt, &same_image, 1, err, sizeof(err));
+    char *key2 = qwen_image_cache_text_build(
+        prompt, &blue_image, 1, err, sizeof(err));
+    TEST_ASSERT(key0 && key1 && key2);
+    TEST_ASSERT(!strcmp(key0, key1) && strcmp(key0, key2));
+    const size_t image_lcp = byte_common_prefix(
+        key0, strlen(key0), key2, strlen(key2));
+    TEST_ASSERT(qwen_image_cache_token_cap(
+                    images[0].v, 1, image_lcp) == 17);
+    char *visible = qwen_image_cache_text_strip(key0);
+    TEST_ASSERT(visible && !strcmp(visible, prompt));
+    free(visible);
+    free(key2);
+    free(key1);
+    free(key0);
     free(prompt);
+    free(blue_pixels);
+    free(same_pixels);
 
     for (int i = 0; i < 3; i++) {
         chat_msgs_free(&msgs[i]);
@@ -30001,14 +30270,15 @@ static void test_warm_record_accepts_visible_and_reasoning_replay(void) {
     s.warm[0].exact_text = xstrdup("hidden reasoning assistant answer");
     s.warm[0].exact_len = strlen(s.warm[0].exact_text);
 
-    const char *visible_replay = "visible assistant answer next user";
-    const char *reasoning_replay = "hidden reasoning assistant answer next user";
-    TEST_ASSERT(warm_rec_full_prefix_len(
-                    &s, 0, visible_replay, strlen(visible_replay)) ==
-                s.warm[0].len);
-    TEST_ASSERT(warm_rec_full_prefix_len(
-                    &s, 0, reasoning_replay, strlen(reasoning_replay)) ==
-                s.warm[0].exact_len);
+    request r = {0};
+    r.prompt_text = xstrdup("visible assistant answer next user");
+    warm_prefix_match match = warm_rec_full_prefix(&s, 0, &r);
+    TEST_ASSERT(match.text_len == s.warm[0].len);
+    free(r.prompt_text);
+    r.prompt_text = xstrdup("hidden reasoning assistant answer next user");
+    match = warm_rec_full_prefix(&s, 0, &r);
+    TEST_ASSERT(match.text_len == s.warm[0].exact_len);
+    free(r.prompt_text);
 
     free(s.warm[0].text);
     free(s.warm[0].exact_text);
@@ -30476,6 +30746,8 @@ static void test_kv_bank_records_require_replay_contract(void) {
     const char *serial = "serial prefix";
     const char *touched = "unknown touched bank";
     const char *malformed = "marked serial prefix";
+    const char *plain_identity = "plain identity prefix";
+    const char *image_identity = "image identity prefix";
     test_kv_text_stub_file_model_ext(
         dir, legacy, 2, DS4_KVSTORE_REASON_BANK_CHECKPOINT, 0, 700, 0);
     test_kv_text_stub_file_model_ext(
@@ -30488,6 +30760,13 @@ static void test_kv_bank_records_require_replay_contract(void) {
     test_kv_text_stub_file_model_ext(
         dir, malformed, 2, DS4_KVSTORE_REASON_COLD,
         DS4_KVSTORE_EXT_BANK_REPLAY_V1, 650, 0);
+    test_kv_text_stub_file_model_ext(
+        dir, plain_identity, 2, DS4_KVSTORE_REASON_BANK_CHECKPOINT,
+        DS4_KVSTORE_EXT_BANK_REPLAY_V1, 700, 0);
+    test_kv_text_stub_file_model_ext(
+        dir, image_identity, 2, DS4_KVSTORE_REASON_BANK_CHECKPOINT,
+        DS4_KVSTORE_EXT_BANK_REPLAY_V1 |
+            DS4_KVSTORE_EXT_IMAGE_PIXELS_V2, 700, 0);
 
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -30537,6 +30816,21 @@ static void test_kv_bank_records_require_replay_contract(void) {
     idx = ds4_kvstore_find_text_lcp(
         &kc, "safe bank prefiX", 2, 2, 32768, 8, &lcp);
     TEST_ASSERT(idx >= 0 && lcp >= 8);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix_identity(
+                    &kc, "plain identity prefix tail", 2, 2, 32768,
+                    DS4_KVSTORE_EXT_IMAGE_PIXELS_V2) < 0);
+    TEST_ASSERT(ds4_kvstore_find_bank_text_prefix_identity(
+                    &kc, "image identity prefix tail", 2, 2, 32768, 0) < 0);
+    idx = ds4_kvstore_find_bank_text_prefix_identity(
+        &kc, "image identity prefix tail", 2, 2, 32768,
+        DS4_KVSTORE_EXT_IMAGE_PIXELS_V2);
+    TEST_ASSERT(idx >= 0 &&
+                (kc.entry[idx].ext_flags & DS4_KVSTORE_EXT_IMAGE_PIXELS_V2));
+    lcp = 0;
+    idx = ds4_kvstore_find_text_lcp_identity(
+        &kc, "image identity prefiX", 2, 2, 32768, 12,
+        DS4_KVSTORE_EXT_IMAGE_PIXELS_V2, &lcp);
+    TEST_ASSERT(idx >= 0 && lcp >= 12);
 
     char safe_sha[41];
     sha1_bytes_hex(safe, strlen(safe), safe_sha);
@@ -30556,7 +30850,8 @@ static void test_kv_bank_records_require_replay_contract(void) {
     ds4_kvstore_entry_free(&after);
 
     kv_cache_close(&kc);
-    const char *texts[] = {legacy, safe, serial, touched, malformed};
+    const char *texts[] = {legacy, safe, serial, touched, malformed,
+                           plain_identity, image_identity};
     for (size_t i = 0; i < sizeof(texts) / sizeof(texts[0]); i++) {
         char sha[41], name[44];
         sha1_bytes_hex(texts[i], strlen(texts[i]), sha);

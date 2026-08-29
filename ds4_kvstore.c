@@ -186,6 +186,7 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
 }
 
 const char *ds4_kvstore_key_kind(uint8_t ext_flags) {
+    if (ext_flags & DS4_KVSTORE_EXT_IMAGE_PIXELS_V2) return "image-pixels";
     if (ext_flags & DS4_KVSTORE_EXT_RESPONSES_VISIBLE) return "responses-visible";
     if (ext_flags & DS4_KVSTORE_EXT_THINKING_VISIBLE) return "thinking-visible";
     return "token-text";
@@ -1274,7 +1275,8 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
 
 static int kv_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                int model_id, int quant_bits, int ctx_size,
-                               bool require_suffix) {
+                               bool require_suffix, uint8_t identity_mask,
+                               uint8_t identity_flags) {
     if (!prompt_text) return -1;
     const size_t prompt_bytes = strlen(prompt_text);
     kv_cache_refresh(kc);
@@ -1282,6 +1284,8 @@ static int kv_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
     for (int i = 0; i < kc->len; i++) {
         ds4_kvstore_entry *e = &kc->entry[i];
         if (!kv_entry_is_automatic_exact_replay(e)) continue;
+        if ((e->ext_flags & identity_mask) !=
+            (identity_flags & identity_mask)) continue;
         if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
         /* A bank lookup always needs a suffix.  In the serial tier, bank
          * payloads also require one because they intentionally omit frontier
@@ -1309,7 +1313,7 @@ static int kv_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size) {
     return kv_find_text_prefix(kc, prompt_text, model_id, quant_bits, ctx_size,
-                               false);
+                               false, 0u, 0u);
 }
 
 int ds4_kvstore_find_bank_text_prefix(ds4_kvstore *kc,
@@ -1317,7 +1321,17 @@ int ds4_kvstore_find_bank_text_prefix(ds4_kvstore *kc,
                                       int model_id, int quant_bits,
                                       int ctx_size) {
     return kv_find_text_prefix(kc, prompt_text, model_id, quant_bits, ctx_size,
-                               true);
+                               true, 0u, 0u);
+}
+
+int ds4_kvstore_find_bank_text_prefix_identity(ds4_kvstore *kc,
+                                               const char *prompt_text,
+                                               int model_id, int quant_bits,
+                                               int ctx_size,
+                                               uint8_t identity_flags) {
+    return kv_find_text_prefix(
+        kc, prompt_text, model_id, quant_bits, ctx_size, true,
+        DS4_KVSTORE_EXT_IMAGE_PIXELS_V2, identity_flags);
 }
 
 /* v0.5.1: the disk twin of the server's P1 partial ranking.  A record whose
@@ -1331,9 +1345,10 @@ int ds4_kvstore_find_bank_text_prefix(ds4_kvstore *kc,
  * streams roughly an order of magnitude faster than prefill, so 1/8 is
  * comfortably net-positive.  Ties prefer the smaller record (cheaper
  * restore, same salvage). */
-int ds4_kvstore_find_text_lcp(ds4_kvstore *kc, const char *prompt_text,
-                              int model_id, int quant_bits, int ctx_size,
-                              size_t min_lcp, size_t *lcp_out) {
+static int kv_find_text_lcp(ds4_kvstore *kc, const char *prompt_text,
+                            int model_id, int quant_bits, int ctx_size,
+                            size_t min_lcp, uint8_t identity_mask,
+                            uint8_t identity_flags, size_t *lcp_out) {
     if (lcp_out) *lcp_out = 0;
     if (!prompt_text || min_lcp == 0) return -1;
     const size_t prompt_bytes = strlen(prompt_text);
@@ -1345,6 +1360,8 @@ int ds4_kvstore_find_text_lcp(ds4_kvstore *kc, const char *prompt_text,
     for (int i = 0; i < kc->len; i++) {
         ds4_kvstore_entry *e = &kc->entry[i];
         if (!kv_entry_is_automatic_exact_replay(e)) continue;
+        if ((e->ext_flags & identity_mask) !=
+            (identity_flags & identity_mask)) continue;
         if ((int)e->tokens < kc->opt.min_tokens) continue;
         if (e->model_id != (uint8_t)model_id) continue;
         if ((uint32_t)ctx_size < e->ctx_size) continue;
@@ -1378,6 +1395,24 @@ int ds4_kvstore_find_text_lcp(ds4_kvstore *kc, const char *prompt_text,
     }
     if (best >= 0 && lcp_out) *lcp_out = best_lcp;
     return best;
+}
+
+int ds4_kvstore_find_text_lcp(ds4_kvstore *kc, const char *prompt_text,
+                              int model_id, int quant_bits, int ctx_size,
+                              size_t min_lcp, size_t *lcp_out) {
+    return kv_find_text_lcp(kc, prompt_text, model_id, quant_bits, ctx_size,
+                            min_lcp, 0u, 0u, lcp_out);
+}
+
+int ds4_kvstore_find_text_lcp_identity(ds4_kvstore *kc,
+                                       const char *prompt_text,
+                                       int model_id, int quant_bits,
+                                       int ctx_size, size_t min_lcp,
+                                       uint8_t identity_flags,
+                                       size_t *lcp_out) {
+    return kv_find_text_lcp(
+        kc, prompt_text, model_id, quant_bits, ctx_size, min_lcp,
+        DS4_KVSTORE_EXT_IMAGE_PIXELS_V2, identity_flags, lcp_out);
 }
 
 /* v0.3 durable pinned banks: shared restore core.  The payload restores

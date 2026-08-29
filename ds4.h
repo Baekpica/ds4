@@ -1226,6 +1226,10 @@ int ds4_session_distributed_route_ready(ds4_session *s, char *err, size_t errlen
 int ds4_qwen_image_probe(const uint8_t *data, size_t data_len,
                          ds4_qwen_image_info *info,
                          char *err, size_t errlen);
+/* Stable cache identity over decoded RGB pixels and source geometry. */
+int ds4_qwen_image_pixel_hash(const uint8_t *data, size_t data_len,
+                              uint64_t *hash,
+                              char *err, size_t errlen);
 
 typedef enum {
     DS4_SESSION_REWRITE_ERROR = -1,
