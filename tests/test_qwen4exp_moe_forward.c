@@ -499,12 +499,19 @@ int main(int argc, char **argv) {
     }
     ds4_gpu_tensor *d_input2 = ds4_gpu_tensor_alloc(
         TEST_HIDDEN * sizeof(float));
+    ds4_gpu_tensor *d_input_rows = ds4_gpu_tensor_alloc(
+        2u * (uint64_t)TEST_HIDDEN * sizeof(float));
     ds4_gpu_tensor *d_output2 = ds4_gpu_tensor_alloc(
         TEST_HIDDEN * sizeof(float));
     ds4_qwen_moe_ws scalar1, batch0, batch1;
-    REQUIRE(d_input2 && d_output2 &&
+    REQUIRE(d_input2 && d_input_rows && d_output2 &&
             ds4_gpu_tensor_write(
                 d_input2, 0, input2, TEST_HIDDEN * sizeof(float)) &&
+            ds4_gpu_tensor_write(
+                d_input_rows, 0, input, TEST_HIDDEN * sizeof(float)) &&
+            ds4_gpu_tensor_write(
+                d_input_rows, (uint64_t)TEST_HIDDEN * sizeof(float),
+                input2, TEST_HIDDEN * sizeof(float)) &&
             qwen4exp_moe_ws_alloc(
                 &scalar1, 2u, TEST_USED, TEST_USED,
                 TEST_HIDDEN, TEST_EXPERT_FF, TEST_EXPERT_FF) &&
@@ -523,6 +530,49 @@ int main(int argc, char **argv) {
                 d_input2, d_output2, 1u, false, false),
             "scalar routed-main reference");
     ds4_qwen_moe_ws *batch_ws[2] = {&batch0, &batch1};
+    ds4_gpu_tensor *bank_input[2] = {d_input, d_input2};
+    REQUIRE(qwen4exp_moe_route_bank2(
+                batch_ws, &fixture_model, &compact_layer,
+                bank_input, d_input_rows, 1u, true),
+            "two-row router projection");
+    float scalar_router[2u * TEST_USED], batch_router[2u * TEST_USED];
+    int32_t scalar_ids[2u * TEST_USED], batch_ids[2u * TEST_USED];
+    float scalar_weights[2u * TEST_USED], batch_weights[2u * TEST_USED];
+    const uint64_t router_bytes = TEST_USED * sizeof(float);
+    const uint64_t id_bytes = TEST_USED * sizeof(int32_t);
+    REQUIRE(ds4_gpu_tensor_read(
+                ws.router_logits, 0u, scalar_router, router_bytes) &&
+            ds4_gpu_tensor_read(
+                scalar1.router_logits, 0u,
+                scalar_router + TEST_USED, router_bytes) &&
+            ds4_gpu_tensor_read(
+                batch0.router_logits, 0u,
+                batch_router, 2u * router_bytes) &&
+            ds4_gpu_tensor_read(
+                ws.selected, 0u, scalar_ids, id_bytes) &&
+            ds4_gpu_tensor_read(
+                scalar1.selected, 0u, scalar_ids + TEST_USED, id_bytes) &&
+            ds4_gpu_tensor_read(
+                batch0.selected, 0u, batch_ids, id_bytes) &&
+            ds4_gpu_tensor_read(
+                batch1.selected, 0u, batch_ids + TEST_USED, id_bytes) &&
+            ds4_gpu_tensor_read(
+                ws.router_weights, 0u, scalar_weights, router_bytes) &&
+            ds4_gpu_tensor_read(
+                scalar1.router_weights, 0u,
+                scalar_weights + TEST_USED, router_bytes) &&
+            ds4_gpu_tensor_read(
+                batch0.router_weights, 0u, batch_weights, router_bytes) &&
+            ds4_gpu_tensor_read(
+                batch1.router_weights, 0u,
+                batch_weights + TEST_USED, router_bytes),
+            "two-row router readback");
+    REQUIRE(memcmp(scalar_router, batch_router, sizeof(scalar_router)) == 0 &&
+            memcmp(scalar_ids, batch_ids, sizeof(scalar_ids)) == 0 &&
+            memcmp(scalar_weights, batch_weights,
+                   sizeof(scalar_weights)) == 0,
+            "two-row router bit parity");
+    puts("real two-bank F32 router projection/top-k       bit-exact");
     REQUIRE(qwen4exp_moe_prepare(
                 &batch0, &fixture_model, &compact_layer,
                 d_input, d_output, 1u, false, true) &&
@@ -554,6 +604,7 @@ int main(int argc, char **argv) {
     qwen4exp_moe_ws_free(&batch0);
     qwen4exp_moe_ws_free(&scalar1);
     ds4_gpu_tensor_free(d_output2);
+    ds4_gpu_tensor_free(d_input_rows);
     ds4_gpu_tensor_free(d_input2);
     free(batch_main);
     free(scalar_main);

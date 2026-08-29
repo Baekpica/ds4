@@ -21360,14 +21360,60 @@ static bool qwen4exp_moe_forward(
                ws, model, layer, input, output, n_tokens);
 }
 
+static bool qwen4exp_moe_route_bank2(
+        ds4_qwen_moe_ws *const ws[2],
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        ds4_gpu_tensor *const input[2],
+        const ds4_gpu_tensor *row_input,
+        uint32_t n_tokens,
+        bool router_bank2) {
+    if (!ws || !ws[0] || !ws[1] || !model || !layer || !input ||
+        !input[0] || !input[1] || !row_input || n_tokens != 1u) return false;
+    const uint32_t hidden = (uint32_t)layer->ffn_gate_inp->dim[0];
+    const uint32_t n_expert = (uint32_t)layer->ffn_gate_inp->dim[1];
+    const uint64_t input_bytes = 2u * (uint64_t)hidden * sizeof(float);
+    const uint64_t router_row_bytes = (uint64_t)n_expert * sizeof(float);
+    const uint64_t selected_row_bytes =
+        (uint64_t)ws[0]->n_used * sizeof(int32_t);
+    const uint64_t weight_row_bytes =
+        (uint64_t)ws[0]->n_used * sizeof(float);
+    return (router_bank2
+                ? (ds4_gpu_tensor_bytes(row_input) >= input_bytes &&
+                   ds4_gpu_matmul_f32_stable_rows_tensor(
+                       ws[0]->router_logits, model->map, model->size,
+                       layer->ffn_gate_inp->abs_offset,
+                       hidden, n_expert, row_input, 2u))
+                : (plain_graph_matmul_tensor(
+                       ws[0]->router_logits, model, layer->ffn_gate_inp,
+                       hidden, n_expert, input[0], 1u) &&
+                   plain_graph_matmul_tensor(
+                       ws[1]->router_logits, model, layer->ffn_gate_inp,
+                       hidden, n_expert, input[1], 1u) &&
+                   ds4_gpu_tensor_copy(
+                       ws[0]->router_logits, router_row_bytes,
+                       ws[1]->router_logits, 0u, router_row_bytes))) &&
+           ds4_gpu_qwen4exp_softmax_topk_router_tensor(
+               ws[0]->selected, ws[0]->router_weights,
+               ws[0]->router_logits, n_expert, ws[0]->n_used, 2u) &&
+           ds4_gpu_tensor_copy(
+               ws[1]->selected, 0u, ws[0]->selected,
+               selected_row_bytes, selected_row_bytes) &&
+           ds4_gpu_tensor_copy(
+               ws[1]->router_weights, 0u, ws[0]->router_weights,
+               weight_row_bytes, weight_row_bytes);
+}
+
 static bool qwen4exp_moe_forward_bank2(
         ds4_qwen_moe_ws *const ws[2],
         const ds4_model *model,
         const ds4_layer_weights *layer,
         ds4_gpu_tensor *const input[2],
+        const ds4_gpu_tensor *row_input,
         ds4_gpu_tensor *const output[2],
         uint32_t n_tokens) {
-    if (!ws || !ws[0] || !ws[1] || !model || !layer || !input || !output)
+    if (!ws || !ws[0] || !ws[1] || !model || !layer || !input ||
+        !row_input || !output)
         return false;
     const char *disabled = getenv("DS4_QWEN_NO_Q5_TAIL_BANK2");
     const bool scalar =
@@ -21403,28 +21449,14 @@ static bool qwen4exp_moe_forward_bank2(
         n_tokens == 1u && ws[0]->capacity >= 2u &&
         ws[0]->n_expert == ws[1]->n_expert &&
         ws[0]->n_used == ws[1]->n_used;
-    const uint64_t router_row_bytes = (uint64_t)n_expert * sizeof(float);
-    const uint64_t selected_row_bytes = (uint64_t)ws[0]->n_used * sizeof(int32_t);
-    const uint64_t weight_row_bytes = (uint64_t)ws[0]->n_used * sizeof(float);
-    if (topk_bank2 &&
-        (!plain_graph_matmul_tensor(
-             ws[0]->router_logits, model, layer->ffn_gate_inp,
-             hidden, n_expert, input[0], n_tokens) ||
-         !plain_graph_matmul_tensor(
-             ws[1]->router_logits, model, layer->ffn_gate_inp,
-             hidden, n_expert, input[1], n_tokens) ||
-         !ds4_gpu_tensor_copy(
-             ws[0]->router_logits, router_row_bytes,
-             ws[1]->router_logits, 0u, router_row_bytes) ||
-         !ds4_gpu_qwen4exp_softmax_topk_router_tensor(
-             ws[0]->selected, ws[0]->router_weights, ws[0]->router_logits,
-             n_expert, ws[0]->n_used, 2u) ||
-         !ds4_gpu_tensor_copy(
-             ws[1]->selected, 0u, ws[0]->selected,
-             selected_row_bytes, selected_row_bytes) ||
-         !ds4_gpu_tensor_copy(
-             ws[1]->router_weights, 0u, ws[0]->router_weights,
-             weight_row_bytes, weight_row_bytes))) return false;
+    const char *router_disabled = getenv("DS4_QWEN_NO_MOE_ROUTER_BANK2");
+    const bool router_bank2 = topk_bank2 &&
+        !(router_disabled && router_disabled[0] &&
+          !(router_disabled[0] == '0' && router_disabled[1] == '\0')) &&
+        layer->ffn_gate_inp->type == DS4_TENSOR_F32;
+    if (topk_bank2 && !qwen4exp_moe_route_bank2(
+            ws, model, layer, input, row_input, n_tokens, router_bank2))
+        return false;
     return qwen4exp_moe_prepare(
                ws[0], model, layer, input[0], output[0], n_tokens,
                topk_bank2, main_bank2) &&
@@ -23003,7 +23035,7 @@ static bool qwen4exp_graph_forward_decode_rows(
         }
         const bool moe_ok = input[0] && input[1] && output[0] && output[1] &&
             qwen4exp_moe_forward_bank2(
-                moe_ws, model, layer, input, output, 1u);
+                moe_ws, model, layer, input, scratch->hc.mixed, output, 1u);
         for (uint32_t r = 0u; r < rows; r++) {
             ds4_gpu_tensor_free(output[r]);
             ds4_gpu_tensor_free(input[r]);
@@ -40669,7 +40701,7 @@ static bool qwen_batch_runtime_decode(
             fprintf(stderr,
                     "ds4: Qwen true row batch active: two-row "
                     "embedding/HC/Q8 output/PLE gather/GDN Q8 projections "
-                    "and paired GDN recurrent/QSA Q-gate/MoE top-k/Q5 "
+                    "and paired GDN recurrent/QSA Q-gate/MoE router/top-k/Q5 "
                     "routed-main/Q5 tail; other PLE/QSA/MoE work bank-owned\n");
         return true;
     }
