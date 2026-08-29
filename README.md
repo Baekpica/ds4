@@ -143,7 +143,7 @@ short-generation A/B measured
 (+8.65%). `DS4_QWEN_NO_ROW_BATCH=1` restores the scalar path. This is bounded,
 state-safe row batching, not a claim that the complete Qwen graph is batched.
 
-Six later increments pair the independent Gated DeltaNet recurrent updates
+Seven later increments pair the independent Gated DeltaNet recurrent updates
 in one two-dimensional CUDA grid, run the final Q8 output projection through
 the existing two-row dense path, and gather both banks' SSD-PLE rows in one
 descriptor batch before bit-exact BF16 promotion. The fourth pairs only the
@@ -151,18 +151,22 @@ assignment-major Q5_0 expert-down tail. The fifth batches only the QSA Q/gate
 Q8 projection; index/KV history, RoPE, attention, and output stay bank-owned.
 The sixth keeps router, top-k, gate/up, and weighted-SwiGLU arithmetic per bank,
 then combines the two packed Q5_K expert-down main worklists; shared-expert
-arithmetic remains independent.
+arithmetic remains independent. The seventh keeps both F32 router projections
+independent, then runs the existing router top-k kernel across the two logits
+rows before returning each bank's selected IDs and normalized weights.
 The same-process 3-by-3
 real-Q5 checks measured 23.24 versus 22.80 tok/s for the recurrent update (+1.96%), then
 23.70 versus 23.15 tok/s for the output projection (+2.35%), and 23.98 versus
 23.82 tok/s for the PLE gather (+0.64%). The tail check measured 24.62 versus
 24.20 tok/s (+1.74%), and the QSA projection check measured 25.15 versus
 24.65 tok/s (+2.01%). The routed-main check measured 25.40 versus 24.91 tok/s
-(+1.95%); all three paired rounds were faster. The raw Q8 path
+(+1.95%), and the router top-k check measured 25.74 versus 25.37 tok/s
+(+1.48%); all three paired rounds were faster. The raw Q8 path
 matched two one-row calls bit-for-bit at the production 2,560 input width, and
 the QSA Q/gate path matched 98,304 output bytes bit-for-bit. The real-weight
-routed-main check matched both 10-by-2,560 output tables bit-for-bit. In all
-cases,
+routed-main check matched both 10-by-2,560 output tables bit-for-bit. Four
+distinct 512-expert router rows also matched their one-row top-k calls
+bit-for-bit. In all cases,
 the full two-bank MTP/disk-KV/partial-fork regression retained
 its exact target token streams. PLE projection/convolution, the remaining QSA
 work, shared MoE work, and the remaining GDN stages are still bank-owned.
@@ -174,6 +178,8 @@ projections for diagnostic A/B runs.
 tail-specific A/B.
 `DS4_QWEN_NO_MOE_MAIN_BANK2=1` restores two independent Q5_K routed-main
 worklists while retaining the paired Q5_0 tail.
+`DS4_QWEN_NO_MOE_TOPK_BANK2=1` restores two independent router top-k launches
+while retaining the other accepted two-bank paths.
 
 The same Q5 artifact then passed guarded still-image serving at a configured
 262,144-token context with 8,192-token prefill chunks. Chat Completions,
@@ -887,7 +893,7 @@ than refusing). The knobs:
 | `DS4_MEM_RECONCILE_TOL_MB` | `256` | When idle, the server reconciles the box's available-memory drop since boot against what its own allocation ledger explains and logs the residual (`mem reconcile:` line, also on `/v1/stats` and `/metrics`); a residual beyond this many MiB is marked `FLAGGED`. `DS4_MEM_RECONCILE_STRICT=1` adds a distinct `mem reconcile STRICT` line for gate scripts to assert on; `DS4_MEM_RECONCILE_WARMUP_MB` pins the named one-time warmup charge instead of letting the first idle pass self-calibrate it. Pure reporting — no admission decision reads it. |
 | `DS4_CONT_PREFILL_CHUNK` / `DS4_CONT_PREFILL_CHUNK_LIVE` | `4096` / `512` | Long prompts are ingested this many tokens at a time so a big admission never blocks the server. The `_LIVE` value applies while other requests are actively decoding: smaller keeps live decode smoother, larger ingests faster. |
 | `DS4_SERVER_FORK_PARTIAL` | `1` | Reuse the longest safe prefix when a prompt diverges inside a retained conversation. Set to `0` for a true cold-control path: Solar then reserves no KDA checkpoints, Motif-3 no SWA-window checkpoints, and Qwen no recurrent-state checkpoints. `DS4_SERVER_FORK_PARTIAL_MIN` (default 192 tokens, floor 136) skips tiny partial matches. |
-| `DS4_QWEN_BATCH` | unset (off) | Set to `1` to enable Qwen's persistent two-bank lane. It supports exact-frontier and partial-prefix forks, bank disk-KV persistence, target-verified embedded MTP with `--mtp-draft 2`, image requests with decoded-pixel cache identity, bounded two-row token-embedding/Hyper-Connection/Q8-output decode, paired GDN recurrent, QSA Q/gate projection, Q5_K routed-main, and Q5_0 tail launches, plus a combined SSD-PLE gather. PLE compute, remaining QSA work, shared MoE work, and the remaining GDN stages stay bank-owned. |
+| `DS4_QWEN_BATCH` | unset (off) | Set to `1` to enable Qwen's persistent two-bank lane. It supports exact-frontier and partial-prefix forks, bank disk-KV persistence, target-verified embedded MTP with `--mtp-draft 2`, image requests with decoded-pixel cache identity, bounded two-row token-embedding/Hyper-Connection/Q8-output decode, paired GDN recurrent, QSA Q/gate projection, router top-k, Q5_K routed-main, and Q5_0 tail launches, plus a combined SSD-PLE gather. PLE compute, remaining QSA work, shared MoE work, and the remaining GDN stages stay bank-owned. |
 | `DS4_QWEN_PREFILL_CHUNK` | `256` (range 1..16384) | Qwen serial and bank prefill width. `8192` is the production serving setting used for the published Spark results; larger values need enough graph memory. |
 | `DS4_QWEN_PLE_CACHE_MB` | `2048` (allowed: 512, 1024, 2048) | Bound for Qwen's pinned SSD-PLE page cache. The full 95.37 GiB sidecar remains outside the unified-memory resident set. |
 | `DS4_QWEN_PLE_WORKERS` | `32` (range 1..64) | Asynchronous SSD-PLE page-read workers. On the reference DGX Spark, 32 retained nearly all of 64 workers' 8K prefill gain with less host submission overhead. |

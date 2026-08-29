@@ -21087,6 +21087,7 @@ static bool qwen4exp_moe_prepare(
         const ds4_gpu_tensor  *input,
         ds4_gpu_tensor        *output,
         uint32_t               n_tokens,
+        bool                   route_ready,
         bool                   defer_main) {
     if (!ws || !model || !layer || !input || !output || n_tokens == 0u ||
         n_tokens > ws->capacity ||
@@ -21138,12 +21139,12 @@ static bool qwen4exp_moe_prepare(
         return false;
     }
 
-    if (!plain_graph_matmul_tensor(
+    if ((!route_ready && (!plain_graph_matmul_tensor(
                 ws->router_logits, model, layer->ffn_gate_inp,
                 hidden, n_expert, input, n_tokens) ||
         !ds4_gpu_qwen4exp_softmax_topk_router_tensor(
                 ws->selected, ws->router_weights, ws->router_logits,
-                n_expert, n_used, n_tokens) ||
+                n_expert, n_used, n_tokens))) ||
         !ds4_gpu_routed_gate_up_tensor(
                 ws->routed_gate, ws->routed_up, input, ws->selected,
                 model->map, model->size,
@@ -21298,7 +21299,7 @@ static bool qwen4exp_moe_forward(
         ds4_gpu_tensor        *output,
         uint32_t               n_tokens) {
     return qwen4exp_moe_prepare(
-               ws, model, layer, input, output, n_tokens, false) &&
+               ws, model, layer, input, output, n_tokens, false, false) &&
            qwen4exp_moe_tail(ws, model, layer, n_tokens) &&
            qwen4exp_moe_finish(
                ws, model, layer, input, output, n_tokens);
@@ -21340,12 +21341,41 @@ static bool qwen4exp_moe_forward_bank2(
         layer->ffn_down_exps->type == DS4_TENSOR_Q5_K &&
         n_tokens == 1u && ws[0]->capacity >= 2u &&
         ws[0]->n_used == ws[1]->n_used;
+    const char *topk_disabled = getenv("DS4_QWEN_NO_MOE_TOPK_BANK2");
+    const bool topk_bank2 =
+        !(topk_disabled && topk_disabled[0] &&
+          !(topk_disabled[0] == '0' && topk_disabled[1] == '\0')) &&
+        n_tokens == 1u && ws[0]->capacity >= 2u &&
+        ws[0]->n_expert == ws[1]->n_expert &&
+        ws[0]->n_used == ws[1]->n_used;
+    const uint64_t router_row_bytes = (uint64_t)n_expert * sizeof(float);
+    const uint64_t selected_row_bytes = (uint64_t)ws[0]->n_used * sizeof(int32_t);
+    const uint64_t weight_row_bytes = (uint64_t)ws[0]->n_used * sizeof(float);
+    if (topk_bank2 &&
+        (!plain_graph_matmul_tensor(
+             ws[0]->router_logits, model, layer->ffn_gate_inp,
+             hidden, n_expert, input[0], n_tokens) ||
+         !plain_graph_matmul_tensor(
+             ws[1]->router_logits, model, layer->ffn_gate_inp,
+             hidden, n_expert, input[1], n_tokens) ||
+         !ds4_gpu_tensor_copy(
+             ws[0]->router_logits, router_row_bytes,
+             ws[1]->router_logits, 0u, router_row_bytes) ||
+         !ds4_gpu_qwen4exp_softmax_topk_router_tensor(
+             ws[0]->selected, ws[0]->router_weights, ws[0]->router_logits,
+             n_expert, ws[0]->n_used, 2u) ||
+         !ds4_gpu_tensor_copy(
+             ws[1]->selected, 0u, ws[0]->selected,
+             selected_row_bytes, selected_row_bytes) ||
+         !ds4_gpu_tensor_copy(
+             ws[1]->router_weights, 0u, ws[0]->router_weights,
+             weight_row_bytes, weight_row_bytes))) return false;
     return qwen4exp_moe_prepare(
                ws[0], model, layer, input[0], output[0], n_tokens,
-               main_bank2) &&
+               topk_bank2, main_bank2) &&
            qwen4exp_moe_prepare(
                ws[1], model, layer, input[1], output[1], n_tokens,
-               main_bank2) &&
+               topk_bank2, main_bank2) &&
            (!main_bank2 ||
             qwen4exp_moe_main_bank2(ws, model, layer, n_tokens)) &&
            ds4_gpu_qwen4exp_q5_0_tail_accum_bank2_tensor(
@@ -40584,7 +40614,7 @@ static bool qwen_batch_runtime_decode(
             fprintf(stderr,
                     "ds4: Qwen true row batch active: two-row "
                     "embedding/HC/Q8 output/PLE gather and paired GDN "
-                    "recurrent/QSA Q-gate/Q5 routed-main/Q5 tail; other "
+                    "recurrent/QSA Q-gate/MoE top-k/Q5 routed-main/Q5 tail; other "
                     "PLE/QSA/MoE work bank-owned\n");
         return true;
     }

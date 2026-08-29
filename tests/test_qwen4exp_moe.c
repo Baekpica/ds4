@@ -203,7 +203,33 @@ static void test_softmax_topk_router(void) {
             sum += weights_got[(uint64_t)row * ROUTER_USED + slot];
         REQUIRE(fabsf(sum - 1.0f) <= 2.0e-6f,
                 "router selected weights sum to one");
+
+        int32_t ids_one[ROUTER_USED];
+        float weights_one[ROUTER_USED];
+        ds4_gpu_tensor *logits_one = ds4_gpu_tensor_view(
+            d_logits, (uint64_t)row * ROUTER_EXPERTS * sizeof(float),
+            ROUTER_EXPERTS * sizeof(float));
+        REQUIRE(logits_one &&
+                ds4_gpu_qwen4exp_softmax_topk_router_tensor(
+                    d_ids, d_weights, logits_one,
+                    ROUTER_EXPERTS, ROUTER_USED, 1u) &&
+                ds4_gpu_tensor_read(
+                    d_ids, 0u, ids_one, sizeof(ids_one)) &&
+                ds4_gpu_tensor_read(
+                    d_weights, 0u, weights_one, sizeof(weights_one)),
+                "router scalar-row parity launch");
+        ds4_gpu_tensor_free(logits_one);
+        REQUIRE(memcmp(
+                    ids_one,
+                    ids_got + (uint64_t)row * ROUTER_USED,
+                    sizeof(ids_one)) == 0 &&
+                memcmp(
+                    weights_one,
+                    weights_got + (uint64_t)row * ROUTER_USED,
+                    sizeof(weights_one)) == 0,
+                "router scalar-row bit parity");
     }
+    puts("Qwen softmax top-10 scalar/multi-row parity  bit-exact");
     REQUIRE(!ds4_gpu_qwen4exp_softmax_topk_router_tensor(
                 d_ids, d_weights, d_logits, ROUTER_EXPERTS, ROUTER_USED, 0u),
             "router rejects zero tokens");

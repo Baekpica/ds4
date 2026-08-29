@@ -517,18 +517,18 @@ int main(int argc, char **argv) {
             "two-bank routed-main device allocation");
     REQUIRE(qwen4exp_moe_prepare(
                 &ws, &fixture_model, &compact_layer,
-                d_input, d_output, 1u, false) &&
+                d_input, d_output, 1u, false, false) &&
             qwen4exp_moe_prepare(
                 &scalar1, &fixture_model, &compact_layer,
-                d_input2, d_output2, 1u, false),
+                d_input2, d_output2, 1u, false, false),
             "scalar routed-main reference");
     ds4_qwen_moe_ws *batch_ws[2] = {&batch0, &batch1};
     REQUIRE(qwen4exp_moe_prepare(
                 &batch0, &fixture_model, &compact_layer,
-                d_input, d_output, 1u, true) &&
+                d_input, d_output, 1u, false, true) &&
             qwen4exp_moe_prepare(
                 &batch1, &fixture_model, &compact_layer,
-                d_input2, d_output2, 1u, true) &&
+                d_input2, d_output2, 1u, false, true) &&
             qwen4exp_moe_main_bank2(
                 batch_ws, &fixture_model, &compact_layer, 1u),
             "two-bank routed-main forward");
