@@ -273,11 +273,15 @@ static void attention_reference(float *out, const float *query,
 }
 
 static void check_vision_attention(void) {
-    enum { VROWS = 3, VHEADS = 2, VDIM = 72, VWIDTH = VHEADS * VDIM };
+    enum { VROWS = 67, VHEADS = 16, VDIM = 72, VWIDTH = VHEADS * VDIM };
     float qkv[VROWS * 3 * VWIDTH];
-    float want[VROWS * VWIDTH], got[VROWS * VWIDTH];
-    int32_t segment_start[VROWS] = {0, 0, 0};
-    int32_t segment_end[VROWS] = {VROWS, VROWS, VROWS};
+    float want[VROWS * VWIDTH], got[VROWS * VWIDTH], naive[VROWS * VWIDTH];
+    int32_t segment_start[VROWS], segment_end[VROWS];
+
+    for (uint32_t row = 0; row < VROWS; row++) {
+        segment_start[row] = row < 36u ? 0 : 36;
+        segment_end[row] = row < 36u ? 36 : VROWS;
+    }
 
     for (uint32_t row = 0; row < VROWS; row++) {
         for (uint32_t head = 0; head < VHEADS; head++) {
@@ -297,7 +301,9 @@ static void check_vision_attention(void) {
             const float *q = qkv + (uint64_t)row * 3u * VWIDTH +
                              (uint64_t)head * VDIM;
             float score[VROWS], maximum = -INFINITY, sum = 0.0f;
-            for (uint32_t key_row = 0; key_row < VROWS; key_row++) {
+            const uint32_t begin = (uint32_t)segment_start[row];
+            const uint32_t end = (uint32_t)segment_end[row];
+            for (uint32_t key_row = begin; key_row < end; key_row++) {
                 const float *k = qkv + (uint64_t)key_row * 3u * VWIDTH +
                                  VWIDTH + (uint64_t)head * VDIM;
                 float dot = 0.0f;
@@ -305,13 +311,13 @@ static void check_vision_attention(void) {
                 score[key_row] = dot / sqrtf((float)VDIM);
                 maximum = fmaxf(maximum, score[key_row]);
             }
-            for (uint32_t key_row = 0; key_row < VROWS; key_row++) {
+            for (uint32_t key_row = begin; key_row < end; key_row++) {
                 score[key_row] = expf(score[key_row] - maximum);
                 sum += score[key_row];
             }
             for (uint32_t d = 0; d < VDIM; d++) {
                 float value = 0.0f;
-                for (uint32_t key_row = 0; key_row < VROWS; key_row++) {
+                for (uint32_t key_row = begin; key_row < end; key_row++) {
                     const float *v = qkv + (uint64_t)key_row * 3u * VWIDTH +
                                      2u * VWIDTH + (uint64_t)head * VDIM;
                     value += score[key_row] * v[d];
@@ -331,12 +337,21 @@ static void check_vision_attention(void) {
     REQUIRE(ds4_gpu_tensor_write(dstart, 0, segment_start, sizeof(segment_start)) &&
             ds4_gpu_tensor_write(dend, 0, segment_end, sizeof(segment_end)),
             "vision attention segment upload");
+    unsetenv("DS4_CUDA_NO_QWEN_VISION_TILE");
     REQUIRE(ds4_gpu_qwen4exp_vision_attention_tensor(
                 dout, dqkv, dstart, dend, VROWS, VHEADS, VDIM),
-            "vision attention launch");
+            "tiled vision attention launch");
     read_f32(dout, got, VROWS * VWIDTH, "vision attention download");
     compare_f32("Qwen vision full-attention softmax", got, want,
                 VROWS * VWIDTH, 5.0e-5f, 5.0e-5);
+    setenv("DS4_CUDA_NO_QWEN_VISION_TILE", "1", 1);
+    REQUIRE(ds4_gpu_qwen4exp_vision_attention_tensor(
+                dout, dqkv, dstart, dend, VROWS, VHEADS, VDIM),
+            "naive vision attention launch");
+    read_f32(dout, naive, VROWS * VWIDTH, "naive vision attention download");
+    REQUIRE(memcmp(got, naive, sizeof(got)) == 0,
+            "tiled/naive vision attention bit parity");
+    unsetenv("DS4_CUDA_NO_QWEN_VISION_TILE");
     ds4_gpu_tensor_free(dend);
     ds4_gpu_tensor_free(dstart);
     ds4_gpu_tensor_free(dout);

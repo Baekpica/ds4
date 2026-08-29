@@ -25980,18 +25980,11 @@ __global__ static void qwen4exp_vision_rope_kernel(
     }
 }
 
-/* ponytail: correctness-first O(P^2) online attention avoids an N-by-N score
- * allocation; replace with a tiled FlashAttention kernel if large-image
- * profiling shows this simple path is the bottleneck. */
-__global__ static void qwen4exp_vision_attention_kernel(
+__device__ __forceinline__ static void qwen4exp_vision_attention_row(
         float *out, const float *qkv,
         const int32_t *segment_start, const int32_t *segment_end,
-        uint32_t rows, uint32_t heads, uint32_t head_dim) {
-    const uint32_t item = blockIdx.x;
-    const uint32_t row = item / heads;
-    const uint32_t head = item - row * heads;
-    if (row >= rows || threadIdx.x >= 32u) return;
-    const uint32_t lane = threadIdx.x;
+        uint32_t row, uint32_t head, uint32_t heads, uint32_t head_dim) {
+    const uint32_t lane = threadIdx.x & 31u;
     const uint32_t width = heads * head_dim;
     const float *q = qkv + (uint64_t)row * 3u * width +
                      (uint64_t)head * head_dim;
@@ -26022,6 +26015,126 @@ __global__ static void qwen4exp_vision_attention_kernel(
         l = l * alpha + beta;
         m = next_m;
     }
+    float *dst = out + (uint64_t)row * width +
+                 (uint64_t)head * head_dim;
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    if (lane < head_dim) dst[lane] = acc0 * inv;
+    if (lane + 32u < head_dim) dst[lane + 32u] = acc1 * inv;
+    if (lane + 64u < head_dim) dst[lane + 64u] = acc2 * inv;
+}
+
+__global__ static void qwen4exp_vision_attention_naive_kernel(
+        float *out, const float *qkv,
+        const int32_t *segment_start, const int32_t *segment_end,
+        uint32_t rows, uint32_t heads, uint32_t head_dim) {
+    const uint32_t item = blockIdx.x;
+    const uint32_t row = item / heads;
+    const uint32_t head = item - row * heads;
+    if (row >= rows || threadIdx.x >= 32u) return;
+    qwen4exp_vision_attention_row(
+        out, qkv, segment_start, segment_end,
+        row, head, heads, head_dim);
+}
+
+/* Eight query warps share each 32-key K/V tile.  The online-softmax order is
+ * unchanged, but K/V global traffic is amortized across the query rows. */
+__global__ static void qwen4exp_vision_attention_tiled_kernel(
+        float *out, const float *qkv,
+        const int32_t *segment_start, const int32_t *segment_end,
+        uint32_t rows, uint32_t heads, uint32_t head_dim) {
+    constexpr uint32_t query_tile = 8u;
+    constexpr uint32_t key_tile = 32u;
+    extern __shared__ float kv_tile[];
+    float *key = kv_tile;
+    float *value = key + key_tile * head_dim;
+    __shared__ int32_t begin, end;
+    __shared__ int same_segment;
+
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row0 = blockIdx.x * query_tile;
+    const uint32_t row = row0 + warp;
+    const uint32_t head = blockIdx.y;
+    const bool active = row < rows;
+    if (threadIdx.x == 0u) {
+        begin = segment_start[row0];
+        end = segment_end[row0];
+        same_segment = 1;
+        const uint32_t row_end = row0 + query_tile < rows
+            ? row0 + query_tile : rows;
+        for (uint32_t r = row0 + 1u; r < row_end; r++) {
+            if (segment_start[r] != begin || segment_end[r] != end) {
+                same_segment = 0;
+                break;
+            }
+        }
+    }
+    __syncthreads();
+    if (!same_segment) {
+        if (active) qwen4exp_vision_attention_row(
+            out, qkv, segment_start, segment_end,
+            row, head, heads, head_dim);
+        return;
+    }
+
+    const uint32_t width = heads * head_dim;
+    const float *q = active
+        ? qkv + (uint64_t)row * 3u * width +
+          (uint64_t)head * head_dim
+        : nullptr;
+    const float q0 = active && lane < head_dim ? q[lane] : 0.0f;
+    const float q1 = active && lane + 32u < head_dim ? q[lane + 32u] : 0.0f;
+    const float q2 = active && lane + 64u < head_dim ? q[lane + 64u] : 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+    const float scale = rsqrtf((float)head_dim);
+
+    for (int32_t key_base = begin; key_base < end; key_base += key_tile) {
+        const uint32_t valid = end - key_base < (int32_t)key_tile
+            ? (uint32_t)(end - key_base) : key_tile;
+        const uint32_t tile_values = valid * head_dim;
+        for (uint32_t i = threadIdx.x; i < 2u * tile_values;
+             i += blockDim.x) {
+            const bool is_value = i >= tile_values;
+            const uint32_t local = is_value ? i - tile_values : i;
+            const uint32_t key_row = local / head_dim;
+            const uint32_t d = local - key_row * head_dim;
+            const uint64_t source =
+                (uint64_t)(key_base + (int32_t)key_row) * 3u * width +
+                (uint64_t)(is_value ? 2u : 1u) * width +
+                (uint64_t)head * head_dim + d;
+            (is_value ? value : key)[local] = qkv[source];
+        }
+        __syncthreads();
+        if (active) {
+            for (uint32_t k = 0u; k < valid; k++) {
+                const float *tile_key = key + k * head_dim;
+                float dot = 0.0f;
+                if (lane < head_dim) dot += q0 * tile_key[lane];
+                if (lane + 32u < head_dim)
+                    dot += q1 * tile_key[lane + 32u];
+                if (lane + 64u < head_dim)
+                    dot += q2 * tile_key[lane + 64u];
+                dot = __shfl_sync(
+                    0xffffffffu, warp_sum_f32(dot), 0) * scale;
+                const float next_m = fmaxf(m, dot);
+                const float alpha = isfinite(m) ? expf(m - next_m) : 0.0f;
+                const float beta = expf(dot - next_m);
+                const float *tile_value = value + k * head_dim;
+                if (lane < head_dim)
+                    acc0 = acc0 * alpha + tile_value[lane] * beta;
+                if (lane + 32u < head_dim)
+                    acc1 = acc1 * alpha + tile_value[lane + 32u] * beta;
+                if (lane + 64u < head_dim)
+                    acc2 = acc2 * alpha + tile_value[lane + 64u] * beta;
+                l = l * alpha + beta;
+                m = next_m;
+            }
+        }
+        __syncthreads();
+    }
+    if (!active) return;
     float *dst = out + (uint64_t)row * width +
                  (uint64_t)head * head_dim;
     const float inv = l > 0.0f ? 1.0f / l : 0.0f;
@@ -26175,11 +26288,21 @@ extern "C" int ds4_gpu_qwen4exp_vision_attention_tensor(
         segment_start->bytes < (uint64_t)rows * sizeof(int32_t) ||
         segment_end->bytes < (uint64_t)rows * sizeof(int32_t) ||
         (uint64_t)rows * heads > (uint64_t)INT_MAX) return 0;
-    qwen4exp_vision_attention_kernel<<<
-        rows * heads, 32u, 0, ds4_current_stream()>>>(
-        (float *)out->ptr, (const float *)qkv->ptr,
-        (const int32_t *)segment_start->ptr,
-        (const int32_t *)segment_end->ptr, rows, heads, head_dim);
+    if (getenv("DS4_CUDA_NO_QWEN_VISION_TILE") != NULL) {
+        qwen4exp_vision_attention_naive_kernel<<<
+            rows * heads, 32u, 0, ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)qkv->ptr,
+            (const int32_t *)segment_start->ptr,
+            (const int32_t *)segment_end->ptr, rows, heads, head_dim);
+    } else {
+        dim3 grid((rows + 7u) / 8u, heads);
+        const uint32_t shared = 2u * 32u * head_dim * sizeof(float);
+        qwen4exp_vision_attention_tiled_kernel<<<
+            grid, 256u, shared, ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)qkv->ptr,
+            (const int32_t *)segment_start->ptr,
+            (const int32_t *)segment_end->ptr, rows, heads, head_dim);
+    }
     return cuda_ok(cudaGetLastError(), "Qwen vision attention launch");
 }
 

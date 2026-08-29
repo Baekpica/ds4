@@ -150,6 +150,26 @@ server counters showed zero request, continuous-batch, census, and governor
 failures. These checks establish cache identity and state reuse, not image
 quality or large-image vision throughput.
 
+The vision attention path was then changed from one warp rereading K/V for
+every query to an 8-query by 32-key shared-memory tile while retaining the
+same online-softmax order and avoiding an N-by-N score allocation. A 67-row,
+two-segment check at the model's actual 16 heads and 72-value head width was
+bit-exact against the previous kernel. NCU measured 24.67 us for the tiled
+kernel versus 31.81 us for the previous path on that check (-22.4%). A
+same-binary 3-by-3 API A/B used a 4,408-patch document image, 1,159 prompt
+tokens, 64 output tokens, and disabled live/disk prefix reuse:
+
+| Vision attention | Prefill | TTFT | Decode |
+|---|---:|---:|---:|
+| 8-query / 32-key tiled | 494.47 tok/s | 10.262 s | 13.77 tok/s |
+| Previous per-query path | 494.50 tok/s | 14.143 s | 14.70 tok/s |
+
+The controlled result is a 27.45% TTFT reduction for this image size. Decode
+is reported for completeness but is not attributed to the vision kernel; the
+64-token MTP tails were thermally variable. The tiled path still performs
+exact full attention with O(P^2) arithmetic and is not presented as a
+tensor-core FlashAttention implementation.
+
 The bounded SSD-PLE cache was then tuned with identical fixed 8,192-token
 direct runs (`--gen-tokens=0`, three runs per setting). With 16 page-read
 workers, 512, 1,024, and 2,048 MiB caches averaged 252.17, 397.72, and 450.26
@@ -823,6 +843,7 @@ than refusing). The knobs:
 | `DS4_QWEN_PREFILL_CHUNK` | `256` (range 1..16384) | Qwen serial and bank prefill width. `8192` is the production serving setting used for the published Spark results; larger values need enough graph memory. |
 | `DS4_QWEN_PLE_CACHE_MB` | `2048` (allowed: 512, 1024, 2048) | Bound for Qwen's pinned SSD-PLE page cache. The full 95.37 GiB sidecar remains outside the unified-memory resident set. |
 | `DS4_QWEN_PLE_WORKERS` | `32` (range 1..64) | Asynchronous SSD-PLE page-read workers. On the reference DGX Spark, 32 retained nearly all of 64 workers' 8K prefill gain with less host submission overhead. |
+| `DS4_CUDA_NO_QWEN_VISION_TILE` | unset (tiled) | Set to `1` only to restore the previous per-query vision-attention kernel for controlled A/B diagnosis. |
 | `DS4_SERVER_CONTINUOUS` | `1` (continuous batching on) | Set to `0` to serve one request at a time on the old serial path. Only worth considering for single-user, latency-critical setups. |
 | `DS4_BATCH_VMM_BUDGET_MB` | unset: sized automatically (the bank plan's allowance, capped to measured capacity at boot, floored at two full-depth **packed** working sets — what two full banks actually commit at the admission-charged rate, not their virtual extents; `DS4_BATCH_VMM_FLOOR_PACKED=0` restores the old virtual-extent floor) | Hard cap on the KV pool, in MiB. Set it to pin the pool to a known size; either way the boot ledger prints `budget=[chosen] [plan X, capacity Y]` plus the work floor that applied, and a separate line whenever the floor is what ruled. |
 | `DS4_BATCH_VMM_TRIM` | `1` (reclaim allowed) | When an admission does not fit, the engine may release idle banks' memory to fund it; the reclaimed conversation then needs a disk restore or re-prefill when it returns. Set to `0` to forbid that: resident context is never sacrificed, and the admission is refused instead. Victims are chosen like warm-record eviction — invalid content first, then the longest-idle bank (shortest history breaks ties) — and the log names each victim with its bytes, history length, and recency; `DS4_BATCH_TRIM_VICTIM=hist` restores the old shortest-history-only order. When one victim's release would cover the whole remaining deficit, the engine now picks the smallest such victim in the same validity class instead of the first in recency order — so a deep trunk no longer dies for a deficit a small idle bank could fund (the `best-fit victim` log line discloses the substitution, and the trim summary reports released vs wanted); `DS4_BATCH_TRIM_BESTFIT=0` restores the pure recency order. |
