@@ -150,6 +150,19 @@ server counters showed zero request, continuous-batch, census, and governor
 failures. These checks establish cache identity and state reuse, not image
 quality or large-image vision throughput.
 
+The bounded SSD-PLE cache was then tuned with identical fixed 8,192-token
+direct runs (`--gen-tokens=0`, three runs per setting). With 16 page-read
+workers, 512, 1,024, and 2,048 MiB caches averaged 252.17, 397.72, and 450.26
+prefill tok/s. At 2,048 MiB, 16, 32, and 64 workers averaged 450.19, 464.67,
+and 466.88 tok/s; 32 workers retained nearly all of the 64-worker result with
+less host submission overhead and is now the default. A cold 9,854-prompt /
+64-output API check with the new defaults measured 467.2 prefill tok/s,
+21.111 s TTFT, and 25.4 decode tok/s. A synchronized two-request check
+completed as `served=2 fallback=0`; all four API requests completed with zero
+request, census, or governor failures under the external 115 GiB guard. The
+minimum observed system-available memory was 8.07 GiB. Direct runs do not
+measure TTFT or decode throughput.
+
 Motif-3 also completed a strict OpenAI Chat gate at the 262,144-token context
 limit: 262,080 prompt tokens at 175.61 tok/s followed by 43 decoded tokens at
 2.52 tok/s, with all three retrieval sentinels exact. Solar Open2 serves 8K
@@ -809,6 +822,7 @@ than refusing). The knobs:
 | `DS4_QWEN_BATCH` | unset (off) | Set to `1` to enable Qwen's persistent two-bank lane. It supports exact-frontier and partial-prefix forks, bank disk-KV persistence, target-verified embedded MTP with `--mtp-draft 2`, and image requests. Image V2 uses decoded-pixel identity for live/disk reuse; it does not claim row-batched kernel throughput. |
 | `DS4_QWEN_PREFILL_CHUNK` | `256` (range 1..16384) | Qwen serial and bank prefill width. `8192` is the production serving setting used for the published Spark results; larger values need enough graph memory. |
 | `DS4_QWEN_PLE_CACHE_MB` | `2048` (allowed: 512, 1024, 2048) | Bound for Qwen's pinned SSD-PLE page cache. The full 95.37 GiB sidecar remains outside the unified-memory resident set. |
+| `DS4_QWEN_PLE_WORKERS` | `32` (range 1..64) | Asynchronous SSD-PLE page-read workers. On the reference DGX Spark, 32 retained nearly all of 64 workers' 8K prefill gain with less host submission overhead. |
 | `DS4_SERVER_CONTINUOUS` | `1` (continuous batching on) | Set to `0` to serve one request at a time on the old serial path. Only worth considering for single-user, latency-critical setups. |
 | `DS4_BATCH_VMM_BUDGET_MB` | unset: sized automatically (the bank plan's allowance, capped to measured capacity at boot, floored at two full-depth **packed** working sets — what two full banks actually commit at the admission-charged rate, not their virtual extents; `DS4_BATCH_VMM_FLOOR_PACKED=0` restores the old virtual-extent floor) | Hard cap on the KV pool, in MiB. Set it to pin the pool to a known size; either way the boot ledger prints `budget=[chosen] [plan X, capacity Y]` plus the work floor that applied, and a separate line whenever the floor is what ruled. |
 | `DS4_BATCH_VMM_TRIM` | `1` (reclaim allowed) | When an admission does not fit, the engine may release idle banks' memory to fund it; the reclaimed conversation then needs a disk restore or re-prefill when it returns. Set to `0` to forbid that: resident context is never sacrificed, and the admission is refused instead. Victims are chosen like warm-record eviction — invalid content first, then the longest-idle bank (shortest history breaks ties) — and the log names each victim with its bytes, history length, and recency; `DS4_BATCH_TRIM_VICTIM=hist` restores the old shortest-history-only order. When one victim's release would cover the whole remaining deficit, the engine now picks the smallest such victim in the same validity class instead of the first in recency order — so a deep trunk no longer dies for a deficit a small idle bank could fund (the `best-fit victim` log line discloses the substitution, and the trim summary reports released vs wanted); `DS4_BATCH_TRIM_BESTFIT=0` restores the pure recency order. |

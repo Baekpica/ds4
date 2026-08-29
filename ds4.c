@@ -31517,7 +31517,7 @@ static bool qwen4exp_engine_open_ple(ds4_engine *engine,
         cache_mb = 2048u;
     }
     const uint32_t workers = qwen4exp_env_u32(
-        "DS4_QWEN_PLE_WORKERS", 16u, 1u, 64u);
+        "DS4_QWEN_PLE_WORKERS", 32u, 1u, 64u);
     char error[512] = {0};
     engine->qwen_ple_store = ds4_ple_store_open(
         root, "ple/ple-manifest.json", (size_t)cache_mb << 20,
