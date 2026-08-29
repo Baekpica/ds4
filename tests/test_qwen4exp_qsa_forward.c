@@ -230,7 +230,7 @@ static void qsa_run_chunks(ds4_qwen_qsa_ws *ws,
         ds4_gpu_tensor *ov = ds4_gpu_tensor_view(output, offset, bytes);
         REQUIRE(iv && ov, "real QSA chunk views");
         REQUIRE(qwen4exp_qsa_forward(
-                    ws, state, model, weights, iv, ov, chunks[c], row),
+                    ws, state, model, weights, iv, ov, chunks[c], row, NULL),
                 "real QSA chunk forward");
         ds4_gpu_tensor_free(ov);
         ds4_gpu_tensor_free(iv);
@@ -432,9 +432,43 @@ int main(int argc, char **argv) {
     REQUIRE(ds4_gpu_tensor_write(
                 dinput, 0, input, input_count * sizeof(float)),
             "real QSA input upload");
+    const uint64_t qproj_row_bytes =
+        (uint64_t)TEST_Q_PROJ_DIM * sizeof(float);
+    const uint64_t input_row_bytes =
+        (uint64_t)TEST_HIDDEN * sizeof(float);
+    ds4_gpu_tensor *dqproj_scalar =
+        ds4_gpu_tensor_alloc(2u * qproj_row_bytes);
+    REQUIRE(dqproj_scalar, "allocate scalar QSA Q projection reference");
+    for (uint32_t row = 0u; row < 2u; row++) {
+        ds4_gpu_tensor *input_row = ds4_gpu_tensor_view(
+            dinput, (uint64_t)row * input_row_bytes, input_row_bytes);
+        ds4_gpu_tensor *output_row = ds4_gpu_tensor_view(
+            dqproj_scalar, (uint64_t)row * qproj_row_bytes,
+            qproj_row_bytes);
+        REQUIRE(input_row && output_row && plain_graph_matmul_tensor(
+                    output_row, &compact, &q_weight,
+                    TEST_HIDDEN, TEST_Q_PROJ_DIM, input_row, 1u),
+                "scalar real QSA Q/gate projection");
+        ds4_gpu_tensor_free(output_row);
+        ds4_gpu_tensor_free(input_row);
+    }
+    REQUIRE(plain_graph_matmul_tensor(
+                ws.q_projected, &compact, &q_weight,
+                TEST_HIDDEN, TEST_Q_PROJ_DIM, dinput, 2u),
+            "row-2 real QSA Q/gate projection");
+    REQUIRE(ds4_gpu_tensor_read(
+                dqproj_scalar, 0, cpu_qproj, 2u * qproj_row_bytes) &&
+            ds4_gpu_tensor_read(
+                ws.q_projected, 0, gpu_qproj, 2u * qproj_row_bytes),
+            "read real QSA Q/gate projection parity outputs");
+    REQUIRE(memcmp(cpu_qproj, gpu_qproj, 2u * qproj_row_bytes) == 0,
+            "real QSA Q/gate N=2 matches two N=1 calls");
+    printf("real Q8_0 Q/gate N=2 vs two N=1              exact (%llu bytes)\n",
+           (unsigned long long)(2u * qproj_row_bytes));
+    ds4_gpu_tensor_free(dqproj_scalar);
     REQUIRE(qwen4exp_qsa_forward(
                 &ws, &state, &compact, &weights,
-                dinput, doutput, TEST_ROWS, 0u),
+                dinput, doutput, TEST_ROWS, 0u, NULL),
             "complete real QSA forward");
     REQUIRE(state.length == TEST_ROWS, "real QSA state length");
     if (demand_page != 0u) {
