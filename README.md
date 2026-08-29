@@ -250,6 +250,30 @@ request, census, or governor failures under the external 115 GiB guard. The
 minimum observed system-available memory was 8.07 GiB. Direct runs do not
 measure TTFT or decode throughput.
 
+A separate teacher-forced full-model comparison scored 2,048 tokens from each
+of two fixed text fixtures on the higher-precision MQ-Q6 artifact and the
+target MQ-Q5 artifact:
+
+| Fixed slice | MQ-Q6 avg NLL / PPL | MQ-Q5 avg NLL / PPL | Q5-Q6 avg NLL |
+|---|---:|---:|---:|
+| Long-form essay | 2.184138 / 8.882991 | 2.140368 / 8.502567 | -0.043770 (-2.00%) |
+| Repetitive structured security fixture | 0.068999 / 1.071435 | 0.081061 / 1.084437 | +0.012062 (+17.48%) |
+| Equal-token aggregate (4,096 tokens) | 1.126569 / 3.085053 | 1.110714 / 3.036527 | -0.015854 (-1.41%) |
+
+The two slices show no Q5 quality collapse in this narrow regression, but they
+are not a representative evaluation suite and do not establish general Q5
+superiority. The structured fixture is highly repetitive, so its low absolute
+perplexity is useful only for the paired comparison.
+
+The same Q5 artifact then completed an exact 262,144-token direct prefill with
+`--gen-tokens=0`, an 8,192-token Qwen chunk, the 2,048 MiB bounded PLE cache,
+and 32 PLE workers. It sustained 277.06 prefill tok/s. The dumped final output
+contained all 248,320 finite logits; the recorded and independently recomputed
+argmax were both token 264. The run completed under the external 115 GiB memory
+guard with `DS4_MEMGOV=observe`; the lowest sampled system-available memory was
+7.8 GiB. This establishes full-window prefill and final-logit production, not
+full-window API generation or decode throughput.
+
 Motif-3 also completed a strict OpenAI Chat gate at the 262,144-token context
 limit: 262,080 prompt tokens at 175.61 tok/s followed by 43 decoded tokens at
 2.52 tok/s, with all three retrieval sentinels exact. Solar Open2 serves 8K

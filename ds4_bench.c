@@ -89,7 +89,7 @@ static void usage(FILE *fp) {
         "Sweep:\n"
         "  --ctx-start N          First measured frontier. Default: 2048\n"
         "  --ctx-max N            Last measured frontier. Default: 32768\n"
-        "  --ctx-alloc N          Allocated context. Default: ctx-max + gen-tokens + 1\n"
+        "  --ctx-alloc N          Allocated context. Default: ctx-max for pure prefill, otherwise ctx-max + gen-tokens + 1\n"
         "  --step-mul F           Multiplicative step. Default: 1\n"
         "  --step-incr N          Linear step when --step-mul is 1. Default: 2048\n"
         "  --gen-tokens N         Greedy decode tokens per frontier. Use 0 for pure prefill. Default: 128\n"
@@ -316,13 +316,15 @@ static bench_config parse_options(int argc, char **argv) {
         exit(2);
     }
     const int max_live_ctx = c.output_head_bench_iters > 0 ? c.ctx_start : c.ctx_max;
-    if (max_live_ctx > INT_MAX - c.gen_tokens - 1) {
+    const int decode_spare = c.gen_tokens > 0 ? 1 : 0;
+    if (max_live_ctx > INT_MAX - c.gen_tokens - decode_spare) {
         fprintf(stderr, "ds4-bench: requested context is too large\n");
         exit(2);
     }
-    if (c.ctx_alloc == 0) c.ctx_alloc = max_live_ctx + c.gen_tokens + 1;
-    if (c.ctx_alloc <= max_live_ctx + c.gen_tokens) {
-        fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than measured context + gen-tokens\n");
+    const int required_ctx = max_live_ctx + c.gen_tokens + decode_spare;
+    if (c.ctx_alloc == 0) c.ctx_alloc = required_ctx;
+    if (c.ctx_alloc < required_ctx) {
+        fprintf(stderr, "ds4-bench: --ctx-alloc is too small for the measured context and generation\n");
         exit(2);
     }
     char dist_err[256];

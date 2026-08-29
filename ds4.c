@@ -63322,7 +63322,7 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
-    if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
+    if (!s || !prompt || prompt->len <= 0 || prompt->len > s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
         return 1;
     }
@@ -63819,7 +63819,7 @@ bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int c
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen) {
-    if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
+    if (!s || !prompt || prompt->len <= 0 || prompt->len > s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
         return DS4_SESSION_REWRITE_ERROR;
     }
@@ -63989,6 +63989,10 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+    if (s->checkpoint.len >= s->ctx_size) {
+        if (errlen) snprintf(err, errlen, "context reached (%d)", s->ctx_size);
+        return 1;
+    }
     if (s->distributed) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
