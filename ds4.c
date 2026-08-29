@@ -21086,7 +21086,8 @@ static bool qwen4exp_moe_prepare(
         const ds4_layer_weights *layer,
         const ds4_gpu_tensor  *input,
         ds4_gpu_tensor        *output,
-        uint32_t               n_tokens) {
+        uint32_t               n_tokens,
+        bool                   defer_main) {
     if (!ws || !model || !layer || !input || !output || n_tokens == 0u ||
         n_tokens > ws->capacity ||
         ds4_gpu_tensor_ptr(input) == ds4_gpu_tensor_ptr(output) ||
@@ -21158,13 +21159,47 @@ static bool qwen4exp_moe_prepare(
         !ds4_gpu_qwen4exp_pack_expert_down_main_tensor(
                 ws->routed_gate, ws->routed_mid, assignments,
                 expert_ff, main_dim) ||
-        !ds4_gpu_routed_matmul_bounded_tensor(
+        (!defer_main && !ds4_gpu_routed_matmul_bounded_tensor(
                 ws->routed_down, ws->routed_gate, ws->selected,
                 model->map, model->size,
                 layer->ffn_down_exps->abs_offset,
                 layer->ffn_down_exps->bytes,
                 layer->ffn_down_exps->type, main_dim, hidden,
-                n_expert, (uint32_t)assignments, 1u, n_tokens)) {
+                n_expert, (uint32_t)assignments, 1u, n_tokens))) {
+        return false;
+    }
+    return true;
+}
+
+static bool qwen4exp_moe_main_bank2(
+        ds4_qwen_moe_ws *const ws[2],
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        uint32_t n_tokens) {
+    const uint32_t hidden = (uint32_t)layer->ffn_gate_inp->dim[0];
+    const uint32_t n_expert = (uint32_t)layer->ffn_gate_inp->dim[1];
+    const uint32_t main_dim = (uint32_t)layer->ffn_down_exps->dim[0];
+    const uint64_t assignments = (uint64_t)n_tokens * ws[0]->n_used;
+    const uint64_t packed_bytes = assignments * main_dim * sizeof(float);
+    const uint64_t id_bytes = assignments * sizeof(int32_t);
+    const uint64_t output_bytes = assignments * hidden * sizeof(float);
+    if (assignments > UINT32_MAX / 2u ||
+        !ds4_gpu_tensor_copy(
+            ws[0]->routed_gate, packed_bytes,
+            ws[1]->routed_gate, 0u, packed_bytes) ||
+        !ds4_gpu_tensor_copy(
+            ws[0]->selected, id_bytes,
+            ws[1]->selected, 0u, id_bytes) ||
+        !ds4_gpu_routed_matmul_bounded_tensor(
+            ws[0]->routed_down, ws[0]->routed_gate, ws[0]->selected,
+            model->map, model->size,
+            layer->ffn_down_exps->abs_offset,
+            layer->ffn_down_exps->bytes,
+            layer->ffn_down_exps->type, main_dim, hidden,
+            n_expert, 2u * (uint32_t)assignments, 1u, 2u * n_tokens) ||
+        !ds4_gpu_tensor_copy(
+            ws[1]->routed_down, 0u,
+            ws[0]->routed_down, output_bytes, output_bytes)) {
         return false;
     }
     return true;
@@ -21263,7 +21298,7 @@ static bool qwen4exp_moe_forward(
         ds4_gpu_tensor        *output,
         uint32_t               n_tokens) {
     return qwen4exp_moe_prepare(
-               ws, model, layer, input, output, n_tokens) &&
+               ws, model, layer, input, output, n_tokens, false) &&
            qwen4exp_moe_tail(ws, model, layer, n_tokens) &&
            qwen4exp_moe_finish(
                ws, model, layer, input, output, n_tokens);
@@ -21298,10 +21333,21 @@ static bool qwen4exp_moe_forward_bank2(
     const uint32_t main_dim = (uint32_t)layer->ffn_down_exps->dim[0];
     const uint32_t tail_dim = (uint32_t)layer->ffn_down_exps_tail->dim[0];
     const uint64_t assignments = (uint64_t)n_tokens * ws[0]->n_used;
+    const char *main_disabled = getenv("DS4_QWEN_NO_MOE_MAIN_BANK2");
+    const bool main_bank2 =
+        !(main_disabled && main_disabled[0] &&
+          !(main_disabled[0] == '0' && main_disabled[1] == '\0')) &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q5_K &&
+        n_tokens == 1u && ws[0]->capacity >= 2u &&
+        ws[0]->n_used == ws[1]->n_used;
     return qwen4exp_moe_prepare(
-               ws[0], model, layer, input[0], output[0], n_tokens) &&
+               ws[0], model, layer, input[0], output[0], n_tokens,
+               main_bank2) &&
            qwen4exp_moe_prepare(
-               ws[1], model, layer, input[1], output[1], n_tokens) &&
+               ws[1], model, layer, input[1], output[1], n_tokens,
+               main_bank2) &&
+           (!main_bank2 ||
+            qwen4exp_moe_main_bank2(ws, model, layer, n_tokens)) &&
            ds4_gpu_qwen4exp_q5_0_tail_accum_bank2_tensor(
                ws[0]->routed_down, ws[0]->routed_mid, ws[0]->selected,
                ws[1]->routed_down, ws[1]->routed_mid, ws[1]->selected,
@@ -40538,8 +40584,8 @@ static bool qwen_batch_runtime_decode(
             fprintf(stderr,
                     "ds4: Qwen true row batch active: two-row "
                     "embedding/HC/Q8 output/PLE gather and paired GDN "
-                    "recurrent/QSA Q-gate/Q5 tail; other PLE/QSA/MoE work "
-                    "bank-owned\n");
+                    "recurrent/QSA Q-gate/Q5 routed-main/Q5 tail; other "
+                    "PLE/QSA/MoE work bank-owned\n");
         return true;
     }
     for (uint32_t i = 0; i < rows; i++) {

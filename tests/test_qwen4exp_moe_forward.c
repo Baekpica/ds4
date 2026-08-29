@@ -411,7 +411,7 @@ int main(int argc, char **argv) {
             "register compact real MoE fixture");
     ds4_qwen_moe_ws ws;
     REQUIRE(qwen4exp_moe_ws_alloc(
-                &ws, 1u, TEST_USED, TEST_USED,
+                &ws, 2u, TEST_USED, TEST_USED,
                 TEST_HIDDEN, TEST_EXPERT_FF, TEST_EXPERT_FF),
             "allocate Qwen real MoE workspace");
     ds4_gpu_tensor *d_input = ds4_gpu_tensor_alloc(
@@ -485,6 +485,79 @@ int main(int argc, char **argv) {
     compare_metrics("real complete Qwen text MoE output",
                     gpu_output, cpu_output, TEST_HIDDEN,
                     3.0e-2, 3.0e-3);
+
+    float *input2 = (float *)malloc(TEST_HIDDEN * sizeof(*input2));
+    float *scalar_main = (float *)malloc(
+        2u * (uint64_t)TEST_USED * TEST_HIDDEN * sizeof(*scalar_main));
+    float *batch_main = (float *)malloc(
+        2u * (uint64_t)TEST_USED * TEST_HIDDEN * sizeof(*batch_main));
+    REQUIRE(input2 && scalar_main && batch_main,
+            "two-bank routed-main host allocation");
+    for (uint32_t i = 0; i < TEST_HIDDEN; i++) {
+        input2[i] = 0.73f * input[i] +
+                    0.11f * sinf((float)(i + 29u) * 0.017f);
+    }
+    ds4_gpu_tensor *d_input2 = ds4_gpu_tensor_alloc(
+        TEST_HIDDEN * sizeof(float));
+    ds4_gpu_tensor *d_output2 = ds4_gpu_tensor_alloc(
+        TEST_HIDDEN * sizeof(float));
+    ds4_qwen_moe_ws scalar1, batch0, batch1;
+    REQUIRE(d_input2 && d_output2 &&
+            ds4_gpu_tensor_write(
+                d_input2, 0, input2, TEST_HIDDEN * sizeof(float)) &&
+            qwen4exp_moe_ws_alloc(
+                &scalar1, 2u, TEST_USED, TEST_USED,
+                TEST_HIDDEN, TEST_EXPERT_FF, TEST_EXPERT_FF) &&
+            qwen4exp_moe_ws_alloc(
+                &batch0, 2u, TEST_USED, TEST_USED,
+                TEST_HIDDEN, TEST_EXPERT_FF, TEST_EXPERT_FF) &&
+            qwen4exp_moe_ws_alloc(
+                &batch1, 2u, TEST_USED, TEST_USED,
+                TEST_HIDDEN, TEST_EXPERT_FF, TEST_EXPERT_FF),
+            "two-bank routed-main device allocation");
+    REQUIRE(qwen4exp_moe_prepare(
+                &ws, &fixture_model, &compact_layer,
+                d_input, d_output, 1u, false) &&
+            qwen4exp_moe_prepare(
+                &scalar1, &fixture_model, &compact_layer,
+                d_input2, d_output2, 1u, false),
+            "scalar routed-main reference");
+    ds4_qwen_moe_ws *batch_ws[2] = {&batch0, &batch1};
+    REQUIRE(qwen4exp_moe_prepare(
+                &batch0, &fixture_model, &compact_layer,
+                d_input, d_output, 1u, true) &&
+            qwen4exp_moe_prepare(
+                &batch1, &fixture_model, &compact_layer,
+                d_input2, d_output2, 1u, true) &&
+            qwen4exp_moe_main_bank2(
+                batch_ws, &fixture_model, &compact_layer, 1u),
+            "two-bank routed-main forward");
+    const uint64_t main_bytes =
+        (uint64_t)TEST_USED * TEST_HIDDEN * sizeof(float);
+    REQUIRE(ds4_gpu_tensor_read(
+                ws.routed_down, 0, scalar_main, main_bytes) &&
+            ds4_gpu_tensor_read(
+                scalar1.routed_down, 0,
+                scalar_main + (uint64_t)TEST_USED * TEST_HIDDEN,
+                main_bytes) &&
+            ds4_gpu_tensor_read(
+                batch0.routed_down, 0, batch_main, main_bytes) &&
+            ds4_gpu_tensor_read(
+                batch1.routed_down, 0,
+                batch_main + (uint64_t)TEST_USED * TEST_HIDDEN,
+                main_bytes),
+            "two-bank routed-main readback");
+    REQUIRE(memcmp(scalar_main, batch_main, 2u * main_bytes) == 0,
+            "two-bank routed-main bit parity");
+    puts("real two-bank Q5_K routed main                  bit-exact");
+    qwen4exp_moe_ws_free(&batch1);
+    qwen4exp_moe_ws_free(&batch0);
+    qwen4exp_moe_ws_free(&scalar1);
+    ds4_gpu_tensor_free(d_output2);
+    ds4_gpu_tensor_free(d_input2);
+    free(batch_main);
+    free(scalar_main);
+    free(input2);
 
     struct rusage usage;
     memset(&usage, 0, sizeof(usage));
