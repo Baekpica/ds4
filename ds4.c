@@ -21254,30 +21254,19 @@ static bool qwen4exp_ple_prepare(ds4_qwen_ple_ws *ws,
     return true;
 }
 
-static bool qwen4exp_ple_forward(ds4_qwen_ple_ws *ws,
-                                 ds4_qwen38_ple_cuda *ple_cuda,
+static bool qwen4exp_ple_compute(ds4_qwen_ple_ws *ws,
                                  const ds4_model *model,
                                  const ds4_qwen_ple_weights *weights,
                                  ds4_gpu_tensor *hidden,
-                                 uint32_t rows,
-                                 char *error,
-                                 size_t error_size) {
-    if (!ws || !ple_cuda || !model || !weights || !hidden || rows == 0u ||
-        rows != ws->prepared_rows || !weights->key || !weights->value ||
+                                 uint32_t rows) {
+    if (!ws || !model || !weights || !hidden || rows == 0u ||
+        rows > ws->capacity || !weights->key || !weights->value ||
         !weights->key_norm || !weights->query_norm || !weights->conv_norm ||
         !weights->conv) return false;
-    ws->prepared_rows = 0u;
     const uint32_t hidden_size = DS4_N_EMBD;
     const uint32_t width = DS4_N_EMBD * DS4_N_HC;
-    const uint64_t embed_values = (uint64_t)rows * hidden_size;
     const uint64_t hc_values = (uint64_t)rows * width;
-    if (hc_values > UINT32_MAX ||
-        !ds4_qwen38_ple_cuda_gather(
-            ple_cuda, ws->row_ids, rows,
-            (void *)ds4_gpu_tensor_ptr(ws->embedding_bf16), NULL,
-            error, error_size) ||
-        !ds4_gpu_qwen4exp_bf16_to_f32_tensor(
-            ws->embedding, ws->embedding_bf16, embed_values)) return false;
+    if (hc_values > UINT32_MAX) return false;
 
     if (weights->key->type == DS4_TENSOR_Q8_0 &&
         weights->value->type == DS4_TENSOR_Q8_0) {
@@ -21313,6 +21302,71 @@ static bool qwen4exp_ple_forward(ds4_qwen_ple_ws *ws,
                rows, width, 4u, DS4_PLE_NGRAM_SIZE) != 0 &&
            plain_graph_add_inplace(hidden, ws->gated, hc_values) &&
            plain_graph_add_inplace(hidden, ws->conv, hc_values);
+}
+
+static bool qwen4exp_ple_forward(ds4_qwen_ple_ws *ws,
+                                 ds4_qwen38_ple_cuda *ple_cuda,
+                                 const ds4_model *model,
+                                 const ds4_qwen_ple_weights *weights,
+                                 ds4_gpu_tensor *hidden,
+                                 uint32_t rows,
+                                 char *error,
+                                 size_t error_size) {
+    if (!ws || !ple_cuda || !model || !weights || !hidden || rows == 0u ||
+        rows > ws->capacity || rows != ws->prepared_rows)
+        return false;
+    ws->prepared_rows = 0u;
+    const uint64_t embed_values = (uint64_t)rows * DS4_N_EMBD;
+    return ds4_qwen38_ple_cuda_gather(
+               ple_cuda, ws->row_ids, rows,
+               (void *)ds4_gpu_tensor_ptr(ws->embedding_bf16), NULL,
+               error, error_size) &&
+           ds4_gpu_qwen4exp_bf16_to_f32_tensor(
+               ws->embedding, ws->embedding_bf16, embed_values) &&
+           qwen4exp_ple_compute(ws, model, weights, hidden, rows);
+}
+
+static bool qwen4exp_ple_forward_bank2(
+        ds4_qwen_ple_ws *const ws[2],
+        ds4_qwen38_ple_cuda *ple_cuda,
+        const ds4_model *model,
+        const ds4_qwen_ple_weights *weights,
+        ds4_gpu_tensor *const hidden[2],
+        char *error,
+        size_t error_size) {
+    if (!ws || !ws[0] || !ws[1] || !ple_cuda || !model || !weights ||
+        !hidden || !hidden[0] || !hidden[1] || ws[0]->capacity < 2u ||
+        ws[1]->capacity == 0u || ws[0]->prepared_rows != 1u ||
+        ws[1]->prepared_rows != 1u) return false;
+    const char *disabled = getenv("DS4_QWEN_NO_PLE_GATHER_BANK2");
+    if (disabled && disabled[0] &&
+        !(disabled[0] == '0' && disabled[1] == '\0')) {
+        return qwen4exp_ple_forward(
+                   ws[0], ple_cuda, model, weights, hidden[0], 1u,
+                   error, error_size) &&
+               qwen4exp_ple_forward(
+                   ws[1], ple_cuda, model, weights, hidden[1], 1u,
+                   error, error_size);
+    }
+    memcpy(ws[0]->row_ids + DS4_PLE_N_HEADS, ws[1]->row_ids,
+           DS4_PLE_N_HEADS * sizeof(ws[0]->row_ids[0]));
+    ws[0]->prepared_rows = 0u;
+    ws[1]->prepared_rows = 0u;
+    const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    return ds4_qwen38_ple_cuda_gather(
+               ple_cuda, ws[0]->row_ids, 2u,
+               (void *)ds4_gpu_tensor_ptr(ws[0]->embedding_bf16), NULL,
+               error, error_size) &&
+           ds4_gpu_qwen4exp_bf16_to_f32_tensor(
+               ws[0]->embedding, ws[0]->embedding_bf16,
+               2u * DS4_N_EMBD) &&
+           ds4_gpu_tensor_copy(
+               ws[1]->embedding, 0u, ws[0]->embedding,
+               row_bytes, row_bytes) &&
+           qwen4exp_ple_compute(
+               ws[0], model, weights, hidden[0], 1u) &&
+           qwen4exp_ple_compute(
+               ws[1], model, weights, hidden[1], 1u);
 }
 
 typedef struct {
@@ -22499,10 +22553,9 @@ static bool qwen4exp_graph_forward_chunk(
     return true;
 }
 
-/* Decode independent sessions through one row matrix.  GDN recurrent state
- * updates share one grid while preserving one block row per bank, and the Q8
- * output uses the bit-identical two-row dense path.  PLE/QSA, MoE, and the
- * remaining GDN stages keep bank-owned arithmetic. */
+/* Decode independent sessions through one row matrix.  PLE row gathering and
+ * GDN recurrent updates share two-row work while preserving bank-owned state;
+ * PLE compute, QSA, MoE, and the remaining GDN stages stay independent. */
 static bool qwen4exp_graph_forward_decode_rows(
         ds4_qwen_gpu_graph *const *graphs,
         const ds4_model *model,
@@ -22550,15 +22603,21 @@ static bool qwen4exp_graph_forward_decode_rows(
     for (uint32_t il = 0u; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *layer = &weights->layer[il];
         if (il == 1u) {
+            ds4_gpu_tensor *hidden_rows[2] = {NULL, NULL};
+            ds4_qwen_ple_ws *ple_ws[2] = {
+                &graphs[0]->ple, &graphs[1]->ple,
+            };
             for (uint32_t r = 0u; r < rows; r++) {
-                ds4_gpu_tensor *row = ds4_gpu_tensor_view(
+                hidden_rows[r] = ds4_gpu_tensor_view(
                     current, (uint64_t)r * hc_row_bytes, hc_row_bytes);
-                const bool ok = row && qwen4exp_ple_forward(
-                    &graphs[r]->ple, ple_cuda, model, &layer->qwen_ple,
-                    row, 1u, ple_error, sizeof(ple_error));
-                ds4_gpu_tensor_free(row);
-                if (!ok) return false;
             }
+            const bool ok = hidden_rows[0] && hidden_rows[1] &&
+                qwen4exp_ple_forward_bank2(
+                    ple_ws, ple_cuda, model, &layer->qwen_ple,
+                    hidden_rows, ple_error, sizeof(ple_error));
+            for (uint32_t r = 0u; r < rows; r++)
+                ds4_gpu_tensor_free(hidden_rows[r]);
+            if (!ok) return false;
         }
         if (!qwen4exp_hc_begin(
                 &scratch->hc, model, &layer->qwen_attn_hc,
@@ -40289,8 +40348,8 @@ static bool qwen_batch_runtime_decode(
         if (rt->row_batch_calls++ == 0u)
             fprintf(stderr,
                     "ds4: Qwen true row batch active: two-row "
-                    "embedding/HC/Q8 output and paired GDN recurrent; "
-                    "bank-owned PLE/QSA/MoE\n");
+                    "embedding/HC/Q8 output/PLE gather and paired GDN "
+                    "recurrent; bank-owned PLE compute/QSA/MoE\n");
         return true;
     }
     for (uint32_t i = 0; i < rows; i++) {
