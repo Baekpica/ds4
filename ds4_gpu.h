@@ -2383,6 +2383,24 @@ int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
         uint32_t                out_dim,
         uint32_t                n_expert);
 
+int ds4_gpu_qwen4exp_q5_0_tail_accum_bank2_tensor(
+        ds4_gpu_tensor       *down0,
+        const ds4_gpu_tensor *mid0,
+        const ds4_gpu_tensor *ids0,
+        ds4_gpu_tensor       *down1,
+        const ds4_gpu_tensor *mid1,
+        const ds4_gpu_tensor *ids1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert);
+
 int ds4_gpu_qwen4exp_q8_0_tail_accum_tensor(
         ds4_gpu_tensor       *down,
         const ds4_gpu_tensor *mid,

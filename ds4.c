@@ -21000,10 +21000,10 @@ static bool qwen4exp_moe_ws_alloc(
     return true;
 }
 
-/* Complete text-backbone and MTP MoE body for the SSD-PLE recipe. Router
- * weights are folded into routed_mid before both down segments, matching the
- * reference's post-expert multiplication by linearity. */
-static bool qwen4exp_moe_forward(
+/* Prepare the routed MoE branch through its 512-column expert-down main.
+ * Router weights are folded into routed_mid before both down segments,
+ * matching the reference's post-expert multiplication by linearity. */
+static bool qwen4exp_moe_prepare(
         ds4_qwen_moe_ws       *ws,
         const ds4_model       *model,
         const ds4_layer_weights *layer,
@@ -21090,7 +21090,21 @@ static bool qwen4exp_moe_forward(
                 n_expert, (uint32_t)assignments, 1u, n_tokens)) {
         return false;
     }
-    const bool tail_ok = q5_tail
+    return true;
+}
+
+static bool qwen4exp_moe_tail(
+        ds4_qwen_moe_ws       *ws,
+        const ds4_model       *model,
+        const ds4_layer_weights *layer,
+        uint32_t               n_tokens) {
+    const uint32_t hidden = (uint32_t)layer->ffn_gate_inp->dim[0];
+    const uint32_t n_expert = (uint32_t)layer->ffn_gate_inp->dim[1];
+    const uint32_t expert_ff = (uint32_t)layer->ffn_gate_exps->dim[1];
+    const uint32_t main_dim = (uint32_t)layer->ffn_down_exps->dim[0];
+    const uint32_t tail_dim = (uint32_t)layer->ffn_down_exps_tail->dim[0];
+    const uint64_t assignments = (uint64_t)n_tokens * ws->n_used;
+    return layer->ffn_down_exps_tail->type == DS4_TENSOR_Q5_0
         ? ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
               ws->routed_down, ws->routed_mid, ws->selected,
               model->map, model->size,
@@ -21105,7 +21119,21 @@ static bool qwen4exp_moe_forward(
               layer->ffn_down_exps_tail->bytes,
               assignments, expert_ff, main_dim, tail_dim,
               hidden, n_expert);
-    if (!tail_ok || !ds4_gpu_moe_sum_tensor(
+}
+
+static bool qwen4exp_moe_finish(
+        ds4_qwen_moe_ws       *ws,
+        const ds4_model       *model,
+        const ds4_layer_weights *layer,
+        const ds4_gpu_tensor  *input,
+        ds4_gpu_tensor        *output,
+        uint32_t               n_tokens) {
+    const uint32_t hidden = (uint32_t)layer->ffn_gate_inp->dim[0];
+    const uint32_t shared_ff = (uint32_t)layer->ffn_gate_shexp->dim[1];
+    const uint32_t n_used = ws->n_used;
+    const uint64_t shared_count = (uint64_t)n_tokens * shared_ff;
+    const uint64_t output_count = (uint64_t)n_tokens * hidden;
+    if (!ds4_gpu_moe_sum_tensor(
             output, ws->routed_down, hidden, n_used, n_tokens)) {
         return false;
     }
@@ -21148,6 +21176,67 @@ static bool qwen4exp_moe_forward(
         return false;
     }
     return true;
+}
+
+static bool qwen4exp_moe_forward(
+        ds4_qwen_moe_ws       *ws,
+        const ds4_model       *model,
+        const ds4_layer_weights *layer,
+        const ds4_gpu_tensor  *input,
+        ds4_gpu_tensor        *output,
+        uint32_t               n_tokens) {
+    return qwen4exp_moe_prepare(
+               ws, model, layer, input, output, n_tokens) &&
+           qwen4exp_moe_tail(ws, model, layer, n_tokens) &&
+           qwen4exp_moe_finish(
+               ws, model, layer, input, output, n_tokens);
+}
+
+static bool qwen4exp_moe_forward_bank2(
+        ds4_qwen_moe_ws *const ws[2],
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        ds4_gpu_tensor *const input[2],
+        ds4_gpu_tensor *const output[2],
+        uint32_t n_tokens) {
+    if (!ws || !ws[0] || !ws[1] || !model || !layer || !input || !output)
+        return false;
+    const char *disabled = getenv("DS4_QWEN_NO_Q5_TAIL_BANK2");
+    const bool scalar =
+        (disabled && disabled[0] &&
+         !(disabled[0] == '0' && disabled[1] == '\0')) ||
+        layer->ffn_down_exps_tail->type != DS4_TENSOR_Q5_0 ||
+        ws[0]->n_used != ws[1]->n_used ||
+        ws[0]->hidden_size != ws[1]->hidden_size ||
+        ws[0]->expert_ff != ws[1]->expert_ff;
+    if (scalar) {
+        return qwen4exp_moe_forward(
+                   ws[0], model, layer, input[0], output[0], n_tokens) &&
+               qwen4exp_moe_forward(
+                   ws[1], model, layer, input[1], output[1], n_tokens);
+    }
+    const uint32_t hidden = (uint32_t)layer->ffn_gate_inp->dim[0];
+    const uint32_t n_expert = (uint32_t)layer->ffn_gate_inp->dim[1];
+    const uint32_t expert_ff = (uint32_t)layer->ffn_gate_exps->dim[1];
+    const uint32_t main_dim = (uint32_t)layer->ffn_down_exps->dim[0];
+    const uint32_t tail_dim = (uint32_t)layer->ffn_down_exps_tail->dim[0];
+    const uint64_t assignments = (uint64_t)n_tokens * ws[0]->n_used;
+    return qwen4exp_moe_prepare(
+               ws[0], model, layer, input[0], output[0], n_tokens) &&
+           qwen4exp_moe_prepare(
+               ws[1], model, layer, input[1], output[1], n_tokens) &&
+           ds4_gpu_qwen4exp_q5_0_tail_accum_bank2_tensor(
+               ws[0]->routed_down, ws[0]->routed_mid, ws[0]->selected,
+               ws[1]->routed_down, ws[1]->routed_mid, ws[1]->selected,
+               model->map, model->size,
+               layer->ffn_down_exps_tail->abs_offset,
+               layer->ffn_down_exps_tail->bytes,
+               assignments, expert_ff, main_dim, tail_dim,
+               hidden, n_expert) &&
+           qwen4exp_moe_finish(
+               ws[0], model, layer, input[0], output[0], n_tokens) &&
+           qwen4exp_moe_finish(
+               ws[1], model, layer, input[1], output[1], n_tokens);
 }
 
 typedef struct {
@@ -22553,9 +22642,9 @@ static bool qwen4exp_graph_forward_chunk(
     return true;
 }
 
-/* Decode independent sessions through one row matrix.  PLE row gathering and
- * GDN recurrent updates share two-row work while preserving bank-owned state;
- * PLE compute, QSA, MoE, and the remaining GDN stages stay independent. */
+/* Decode independent sessions through one row matrix. PLE row gathering,
+ * GDN recurrent updates, and the Q5_0 MoE tail share two-bank launches while
+ * preserving bank-owned state; other PLE/QSA/MoE/GDN work stays independent. */
 static bool qwen4exp_graph_forward_decode_rows(
         ds4_qwen_gpu_graph *const *graphs,
         const ds4_model *model,
@@ -22676,19 +22765,27 @@ static bool qwen4exp_graph_forward_decode_rows(
         if (!qwen4exp_hc_begin(
                 &scratch->hc, model, &layer->qwen_ffn_hc,
                 current, rows, true)) return false;
+        ds4_gpu_tensor *input[2] = {NULL, NULL};
+        ds4_gpu_tensor *output[2] = {NULL, NULL};
+        ds4_qwen_moe_ws *moe_ws[2] = {
+            &graphs[0]->moe_ws, &graphs[1]->moe_ws,
+        };
         for (uint32_t r = 0u; r < rows; r++) {
-            ds4_gpu_tensor *input = ds4_gpu_tensor_view(
+            input[r] = ds4_gpu_tensor_view(
                 scratch->hc.mixed,
                 (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
-            ds4_gpu_tensor *output = ds4_gpu_tensor_view(
+            output[r] = ds4_gpu_tensor_view(
                 scratch->block,
                 (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
-            const bool ok = input && output && qwen4exp_moe_forward(
-                &graphs[r]->moe_ws, model, layer, input, output, 1u);
-            ds4_gpu_tensor_free(output);
-            ds4_gpu_tensor_free(input);
-            if (!ok) return false;
         }
+        const bool moe_ok = input[0] && input[1] && output[0] && output[1] &&
+            qwen4exp_moe_forward_bank2(
+                moe_ws, model, layer, input, output, 1u);
+        for (uint32_t r = 0u; r < rows; r++) {
+            ds4_gpu_tensor_free(output[r]);
+            ds4_gpu_tensor_free(input[r]);
+        }
+        if (!moe_ok) return false;
         if (!qwen4exp_hc_finish(
                 &scratch->hc, current, scratch->block, next, rows))
             return false;
@@ -40349,7 +40446,7 @@ static bool qwen_batch_runtime_decode(
             fprintf(stderr,
                     "ds4: Qwen true row batch active: two-row "
                     "embedding/HC/Q8 output/PLE gather and paired GDN "
-                    "recurrent; bank-owned PLE compute/QSA/MoE\n");
+                    "recurrent/Q5 tail; other PLE/QSA/MoE work bank-owned\n");
         return true;
     }
     for (uint32_t i = 0; i < rows; i++) {

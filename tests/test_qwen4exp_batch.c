@@ -359,12 +359,15 @@ int main(int argc, char **argv) {
         const int gdn_recurrent = strcmp(row_bench, "gdn-recurrent") == 0;
         const int output_only = strcmp(row_bench, "output") == 0;
         const int ple_gather = strcmp(row_bench, "ple-gather") == 0;
+        const int q5_tail = strcmp(row_bench, "q5-tail") == 0;
         const char *isolated_toggle = gdn_recurrent
             ? "DS4_QWEN_NO_GDN_RECURRENT_BANK2"
             : (output_only ? "DS4_QWEN_NO_OUTPUT_ROW_BATCH" :
-               (ple_gather ? "DS4_QWEN_NO_PLE_GATHER_BANK2" : NULL));
+               (ple_gather ? "DS4_QWEN_NO_PLE_GATHER_BANK2" :
+                (q5_tail ? "DS4_QWEN_NO_Q5_TAIL_BANK2" : NULL)));
         const char *fast_label = gdn_recurrent ? "bank2" :
-            ((output_only || ple_gather) ? "row2" : "row");
+            ((output_only || ple_gather) ? "row2" :
+             (q5_tail ? "bank2" : "row"));
         double row_seconds[3] = {0.0};
         double scalar_seconds[3] = {0.0};
         const int order[3][2] = {{1, 0}, {0, 1}, {1, 0}};
@@ -412,6 +415,7 @@ int main(int argc, char **argv) {
         unsetenv("DS4_QWEN_NO_GDN_RECURRENT_BANK2");
         unsetenv("DS4_QWEN_NO_OUTPUT_ROW_BATCH");
         unsetenv("DS4_QWEN_NO_PLE_GATHER_BANK2");
+        unsetenv("DS4_QWEN_NO_Q5_TAIL_BANK2");
         double row_total = 0.0, scalar_total = 0.0;
         for (int i = 0; i < 3; i++) {
             row_total += row_seconds[i];
@@ -422,7 +426,8 @@ int main(int argc, char **argv) {
                "scalar %.2f tok/s [%.3f %.3f %.3f s], speedup %.2f%%\n",
                gdn_recurrent ? "GDN recurrent" :
                    (output_only ? "output" :
-                    (ple_gather ? "PLE gather" : "row")),
+                    (ple_gather ? "PLE gather" :
+                     (q5_tail ? "Q5 tail" : "row"))),
                fast_label,
                tokens / row_total,
                row_seconds[0], row_seconds[1], row_seconds[2],

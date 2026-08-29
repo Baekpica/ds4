@@ -17071,9 +17071,12 @@ __global__ static void qwen4exp_pack_expert_down_main_kernel(
  * A separate routed-MMQ output would cost assignments*2560 extra F32 bytes;
  * this small-K reduction keeps the split memory-neutral for prefill. */
 __global__ static void qwen4exp_q5_0_tail_accum_kernel(
-        float *down,
-        const float *mid,
-        const int32_t *ids,
+        float *down0,
+        const float *mid0,
+        const int32_t *ids0,
+        float *down1,
+        const float *mid1,
+        const int32_t *ids1,
         const cuda_block_q5_0 *weights,
         uint32_t mid_width,
         uint32_t main_dim,
@@ -17088,6 +17091,9 @@ __global__ static void qwen4exp_q5_0_tail_accum_kernel(
                                   rows_per_block;
     const uint64_t assignment = (uint64_t)blockIdx.x / output_tiles;
     if (assignment >= assignments) return;
+    float *down = blockIdx.y == 0u ? down0 : down1;
+    const float *mid = blockIdx.y == 0u ? mid0 : mid1;
+    const int32_t *ids = blockIdx.y == 0u ? ids0 : ids1;
     const uint32_t tile = (uint32_t)blockIdx.x % output_tiles;
     const int32_t expert_i32 = ids[assignment];
     if (expert_i32 < 0 || (uint32_t)expert_i32 >= n_expert) return;
@@ -30168,11 +30174,10 @@ extern "C" int ds4_gpu_qwen4exp_pack_expert_down_main_tensor(
     return cuda_ok(cudaGetLastError(), "Qwen4Exp expert-down main pack launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
+static int qwen4exp_q5_0_tail_args_valid(
         ds4_gpu_tensor       *down,
         const ds4_gpu_tensor *mid,
         const ds4_gpu_tensor *ids,
-        const void             *model_map,
         uint64_t                model_size,
         uint64_t                weight_offset,
         uint64_t                weight_bytes,
@@ -30181,8 +30186,9 @@ extern "C" int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
         uint32_t                main_dim,
         uint32_t                tail_dim,
         uint32_t                out_dim,
-        uint32_t                n_expert) {
-    if (!down || !mid || !ids || !model_map || down->ptr == mid->ptr ||
+        uint32_t                n_expert,
+        uint64_t               *blocks_out) {
+    if (!down || !mid || !ids || !blocks_out || down->ptr == mid->ptr ||
         assignments == 0u || mid_width == 0u || main_dim == 0u ||
         tail_dim == 0u || tail_dim % 32u != 0u || out_dim == 0u ||
         n_expert == 0u || main_dim > mid_width ||
@@ -30213,6 +30219,65 @@ extern "C" int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
         down->bytes < tasks * sizeof(float)) {
         return 0;
     }
+    constexpr uint64_t rows_per_block = 64u;
+    *blocks_out = assignments *
+        ((out_dim + rows_per_block - 1u) / rows_per_block);
+    return 1;
+}
+
+static int qwen4exp_q5_0_tail_accum_launch_one(
+        ds4_gpu_tensor       *down,
+        const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids,
+        const cuda_block_q5_0 *tail_weights,
+        uint64_t                blocks,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        int                     use_expert_major) {
+    if (use_expert_major &&
+        ds4_mmq_q5_0_f32_moe_accum(
+            tail_weights, (const float *)mid->ptr,
+            (const int32_t *)ids->ptr, (float *)down->ptr,
+            (int)out_dim, (int)tail_dim, (int)mid_width, (int)main_dim,
+            (int)assignments, (int)n_expert, 1,
+            ds4_current_stream()) == 0) {
+        return 1;
+    }
+    qwen4exp_q5_0_tail_accum_kernel<<<
+        dim3((unsigned)blocks, 1u), 256u,
+        tail_dim * sizeof(float), ds4_current_stream()>>>(
+            (float *)down->ptr, (const float *)mid->ptr,
+            (const int32_t *)ids->ptr, nullptr, nullptr, nullptr,
+            tail_weights, mid_width, main_dim, tail_dim, out_dim,
+            n_expert, assignments);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp Q5_0 tail accumulate launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
+        ds4_gpu_tensor       *down,
+        const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert) {
+    uint64_t blocks = 0u;
+    if (!model_map || !qwen4exp_q5_0_tail_args_valid(
+            down, mid, ids, model_size, weight_offset, weight_bytes,
+            assignments, mid_width, main_dim, tail_dim, out_dim, n_expert,
+            &blocks)) {
+        return 0;
+    }
     const cuda_block_q5_0 *tail_weights =
         (const cuda_block_q5_0 *)cuda_model_range_ptr(
             model_map, weight_offset, weight_bytes,
@@ -30223,24 +30288,70 @@ extern "C" int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
         !(expert_major && expert_major[0] == '0') &&
         (assignments >= (uint64_t)n_expert * 8u ||
          (expert_major && expert_major[0] == '1'));
-    if (use_expert_major &&
-        ds4_mmq_q5_0_f32_moe_accum(
-            tail_weights, (const float *)mid->ptr,
-            (const int32_t *)ids->ptr, (float *)down->ptr,
-            (int)out_dim, (int)tail_dim, (int)mid_width, (int)main_dim,
-            (int)assignments, (int)n_expert, 1,
-            ds4_current_stream()) == 0) {
-        return 1;
+    return qwen4exp_q5_0_tail_accum_launch_one(
+        down, mid, ids, tail_weights, blocks, assignments, mid_width,
+        main_dim, tail_dim, out_dim, n_expert, use_expert_major);
+}
+
+extern "C" int ds4_gpu_qwen4exp_q5_0_tail_accum_bank2_tensor(
+        ds4_gpu_tensor       *down0,
+        const ds4_gpu_tensor *mid0,
+        const ds4_gpu_tensor *ids0,
+        ds4_gpu_tensor       *down1,
+        const ds4_gpu_tensor *mid1,
+        const ds4_gpu_tensor *ids1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert) {
+    uint64_t blocks0 = 0u, blocks1 = 0u;
+    if (!model_map || down0 == down1 ||
+        !qwen4exp_q5_0_tail_args_valid(
+            down0, mid0, ids0, model_size, weight_offset, weight_bytes,
+            assignments, mid_width, main_dim, tail_dim, out_dim, n_expert,
+            &blocks0) ||
+        !qwen4exp_q5_0_tail_args_valid(
+            down1, mid1, ids1, model_size, weight_offset, weight_bytes,
+            assignments, mid_width, main_dim, tail_dim, out_dim, n_expert,
+            &blocks1) ||
+        down0->ptr == down1->ptr || down0->ptr == mid1->ptr ||
+        down1->ptr == mid0->ptr || blocks0 != blocks1) {
+        return 0;
     }
-    constexpr uint64_t rows_per_block = 64u;
-    const uint64_t blocks = assignments *
-        ((out_dim + rows_per_block - 1u) / rows_per_block);
+    const cuda_block_q5_0 *tail_weights =
+        (const cuda_block_q5_0 *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes,
+            "qwen4exp_q5_0_expert_down_tail_bank2");
+    if (!tail_weights) return 0;
+    const char *expert_major = getenv("DS4_QWEN_Q5_TAIL_EXPERT_MAJOR");
+    const int use_expert_major =
+        !(expert_major && expert_major[0] == '0') &&
+        (assignments >= (uint64_t)n_expert * 8u ||
+         (expert_major && expert_major[0] == '1'));
+    if (use_expert_major) {
+        return qwen4exp_q5_0_tail_accum_launch_one(
+                   down0, mid0, ids0, tail_weights, blocks0, assignments,
+                   mid_width, main_dim, tail_dim, out_dim, n_expert, 1) &&
+               qwen4exp_q5_0_tail_accum_launch_one(
+                   down1, mid1, ids1, tail_weights, blocks1, assignments,
+                   mid_width, main_dim, tail_dim, out_dim, n_expert, 1);
+    }
     qwen4exp_q5_0_tail_accum_kernel<<<
-        (unsigned)blocks, 256u, tail_dim * sizeof(float), ds4_current_stream()>>>(
-            (float *)down->ptr, (const float *)mid->ptr,
-            (const int32_t *)ids->ptr, tail_weights, mid_width, main_dim,
+        dim3((unsigned)blocks0, 2u), 256u,
+        tail_dim * sizeof(float), ds4_current_stream()>>>(
+            (float *)down0->ptr, (const float *)mid0->ptr,
+            (const int32_t *)ids0->ptr,
+            (float *)down1->ptr, (const float *)mid1->ptr,
+            (const int32_t *)ids1->ptr, tail_weights, mid_width, main_dim,
             tail_dim, out_dim, n_expert, assignments);
-    return cuda_ok(cudaGetLastError(), "Qwen4Exp Q5_0 tail accumulate launch");
+    return cuda_ok(cudaGetLastError(),
+                   "Qwen4Exp paired Q5_0 tail accumulate launch");
 }
 
 extern "C" int ds4_gpu_qwen4exp_q8_0_tail_accum_tensor(

@@ -561,6 +561,119 @@ static void test_split_down(void *model_map, uint64_t model_size,
     free(mid);
 }
 
+static void test_q5_tail_bank2(void *model_map, uint64_t model_size,
+                               uint64_t tail_offset, uint64_t tail_bytes) {
+    const uint64_t mid_count = (uint64_t)DOWN_ASSIGNMENTS * DOWN_MID;
+    const uint64_t down_count = (uint64_t)DOWN_ASSIGNMENTS * HIDDEN;
+    float *mid0 = (float *)malloc(mid_count * sizeof(*mid0));
+    float *mid1 = (float *)malloc(mid_count * sizeof(*mid1));
+    float *seed0 = (float *)malloc(down_count * sizeof(*seed0));
+    float *seed1 = (float *)malloc(down_count * sizeof(*seed1));
+    float *scalar0 = (float *)malloc(down_count * sizeof(*scalar0));
+    float *scalar1 = (float *)malloc(down_count * sizeof(*scalar1));
+    float *paired0 = (float *)malloc(down_count * sizeof(*paired0));
+    float *paired1 = (float *)malloc(down_count * sizeof(*paired1));
+    int32_t ids0[DOWN_ASSIGNMENTS];
+    int32_t ids1[DOWN_ASSIGNMENTS];
+    REQUIRE(mid0 && mid1 && seed0 && seed1 && scalar0 && scalar1 &&
+            paired0 && paired1, "paired Q5 tail host allocation");
+    for (uint64_t i = 0; i < mid_count; i++) {
+        mid0[i] = 0.27f * sinf((float)(i + 3u) * 0.021f);
+        mid1[i] = 0.19f * cosf((float)(i + 17u) * 0.015f) - 0.03f;
+    }
+    for (uint64_t i = 0; i < down_count; i++) {
+        seed0[i] = 0.11f * sinf((float)(i + 1u) * 0.009f);
+        seed1[i] = 0.07f * cosf((float)(i + 5u) * 0.013f);
+    }
+    for (uint32_t i = 0; i < DOWN_ASSIGNMENTS; i++) {
+        ids0[i] = (int32_t)((i * 3u + 1u) % DOWN_EXPERTS);
+        ids1[i] = (int32_t)((i * 5u + 2u) % DOWN_EXPERTS);
+    }
+
+    ds4_gpu_tensor *d_mid0 = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
+    ds4_gpu_tensor *d_mid1 = ds4_gpu_tensor_alloc(mid_count * sizeof(float));
+    ds4_gpu_tensor *d_ids0 = ds4_gpu_tensor_alloc(sizeof(ids0));
+    ds4_gpu_tensor *d_ids1 = ds4_gpu_tensor_alloc(sizeof(ids1));
+    ds4_gpu_tensor *d_down0 = ds4_gpu_tensor_alloc(down_count * sizeof(float));
+    ds4_gpu_tensor *d_down1 = ds4_gpu_tensor_alloc(down_count * sizeof(float));
+    REQUIRE(d_mid0 && d_mid1 && d_ids0 && d_ids1 && d_down0 && d_down1,
+            "paired Q5 tail GPU allocation");
+    REQUIRE(ds4_gpu_tensor_write(d_mid0, 0, mid0, mid_count * sizeof(float)) &&
+            ds4_gpu_tensor_write(d_mid1, 0, mid1, mid_count * sizeof(float)) &&
+            ds4_gpu_tensor_write(d_ids0, 0, ids0, sizeof(ids0)) &&
+            ds4_gpu_tensor_write(d_ids1, 0, ids1, sizeof(ids1)),
+            "paired Q5 tail input upload");
+    REQUIRE(setenv("DS4_QWEN_Q5_TAIL_EXPERT_MAJOR", "0", 1) == 0,
+            "select assignment-major Q5 tail path");
+
+    REQUIRE(ds4_gpu_tensor_write(
+                d_down0, 0, seed0, down_count * sizeof(float)) &&
+            ds4_gpu_tensor_write(
+                d_down1, 0, seed1, down_count * sizeof(float)),
+            "scalar Q5 tail seed upload");
+    REQUIRE(ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
+                d_down0, d_mid0, d_ids0, model_map, model_size,
+                tail_offset, tail_bytes, DOWN_ASSIGNMENTS, DOWN_MID,
+                DOWN_MAIN, DOWN_TAIL, HIDDEN, DOWN_EXPERTS) &&
+            ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
+                d_down1, d_mid1, d_ids1, model_map, model_size,
+                tail_offset, tail_bytes, DOWN_ASSIGNMENTS, DOWN_MID,
+                DOWN_MAIN, DOWN_TAIL, HIDDEN, DOWN_EXPERTS),
+            "scalar Q5 tail bank launches");
+    REQUIRE(ds4_gpu_tensor_read(
+                d_down0, 0, scalar0, down_count * sizeof(float)) &&
+            ds4_gpu_tensor_read(
+                d_down1, 0, scalar1, down_count * sizeof(float)),
+            "scalar Q5 tail bank download");
+
+    REQUIRE(ds4_gpu_tensor_write(
+                d_down0, 0, seed0, down_count * sizeof(float)) &&
+            ds4_gpu_tensor_write(
+                d_down1, 0, seed1, down_count * sizeof(float)),
+            "paired Q5 tail seed upload");
+    REQUIRE(ds4_gpu_qwen4exp_q5_0_tail_accum_bank2_tensor(
+                d_down0, d_mid0, d_ids0, d_down1, d_mid1, d_ids1,
+                model_map, model_size, tail_offset, tail_bytes,
+                DOWN_ASSIGNMENTS, DOWN_MID, DOWN_MAIN, DOWN_TAIL,
+                HIDDEN, DOWN_EXPERTS),
+            "paired Q5 tail launch");
+    REQUIRE(ds4_gpu_tensor_read(
+                d_down0, 0, paired0, down_count * sizeof(float)) &&
+            ds4_gpu_tensor_read(
+                d_down1, 0, paired1, down_count * sizeof(float)),
+            "paired Q5 tail download");
+    REQUIRE(memcmp(paired0, scalar0, down_count * sizeof(float)) == 0,
+            "paired Q5 tail bank0 bit parity");
+    REQUIRE(memcmp(paired1, scalar1, down_count * sizeof(float)) == 0,
+            "paired Q5 tail bank1 bit parity");
+    REQUIRE(!ds4_gpu_qwen4exp_q5_0_tail_accum_bank2_tensor(
+                d_down0, d_mid0, d_ids0, d_down0, d_mid1, d_ids1,
+                model_map, model_size, tail_offset, tail_bytes,
+                DOWN_ASSIGNMENTS, DOWN_MID, DOWN_MAIN, DOWN_TAIL,
+                HIDDEN, DOWN_EXPERTS),
+            "paired Q5 tail rejects shared output");
+    printf("%-45s pass (%llu exact values per bank)\n",
+           "Qwen paired Q5_0 tail bit parity",
+           (unsigned long long)down_count);
+    REQUIRE(setenv("DS4_QWEN_Q5_TAIL_EXPERT_MAJOR", "1", 1) == 0,
+            "restore expert-major Q5 tail test path");
+
+    ds4_gpu_tensor_free(d_down1);
+    ds4_gpu_tensor_free(d_down0);
+    ds4_gpu_tensor_free(d_ids1);
+    ds4_gpu_tensor_free(d_ids0);
+    ds4_gpu_tensor_free(d_mid1);
+    ds4_gpu_tensor_free(d_mid0);
+    free(paired1);
+    free(paired0);
+    free(scalar1);
+    free(scalar0);
+    free(seed1);
+    free(seed0);
+    free(mid1);
+    free(mid0);
+}
+
 int main(void) {
     REQUIRE(ds4_gpu_init(), "CUDA init");
     REQUIRE(unsetenv("DS4_CUDA_COPY_MODEL") == 0,
@@ -599,6 +712,7 @@ int main(void) {
     test_shared_expert_gate();
     test_split_down(model_map, model_size, main_offset, main_bytes,
                     tail_offset, tail_bytes, q8_tail_offset, q8_tail_bytes);
+    test_q5_tail_bank2(model_map, model_size, tail_offset, tail_bytes);
 
     REQUIRE(ds4_gpu_synchronize(), "final CUDA synchronization");
     ds4_gpu_unregister_model_map(model_map);
