@@ -17351,12 +17351,11 @@ static uint32_t request_compute_needs(const request *r) {
         r->anthropic_requires_live_tool_state) {
         /* Inc 6b: a live continuation whose pinned record is BANK-owned is
          * the continuous lane's to serve (claim + generation equality at
-         * admit).  Everything else keeps the serial bit: serial-owned
-         * records, unresolved ids (the honest serial 409), and live
-         * REASONING state (visible-state machinery is serial-only). */
-        const bool bank = r->live_state_bank_owned &&
-                          !r->responses_requires_live_reasoning;
-        n |= bank ? DS4_NEED_BANK_FRONTIER : DS4_NEED_LIVE_FRONTIER;
+         * admit).  Its exact KV frontier already contains hidden reasoning,
+         * so a client need not replay that text.  Serial-owned records and
+         * unresolved ids keep the serial bit and its honest 409/replay path. */
+        n |= r->live_state_bank_owned ? DS4_NEED_BANK_FRONTIER
+                                      : DS4_NEED_LIVE_FRONTIER;
     }
     if (r->has_tools && r->api != API_OPENAI) {
         n |= DS4_NEED_CONTINUATION_PUBLISH;
@@ -31920,10 +31919,13 @@ static void test_request_compute_needs_matrix(void) {
     /* Inc 6b: bank-owned -> the cont frontier bit ... */
     r.live_state_bank_owned = true;
     TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_BANK_FRONTIER);
-    /* ... but live REASONING state is serial-only visible-state machinery,
-     * so it keeps the serial bit even alongside a bank-owned pin. */
+    /* A bank-owned frontier includes hidden reasoning KV, so an output-only
+     * continuation does not need serial visible-state reconstruction. */
     r.responses_requires_live_reasoning = true;
-    TEST_ASSERT(request_compute_needs(&r) == DS4_NEED_LIVE_FRONTIER);
+    r.think_mode = DS4_THINK_LOW;
+    TEST_ASSERT(request_compute_needs(&r) ==
+                (DS4_NEED_BANK_FRONTIER | DS4_NEED_THINKING));
+    r.think_mode = DS4_THINK_NONE;
     r.responses_requires_live_reasoning = false;
     r.live_state_bank_owned = false;
     r.responses_requires_live_tool_state = false;
@@ -32223,6 +32225,9 @@ static void test_route_decide_reason_table(void) {
         d = route_decide(DS4_NEED_BANK_FRONTIER, DS4_WIRE_ANTHROPIC, &on);
         TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT_BANK);
         d = route_decide(DS4_NEED_BANK_FRONTIER | stream_tools, DS4_WIRE_RESPONSES, &on);
+        TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT_BANK);
+        d = route_decide(DS4_NEED_BANK_FRONTIER | DS4_NEED_THINKING,
+                         DS4_WIRE_RESPONSES, &on);
         TEST_ASSERT(d.lane == ROUTE_LANE_CONTINUOUS && d.reason == ROUTE_REASON_CONT_BANK);
         d = route_decide(DS4_NEED_BANK_FRONTIER | DS4_NEED_TOOL_SCAN |
                          DS4_NEED_CONTINUATION_PUBLISH | DS4_NEED_CORRECTIVE_RECOVERY,

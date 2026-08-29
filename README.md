@@ -110,14 +110,18 @@ with no failures, including a three-request continuous epoch with
 The Q5 artifact was subsequently served at a 262,144-token context with two
 banks, 8,192-token prefill chunks, partial-prefix reuse, and a 32 GiB disk-KV
 budget. Concurrent Chat Completions and Anthropic Messages requests returned
-their native HTTP 200 shapes, and a high-reasoning Responses function call plus
-`function_call_output` continuation completed through the serial fallback with
-377 cached tokens, zero serial refusals, zero request failures, and zero memory
-faults. Agent/tool deployments must therefore leave the serial lane enabled:
-`--no-serial` intentionally returns typed 503 responses when a live reasoning
-or tool frontier requires that lane. A three-bank 262K trial was not retained
-on the 128 GiB reference host because the same serial continuation reduced
-`MemAvailable` to 1.12 GiB; two banks are the guarded production setting.
+their native HTTP 200 shapes. A later guarded `--no-serial` check streamed a
+low-reasoning Responses function call on a Qwen bank, then replayed that
+`function_call` without its hidden reasoning and appended only the new
+`function_call_output`. The directed continuation completed on the same bank
+with 395 cached tokens plus a 27-token suffix. `/v1/stats` reported two
+continuous Responses requests, zero serial requests, one continuous bank
+continuation, and zero request, batch, or governor failures. This proves the
+live bank-owned reasoning/tool continuation path; buffered first tool-generation
+requests still need the serial lane for their model-visible corrective retry.
+A three-bank 262K trial was not retained on the 128 GiB reference host because
+the earlier serial continuation reduced `MemAvailable` to 1.12 GiB; two banks
+are the guarded production setting.
 
 The two-bank MTP path was checked on the same Q5 artifact with four fixed cold
 API prompts. Plain decode averaged 23.65 tok/s; `--mtp-draft 2` averaged
@@ -548,15 +552,17 @@ and short grace/TTL windows (`DS4_CONT_GRACE_S`, `DS4_CONT_TTL_S`,
 before its follow-up arrives.
 
 **Streaming tool turns ride the batched lane.** Anthropic and Responses
-STREAMING tool requests are served on the continuous-batching lane: the tool
+streaming tool requests are served on the continuous-batching lane: the tool
 turn's registry record is owned by its KV bank, and an output-only follow-up
 continues that bank in place after the same generation/frontier equality
-check. Buffered tool requests deliberately stay on the serial lane — its
-model-visible corrective retry (feeding a malformed tool call back to the
+check, including a Responses replay that omits the bank's hidden reasoning.
+Buffered first tool-generation requests deliberately stay on the serial lane —
+its model-visible corrective retry (feeding a malformed tool call back to the
 model as a tool error) has no per-row equivalent in the batched loop, and a
 parse-time boolean cannot predict a semantic failure discovered after
-generation. A mixed client that streams the tool turn but sends the follow-up
-buffered gets the honest `409` + full-replay path. Per-surface kill switches
+generation. An output-only follow-up may itself be streaming or buffered; a
+buffered follow-up that redeclares tools requests the same corrective contract
+and therefore stays serial. Per-surface kill switches
 `DS4_SERVER_CONT_TOOLS_ANTHROPIC=0` / `DS4_SERVER_CONT_TOOLS_RESPONSES=0`
 restore the previous all-serial tool behavior (kept for one release, like the
 Inc 3 stateless switches they compose with).
