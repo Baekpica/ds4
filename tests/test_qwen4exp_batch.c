@@ -354,7 +354,9 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    if (getenv("DS4_QWEN_ROW_BENCH")) {
+    const char *row_bench = getenv("DS4_QWEN_ROW_BENCH");
+    if (row_bench) {
+        const int gdn_only = strcmp(row_bench, "gdn-recurrent") == 0;
         double row_seconds[3] = {0.0};
         double scalar_seconds[3] = {0.0};
         const int order[3][2] = {{1, 0}, {0, 1}, {1, 0}};
@@ -363,9 +365,12 @@ int main(int argc, char **argv) {
         for (int round = 0; round < 3; round++) {
             for (int pass = 0; pass < 2; pass++) {
                 const int row_batch = order[round][pass];
-                if ((row_batch
-                         ? unsetenv("DS4_QWEN_NO_ROW_BATCH")
-                         : setenv("DS4_QWEN_NO_ROW_BATCH", "1", 1)) != 0) {
+                const char *toggle = gdn_only
+                    ? "DS4_QWEN_NO_GDN_RECURRENT_BANK2"
+                    : "DS4_QWEN_NO_ROW_BATCH";
+                if ((gdn_only && unsetenv("DS4_QWEN_NO_ROW_BATCH") != 0) ||
+                    (row_batch ? unsetenv(toggle)
+                               : setenv(toggle, "1", 1)) != 0) {
                     perror("row batch benchmark environment");
                     failed = 1;
                     goto cleanup;
@@ -396,14 +401,17 @@ int main(int argc, char **argv) {
             }
         }
         unsetenv("DS4_QWEN_NO_ROW_BATCH");
+        unsetenv("DS4_QWEN_NO_GDN_RECURRENT_BANK2");
         double row_total = 0.0, scalar_total = 0.0;
         for (int i = 0; i < 3; i++) {
             row_total += row_seconds[i];
             scalar_total += scalar_seconds[i];
         }
         const double tokens = 2.0 * MTP_BUDGET * 3.0;
-        printf("Qwen row A/B: row %.2f tok/s [%.3f %.3f %.3f s], "
+        printf("Qwen %s A/B: %s %.2f tok/s [%.3f %.3f %.3f s], "
                "scalar %.2f tok/s [%.3f %.3f %.3f s], speedup %.2f%%\n",
+               gdn_only ? "GDN recurrent" : "row",
+               gdn_only ? "bank2" : "row",
                tokens / row_total,
                row_seconds[0], row_seconds[1], row_seconds[2],
                tokens / scalar_total,

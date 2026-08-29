@@ -284,6 +284,14 @@ int main(void) {
     float *core_want = malloc(core_count * sizeof(float));
     float *core_got = malloc(core_count * sizeof(float));
     float *core_chunk = malloc(core_count * sizeof(float));
+    float *mixed1 = malloc(conv_count * sizeof(float));
+    float *beta1 = malloc(control_count * sizeof(float));
+    float *g1 = malloc(control_count * sizeof(float));
+    float *state1_initial = malloc(recurrent_count * sizeof(float));
+    float *state1_want = malloc(recurrent_count * sizeof(float));
+    float *state1_got = malloc(recurrent_count * sizeof(float));
+    float *core1_want = malloc(core_count * sizeof(float));
+    float *core1_got = malloc(core_count * sizeof(float));
     float *z = malloc(core_count * sizeof(float));
     float *norm_want = malloc(core_count * sizeof(float));
     float *norm_got = malloc(core_count * sizeof(float));
@@ -291,7 +299,9 @@ int main(void) {
             conv_state_initial && conv_state_want && conv_state_got && a && b &&
             beta_want && g_want && control_got && mixed && state_initial &&
             state_want && state_got && core_want && core_got && core_chunk &&
-            z && norm_want && norm_got, "GDN host allocations");
+            mixed1 && beta1 && g1 && state1_initial && state1_want &&
+            state1_got && core1_want && core1_got && z && norm_want &&
+            norm_got, "GDN host allocations");
 
     for (uint64_t i = 0; i < conv_weight_count; i++) {
         const float source = 0.16f * sinf((float)(i + 1u) * 0.017f) +
@@ -327,6 +337,16 @@ int main(void) {
     for (uint64_t i = 0; i < recurrent_count; i++)
         state_initial[i] =
             0.0007f * sinf((float)(i + 17u) * 0.0017f);
+    for (uint64_t i = 0; i < conv_count; i++)
+        mixed1[i] = 0.17f * cosf((float)(i + 11u) * 0.0043f) -
+                    0.06f * sinf((float)(i + 37u) * 0.0081f);
+    for (uint64_t i = 0; i < control_count; i++) {
+        beta1[i] = sigmoid_ref(-0.9f + 0.021f * (float)(i % 97u));
+        g1[i] = -0.008f - 0.0003f * (float)(i % VALUE_HEADS);
+    }
+    for (uint64_t i = 0; i < recurrent_count; i++)
+        state1_initial[i] =
+            0.0005f * cosf((float)(i + 29u) * 0.0013f);
     memcpy(state_want, state_initial, recurrent_count * sizeof(float));
     recurrent_reference(core_want, state_want, mixed, beta_want, g_want,
                         ROWS);
@@ -356,14 +376,24 @@ int main(void) {
     ds4_gpu_tensor *dstate =
         ds4_gpu_tensor_alloc(recurrent_count * sizeof(float));
     ds4_gpu_tensor *dcore = ds4_gpu_tensor_alloc(core_count * sizeof(float));
+    ds4_gpu_tensor *dmixed1 = ds4_gpu_tensor_alloc(conv_count * sizeof(float));
+    ds4_gpu_tensor *dbeta1 = ds4_gpu_tensor_alloc(control_count * sizeof(float));
+    ds4_gpu_tensor *dg1 = ds4_gpu_tensor_alloc(control_count * sizeof(float));
+    ds4_gpu_tensor *dstate1 =
+        ds4_gpu_tensor_alloc(recurrent_count * sizeof(float));
+    ds4_gpu_tensor *dcore1 = ds4_gpu_tensor_alloc(core_count * sizeof(float));
     ds4_gpu_tensor *dz = ds4_gpu_tensor_alloc(core_count * sizeof(float));
     ds4_gpu_tensor *dnorm = ds4_gpu_tensor_alloc(core_count * sizeof(float));
     REQUIRE(dconv_in && dconv_out && dconv_state && da && db && dbeta && dg &&
-            dmixed && dstate && dcore && dz && dnorm, "GDN GPU allocations");
+            dmixed && dstate && dcore && dmixed1 && dbeta1 && dg1 && dstate1 &&
+            dcore1 && dz && dnorm, "GDN GPU allocations");
     upload_f32(dconv_in, conv_input, conv_count, "GDN conv input upload");
     upload_f32(da, a, control_count, "GDN a upload");
     upload_f32(db, b, control_count, "GDN b upload");
     upload_f32(dmixed, mixed, conv_count, "GDN mixed QKV upload");
+    upload_f32(dmixed1, mixed1, conv_count, "GDN bank1 mixed QKV upload");
+    upload_f32(dbeta1, beta1, control_count, "GDN bank1 beta upload");
+    upload_f32(dg1, g1, control_count, "GDN bank1 decay upload");
     upload_f32(dz, z, core_count, "GDN z upload");
 
     upload_f32(dconv_state, conv_state_initial, conv_state_count,
@@ -438,6 +468,43 @@ int main(void) {
     compare_f32("GDN recurrent full final state", state_got, state_want,
                 recurrent_count, 5.0e-5f, 2.0e-4);
 
+    upload_f32(dstate1, state1_initial, recurrent_count,
+               "GDN bank1 scalar state upload");
+    REQUIRE(ds4_gpu_qwen4exp_gdn_recurrent_tensor(
+                dcore1, dstate1, dmixed1, dbeta1, dg1, ROWS, KEY_HEADS,
+                VALUE_HEADS, HEAD_DIM),
+            "GDN bank1 scalar recurrent launch");
+    download_f32(dcore1, core1_want, core_count,
+                 "GDN bank1 scalar output download");
+    download_f32(dstate1, state1_want, recurrent_count,
+                 "GDN bank1 scalar state download");
+
+    upload_f32(dstate, state_initial, recurrent_count,
+               "GDN bank0 paired state reset");
+    upload_f32(dstate1, state1_initial, recurrent_count,
+               "GDN bank1 paired state reset");
+    REQUIRE(ds4_gpu_qwen4exp_gdn_recurrent_bank2_tensor(
+                dcore, dstate, dmixed, dbeta, dg,
+                dcore1, dstate1, dmixed1, dbeta1, dg1,
+                ROWS, KEY_HEADS, VALUE_HEADS, HEAD_DIM),
+            "GDN paired-bank recurrent launch");
+    download_f32(dcore, core_chunk, core_count,
+                 "GDN bank0 paired output download");
+    download_f32(dstate, state_want, recurrent_count,
+                 "GDN bank0 paired state download");
+    download_f32(dcore1, core1_got, core_count,
+                 "GDN bank1 paired output download");
+    download_f32(dstate1, state1_got, recurrent_count,
+                 "GDN bank1 paired state download");
+    compare_f32("GDN paired bank0 output bit parity", core_chunk, core_got,
+                core_count, 0.0f, 0.0);
+    compare_f32("GDN paired bank0 state bit parity", state_want, state_got,
+                recurrent_count, 0.0f, 0.0);
+    compare_f32("GDN paired bank1 output bit parity", core1_got, core1_want,
+                core_count, 0.0f, 0.0);
+    compare_f32("GDN paired bank1 state bit parity", state1_got, state1_want,
+                recurrent_count, 0.0f, 0.0);
+
     upload_f32(dstate, state_initial, recurrent_count,
                "GDN recurrent chunk state reset");
     run_recurrent_chunks(dcore, dstate, dmixed, dbeta, dg, chunks, 4u);
@@ -472,6 +539,11 @@ int main(void) {
                 dmixed, dstate, dmixed, dbeta, dg, ROWS, KEY_HEADS,
                 VALUE_HEADS, HEAD_DIM),
             "GDN recurrent rejects output/input alias");
+    REQUIRE(!ds4_gpu_qwen4exp_gdn_recurrent_bank2_tensor(
+                dcore, dstate, dmixed, dbeta, dg,
+                dcore1, dstate, dmixed1, dbeta1, dg1,
+                ROWS, KEY_HEADS, VALUE_HEADS, HEAD_DIM),
+            "GDN paired recurrent rejects shared state");
     REQUIRE(!ds4_gpu_qwen4exp_gdn_controls_tensor(
                 dbeta, dbeta, db, da, model_map, model_size,
                 a_log_offset, dt_bias_offset, ROWS, VALUE_HEADS),
@@ -480,6 +552,11 @@ int main(void) {
     REQUIRE(ds4_gpu_synchronize(), "final GDN synchronization");
     ds4_gpu_tensor_free(dnorm);
     ds4_gpu_tensor_free(dz);
+    ds4_gpu_tensor_free(dcore1);
+    ds4_gpu_tensor_free(dstate1);
+    ds4_gpu_tensor_free(dg1);
+    ds4_gpu_tensor_free(dbeta1);
+    ds4_gpu_tensor_free(dmixed1);
     ds4_gpu_tensor_free(dcore);
     ds4_gpu_tensor_free(dstate);
     ds4_gpu_tensor_free(dmixed);
@@ -494,6 +571,8 @@ int main(void) {
     ds4_gpu_cleanup();
 
     free(norm_got); free(norm_want); free(z);
+    free(core1_got); free(core1_want); free(state1_got); free(state1_want);
+    free(state1_initial); free(g1); free(beta1); free(mixed1);
     free(core_chunk); free(core_got); free(core_want);
     free(state_got); free(state_want); free(state_initial);
     free(mixed); free(control_got); free(g_want); free(beta_want);

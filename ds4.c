@@ -20351,17 +20351,15 @@ static bool qwen4exp_gdn_ws_alloc(
     return true;
 }
 
-static bool qwen4exp_gdn_forward(
+static bool qwen4exp_gdn_prepare(
         ds4_qwen_gdn_ws                    *ws,
         ds4_qwen_gdn_state                 *state,
         const ds4_model                    *model,
         const ds4_qwen_linear_attention_weights *weights,
         const ds4_gpu_tensor               *input,
-        ds4_gpu_tensor                     *output,
         uint32_t                            n_tokens) {
-    if (!ws || !state || !model || !weights || !input || !output ||
-        n_tokens == 0u || n_tokens > ws->capacity ||
-        ds4_gpu_tensor_ptr(input) == ds4_gpu_tensor_ptr(output) ||
+    if (!ws || !state || !model || !weights || !input || n_tokens == 0u ||
+        n_tokens > ws->capacity ||
         !weights->a_log || !weights->conv || !weights->dt_bias ||
         !weights->in_a || !weights->in_b || !weights->qkv || !weights->z ||
         !weights->norm || !weights->out || !state->conv ||
@@ -20415,17 +20413,82 @@ static bool qwen4exp_gdn_forward(
                ws->beta, ws->g, ws->b, ws->a,
                model->map, model->size,
                weights->a_log->abs_offset, weights->dt_bias->abs_offset,
-               n_tokens, value_heads) != 0 &&
-           ds4_gpu_qwen4exp_gdn_recurrent_tensor(
-               ws->core, state->recurrent, ws->qkv, ws->beta, ws->g,
-               n_tokens, ws->key_heads, value_heads, head_dim) != 0 &&
-           ds4_gpu_qwen4exp_gdn_gated_rms_norm_tensor(
+               n_tokens, value_heads) != 0;
+}
+
+static bool qwen4exp_gdn_finish(
+        ds4_qwen_gdn_ws                    *ws,
+        const ds4_model                    *model,
+        const ds4_qwen_linear_attention_weights *weights,
+        ds4_gpu_tensor                     *output,
+        uint32_t                            n_tokens) {
+    return ds4_gpu_qwen4exp_gdn_gated_rms_norm_tensor(
                ws->gated, ws->core, ws->z,
                model->map, model->size, weights->norm->abs_offset,
-               n_tokens, value_heads, head_dim, DS4_RMS_EPS) != 0 &&
+               n_tokens, ws->value_heads, ws->head_dim, DS4_RMS_EPS) != 0 &&
            plain_graph_matmul_tensor(
                output, model, weights->out,
-               value_dim, hidden, ws->gated, n_tokens);
+               ws->value_dim, ws->hidden_size, ws->gated, n_tokens);
+}
+
+static bool qwen4exp_gdn_forward(
+        ds4_qwen_gdn_ws                    *ws,
+        ds4_qwen_gdn_state                 *state,
+        const ds4_model                    *model,
+        const ds4_qwen_linear_attention_weights *weights,
+        const ds4_gpu_tensor               *input,
+        ds4_gpu_tensor                     *output,
+        uint32_t                            n_tokens) {
+    return output && input &&
+           ds4_gpu_tensor_ptr(input) != ds4_gpu_tensor_ptr(output) &&
+           qwen4exp_gdn_prepare(ws, state, model, weights, input, n_tokens) &&
+           ds4_gpu_qwen4exp_gdn_recurrent_tensor(
+               ws->core, state->recurrent, ws->qkv, ws->beta, ws->g,
+               n_tokens, ws->key_heads, ws->value_heads, ws->head_dim) != 0 &&
+           qwen4exp_gdn_finish(ws, model, weights, output, n_tokens);
+}
+
+static bool qwen4exp_gdn_forward_bank2(
+        ds4_qwen_gdn_ws *const ws[2],
+        ds4_qwen_gdn_state *const state[2],
+        const ds4_model *model,
+        const ds4_qwen_linear_attention_weights *weights,
+        ds4_gpu_tensor *const input[2],
+        ds4_gpu_tensor *const output[2],
+        uint32_t n_tokens) {
+    if (!ws || !state || !input || !output || !ws[0] || !ws[1] ||
+        !state[0] || !state[1] ||
+        ws[0]->key_heads != ws[1]->key_heads ||
+        ws[0]->value_heads != ws[1]->value_heads ||
+        ws[0]->head_dim != ws[1]->head_dim) return false;
+    const char *disabled = getenv("DS4_QWEN_NO_GDN_RECURRENT_BANK2");
+    if (disabled && disabled[0] &&
+        !(disabled[0] == '0' && disabled[1] == '\0')) {
+        return qwen4exp_gdn_forward(
+                   ws[0], state[0], model, weights,
+                   input[0], output[0], n_tokens) &&
+               qwen4exp_gdn_forward(
+                   ws[1], state[1], model, weights,
+                   input[1], output[1], n_tokens);
+    }
+    return output[0] && output[1] && input[0] && input[1] &&
+           ds4_gpu_tensor_ptr(input[0]) != ds4_gpu_tensor_ptr(output[0]) &&
+           ds4_gpu_tensor_ptr(input[1]) != ds4_gpu_tensor_ptr(output[1]) &&
+           qwen4exp_gdn_prepare(
+               ws[0], state[0], model, weights, input[0], n_tokens) &&
+           qwen4exp_gdn_prepare(
+               ws[1], state[1], model, weights, input[1], n_tokens) &&
+           ds4_gpu_qwen4exp_gdn_recurrent_bank2_tensor(
+               ws[0]->core, state[0]->recurrent,
+               ws[0]->qkv, ws[0]->beta, ws[0]->g,
+               ws[1]->core, state[1]->recurrent,
+               ws[1]->qkv, ws[1]->beta, ws[1]->g,
+               n_tokens, ws[0]->key_heads, ws[0]->value_heads,
+               ws[0]->head_dim) != 0 &&
+           qwen4exp_gdn_finish(
+               ws[0], model, weights, output[0], n_tokens) &&
+           qwen4exp_gdn_finish(
+               ws[1], model, weights, output[1], n_tokens);
 }
 
 /* Qwen Sparse Attention keeps independent persistent index/KV caches for
@@ -22436,9 +22499,9 @@ static bool qwen4exp_graph_forward_chunk(
     return true;
 }
 
-/* Decode independent sessions through one row matrix.  PLE/GDN/QSA/MoE and
- * the output projection keep bank-owned scalar arithmetic; embedding and
- * Hyper-Connections consume both live rows together. */
+/* Decode independent sessions through one row matrix.  GDN recurrent state
+ * updates share one grid while preserving one block row per bank; PLE/QSA,
+ * MoE, output, and the remaining GDN stages keep bank-owned arithmetic. */
 static bool qwen4exp_graph_forward_decode_rows(
         ds4_qwen_gpu_graph *const *graphs,
         const ds4_model *model,
@@ -22499,26 +22562,48 @@ static bool qwen4exp_graph_forward_decode_rows(
         if (!qwen4exp_hc_begin(
                 &scratch->hc, model, &layer->qwen_attn_hc,
                 current, rows, true)) return false;
-        for (uint32_t r = 0u; r < rows; r++) {
-            ds4_qwen_gpu_graph *g = graphs[r];
-            ds4_gpu_tensor *input = ds4_gpu_tensor_view(
-                scratch->hc.mixed,
-                (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
-            ds4_gpu_tensor *output = ds4_gpu_tensor_view(
-                scratch->block,
-                (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
-            const bool ok = input && output &&
-                (ds4_qwen4exp_layer_is_full_attention(il)
-                     ? qwen4exp_qsa_forward(
-                           &g->qsa_ws, &g->qsa_state[il], model,
-                           &layer->qwen_qsa, input, output, 1u,
-                           positions[r],
-                           g->mrope_active ? g->mrope_positions : NULL)
-                     : qwen4exp_gdn_forward(
-                           &g->gdn_ws, &g->gdn_state[il], model,
-                           &layer->qwen_linear_attn, input, output, 1u));
-            ds4_gpu_tensor_free(output);
-            ds4_gpu_tensor_free(input);
+        if (ds4_qwen4exp_layer_is_full_attention(il)) {
+            for (uint32_t r = 0u; r < rows; r++) {
+                ds4_qwen_gpu_graph *g = graphs[r];
+                ds4_gpu_tensor *input = ds4_gpu_tensor_view(
+                    scratch->hc.mixed,
+                    (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
+                ds4_gpu_tensor *output = ds4_gpu_tensor_view(
+                    scratch->block,
+                    (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
+                const bool ok = input && output && qwen4exp_qsa_forward(
+                    &g->qsa_ws, &g->qsa_state[il], model,
+                    &layer->qwen_qsa, input, output, 1u, positions[r],
+                    g->mrope_active ? g->mrope_positions : NULL);
+                ds4_gpu_tensor_free(output);
+                ds4_gpu_tensor_free(input);
+                if (!ok) return false;
+            }
+        } else {
+            ds4_gpu_tensor *input[2] = {NULL, NULL};
+            ds4_gpu_tensor *output[2] = {NULL, NULL};
+            ds4_qwen_gdn_ws *gdn_ws[2] = {
+                &graphs[0]->gdn_ws, &graphs[1]->gdn_ws,
+            };
+            ds4_qwen_gdn_state *gdn_state[2] = {
+                &graphs[0]->gdn_state[il], &graphs[1]->gdn_state[il],
+            };
+            for (uint32_t r = 0u; r < rows; r++) {
+                input[r] = ds4_gpu_tensor_view(
+                    scratch->hc.mixed,
+                    (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
+                output[r] = ds4_gpu_tensor_view(
+                    scratch->block,
+                    (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
+            }
+            const bool ok = input[0] && input[1] && output[0] && output[1] &&
+                qwen4exp_gdn_forward_bank2(
+                    gdn_ws, gdn_state, model, &layer->qwen_linear_attn,
+                    input, output, 1u);
+            for (uint32_t r = 0u; r < rows; r++) {
+                ds4_gpu_tensor_free(output[r]);
+                ds4_gpu_tensor_free(input[r]);
+            }
             if (!ok) return false;
         }
         if (!qwen4exp_hc_finish(
@@ -39749,12 +39834,12 @@ static uint64_t batch_span_need(const ds4_gpu_tensor *tensor,
 }
 
 /* Qwen keeps two bank-owned recurrent/cache states.  Decode shares the carrier
- * graph's embedding and HC scratch as one two-row batch.  MoE and the output
- * projection stay on scalar decode arithmetic because their multi-row kernels
- * change token selection or the recurrent trajectory when a surviving bank
- * returns to one-row MTP.
+ * graph's embedding and HC scratch as one two-row batch; independent GDN
+ * recurrent states share one two-dimensional grid.  MoE and output stay on
+ * scalar arithmetic because their multi-row kernels change token selection or
+ * the recurrent trajectory when a surviving bank returns to one-row MTP.
  * ponytail: keep the first state-safe implementation at two banks; lift it only
- * after the stateful PLE/GDN/QSA fronts also take descriptor arrays. */
+ * after the remaining stateful PLE/GDN/QSA fronts take descriptor arrays. */
 enum { DS4_QWEN_BANK_MAX = 2 };
 
 typedef struct ds4_qwen_batch_runtime {
@@ -40192,7 +40277,8 @@ static bool qwen_batch_runtime_decode(
         if (rt->row_batch_calls++ == 0u)
             fprintf(stderr,
                     "ds4: Qwen true row batch active: two-row embedding/HC "
-                    "with bank-owned PLE/GDN/QSA/MoE/output\n");
+                    "and paired GDN recurrent; bank-owned "
+                    "PLE/QSA/MoE/output\n");
         return true;
     }
     for (uint32_t i = 0; i < rows; i++) {

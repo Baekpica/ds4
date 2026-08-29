@@ -8790,13 +8790,20 @@ __global__ static void qwen4exp_gdn_controls_kernel(
  * advances to the next token. Q/K heads are repeated contiguously over value
  * heads (48 / 16 == 3 in the production checkpoint). */
 __global__ static void qwen4exp_gdn_recurrent_kernel(
-        float *out, float *state, const float *mixed_qkv,
-        const float *beta, const float *g, uint32_t rows,
+        float *out0, float *state0, const float *mixed_qkv0,
+        const float *beta0, const float *g0,
+        float *out1, float *state1, const float *mixed_qkv1,
+        const float *beta1, const float *g1, uint32_t rows,
         uint32_t key_heads, uint32_t value_heads, uint32_t head_dim,
         uint32_t key_dim, uint32_t value_dim, uint32_t repeat) {
     const uint32_t value_head = blockIdx.x;
     const uint32_t tid = threadIdx.x;
     if (value_head >= value_heads) return;
+    float *out = blockIdx.y == 0u ? out0 : out1;
+    float *state = blockIdx.y == 0u ? state0 : state1;
+    const float *mixed_qkv = blockIdx.y == 0u ? mixed_qkv0 : mixed_qkv1;
+    const float *beta = blockIdx.y == 0u ? beta0 : beta1;
+    const float *g = blockIdx.y == 0u ? g0 : g1;
 
     extern __shared__ float shared[];
     float *q_raw = shared;
@@ -25493,19 +25500,36 @@ extern "C" int ds4_gpu_qwen4exp_gdn_controls_tensor(
                    "Qwen4Exp Gated DeltaNet controls launch");
 }
 
-extern "C" int ds4_gpu_qwen4exp_gdn_recurrent_tensor(
-        ds4_gpu_tensor *out, ds4_gpu_tensor *state,
-        const ds4_gpu_tensor *mixed_qkv,
-        const ds4_gpu_tensor *beta, const ds4_gpu_tensor *g,
-        uint32_t rows, uint32_t key_heads, uint32_t value_heads,
-        uint32_t head_dim) {
-    if (!out || !state || !mixed_qkv || !beta || !g || rows == 0u ||
-        key_heads == 0u || value_heads == 0u || head_dim == 0u ||
-        head_dim > 1024u || (head_dim & (head_dim - 1u)) != 0u ||
-        value_heads % key_heads != 0u || value_heads > (uint32_t)INT_MAX ||
-        out->ptr == state->ptr || out->ptr == mixed_qkv->ptr ||
-        state->ptr == mixed_qkv->ptr || state->ptr == beta->ptr ||
-        state->ptr == g->ptr) {
+static bool qwen4exp_gdn_recurrent_tensors_valid(
+        const ds4_gpu_tensor *out, const ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *mixed_qkv, const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *g, uint64_t out_values,
+        uint64_t input_values, uint64_t state_values,
+        uint64_t control_values) {
+    return out && state && mixed_qkv && beta && g &&
+           out->ptr != state->ptr && out->ptr != mixed_qkv->ptr &&
+           state->ptr != mixed_qkv->ptr && state->ptr != beta->ptr &&
+           state->ptr != g->ptr &&
+           out->bytes >= out_values * sizeof(float) &&
+           mixed_qkv->bytes >= input_values * sizeof(float) &&
+           state->bytes >= state_values * sizeof(float) &&
+           beta->bytes >= control_values * sizeof(float) &&
+           g->bytes >= control_values * sizeof(float);
+}
+
+static int qwen4exp_gdn_recurrent_launch(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *state0,
+        const ds4_gpu_tensor *mixed_qkv0,
+        const ds4_gpu_tensor *beta0, const ds4_gpu_tensor *g0,
+        ds4_gpu_tensor *out1, ds4_gpu_tensor *state1,
+        const ds4_gpu_tensor *mixed_qkv1,
+        const ds4_gpu_tensor *beta1, const ds4_gpu_tensor *g1,
+        uint32_t banks, uint32_t rows, uint32_t key_heads,
+        uint32_t value_heads, uint32_t head_dim) {
+    if ((banks != 1u && banks != 2u) || rows == 0u || key_heads == 0u ||
+        value_heads == 0u || head_dim == 0u || head_dim > 1024u ||
+        (head_dim & (head_dim - 1u)) != 0u ||
+        value_heads % key_heads != 0u || value_heads > (uint32_t)INT_MAX) {
         return 0;
     }
     const uint64_t key_dim64 = (uint64_t)key_heads * head_dim;
@@ -25523,11 +25547,15 @@ extern "C" int ds4_gpu_qwen4exp_gdn_recurrent_tensor(
         input_values > UINT64_MAX / sizeof(float) ||
         state_values > UINT64_MAX / sizeof(float) ||
         control_values > UINT64_MAX / sizeof(float) ||
-        out->bytes < out_values * sizeof(float) ||
-        mixed_qkv->bytes < input_values * sizeof(float) ||
-        state->bytes < state_values * sizeof(float) ||
-        beta->bytes < control_values * sizeof(float) ||
-        g->bytes < control_values * sizeof(float)) {
+        !qwen4exp_gdn_recurrent_tensors_valid(
+            out0, state0, mixed_qkv0, beta0, g0, out_values,
+            input_values, state_values, control_values) ||
+        (banks == 2u &&
+         (!qwen4exp_gdn_recurrent_tensors_valid(
+              out1, state1, mixed_qkv1, beta1, g1, out_values,
+              input_values, state_values, control_values) ||
+          out0->ptr == out1->ptr || state0->ptr == state1->ptr ||
+          out0->ptr == state1->ptr || out1->ptr == state0->ptr))) {
         return 0;
     }
     const uint32_t threads = head_dim == 128u ? 512u : head_dim;
@@ -25535,14 +25563,47 @@ extern "C" int ds4_gpu_qwen4exp_gdn_recurrent_tensor(
         ? 7u * head_dim : 4u * head_dim;
     const uint32_t shared_bytes = shared_values * (uint32_t)sizeof(float);
     qwen4exp_gdn_recurrent_kernel<<<
-            value_heads, threads, shared_bytes, ds4_current_stream()>>>(
-            (float *)out->ptr, (float *)state->ptr,
-            (const float *)mixed_qkv->ptr, (const float *)beta->ptr,
-            (const float *)g->ptr, rows, key_heads, value_heads, head_dim,
+            dim3(value_heads, banks), threads, shared_bytes,
+            ds4_current_stream()>>>(
+            (float *)out0->ptr, (float *)state0->ptr,
+            (const float *)mixed_qkv0->ptr, (const float *)beta0->ptr,
+            (const float *)g0->ptr,
+            banks == 2u ? (float *)out1->ptr : nullptr,
+            banks == 2u ? (float *)state1->ptr : nullptr,
+            banks == 2u ? (const float *)mixed_qkv1->ptr : nullptr,
+            banks == 2u ? (const float *)beta1->ptr : nullptr,
+            banks == 2u ? (const float *)g1->ptr : nullptr,
+            rows, key_heads, value_heads, head_dim,
             (uint32_t)key_dim64, (uint32_t)value_dim64,
             value_heads / key_heads);
     return cuda_ok(cudaGetLastError(),
                    "Qwen4Exp recurrent Gated Delta rule launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_gdn_recurrent_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *mixed_qkv,
+        const ds4_gpu_tensor *beta, const ds4_gpu_tensor *g,
+        uint32_t rows, uint32_t key_heads, uint32_t value_heads,
+        uint32_t head_dim) {
+    return qwen4exp_gdn_recurrent_launch(
+        out, state, mixed_qkv, beta, g, nullptr, nullptr, nullptr, nullptr,
+        nullptr, 1u, rows, key_heads, value_heads, head_dim);
+}
+
+extern "C" int ds4_gpu_qwen4exp_gdn_recurrent_bank2_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *state0,
+        const ds4_gpu_tensor *mixed_qkv0,
+        const ds4_gpu_tensor *beta0, const ds4_gpu_tensor *g0,
+        ds4_gpu_tensor *out1, ds4_gpu_tensor *state1,
+        const ds4_gpu_tensor *mixed_qkv1,
+        const ds4_gpu_tensor *beta1, const ds4_gpu_tensor *g1,
+        uint32_t rows, uint32_t key_heads, uint32_t value_heads,
+        uint32_t head_dim) {
+    return qwen4exp_gdn_recurrent_launch(
+        out0, state0, mixed_qkv0, beta0, g0,
+        out1, state1, mixed_qkv1, beta1, g1,
+        2u, rows, key_heads, value_heads, head_dim);
 }
 
 extern "C" int ds4_gpu_qwen4exp_gdn_gated_rms_norm_tensor(

@@ -1243,6 +1243,22 @@ int ds4_gpu_qwen4exp_gdn_recurrent_tensor(
         uint32_t                value_heads,
         uint32_t                head_dim);
 
+int ds4_gpu_qwen4exp_gdn_recurrent_bank2_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *state0,
+        const ds4_gpu_tensor *mixed_qkv0,
+        const ds4_gpu_tensor *beta0,
+        const ds4_gpu_tensor *g0,
+        ds4_gpu_tensor       *out1,
+        ds4_gpu_tensor       *state1,
+        const ds4_gpu_tensor *mixed_qkv1,
+        const ds4_gpu_tensor *beta1,
+        const ds4_gpu_tensor *g1,
+        uint32_t                rows,
+        uint32_t                key_heads,
+        uint32_t                value_heads,
+        uint32_t                head_dim);
+
 int ds4_gpu_qwen4exp_gdn_gated_rms_norm_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *core,
