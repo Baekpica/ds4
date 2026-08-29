@@ -88,6 +88,7 @@ struct ds4_ple_store {
     bool work_cond_ready;
     bool state_cond_ready;
     bool stopping;
+    bool latency_stats;
     ds4_ple_stats stats;
 };
 
@@ -1154,11 +1155,18 @@ static void *cache_worker(void *opaque) {
         uint8_t *data = slot->data;
         pthread_mutex_unlock(&store->mutex);
 
+        const uint64_t read_started =
+            store->latency_stats ? ple_now_ns() : 0;
         ssize_t got;
         do {
             got = pread(store->physical[file_index].fd, data,
                         DS4_PLE_PAGE_BYTES, (off_t)page_offset);
         } while (got < 0 && errno == EINTR);
+        const uint64_t read_finished =
+            store->latency_stats ? ple_now_ns() : 0;
+        const uint64_t read_elapsed =
+            read_finished >= read_started
+                ? read_finished - read_started : 0;
         const int saved =
             got == (ssize_t)DS4_PLE_PAGE_BYTES
                 ? 0
@@ -1176,6 +1184,14 @@ static void *cache_worker(void *opaque) {
         if (slot->generation == item.generation &&
             slot->state == DS4_PLE_PAGE_LOADING) {
             store->stats.read_operations++;
+            if (store->latency_stats) {
+                store->stats.read_latency_samples++;
+                store->stats.read_nanoseconds_total += read_elapsed;
+                if (read_elapsed > store->stats.read_nanoseconds_max)
+                    store->stats.read_nanoseconds_max = read_elapsed;
+                store->stats.read_latency_histogram[
+                    ds4_ple_latency_bucket(read_elapsed)]++;
+            }
             if (saved == 0) {
                 slot->state = DS4_PLE_PAGE_READY;
                 store->stats.physical_bytes += DS4_PLE_PAGE_BYTES;
@@ -1308,6 +1324,9 @@ ds4_ple_store *ds4_ple_store_open(
                   "cannot allocate PLE store");
         return NULL;
     }
+    const char *latency_stats = getenv("DS4_PLE_LATENCY_STATS");
+    store->latency_stats =
+        latency_stats && strcmp(latency_stats, "0") != 0;
     for (uint32_t i = 0; i < DS4_PLE_N_PHYSICAL_FILES; i++)
         store->physical[i].fd = -1;
 

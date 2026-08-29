@@ -32153,6 +32153,82 @@ static bool qwen4exp_engine_open_ple(ds4_engine *engine,
     return true;
 #endif
 }
+
+#ifndef __APPLE__
+static uint64_t qwen4exp_ple_percentile_ns(
+        const uint64_t histogram[DS4_PLE_LATENCY_BUCKETS],
+        uint64_t samples,
+        uint32_t percentile) {
+    if (!samples) return 0;
+    const uint64_t target = (samples * percentile + 99u) / 100u;
+    uint64_t cumulative = 0;
+    for (uint32_t i = 0; i < DS4_PLE_LATENCY_BUCKETS; i++) {
+        cumulative += histogram[i];
+        if (cumulative >= target)
+            return ds4_ple_latency_bucket_upper_ns(i);
+    }
+    return UINT64_MAX;
+}
+
+static void qwen4exp_report_ple_stats(ds4_engine *engine) {
+    if (!engine || !engine->qwen_ple_store || !engine->qwen_ple_cuda)
+        return;
+    ds4_ple_stats store = {0};
+    ds4_qwen38_ple_cuda_stats cuda = {0};
+    ds4_ple_store_get_stats(engine->qwen_ple_store, &store);
+    if (!store.read_latency_samples) return;
+    ds4_qwen38_ple_cuda_get_stats(engine->qwen_ple_cuda, &cuda);
+
+    fprintf(stderr,
+            "ds4: Qwen PLE SSD stats: reads=%" PRIu64
+            " physical_bytes=%" PRIu64 " logical_bytes=%" PRIu64
+            " hits=%" PRIu64 " inflight=%" PRIu64
+            " misses=%" PRIu64 " evictions=%" PRIu64
+            " page_requests=%" PRIu64 " dropped=%" PRIu64
+            " read_errors=%" PRIu64 "\n",
+            store.read_operations, store.physical_bytes,
+            store.logical_bytes, store.cache_hits,
+            store.cache_inflight_hits, store.cache_misses,
+            store.cache_evictions, store.page_requests,
+            store.prefetch_dropped, store.read_errors);
+    fprintf(stderr,
+            "ds4: Qwen PLE SSD read latency: samples=%" PRIu64
+            " mean=%.3f us p50<=%.3f us p95<=%.3f us"
+            " p99<=%.3f us max=%.3f us\n",
+            store.read_latency_samples,
+            (double)store.read_nanoseconds_total /
+                (double)store.read_latency_samples / 1.0e3,
+            (double)qwen4exp_ple_percentile_ns(
+                store.read_latency_histogram,
+                store.read_latency_samples, 50u) / 1.0e3,
+            (double)qwen4exp_ple_percentile_ns(
+                store.read_latency_histogram,
+                store.read_latency_samples, 95u) / 1.0e3,
+            (double)qwen4exp_ple_percentile_ns(
+                store.read_latency_histogram,
+                store.read_latency_samples, 99u) / 1.0e3,
+            (double)store.read_nanoseconds_max / 1.0e3);
+    fprintf(stderr,
+            "ds4: Qwen PLE layer wait: samples=%" PRIu64
+            " rows=%" PRIu64 " mean=%.3f ms p50<=%.3f ms"
+            " p95<=%.3f ms p99<=%.3f ms max=%.3f ms\n",
+            cuda.gather_calls, cuda.gathered_rows,
+            cuda.gather_calls
+                ? (double)cuda.acquire_nanoseconds_total /
+                      (double)cuda.gather_calls / 1.0e6
+                : 0.0,
+            (double)qwen4exp_ple_percentile_ns(
+                cuda.acquire_latency_histogram,
+                cuda.gather_calls, 50u) / 1.0e6,
+            (double)qwen4exp_ple_percentile_ns(
+                cuda.acquire_latency_histogram,
+                cuda.gather_calls, 95u) / 1.0e6,
+            (double)qwen4exp_ple_percentile_ns(
+                cuda.acquire_latency_histogram,
+                cuda.gather_calls, 99u) / 1.0e6,
+            (double)cuda.acquire_nanoseconds_max / 1.0e6);
+}
+#endif
 #endif
 
 #define DS4_MTP_GUARD_MIN_DRAFTS 256u
@@ -62060,6 +62136,7 @@ void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #ifndef DS4_NO_GPU
 #ifndef __APPLE__
+    qwen4exp_report_ple_stats(e);
     ds4_qwen38_ple_cuda_destroy(e->qwen_ple_cuda);
 #endif
     e->qwen_ple_cuda = NULL;

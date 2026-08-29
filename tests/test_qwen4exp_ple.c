@@ -134,6 +134,7 @@ int main(int argc, char **argv) {
                 argv[0]);
         return 2;
     }
+    TEST_ASSERT(setenv("DS4_PLE_LATENCY_STATS", "1", 1) == 0);
 
     char error[512] = {0};
     ds4_ple_store *direct = ds4_ple_store_open(
@@ -207,6 +208,13 @@ int main(int argc, char **argv) {
                 stats.read_operations * DS4_PLE_PAGE_BYTES);
     TEST_ASSERT(stats.read_errors == 0);
     TEST_ASSERT(stats.cache_hits + stats.cache_inflight_hits > 0);
+    uint64_t read_histogram_samples = 0;
+    for (uint32_t i = 0; i < DS4_PLE_LATENCY_BUCKETS; i++)
+        read_histogram_samples += stats.read_latency_histogram[i];
+    TEST_ASSERT(stats.read_latency_samples == stats.read_operations);
+    TEST_ASSERT(read_histogram_samples == stats.read_latency_samples);
+    TEST_ASSERT(stats.read_nanoseconds_total >= stats.read_nanoseconds_max);
+    TEST_ASSERT(stats.read_nanoseconds_max > 0);
 
     check_concurrent_reads(
         direct, buffered, layout->usable_vocabulary_rows);

@@ -17,6 +17,31 @@ extern "C" {
 #define DS4_PLE_ROW_DIM 160u
 #define DS4_PLE_ROW_BYTES 320u
 #define DS4_PLE_PAGE_BYTES 4096u
+#define DS4_PLE_LATENCY_BUCKETS 64u
+
+/* Log2 buckets use an inclusive power-of-two upper bound in nanoseconds. */
+static inline uint32_t ds4_ple_latency_bucket(uint64_t nanoseconds) {
+    if (nanoseconds <= 1u) return 0u;
+#if defined(__GNUC__) || defined(__clang__)
+    const uint32_t bucket =
+        64u - (uint32_t)__builtin_clzll(nanoseconds - 1u);
+    return bucket < DS4_PLE_LATENCY_BUCKETS
+        ? bucket : DS4_PLE_LATENCY_BUCKETS - 1u;
+#else
+    uint32_t bucket = 0;
+    uint64_t upper = 1u;
+    while (upper < nanoseconds && bucket < DS4_PLE_LATENCY_BUCKETS - 1u) {
+        upper <<= 1u;
+        bucket++;
+    }
+    return bucket;
+#endif
+}
+
+static inline uint64_t ds4_ple_latency_bucket_upper_ns(uint32_t bucket) {
+    return bucket >= DS4_PLE_LATENCY_BUCKETS - 1u
+        ? UINT64_MAX : UINT64_C(1) << bucket;
+}
 
 typedef struct {
     uint32_t unigram_vocab_size;
@@ -62,6 +87,10 @@ typedef struct {
     uint64_t read_operations;
     uint64_t physical_bytes;
     uint64_t read_errors;
+    uint64_t read_latency_samples;
+    uint64_t read_nanoseconds_total;
+    uint64_t read_nanoseconds_max;
+    uint64_t read_latency_histogram[DS4_PLE_LATENCY_BUCKETS];
     uint64_t wait_samples;
     uint64_t wait_nanoseconds_total;
     uint64_t wait_nanoseconds_max;

@@ -15,6 +15,7 @@ typedef struct {
     uint64_t output_bytes;
     uint64_t acquire_nanoseconds_total;
     uint64_t acquire_nanoseconds_max;
+    uint64_t acquire_latency_histogram[DS4_PLE_LATENCY_BUCKETS];
 } ds4_qwen38_ple_cuda_stats;
 
 /* Register exactly the store's bounded cache allocation as mapped pinned host

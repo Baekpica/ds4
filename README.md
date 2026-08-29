@@ -274,6 +274,35 @@ guard with `DS4_MEMGOV=observe`; the lowest sampled system-available memory was
 7.8 GiB. This establishes full-window prefill and final-logit production, not
 full-window API generation or decode throughput.
 
+A follow-up incremental full-window sweep enabled
+`DS4_PLE_LATENCY_STATS=1` with the same Q5 artifact, prompt, chunk, cache,
+worker count, and 115 GiB guard. Each row adds exactly 32,768 prompt tokens to
+the retained session:
+
+| Context frontier | Added tokens | Segment prefill |
+|---:|---:|---:|
+| 32,768 | 32,768 | 427.31 tok/s |
+| 65,536 | 32,768 | 361.80 tok/s |
+| 98,304 | 32,768 | 334.40 tok/s |
+| 131,072 | 32,768 | 294.62 tok/s |
+| 163,840 | 32,768 | 271.04 tok/s |
+| 196,608 | 32,768 | 247.79 tok/s |
+| 229,376 | 32,768 | 218.73 tok/s |
+| 262,144 | 32,768 | 198.27 tok/s |
+
+The token-weighted rate was 277.49 tok/s, within 0.2% of the preceding
+uninstrumented 277.06 tok/s run. The SSD counters include the engine's
+512-token/two-gather boot prewarm, so 34 gather samples cover 262,656 tokens.
+They recorded 706,922 successful aligned 4 KiB reads (2.6967 GiB physical),
+with 220.801 us mean latency, p50 <= 262.144 us, p95 <= 524.288 us,
+p99 <= 1,048.576 us, and a 37.413 ms maximum. Among classified page accesses,
+90.15% were ready hits, 1.96% inflight hits, and 7.89% misses; there were
+390,767 evictions. The gather-level host wait for all PLE row leases averaged
+2.144 s per 8,192-token chunk, with p50 <= 2.147 s, p95 <= 4.295 s,
+p99 <= 8.590 s, and a 4.770 s observed maximum. Percentiles are conservative
+power-of-two histogram upper bounds; gather wait excludes the CUDA projection
+that follows acquisition. This direct run has no API TTFT or decode result.
+
 Motif-3 also completed a strict OpenAI Chat gate at the 262,144-token context
 limit: 262,080 prompt tokens at 175.61 tok/s followed by 43 decoded tokens at
 2.52 tok/s, with all three retrieval sentinels exact. Solar Open2 serves 8K
@@ -936,6 +965,7 @@ than refusing). The knobs:
 | `DS4_QWEN_PREFILL_CHUNK` | `256` (range 1..16384) | Qwen serial and bank prefill width. `8192` is the production serving setting used for the published Spark results; larger values need enough graph memory. |
 | `DS4_QWEN_PLE_CACHE_MB` | `2048` (allowed: 512, 1024, 2048) | Bound for Qwen's pinned SSD-PLE page cache. The full 95.37 GiB sidecar remains outside the unified-memory resident set. |
 | `DS4_QWEN_PLE_WORKERS` | `32` (range 1..64) | Asynchronous SSD-PLE page-read workers. On the reference DGX Spark, 32 retained nearly all of 64 workers' 8K prefill gain with less host submission overhead. |
+| `DS4_PLE_LATENCY_STATS` | unset (off) | Set to `1` for per-read SSD timing and shutdown-time read/layer-wait mean, p50, p95, p99, and maximum logs. Quantiles are power-of-two upper bounds. Leave it unset for normal serving so page workers avoid the two clock reads per I/O. |
 | `DS4_CUDA_NO_QWEN_VISION_TILE` | unset (tiled) | Set to `1` only to restore the previous per-query vision-attention kernel for controlled A/B diagnosis. |
 | `DS4_SERVER_CONTINUOUS` | `1` (continuous batching on) | Set to `0` to serve one request at a time on the old serial path. Only worth considering for single-user, latency-critical setups. |
 | `DS4_BATCH_VMM_BUDGET_MB` | unset: sized automatically (the bank plan's allowance, capped to measured capacity at boot, floored at two full-depth **packed** working sets — what two full banks actually commit at the admission-charged rate, not their virtual extents; `DS4_BATCH_VMM_FLOOR_PACKED=0` restores the old virtual-extent floor) | Hard cap on the KV pool, in MiB. Set it to pin the pool to a known size; either way the boot ledger prints `budget=[chosen] [plan X, capacity Y]` plus the work floor that applied, and a separate line whenever the floor is what ruled. |

@@ -174,6 +174,17 @@ int main(int argc, char **argv) {
     ds4_ple_stats store_stats;
     ds4_qwen38_ple_cuda_get_stats(cuda_context, &cuda_stats);
     ds4_ple_store_get_stats(store, &store_stats);
+    uint64_t acquire_histogram_samples = 0;
+    for (uint32_t i = 0; i < DS4_PLE_LATENCY_BUCKETS; i++)
+        acquire_histogram_samples +=
+            cuda_stats.acquire_latency_histogram[i];
+    if (acquire_histogram_samples != cuda_stats.gather_calls) {
+        fprintf(stderr,
+                "CUDA PLE acquire histogram mismatch: samples=%" PRIu64
+                " gathers=%" PRIu64 "\n",
+                acquire_histogram_samples, cuda_stats.gather_calls);
+        return 1;
+    }
     const ds4_ple_layout *layout = ds4_ple_store_layout(store);
     struct rusage usage;
     memset(&usage, 0, sizeof(usage));

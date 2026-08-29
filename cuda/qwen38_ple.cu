@@ -430,6 +430,10 @@ bool ds4_qwen38_ple_cuda_gather(
     __atomic_fetch_add(
         &context->stats.acquire_nanoseconds_total,
         acquire_elapsed, __ATOMIC_RELAXED);
+    __atomic_fetch_add(
+        &context->stats.acquire_latency_histogram[
+            ds4_ple_latency_bucket(acquire_elapsed)],
+        UINT64_C(1), __ATOMIC_RELAXED);
     uint64_t old = __atomic_load_n(
         &context->stats.acquire_nanoseconds_max,
         __ATOMIC_RELAXED);
@@ -458,4 +462,8 @@ void ds4_qwen38_ple_cuda_get_stats(
     stats->acquire_nanoseconds_max = __atomic_load_n(
         &context->stats.acquire_nanoseconds_max,
         __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < DS4_PLE_LATENCY_BUCKETS; i++)
+        stats->acquire_latency_histogram[i] = __atomic_load_n(
+            &context->stats.acquire_latency_histogram[i],
+            __ATOMIC_RELAXED);
 }
