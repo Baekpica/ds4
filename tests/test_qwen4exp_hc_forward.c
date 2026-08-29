@@ -55,6 +55,7 @@ int main(void) {
     ds4_tensor down = make_weight(&cursor, WIDTH, LOW);
     ds4_tensor up = make_weight(&cursor, LOW, WIDTH);
     ds4_tensor inject = make_weight(&cursor, WIDTH, HC);
+    ds4_tensor dense = make_weight(&cursor, WIDTH, LOW);
     const uint64_t model_size = align4k(cursor);
     unsigned char *map = NULL;
     REQUIRE(posix_memalign((void **)&map, 4096u, (size_t)model_size) == 0,
@@ -64,12 +65,15 @@ int main(void) {
     uint16_t *down_data = (uint16_t *)(map + down.abs_offset);
     uint16_t *up_data = (uint16_t *)(map + up.abs_offset);
     uint16_t *inject_data = (uint16_t *)(map + inject.abs_offset);
+    uint16_t *dense_data = (uint16_t *)(map + dense.abs_offset);
     for (uint32_t low = 0; low < LOW; low++)
         down_data[(uint64_t)low * WIDTH + low] = bf16(1.0f);
     for (uint32_t out = 0; out < WIDTH; out++)
         up_data[(uint64_t)out * LOW + out % LOW] = bf16(1.0f);
     for (uint32_t lane = 0; lane < HC; lane++)
         inject_data[(uint64_t)lane * WIDTH + (uint64_t)lane * HIDDEN] = bf16(1.0f);
+    for (uint64_t i = 0u; i < dense.elements; i++)
+        dense_data[i] = bf16((float)((int)(i % 29u) - 14) * 0.001f);
 
     ds4_model model;
     memset(&model, 0, sizeof(model));
@@ -91,7 +95,10 @@ int main(void) {
     float *want = malloc(hc_values * sizeof(*want));
     float *mixed_got = malloc(block_values * sizeof(*mixed_got));
     float *mixed_want = malloc(block_values * sizeof(*mixed_want));
-    REQUIRE(input && block && got && want && mixed_got && mixed_want,
+    float *scalar_got = malloc(hc_values * sizeof(*scalar_got));
+    float *scalar_mixed = malloc(block_values * sizeof(*scalar_mixed));
+    REQUIRE(input && block && got && want && mixed_got && mixed_want &&
+            scalar_got && scalar_mixed,
             "host buffers");
     for (uint64_t i = 0; i < hc_values; i++)
         input[i] = 0.8f * sinf((float)(i + 1u) * 0.003f) + 0.2f;
@@ -135,18 +142,53 @@ int main(void) {
     ds4_gpu_tensor *dinput = ds4_gpu_tensor_alloc(hc_values * sizeof(float));
     ds4_gpu_tensor *dblock = ds4_gpu_tensor_alloc(block_values * sizeof(float));
     ds4_gpu_tensor *dout = ds4_gpu_tensor_alloc(hc_values * sizeof(float));
+    ds4_gpu_tensor *dense_batch = ds4_gpu_tensor_alloc(
+        (uint64_t)ROWS * LOW * sizeof(float));
+    ds4_gpu_tensor *dense_scalar = ds4_gpu_tensor_alloc(
+        (uint64_t)ROWS * LOW * sizeof(float));
     ds4_qwen_hc_ws ws;
-    REQUIRE(dinput && dblock && dout &&
-            qwen4exp_hc_ws_alloc(&ws, ROWS, HIDDEN, HC, LOW), "HC workspace");
+    ds4_qwen_hc_ws scalar_ws;
+    REQUIRE(dinput && dblock && dout && dense_batch && dense_scalar &&
+            qwen4exp_hc_ws_alloc(&ws, ROWS, HIDDEN, HC, LOW) &&
+            qwen4exp_hc_ws_alloc(&scalar_ws, 1u, HIDDEN, HC, LOW),
+            "HC workspace");
     REQUIRE(ds4_gpu_tensor_write(dinput, 0, input, hc_values * sizeof(float)) &&
             ds4_gpu_tensor_write(dblock, 0, block, block_values * sizeof(float)),
             "input upload");
-    REQUIRE(qwen4exp_hc_begin(&ws, &model, &weights, dinput, ROWS), "HC begin");
+    REQUIRE(qwen4exp_hc_begin(
+                &ws, &model, &weights, dinput, ROWS, true), "HC begin");
     REQUIRE(ds4_gpu_tensor_read(ws.mixed, 0, mixed_got,
                                 block_values * sizeof(float)),
             "mixed-input readback");
     REQUIRE(qwen4exp_hc_finish(&ws, dinput, dblock, dout, ROWS), "HC finish");
     REQUIRE(ds4_gpu_tensor_read(dout, 0, got, hc_values * sizeof(float)), "output readback");
+    for (uint32_t row = 0u; row < ROWS; row++) {
+        ds4_gpu_tensor *input_row = ds4_gpu_tensor_view(
+            dinput, (uint64_t)row * WIDTH * sizeof(float),
+            (uint64_t)WIDTH * sizeof(float));
+        ds4_gpu_tensor *block_row = ds4_gpu_tensor_view(
+            dblock, (uint64_t)row * HIDDEN * sizeof(float),
+            (uint64_t)HIDDEN * sizeof(float));
+        ds4_gpu_tensor *out_row = ds4_gpu_tensor_view(
+            dout, (uint64_t)row * WIDTH * sizeof(float),
+            (uint64_t)WIDTH * sizeof(float));
+        REQUIRE(input_row && block_row && out_row &&
+                qwen4exp_hc_begin(
+                    &scalar_ws, &model, &weights, input_row, 1u, true) &&
+                ds4_gpu_tensor_read(
+                    scalar_ws.mixed, 0,
+                    scalar_mixed + (uint64_t)row * HIDDEN,
+                    (uint64_t)HIDDEN * sizeof(float)) &&
+                qwen4exp_hc_finish(
+                    &scalar_ws, input_row, block_row, out_row, 1u),
+                "scalar-row HC");
+        ds4_gpu_tensor_free(out_row);
+        ds4_gpu_tensor_free(block_row);
+        ds4_gpu_tensor_free(input_row);
+    }
+    REQUIRE(ds4_gpu_tensor_read(
+                dout, 0, scalar_got, hc_values * sizeof(float)),
+            "scalar-row output readback");
     float mixed_worst = 0.0f, worst = 0.0f;
     for (uint64_t i = 0; i < block_values; i++) {
         const float error = fabsf(mixed_got[i] - mixed_want[i]);
@@ -160,13 +202,54 @@ int main(void) {
            mixed_worst, worst);
     REQUIRE(mixed_worst < 2.0e-4f, "integrated HC projection parity");
     REQUIRE(worst < 2.0e-4f, "integrated HC residual parity");
+    REQUIRE(memcmp(mixed_got, scalar_mixed,
+                   block_values * sizeof(float)) == 0,
+            "two-row HC mixed output differs from scalar rows");
+    REQUIRE(memcmp(got, scalar_got, hc_values * sizeof(float)) == 0,
+            "two-row HC residual differs from scalar rows");
 
+    REQUIRE(ds4_gpu_matmul_bf16_stable_rows_tensor(
+                dense_batch, map, model_size, dense.abs_offset,
+                WIDTH, LOW, dinput, ROWS),
+            "dense two-row BF16 projection");
+    for (uint32_t row = 0u; row < ROWS; row++) {
+        ds4_gpu_tensor *input_row = ds4_gpu_tensor_view(
+            dinput, (uint64_t)row * WIDTH * sizeof(float),
+            (uint64_t)WIDTH * sizeof(float));
+        ds4_gpu_tensor *output_row = ds4_gpu_tensor_view(
+            dense_scalar, (uint64_t)row * LOW * sizeof(float),
+            (uint64_t)LOW * sizeof(float));
+        REQUIRE(input_row && output_row &&
+                ds4_gpu_matmul_bf16_stable_rows_tensor(
+                    output_row, map, model_size, dense.abs_offset,
+                    WIDTH, LOW, input_row, 1u),
+                "dense scalar-row BF16 projection");
+        ds4_gpu_tensor_free(output_row);
+        ds4_gpu_tensor_free(input_row);
+    }
+    float dense_batch_host[ROWS * LOW];
+    float dense_scalar_host[ROWS * LOW];
+    REQUIRE(ds4_gpu_tensor_read(
+                dense_batch, 0u, dense_batch_host,
+                sizeof(dense_batch_host)) &&
+            ds4_gpu_tensor_read(
+                dense_scalar, 0u, dense_scalar_host,
+                sizeof(dense_scalar_host)),
+            "dense BF16 projection readback");
+    REQUIRE(memcmp(dense_batch_host, dense_scalar_host,
+                   sizeof(dense_batch_host)) == 0,
+            "dense two-row BF16 projection differs from scalar rows");
+
+    qwen4exp_hc_ws_free(&scalar_ws);
     qwen4exp_hc_ws_free(&ws);
+    ds4_gpu_tensor_free(dense_scalar);
+    ds4_gpu_tensor_free(dense_batch);
     ds4_gpu_tensor_free(dout);
     ds4_gpu_tensor_free(dblock);
     ds4_gpu_tensor_free(dinput);
     ds4_gpu_unregister_model_map(map);
     ds4_gpu_cleanup();
+    free(scalar_mixed); free(scalar_got);
     free(mixed_want); free(mixed_got); free(want); free(got);
     free(block); free(input); free(map);
     return 0;

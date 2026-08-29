@@ -24712,7 +24712,7 @@ static int cuda_matmul_f16_tensor_impl(ds4_gpu_tensor *out, const void *model_ma
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
 
-extern "C" int ds4_gpu_matmul_bf16_tensor(
+static int cuda_matmul_bf16_tensor_impl(
         ds4_gpu_tensor *out,
         const void *model_map,
         uint64_t model_size,
@@ -24720,7 +24720,8 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(
         uint64_t in_dim,
         uint64_t out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t n_tok) {
+        uint64_t n_tok,
+        bool stable_rows) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0 ||
         weight_offset > model_size || out_dim > UINT64_MAX / in_dim) {
         return 0;
@@ -24751,7 +24752,8 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(
             xb, (const float *)x->ptr, x_count);
     if (!cuda_ok(cudaGetLastError(), "bf16 activation convert launch")) return 0;
 
-    if (g_cublas_ready && in_dim <= INT_MAX && out_dim <= INT_MAX && n_tok <= INT_MAX) {
+    if (g_cublas_ready && !stable_rows &&
+        in_dim <= INT_MAX && out_dim <= INT_MAX && n_tok <= INT_MAX) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
         const cublasStatus_t st = cublasGemmEx(
@@ -24781,6 +24783,34 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(
     matmul_bf16_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
             (float *)out->ptr, w, xb, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_bf16 launch");
+}
+
+extern "C" int ds4_gpu_matmul_bf16_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    return cuda_matmul_bf16_tensor_impl(
+        out, model_map, model_size, weight_offset,
+        in_dim, out_dim, x, n_tok, false);
+}
+
+extern "C" int ds4_gpu_matmul_bf16_stable_rows_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    return cuda_matmul_bf16_tensor_impl(
+        out, model_map, model_size, weight_offset,
+        in_dim, out_dim, x, n_tok, true);
 }
 
 /* P3-Inc1: batched f16 matmul with the input rms_norm folded into the

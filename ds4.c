@@ -20120,11 +20120,24 @@ static bool qwen4exp_hc_ws_alloc(ds4_qwen_hc_ws *ws,
     return true;
 }
 
+static bool qwen4exp_hc_matmul(
+        ds4_gpu_tensor *out, const ds4_model *model,
+        const ds4_tensor *weight, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t rows, bool stable_rows) {
+    return stable_rows
+        ? ds4_gpu_matmul_bf16_stable_rows_tensor(
+              out, model->map, model->size, weight->abs_offset,
+              in_dim, out_dim, x, rows) != 0
+        : plain_graph_matmul_tensor(
+              out, model, weight, in_dim, out_dim, x, rows);
+}
+
 static bool qwen4exp_hc_begin(ds4_qwen_hc_ws *ws,
                               const ds4_model *model,
                               const ds4_qwen_hc_weights *weights,
                               const ds4_gpu_tensor *hyper_input,
-                              uint32_t rows) {
+                              uint32_t rows,
+                              bool stable_rows) {
     if (!ws || !model || !weights || !hyper_input || rows == 0u ||
         rows > ws->capacity || !weights->norm || !weights->mix_down ||
         !weights->mix_up) return false;
@@ -20147,18 +20160,18 @@ static bool qwen4exp_hc_begin(ds4_qwen_hc_ws *ws,
                ws->normed, hyper_input, model->map, model->size,
                weights->norm->abs_offset, (uint32_t)width,
                ws->hidden_size, rows, DS4_RMS_EPS) != 0 &&
-           plain_graph_matmul_tensor(
+           qwen4exp_hc_matmul(
                ws->low, model, weights->mix_down, width, ws->lowrank,
-               ws->normed, rows) &&
+               ws->normed, rows, stable_rows) &&
            ds4_gpu_qwen4exp_hc_down_silu_tensor(
                ws->low, ws->low, (uint64_t)rows * ws->lowrank,
                ws->hc_count) != 0 &&
-           plain_graph_matmul_tensor(
+           qwen4exp_hc_matmul(
                ws->mix_logits, model, weights->mix_up, ws->lowrank,
-               width, ws->low, rows) &&
-           (!weights->inject || plain_graph_matmul_tensor(
+               width, ws->low, rows, stable_rows) &&
+           (!weights->inject || qwen4exp_hc_matmul(
                ws->inject_logits, model, weights->inject, width,
-               ws->hc_count, ws->normed, rows)) &&
+               ws->hc_count, ws->normed, rows, stable_rows)) &&
            ds4_gpu_qwen4exp_hc_mix_inject_tensor(
                ws->mixed, weights->inject ? ws->injection : NULL,
                ws->normed, ws->mix_logits,
@@ -21562,14 +21575,12 @@ typedef struct {
     int32_t mrope_delta;
     bool mrope_active;
 
-    /* The embedded one-layer MTP head is opt-in.  It shares the target
-     * scratch sequentially, but owns its QSA history and one recurrent-state
-     * rollback slot so a rejected two-row verify cannot advance the target. */
+    /* The embedded one-layer MTP head is opt-in.  It shares target scratch,
+     * owns its QSA history, and verifies drafts with exact one-row target
+     * arithmetic. */
     ds4_qwen_qsa_state mtp_qsa_state;
     ds4_gpu_tensor *mtp_hidden;
     ds4_gpu_tensor *mtp_pending_hc;
-    ds4_gpu_tensor *mtp_target_backup;
-    uint64_t mtp_target_backup_bytes;
     bool mtp_enabled;
     bool mtp_pending_valid;
     bool mtp_suspended;
@@ -21596,10 +21607,9 @@ static void qwen4exp_graph_free(ds4_qwen_gpu_graph *graph) {
     if (!graph) return;
     /* MTP prefix maintenance intentionally returns before a host read.  Drain
      * that stream once at session teardown before releasing its VMM buffers. */
-    if (graph->mtp_hidden || graph->mtp_pending_hc ||
-        graph->mtp_target_backup) (void)ds4_gpu_synchronize();
+    if (graph->mtp_hidden || graph->mtp_pending_hc)
+        (void)ds4_gpu_synchronize();
     qwen4exp_qsa_state_free(&graph->mtp_qsa_state);
-    ds4_gpu_tensor_free(graph->mtp_target_backup);
     ds4_gpu_tensor_free(graph->mtp_pending_hc);
     ds4_gpu_tensor_free(graph->mtp_hidden);
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -22105,98 +22115,25 @@ static bool qwen4exp_graph_mtp_enable(ds4_qwen_gpu_graph *graph) {
     const uint64_t hidden_bytes =
         (uint64_t)graph->capacity * width * sizeof(float);
     const uint64_t pending_bytes = width * sizeof(float);
-    const uint64_t backup_bytes =
-        qwen4exp_recurrent_checkpoint_bytes(graph);
-    if (hidden_bytes == 0u || pending_bytes == 0u || backup_bytes == 0u ||
+    if (hidden_bytes == 0u || pending_bytes == 0u ||
         !qwen4exp_qsa_state_alloc(
             &graph->mtp_qsa_state, graph->context_cap, 4u,
             DS4_N_INDEXER_HEAD_DIM, DS4_N_HEAD_KV, DS4_N_HEAD_DIM) ||
         !(graph->mtp_hidden = ds4_gpu_tensor_alloc(hidden_bytes)) ||
-        !(graph->mtp_pending_hc = ds4_gpu_tensor_alloc(pending_bytes)) ||
-        !(graph->mtp_target_backup = ds4_gpu_tensor_reserve(backup_bytes))) {
+        !(graph->mtp_pending_hc = ds4_gpu_tensor_alloc(pending_bytes))) {
         qwen4exp_qsa_state_free(&graph->mtp_qsa_state);
-        ds4_gpu_tensor_free(graph->mtp_target_backup);
         ds4_gpu_tensor_free(graph->mtp_pending_hc);
         ds4_gpu_tensor_free(graph->mtp_hidden);
-        graph->mtp_target_backup = NULL;
         graph->mtp_pending_hc = NULL;
         graph->mtp_hidden = NULL;
         return false;
     }
-    graph->mtp_target_backup_bytes = backup_bytes;
     graph->mtp_enabled = true;
     graph->mtp_pending_valid = false;
     graph->mtp_suspended = false;
     fprintf(stderr,
             "ds4: Qwen embedded MTP ready: one QSA layer, "
-            "rollback=%.2f MiB demand-mapped\n",
-            (double)backup_bytes / 1048576.0);
-    return true;
-}
-
-static bool qwen4exp_recurrent_state_copy(
-        ds4_qwen_gpu_graph *graph, bool to_backup) {
-    if (!graph || !graph->mtp_target_backup ||
-        graph->mtp_target_backup_bytes == 0u) return false;
-    uint64_t cursor = 0u;
-#define QWEN_MTP_COPY_STATE(tensor)                                           \
-    do {                                                                       \
-        const uint64_t qwen_mtp_bytes_ = ds4_gpu_tensor_bytes((tensor));       \
-        if (qwen_mtp_bytes_ == 0u ||                                           \
-            qwen_mtp_bytes_ > graph->mtp_target_backup_bytes - cursor ||       \
-            (to_backup                                                        \
-                 ? ds4_gpu_tensor_copy(graph->mtp_target_backup, cursor,       \
-                                       (tensor), 0, qwen_mtp_bytes_)            \
-                 : ds4_gpu_tensor_copy((tensor), 0,                            \
-                                       graph->mtp_target_backup, cursor,        \
-                                       qwen_mtp_bytes_)) == 0) {                \
-            return false;                                                      \
-        }                                                                      \
-        cursor += qwen_mtp_bytes_;                                             \
-    } while (0)
-    QWEN_MTP_COPY_STATE(graph->ple.conv_state);
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (ds4_qwen4exp_layer_is_full_attention(il)) continue;
-        QWEN_MTP_COPY_STATE(graph->gdn_state[il].conv);
-        QWEN_MTP_COPY_STATE(graph->gdn_state[il].recurrent);
-    }
-#undef QWEN_MTP_COPY_STATE
-    return cursor == graph->mtp_target_backup_bytes;
-}
-
-static bool qwen4exp_graph_mtp_backup_target(ds4_qwen_gpu_graph *graph) {
-    if (!graph || !graph->mtp_target_backup) return false;
-    const uint64_t resident = ds4_gpu_tensor_resident(
-        graph->mtp_target_backup, 0, graph->mtp_target_backup_bytes);
-    const uint64_t need = resident < graph->mtp_target_backup_bytes
-        ? graph->mtp_target_backup_bytes - resident : 0u;
-    const uint64_t usable = ds4_mem_usable_beyond(0u);
-    if (need != 0u && usable != UINT64_MAX && need > usable) {
-        fprintf(stderr,
-                "ds4: Qwen MTP rollback refused: need %.2f MiB, "
-                "governed usable %.2f MiB\n",
-                (double)need / 1048576.0,
-                (double)usable / 1048576.0);
-        return false;
-    }
-    return ds4_gpu_tensor_ensure(
-               graph->mtp_target_backup, 0,
-               graph->mtp_target_backup_bytes) != 0 &&
-           qwen4exp_recurrent_state_copy(graph, true);
-}
-
-static bool qwen4exp_graph_mtp_restore_target(
-        ds4_qwen_gpu_graph *graph, uint32_t length,
-        ds4_ple_hash_state hash_state) {
-    if (!graph || length > graph->context_cap ||
-        !qwen4exp_recurrent_state_copy(graph, false)) return false;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (ds4_qwen4exp_layer_is_full_attention(il))
-            graph->qsa_state[il].length = length;
-    }
-    graph->ple.hash_state = hash_state;
-    graph->ple.prepared_rows = 0u;
-    graph->length = length;
+            "exact sequential target verification\n");
     return true;
 }
 
@@ -22267,7 +22204,7 @@ static bool qwen4exp_graph_mtp_step(
     ds4_gpu_tensor *current = graph->hidden[1];
     ds4_gpu_tensor *next = graph->mtp_hidden;
     QWEN_MTP_REQUIRE(qwen4exp_hc_begin(
-        &graph->hc, model, &layer->qwen_attn_hc, current, rows),
+        &graph->hc, model, &layer->qwen_attn_hc, current, rows, false),
         "attention-hc-mix");
     QWEN_MTP_REQUIRE(qwen4exp_qsa_forward(
         &graph->qsa_ws, &graph->mtp_qsa_state, model,
@@ -22279,7 +22216,7 @@ static bool qwen4exp_graph_mtp_step(
     current = next;
     next = graph->hidden[1];
     QWEN_MTP_REQUIRE(qwen4exp_hc_begin(
-        &graph->hc, model, &layer->qwen_ffn_hc, current, rows),
+        &graph->hc, model, &layer->qwen_ffn_hc, current, rows, false),
         "ffn-hc-mix");
     QWEN_MTP_REQUIRE(qwen4exp_moe_forward(
         &graph->moe_ws, model, layer, graph->hc.mixed,
@@ -22292,7 +22229,7 @@ static bool qwen4exp_graph_mtp_step(
     if (!logits) return true;
     QWEN_MTP_REQUIRE(qwen4exp_hc_begin(
         &graph->hc, model, &weights->qwen_mtp_input_hc,
-        current, rows), "output-hc-mix");
+        current, rows, false), "output-hc-mix");
     const uint64_t row_bytes = (uint64_t)hidden * sizeof(float);
     ds4_gpu_tensor *last = ds4_gpu_tensor_view(
         graph->hc.mixed, (uint64_t)(rows - 1u) * row_bytes, row_bytes);
@@ -22343,6 +22280,36 @@ static void qwen4exp_graph_mtp_disable(
     graph->mtp_suspended = false;
 }
 
+static bool qwen4exp_graph_ensure_mrope(
+        ds4_qwen_gpu_graph *graph, uint32_t pos0, uint32_t rows) {
+    if (!graph || rows == 0u || pos0 > graph->context_cap ||
+        rows > graph->context_cap - pos0) return false;
+    if (!graph->mrope_active || pos0 + rows <= graph->mrope_written)
+        return true;
+    const uint32_t first = graph->mrope_written;
+    const uint32_t count = pos0 + rows - first;
+    int32_t *positions = xmalloc((size_t)count * 3u * sizeof(*positions));
+    bool valid = true;
+    for (uint32_t i = 0u; i < count; i++) {
+        const int64_t p = (int64_t)first + i + graph->mrope_delta;
+        if (p < 0 || p > INT32_MAX) {
+            valid = false;
+            break;
+        }
+        positions[3u * i] = (int32_t)p;
+        positions[3u * i + 1u] = (int32_t)p;
+        positions[3u * i + 2u] = (int32_t)p;
+    }
+    const uint64_t offset = (uint64_t)first * 3u * sizeof(*positions);
+    const uint64_t bytes = (uint64_t)count * 3u * sizeof(*positions);
+    const bool written = valid && graph->mrope_positions &&
+        ds4_gpu_tensor_ensure(graph->mrope_positions, offset, bytes) &&
+        ds4_gpu_tensor_write(graph->mrope_positions, offset, positions, bytes);
+    free(positions);
+    if (written) graph->mrope_written = pos0 + rows;
+    return written;
+}
+
 static bool qwen4exp_graph_forward_chunk(
         ds4_qwen_gpu_graph *graph,
         const ds4_model *model,
@@ -22353,6 +22320,7 @@ static bool qwen4exp_graph_forward_chunk(
         uint32_t rows,
         uint32_t pos0,
         uint32_t logits_rows,
+        bool stable_hc,
         float *logits) {
     if (!graph || !model || !weights || !ple_store || !ple_cuda || !tokens ||
         rows == 0u || rows > graph->capacity || pos0 != graph->length ||
@@ -22360,30 +22328,7 @@ static bool qwen4exp_graph_forward_chunk(
         logits_rows > rows || logits_rows > 2u ||
         ((logits_rows != 0u) != (logits != NULL)))
         return false;
-    if (graph->mrope_active && pos0 + rows > graph->mrope_written) {
-        const uint32_t first = graph->mrope_written;
-        const uint32_t count = pos0 + rows - first;
-        int32_t *positions = xmalloc((size_t)count * 3u * sizeof(int32_t));
-        bool valid = true;
-        for (uint32_t i = 0u; i < count; i++) {
-            const int64_t p = (int64_t)first + i + graph->mrope_delta;
-            if (p < 0 || p > INT32_MAX) {
-                valid = false;
-                break;
-            }
-            positions[3u * i] = (int32_t)p;
-            positions[3u * i + 1u] = (int32_t)p;
-            positions[3u * i + 2u] = (int32_t)p;
-        }
-        const uint64_t offset = (uint64_t)first * 3u * sizeof(int32_t);
-        const uint64_t bytes = (uint64_t)count * 3u * sizeof(int32_t);
-        const bool written = valid && graph->mrope_positions &&
-            ds4_gpu_tensor_ensure(graph->mrope_positions, offset, bytes) &&
-            ds4_gpu_tensor_write(graph->mrope_positions, offset, positions, bytes);
-        free(positions);
-        if (!written) return false;
-        graph->mrope_written = pos0 + rows;
-    }
+    if (!qwen4exp_graph_ensure_mrope(graph, pos0, rows)) return false;
     char ple_error[256] = {0};
     /* Submit SSD reads before token embedding and decoder layer 0; the PLE
      * rows are first consumed at layer 1, so those GPU stages hide I/O. */
@@ -22435,7 +22380,8 @@ static bool qwen4exp_graph_forward_chunk(
             return false;
         }
         if (!qwen4exp_hc_begin(
-                &graph->hc, model, &layer->qwen_attn_hc, current, rows))
+                &graph->hc, model, &layer->qwen_attn_hc,
+                current, rows, stable_hc))
             return false;
         const bool attention_ok = ds4_qwen4exp_layer_is_full_attention(il)
             ? qwen4exp_qsa_forward(
@@ -22454,7 +22400,8 @@ static bool qwen4exp_graph_forward_chunk(
         next = swap;
 
         if (!qwen4exp_hc_begin(
-                &graph->hc, model, &layer->qwen_ffn_hc, current, rows) ||
+                &graph->hc, model, &layer->qwen_ffn_hc,
+                current, rows, stable_hc) ||
             !qwen4exp_moe_forward(
                 &graph->moe_ws, model, layer, graph->hc.mixed,
                 graph->block, rows) ||
@@ -22468,7 +22415,8 @@ static bool qwen4exp_graph_forward_chunk(
     if (current != graph->hidden[0]) return false;
     if (logits_rows != 0u) {
         if (!qwen4exp_hc_begin(
-                &graph->hc, model, &weights->qwen_input_hc, current, rows))
+                &graph->hc, model, &weights->qwen_input_hc,
+                current, rows, stable_hc))
             return false;
         const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
         const uint32_t first_row = rows - logits_rows;
@@ -22485,6 +22433,156 @@ static bool qwen4exp_graph_forward_chunk(
             return false;
     }
     graph->length = pos0 + rows;
+    return true;
+}
+
+/* Decode independent sessions through one row matrix.  PLE/GDN/QSA/MoE and
+ * the output projection keep bank-owned scalar arithmetic; embedding and
+ * Hyper-Connections consume both live rows together. */
+static bool qwen4exp_graph_forward_decode_rows(
+        ds4_qwen_gpu_graph *const *graphs,
+        const ds4_model *model,
+        const ds4_weights *weights,
+        ds4_ple_store *ple_store,
+        ds4_qwen38_ple_cuda *ple_cuda,
+        const int *tokens,
+        const uint32_t *positions,
+        uint32_t rows,
+        float *logits) {
+    if (!graphs || !model || !weights || !ple_store || !ple_cuda ||
+        !tokens || !positions || !logits || rows < 2u || !graphs[0] ||
+        rows > graphs[0]->capacity || rows > 2u) return false;
+    ds4_qwen_gpu_graph *scratch = graphs[0];
+    char ple_error[256] = {0};
+    for (uint32_t r = 0u; r < rows; r++) {
+        ds4_qwen_gpu_graph *g = graphs[r];
+        if (!g || g->capacity == 0u || positions[r] != g->length ||
+            positions[r] >= g->context_cap || g->image_features ||
+            !qwen4exp_graph_ensure_mrope(g, positions[r], 1u) ||
+            !qwen4exp_ple_prepare(
+                &g->ple, ple_store, &tokens[r], 1u,
+                ple_error, sizeof(ple_error))) return false;
+        for (uint32_t prior = 0u; prior < r; prior++)
+            if (graphs[prior] == g) return false;
+    }
+
+    const uint64_t hidden = DS4_N_EMBD;
+    const uint64_t width = hidden * DS4_N_HC;
+    const uint64_t hidden_row_bytes = hidden * sizeof(float);
+    const uint64_t hc_row_bytes = width * sizeof(float);
+    if (!ds4_gpu_tensor_write(
+            scratch->tokens, 0, tokens,
+            (uint64_t)rows * sizeof(*tokens)) ||
+        !ds4_gpu_embed_tokens_quant_tensor(
+            scratch->embedding, scratch->tokens, model->map, model->size,
+            weights->token_embd->abs_offset, weights->token_embd->type,
+            DS4_N_VOCAB, rows, DS4_N_EMBD) ||
+        !ds4_gpu_repeat_hc_rows_tensor(
+            scratch->hidden[0], scratch->embedding,
+            DS4_N_EMBD, DS4_N_HC, rows)) return false;
+
+    ds4_gpu_tensor *current = scratch->hidden[0];
+    ds4_gpu_tensor *next = scratch->hidden[1];
+    for (uint32_t il = 0u; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &weights->layer[il];
+        if (il == 1u) {
+            for (uint32_t r = 0u; r < rows; r++) {
+                ds4_gpu_tensor *row = ds4_gpu_tensor_view(
+                    current, (uint64_t)r * hc_row_bytes, hc_row_bytes);
+                const bool ok = row && qwen4exp_ple_forward(
+                    &graphs[r]->ple, ple_cuda, model, &layer->qwen_ple,
+                    row, 1u, ple_error, sizeof(ple_error));
+                ds4_gpu_tensor_free(row);
+                if (!ok) return false;
+            }
+        }
+        if (!qwen4exp_hc_begin(
+                &scratch->hc, model, &layer->qwen_attn_hc,
+                current, rows, true)) return false;
+        for (uint32_t r = 0u; r < rows; r++) {
+            ds4_qwen_gpu_graph *g = graphs[r];
+            ds4_gpu_tensor *input = ds4_gpu_tensor_view(
+                scratch->hc.mixed,
+                (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
+            ds4_gpu_tensor *output = ds4_gpu_tensor_view(
+                scratch->block,
+                (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
+            const bool ok = input && output &&
+                (ds4_qwen4exp_layer_is_full_attention(il)
+                     ? qwen4exp_qsa_forward(
+                           &g->qsa_ws, &g->qsa_state[il], model,
+                           &layer->qwen_qsa, input, output, 1u,
+                           positions[r],
+                           g->mrope_active ? g->mrope_positions : NULL)
+                     : qwen4exp_gdn_forward(
+                           &g->gdn_ws, &g->gdn_state[il], model,
+                           &layer->qwen_linear_attn, input, output, 1u));
+            ds4_gpu_tensor_free(output);
+            ds4_gpu_tensor_free(input);
+            if (!ok) return false;
+        }
+        if (!qwen4exp_hc_finish(
+                &scratch->hc, current, scratch->block, next, rows))
+            return false;
+        ds4_gpu_tensor *swap = current;
+        current = next;
+        next = swap;
+
+        if (!qwen4exp_hc_begin(
+                &scratch->hc, model, &layer->qwen_ffn_hc,
+                current, rows, true)) return false;
+        for (uint32_t r = 0u; r < rows; r++) {
+            ds4_gpu_tensor *input = ds4_gpu_tensor_view(
+                scratch->hc.mixed,
+                (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
+            ds4_gpu_tensor *output = ds4_gpu_tensor_view(
+                scratch->block,
+                (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
+            const bool ok = input && output && qwen4exp_moe_forward(
+                &graphs[r]->moe_ws, model, layer, input, output, 1u);
+            ds4_gpu_tensor_free(output);
+            ds4_gpu_tensor_free(input);
+            if (!ok) return false;
+        }
+        if (!qwen4exp_hc_finish(
+                &scratch->hc, current, scratch->block, next, rows))
+            return false;
+        swap = current;
+        current = next;
+        next = swap;
+    }
+    if (current != scratch->hidden[0]) return false;
+
+    /* Keep each bank's final HC row in the graph that owns its state. */
+    for (uint32_t r = 0u; r < rows; r++) {
+        if (r == 0u) continue;
+        if (!ds4_gpu_tensor_copy(
+                graphs[r]->hidden[0], 0u, current,
+                (uint64_t)r * hc_row_bytes, hc_row_bytes)) return false;
+    }
+    if (!qwen4exp_hc_begin(
+            &scratch->hc, model, &weights->qwen_input_hc,
+            current, rows, true)) return false;
+    for (uint32_t r = 0u; r < rows; r++) {
+        ds4_gpu_tensor *input = ds4_gpu_tensor_view(
+            scratch->hc.mixed,
+            (uint64_t)r * hidden_row_bytes, hidden_row_bytes);
+        ds4_gpu_tensor *output = ds4_gpu_tensor_view(
+            scratch->logits,
+            (uint64_t)r * DS4_N_VOCAB * sizeof(float),
+            (uint64_t)DS4_N_VOCAB * sizeof(float));
+        const bool ok = input && output && plain_graph_matmul_tensor(
+            output, model, weights->output,
+            DS4_N_EMBD, DS4_N_VOCAB, input, 1u);
+        ds4_gpu_tensor_free(output);
+        ds4_gpu_tensor_free(input);
+        if (!ok) return false;
+    }
+    if (!ds4_gpu_tensor_read(
+            scratch->logits, 0u, logits,
+            (uint64_t)rows * DS4_N_VOCAB * sizeof(*logits))) return false;
+    for (uint32_t r = 0u; r < rows; r++)
+        graphs[r]->length = positions[r] + 1u;
     return true;
 }
 
@@ -39650,10 +39748,13 @@ static uint64_t batch_span_need(const ds4_gpu_tensor *tensor,
     return resident < bytes ? bytes - resident : 0u;
 }
 
-/* Qwen's kernels are still single-row/single-sequence, but the server can
- * keep two independent graphs alive and interleave them through the existing
- * continuous scheduler.  ponytail: cap this first banked runtime at two;
- * lift it only after Qwen shares prefill scratch or gains a true row batch. */
+/* Qwen keeps two bank-owned recurrent/cache states.  Decode shares the carrier
+ * graph's embedding and HC scratch as one two-row batch.  MoE and the output
+ * projection stay on scalar decode arithmetic because their multi-row kernels
+ * change token selection or the recurrent trajectory when a surviving bank
+ * returns to one-row MTP.
+ * ponytail: keep the first state-safe implementation at two banks; lift it only
+ * after the stateful PLE/GDN/QSA fronts also take descriptor arrays. */
 enum { DS4_QWEN_BANK_MAX = 2 };
 
 typedef struct ds4_qwen_batch_runtime {
@@ -39663,6 +39764,7 @@ typedef struct ds4_qwen_batch_runtime {
     ds4_qwen_gpu_graph *graph;
     uint64_t graph_bytes[DS4_QWEN_BANK_MAX];
     float *bank_logits;
+    float *row_logits;
     uint8_t *bank_logits_valid;
     float *mtp_logits;
     double mtp_baseline_ms[DS4_QWEN_BANK_MAX];
@@ -39679,6 +39781,7 @@ typedef struct ds4_qwen_batch_runtime {
     uint64_t checkpoint_clock;
     uint64_t checkpoint_slot_bytes;
     uint32_t checkpoint_stride;
+    uint64_t row_batch_calls;
 } ds4_qwen_batch_runtime;
 
 static uint64_t qwen_batch_census_live(void) {
@@ -39686,6 +39789,12 @@ static uint64_t qwen_batch_census_live(void) {
     return ds4_gpu_mem_census_read(
                DS4_MEMC_BATCH_BANK, DS4_MEMD_UNIFIED_DEVICE, &cell) == 0
         ? ds4_mem_cell_live(&cell) : 0u;
+}
+
+static bool qwen_batch_runtime_row_batch_enabled(void) {
+    const char *disabled = getenv("DS4_QWEN_NO_ROW_BATCH");
+    return !(disabled && disabled[0] &&
+             !(disabled[0] == '0' && disabled[1] == '\0'));
 }
 
 static bool qwen_batch_runtime_graph_live(
@@ -39733,6 +39842,7 @@ static void qwen_batch_runtime_free(ds4_qwen_batch_runtime *rt) {
     ds4_gpu_tensor_free(rt->checkpoint_slab);
     free(rt->checkpoint_logits);
     free(rt->mtp_logits);
+    free(rt->row_logits);
     free(rt->bank_logits);
     free(rt->bank_logits_valid);
     free(rt);
@@ -39750,13 +39860,16 @@ static ds4_qwen_batch_runtime *qwen_batch_runtime_create(
     rt->graph = xcalloc(max_seq, sizeof(*rt->graph));
     rt->bank_logits = xcalloc(
         (size_t)max_seq * DS4_N_VOCAB, sizeof(*rt->bank_logits));
+    rt->row_logits = xcalloc(
+        (size_t)max_seq * DS4_N_VOCAB, sizeof(*rt->row_logits));
     rt->bank_logits_valid = xcalloc(
         max_seq, sizeof(*rt->bank_logits_valid));
     if (ds4_engine_has_mtp(e)) {
         rt->mtp_logits = xcalloc(
             2u * (size_t)DS4_N_VOCAB, sizeof(*rt->mtp_logits));
     }
-    if (!rt->graph || !rt->bank_logits || !rt->bank_logits_valid) {
+    if (!rt->graph || !rt->bank_logits || !rt->row_logits ||
+        !rt->bank_logits_valid) {
         qwen_batch_runtime_free(rt);
         return NULL;
     }
@@ -39801,8 +39914,8 @@ static ds4_qwen_batch_runtime *qwen_batch_runtime_create(
             ? UINT32_MAX : (uint32_t)stride;
     }
     fprintf(stderr,
-            "ds4: Qwen bank runtime: %u independent graphs, ctx=%u "
-            "prefill=%u, partial=%u x %.2f MiB checkpoints stride=%u\n",
+            "ds4: Qwen bank runtime: %u bank states, shared HC row batch, "
+            "ctx=%u prefill=%u, partial=%u x %.2f MiB checkpoints stride=%u\n",
             max_seq, ctx_size, prefill_cap,
             rt->checkpoint_slab ? DS4_PARTIAL_CHECKPOINT_SLOTS : 0u,
             (double)rt->checkpoint_slot_bytes / 1048576.0,
@@ -40007,6 +40120,7 @@ static bool qwen_batch_runtime_prefill(
         e->qwen_ple_store, e->qwen_ple_cuda,
         tokens, rows, pos,
         final ? 1u : 0u,
+        false,
         final ? rt->bank_logits + (size_t)bank * DS4_N_VOCAB : NULL);
     if (ok && rt->graph[bank].mtp_enabled) {
         ds4_qwen_gpu_graph *g = &rt->graph[bank];
@@ -40038,6 +40152,49 @@ static bool qwen_batch_runtime_decode(
         const uint32_t *positions, uint32_t rows) {
     if (!rt || !e || !banks || !tokens || !positions || rows == 0u ||
         rows > rt->max_seq) return false;
+    bool row_batch = rows > 1u && qwen_batch_runtime_row_batch_enabled();
+    for (uint32_t i = 0u; i < rows; i++) {
+        if (banks[i] >= rt->max_seq) return false;
+        for (uint32_t prior = 0u; prior < i; prior++)
+            if (banks[prior] == banks[i]) return false;
+        if (rt->graph[banks[i]].image_features) row_batch = false;
+    }
+    if (row_batch) {
+        ds4_qwen_gpu_graph *graphs[DS4_QWEN_BANK_MAX] = {0};
+        for (uint32_t i = 0u; i < rows; i++) {
+            graphs[i] = &rt->graph[banks[i]];
+            rt->bank_logits_valid[banks[i]] = 0u;
+        }
+        const uint64_t before = qwen_batch_census_live();
+        if (!qwen4exp_graph_forward_decode_rows(
+                graphs, &e->model, &e->weights,
+                e->qwen_ple_store, e->qwen_ple_cuda,
+                tokens, positions, rows, rt->row_logits)) return false;
+        const uint64_t after = qwen_batch_census_live();
+        const uint64_t growth = after > before ? after - before : 0u;
+        const uint64_t share = (growth + rows - 1u) / rows;
+        for (uint32_t i = 0u; i < rows; i++) {
+            const uint32_t bank = banks[i];
+            if (UINT64_MAX - rt->graph_bytes[bank] >= share)
+                rt->graph_bytes[bank] += share;
+            memcpy(rt->bank_logits + (size_t)bank * DS4_N_VOCAB,
+                   rt->row_logits + (size_t)i * DS4_N_VOCAB,
+                   (size_t)DS4_N_VOCAB * sizeof(*rt->row_logits));
+            if (rt->graph[bank].mtp_enabled &&
+                !qwen4exp_graph_mtp_feed_chunk(
+                    &rt->graph[bank], &e->model, &e->weights,
+                    &tokens[i], 1u)) {
+                qwen4exp_graph_mtp_disable(
+                    &rt->graph[bank], "row-batch state update failed");
+            }
+            rt->bank_logits_valid[bank] = 1u;
+        }
+        if (rt->row_batch_calls++ == 0u)
+            fprintf(stderr,
+                    "ds4: Qwen true row batch active: two-row embedding/HC "
+                    "with bank-owned PLE/GDN/QSA/MoE/output\n");
+        return true;
+    }
     for (uint32_t i = 0; i < rows; i++) {
         const uint32_t bank = banks[i];
         if (bank >= rt->max_seq) return false;
@@ -40047,7 +40204,7 @@ static bool qwen_batch_runtime_decode(
                 &rt->graph[bank], &e->model, &e->weights,
                 e->qwen_ple_store, e->qwen_ple_cuda,
                 &tokens[i], 1u, positions[i],
-                1u,
+                1u, true,
                 rt->bank_logits + (size_t)bank * DS4_N_VOCAB);
         if (ok && rt->graph[bank].mtp_enabled &&
             !qwen4exp_graph_mtp_feed_chunk(
@@ -40064,8 +40221,8 @@ static bool qwen_batch_runtime_decode(
 }
 
 /* Commit one already-emitted bank token and sample its genuine successor.
- * When the embedded one-layer drafter is warm, verify [token, draft] in one
- * target call; a miss restores recurrent state and replays only token. */
+ * The embedded one-layer drafter proposes one token; the target verifies each
+ * committed token with its ordinary one-row arithmetic. */
 static bool qwen_batch_runtime_decode_next(
         ds4_qwen_batch_runtime *rt, ds4_engine *e, uint32_t bank,
         int token, uint32_t pos, float temperature, int top_k,
@@ -40106,59 +40263,41 @@ static bool qwen_batch_runtime_decode_next(
     }
     const int draft = sample_argmax(rt->mtp_logits, DS4_N_VOCAB);
     *drafted = true;
-    const ds4_ple_hash_state saved_hash = g->ple.hash_state;
-    if (!qwen4exp_graph_mtp_backup_target(g)) {
-        qwen4exp_graph_mtp_disable(g, "bank rollback reservation failed");
-        return qwen_batch_runtime_decode_next(
-            rt, e, bank, token, pos, temperature, top_k, top_p, min_p,
-            rng, override, next_token, committed, drafted, hit);
-    }
-
-    const int verify_tokens[2] = {token, draft};
     if (!qwen4exp_graph_forward_chunk(
             g, &e->model, &e->weights,
             e->qwen_ple_store, e->qwen_ple_cuda,
-            verify_tokens, 2u, pos, 2u, rt->mtp_logits)) {
-        if (!qwen4exp_graph_mtp_restore_target(g, pos, saved_hash))
-            return false;
-        qwen4exp_graph_mtp_disable(g, "bank two-row target verify failed");
-        return qwen_batch_runtime_decode_next(
-            rt, e, bank, token, pos, temperature, top_k, top_p, min_p,
-            rng, override, next_token, committed, drafted, hit);
-    }
+            &token, 1u, pos, 1u, true, rt->mtp_logits)) return false;
 
-    const uint64_t rng_before_verify = *rng;
     *next_token = sample_top_p_min_p_override(
         rt->mtp_logits, DS4_N_VOCAB,
         temperature, top_k, top_p, min_p, rng, override);
     if (*next_token == draft) {
+        const uint64_t row_bytes =
+            (uint64_t)DS4_N_EMBD * DS4_N_HC * sizeof(float);
+        ds4_gpu_tensor *target_first = ds4_gpu_tensor_view(
+            g->hidden[0], 0u, row_bytes);
+        const bool caught_up = target_first && qwen4exp_graph_mtp_step(
+            g, &e->model, &e->weights, target_first, &draft, 1u, NULL);
+        ds4_gpu_tensor_free(target_first);
+        if (!caught_up)
+            qwen4exp_graph_mtp_disable(
+                g, "bank accepted-prefix catch-up failed");
+        if (!qwen4exp_graph_forward_chunk(
+                g, &e->model, &e->weights,
+                e->qwen_ple_store, e->qwen_ple_cuda,
+                &draft, 1u, pos + 1u, 1u,
+                true,
+                rt->mtp_logits + DS4_N_VOCAB)) return false;
         memcpy(logits, rt->mtp_logits + DS4_N_VOCAB,
                (size_t)DS4_N_VOCAB * sizeof(*logits));
         *committed = 2u;
         *hit = true;
-        const uint64_t row_bytes =
-            (uint64_t)DS4_N_EMBD * DS4_N_HC * sizeof(float);
-        ds4_gpu_tensor *row0 = ds4_gpu_tensor_view(
-            g->hidden[0], 0u, row_bytes);
-        const bool caught_up = row0 && qwen4exp_graph_mtp_step(
-            g, &e->model, &e->weights, row0, &draft, 1u, NULL) &&
-            qwen4exp_graph_mtp_save_pending(g, 1u);
-        ds4_gpu_tensor_free(row0);
-        if (!caught_up)
+        if (g->mtp_enabled && !qwen4exp_graph_mtp_save_pending(g, 0u))
             qwen4exp_graph_mtp_disable(
-                g, "bank accepted-prefix catch-up failed");
+                g, "bank accepted-prefix save failed");
     } else {
-        if (!qwen4exp_graph_mtp_restore_target(g, pos, saved_hash) ||
-            !qwen4exp_graph_forward_chunk(
-                g, &e->model, &e->weights,
-                e->qwen_ple_store, e->qwen_ple_cuda,
-                &token, 1u, pos, 1u, logits)) {
-            return false;
-        }
-        *rng = rng_before_verify;
-        *next_token = sample_top_p_min_p_override(
-            logits, DS4_N_VOCAB, temperature, top_k, top_p, min_p,
-            rng, override);
+        memcpy(logits, rt->mtp_logits,
+               (size_t)DS4_N_VOCAB * sizeof(*logits));
         if (!qwen4exp_graph_mtp_save_pending(g, 0u))
             qwen4exp_graph_mtp_disable(
                 g, "bank rejected-prefix catch-up failed");
@@ -55908,7 +56047,11 @@ static int family_banked_engine_continuous_generate(
         const uint32_t decode_cap =
             family_cap < DS4_MULTISEQ_MAX_SEQ
                 ? family_cap : DS4_MULTISEQ_MAX_SEQ;
-        const bool qwen_mtp = ctx->qwen && ctx->qwen->mtp_logits;
+        /* One active bank uses speculative latency mode.  With multiple live
+         * banks, one state-safe target row batch shares the arithmetic that is
+         * bit-stable with scalar continuation and keeps each drafter warm. */
+        const bool qwen_mtp = ctx->qwen && ctx->qwen->mtp_logits &&
+            decode_count == 1u;
         if (qwen_mtp) {
             for (uint32_t row = 0u; ok && row < decode_count; row++) {
                 const uint32_t b = decode_banks[row];
@@ -62872,6 +63015,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                     e->qwen_ple_store, e->qwen_ple_cuda,
                     prompt->v + start, rows, (uint32_t)start,
                     last ? 1u : 0u,
+                    false,
                     last ? s->logits : NULL)) {
                 snprintf(err, errlen,
                          "Qwen4Exp prefill failed at token range %d:%d",
@@ -63393,7 +63537,8 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         if (!qwen4exp_graph_forward_chunk(
                 g, &e->model, &e->weights,
                 e->qwen_ple_store, e->qwen_ple_cuda,
-                &token, 1u, (uint32_t)s->checkpoint.len, 1u, s->logits)) {
+                &token, 1u, (uint32_t)s->checkpoint.len,
+                1u, true, s->logits)) {
             if (errlen) snprintf(err, errlen,
                                  "Qwen4Exp decode failed at position %d",
                                  s->checkpoint.len);
@@ -63798,8 +63943,8 @@ static int ds4_session_qwen_mtp_plain_step(
 }
 
 /* One embedded-Qwen MTP layer proposes exactly one future token.  The target
- * verifies [normal, draft] together; recurrent state rolls back on a miss,
- * while append-only QSA rows are hidden again by restoring their lengths. */
+ * verifies on its ordinary one-row arithmetic so accepted output stays
+ * identical to non-MTP generation. */
 static int ds4_session_eval_qwen_mtp(
         ds4_session *s, int first_token, int max_tokens, int eos_token,
         int *accepted, int accepted_cap, char *err, size_t errlen) {
@@ -63828,32 +63973,40 @@ static int ds4_session_eval_qwen_mtp(
     }
     const int draft = sample_argmax(s->mtp_logits, DS4_N_VOCAB);
     ds4_metric_add(&ds4_metrics_get()->spec_drafts, 1);
-    const ds4_ple_hash_state saved_hash = g->ple.hash_state;
-    if (!qwen4exp_graph_mtp_backup_target(g)) {
-        qwen4exp_graph_mtp_disable(g, "rollback reservation failed");
-        return ds4_session_qwen_mtp_plain_step(
-            s, first_token, accepted, err, errlen);
-    }
-
-    const int verify_tokens[2] = {first_token, draft};
     if (!qwen4exp_graph_forward_chunk(
             g, &e->model, &e->weights,
             e->qwen_ple_store, e->qwen_ple_cuda,
-            verify_tokens, 2u, pos, 2u, s->mtp_logits)) {
-        if (!qwen4exp_graph_mtp_restore_target(g, pos, saved_hash)) {
-            if (errlen) snprintf(err, errlen,
-                                 "Qwen MTP target rollback failed at %u", pos);
-            s->checkpoint_valid = false;
-            return -1;
-        }
-        qwen4exp_graph_mtp_disable(g, "two-row target verify failed");
-        return ds4_session_qwen_mtp_plain_step(
-            s, first_token, accepted, err, errlen);
+            &first_token, 1u, pos, 1u, true, s->mtp_logits)) {
+        if (errlen) snprintf(err, errlen,
+                             "Qwen MTP target verify failed at %u", pos);
+        s->checkpoint_valid = false;
+        return -1;
     }
 
     int n_accepted = 1;
     const int target_next = sample_argmax(s->mtp_logits, DS4_N_VOCAB);
     if (target_next == draft) {
+        const uint64_t hc_row_bytes =
+            (uint64_t)DS4_N_EMBD * DS4_N_HC * sizeof(float);
+        ds4_gpu_tensor *target_first = ds4_gpu_tensor_view(
+            g->hidden[0], 0u, hc_row_bytes);
+        const bool mtp_ok = target_first && qwen4exp_graph_mtp_step(
+            g, &e->model, &e->weights, target_first, &draft, 1u, NULL);
+        ds4_gpu_tensor_free(target_first);
+        if (!mtp_ok)
+            qwen4exp_graph_mtp_disable(g, "accepted-prefix catch-up failed");
+        if (!qwen4exp_graph_forward_chunk(
+                g, &e->model, &e->weights,
+                e->qwen_ple_store, e->qwen_ple_cuda,
+                &draft, 1u, pos + 1u, 1u,
+                true,
+                s->mtp_logits + DS4_N_VOCAB)) {
+            if (errlen) snprintf(err, errlen,
+                                 "Qwen MTP accepted draft failed at %u",
+                                 pos + 1u);
+            s->checkpoint_valid = false;
+            return -1;
+        }
         ds4_metric_add(&ds4_metrics_get()->spec_hits, 1);
         memcpy(s->logits, s->mtp_logits + DS4_N_VOCAB,
                (size_t)DS4_N_VOCAB * sizeof(*s->logits));
@@ -63862,29 +64015,11 @@ static int ds4_session_eval_qwen_mtp(
         accepted[0] = first_token;
         accepted[1] = draft;
         n_accepted = 2;
-
-        const uint64_t hc_row_bytes =
-            (uint64_t)DS4_N_EMBD * DS4_N_HC * sizeof(float);
-        ds4_gpu_tensor *row0 = ds4_gpu_tensor_view(
-            g->hidden[0], 0, hc_row_bytes);
-        const bool mtp_ok = row0 && qwen4exp_graph_mtp_step(
-            g, &e->model, &e->weights, row0, &draft, 1u, NULL) &&
-            qwen4exp_graph_mtp_save_pending(g, 1u);
-        ds4_gpu_tensor_free(row0);
-        if (!mtp_ok)
-            qwen4exp_graph_mtp_disable(g, "accepted-prefix catch-up failed");
+        if (g->mtp_enabled && !qwen4exp_graph_mtp_save_pending(g, 0u))
+            qwen4exp_graph_mtp_disable(g, "accepted-prefix save failed");
     } else {
-        if (!qwen4exp_graph_mtp_restore_target(g, pos, saved_hash) ||
-            !qwen4exp_graph_forward_chunk(
-                g, &e->model, &e->weights,
-                e->qwen_ple_store, e->qwen_ple_cuda,
-                &first_token, 1u, pos, 1u, s->logits)) {
-            if (errlen) snprintf(err, errlen,
-                                 "Qwen MTP rejected-draft replay failed at %u",
-                                 pos);
-            s->checkpoint_valid = false;
-            return -1;
-        }
+        memcpy(s->logits, s->mtp_logits,
+               (size_t)DS4_N_VOCAB * sizeof(*s->logits));
         token_vec_push(&s->checkpoint, first_token);
         accepted[0] = first_token;
         if (!qwen4exp_graph_mtp_save_pending(g, 0u))

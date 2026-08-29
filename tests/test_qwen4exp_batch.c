@@ -10,6 +10,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static double bench_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
 static int serial_greedy(ds4_engine *engine, const ds4_tokens *prompt,
                          int budget, int *out, char *err, size_t errlen) {
@@ -159,6 +166,7 @@ static void fork_done(void *ud, void *user, const int *tokens,
 typedef struct {
     ds4_batch_ctx *ctx;
     const ds4_tokens *prompts;
+    int budget[2];
     int next;
     int tokens[2][12];
     int n[2];
@@ -174,7 +182,7 @@ static int bank_mtp_admit(void *ud, ds4_cont_request *req) {
     memset(req, 0, sizeof(*req));
     req->tokens = test->prompts[i].v;
     req->n = test->prompts[i].len;
-    req->max_new = 12;
+    req->max_new = test->budget[i];
     req->eos = -1;
     req->user = (void *)(uintptr_t)(i + 1);
     return 1;
@@ -189,7 +197,7 @@ static void bank_mtp_done(void *ud, void *user, const int *tokens,
         test->failed = 1;
         return;
     }
-    if (!tokens || n != 12 ||
+    if (!tokens || n != test->budget[i] ||
         !ds4_cont_last_done_stats(test->ctx, &test->stats[i])) {
         test->failed = 1;
         return;
@@ -270,10 +278,22 @@ int main(int argc, char **argv) {
             engine, &prompt[1], MTP_BUDGET, mtp_got[1],
             &mtp_multi_accepts[1], err, sizeof(err)) != 0 ||
         memcmp(mtp_got[0], mtp_oracle[0], sizeof(mtp_got[0])) != 0 ||
+        memcmp(mtp_got[1], mtp_oracle[1], sizeof(mtp_got[1])) != 0 ||
         mtp_multi_accepts[0] == 0 || mtp_multi_accepts[1] == 0) {
         fprintf(stderr,
                 "Qwen target-verified MTP failed: %s multi_accepts=%d/%d\n",
                 err, mtp_multi_accepts[0], mtp_multi_accepts[1]);
+        for (int i = 0; i < 2; i++) {
+            for (int j = 0; j < MTP_BUDGET; j++) {
+                if (mtp_got[i][j] != mtp_oracle[i][j]) {
+                    fprintf(stderr,
+                            "Qwen MTP prompt %d first mismatch at %d: "
+                            "got=%d want=%d\n",
+                            i, j, mtp_got[i][j], mtp_oracle[i][j]);
+                    break;
+                }
+            }
+        }
         failed = 1;
         goto cleanup;
     }
@@ -296,19 +316,23 @@ int main(int argc, char **argv) {
     bank_mtp_case bank_mtp = {
         .ctx = ctx,
         .prompts = prompt,
+        .budget = {4, MTP_BUDGET},
     };
     err[0] = '\0';
     if (ds4_engine_continuous_generate(
             ctx, bank_mtp_admit, NULL, bank_mtp_done, &bank_mtp,
             err, sizeof(err)) != 0 || bank_mtp.failed ||
         bank_mtp.completed != 2 ||
-        bank_mtp.n[0] != MTP_BUDGET || bank_mtp.n[1] != MTP_BUDGET ||
-        memcmp(bank_mtp.tokens, mtp_got, sizeof(mtp_got)) != 0 ||
-        bank_mtp.stats[0].spec_drafts == 0u ||
+        bank_mtp.n[0] != bank_mtp.budget[0] ||
+        bank_mtp.n[1] != bank_mtp.budget[1] ||
+        memcmp(bank_mtp.tokens[0], mtp_oracle[0],
+               (size_t)bank_mtp.budget[0] * sizeof(mtp_oracle[0][0])) != 0 ||
+        memcmp(bank_mtp.tokens[1], mtp_oracle[1],
+               (size_t)bank_mtp.budget[1] * sizeof(mtp_oracle[1][0])) != 0 ||
         bank_mtp.stats[1].spec_drafts == 0u ||
         bank_mtp.stats[0].spec_hits + bank_mtp.stats[1].spec_hits == 0u) {
         fprintf(stderr,
-                "Qwen bank MTP failed: %s completed=%d "
+                "Qwen bank row transition failed: %s completed=%d "
                 "tokens=%d/%d drafts=%llu/%llu hits=%llu/%llu\n",
                 err, bank_mtp.completed, bank_mtp.n[0], bank_mtp.n[1],
                 (unsigned long long)bank_mtp.stats[0].spec_drafts,
@@ -316,18 +340,75 @@ int main(int argc, char **argv) {
                 (unsigned long long)bank_mtp.stats[0].spec_hits,
                 (unsigned long long)bank_mtp.stats[1].spec_hits);
         for (int i = 0; i < 2; i++) {
-            for (int j = 0; j < MTP_BUDGET; j++) {
-                if (bank_mtp.tokens[i][j] != mtp_got[i][j]) {
+            for (int j = 0; j < bank_mtp.budget[i]; j++) {
+                if (bank_mtp.tokens[i][j] != mtp_oracle[i][j]) {
                     fprintf(stderr,
-                            "Qwen bank MTP row %d first mismatch at %d: "
+                            "Qwen bank row %d first mismatch at %d: "
                             "got=%d want=%d\n",
-                            i, j, bank_mtp.tokens[i][j], mtp_got[i][j]);
+                            i, j, bank_mtp.tokens[i][j], mtp_oracle[i][j]);
                     break;
                 }
             }
         }
         failed = 1;
         goto cleanup;
+    }
+
+    if (getenv("DS4_QWEN_ROW_BENCH")) {
+        double row_seconds[3] = {0.0};
+        double scalar_seconds[3] = {0.0};
+        const int order[3][2] = {{1, 0}, {0, 1}, {1, 0}};
+        const int perf_budget[2] = {MTP_BUDGET, MTP_BUDGET};
+        const int perf_eos[2] = {-1, -1};
+        for (int round = 0; round < 3; round++) {
+            for (int pass = 0; pass < 2; pass++) {
+                const int row_batch = order[round][pass];
+                if ((row_batch
+                         ? unsetenv("DS4_QWEN_NO_ROW_BATCH")
+                         : setenv("DS4_QWEN_NO_ROW_BATCH", "1", 1)) != 0) {
+                    perror("row batch benchmark environment");
+                    failed = 1;
+                    goto cleanup;
+                }
+                ds4_batch_gen_result perf[2] = {0};
+                const double t0 = bench_now();
+                const int rc = ds4_engine_batched_generate_ctx(
+                    ctx, prompt, 2, perf_budget, perf_eos,
+                    perf, err, sizeof(err));
+                const double elapsed = bench_now() - t0;
+                if (rc != 0 || perf[0].n_tokens != MTP_BUDGET ||
+                    perf[1].n_tokens != MTP_BUDGET ||
+                    memcmp(perf[0].tokens, mtp_oracle[0],
+                           sizeof(mtp_oracle[0])) != 0 ||
+                    memcmp(perf[1].tokens, mtp_oracle[1],
+                           sizeof(mtp_oracle[1])) != 0) {
+                    fprintf(stderr,
+                            "Qwen row benchmark parity failed: mode=%s %s\n",
+                            row_batch ? "row" : "scalar", err);
+                    free(perf[0].tokens);
+                    free(perf[1].tokens);
+                    failed = 1;
+                    goto cleanup;
+                }
+                free(perf[0].tokens);
+                free(perf[1].tokens);
+                (row_batch ? row_seconds : scalar_seconds)[round] = elapsed;
+            }
+        }
+        unsetenv("DS4_QWEN_NO_ROW_BATCH");
+        double row_total = 0.0, scalar_total = 0.0;
+        for (int i = 0; i < 3; i++) {
+            row_total += row_seconds[i];
+            scalar_total += scalar_seconds[i];
+        }
+        const double tokens = 2.0 * MTP_BUDGET * 3.0;
+        printf("Qwen row A/B: row %.2f tok/s [%.3f %.3f %.3f s], "
+               "scalar %.2f tok/s [%.3f %.3f %.3f s], speedup %.2f%%\n",
+               tokens / row_total,
+               row_seconds[0], row_seconds[1], row_seconds[2],
+               tokens / scalar_total,
+               scalar_seconds[0], scalar_seconds[1], scalar_seconds[2],
+               (scalar_total / row_total - 1.0) * 100.0);
     }
 
     const int budget[2] = {2, 2};
