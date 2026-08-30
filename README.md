@@ -1,6 +1,6 @@
-# Entrpi/DwarfStar
+# ds4: dfm Edition
 
-**Entrpi/DwarfStar** (`ds4`) is a small native inference engine for **DeepSeek
+**DwarfStar** (`ds4`) is a small native inference engine for **DeepSeek
 V4 Flash**, with support for **DeepSeek V4 PRO** on very high-memory
 machines. It is intentionally narrow: not a generic GGUF runner, not a
 wrapper around another runtime, completely self-contained. It provides
@@ -9,18 +9,13 @@ DS4-specific loading, prompt rendering, tool calling, KV state handling
 plus tools for GGUF and imatrix generation and for quality and speed
 testing.
 
-This repository, [Entrpi/ds4](https://github.com/Entrpi/ds4), is a fork
-of [antirez/ds4](https://github.com/antirez/ds4) (the original
+This repository is a fork of [Entrpi/ds4](https://github.com/Entrpi/ds4) and [antirez/ds4](https://github.com/antirez/ds4) (the original
 DwarfStar) that has diverged nearly since the project's inception: it
 builds the CUDA/Linux side into a **batched multi-request serving
 engine**. The
 reference machines are the DGX Spark (GB10, `sm_121`) and the RTX PRO
 6000 Blackwell (`sm_120`). Upstream's heart is a single-user CLI/agent
-engine, Metal first; the fork keeps all of that working. The fork story
-and its measured results are in [About this fork](#about-this-fork)
-near the end of this README. On a DGX Spark, the fastest path is the
-packaged installer at
-[Entrpi/ds4-on-spark](https://github.com/Entrpi/ds4-on-spark).
+engine, Metal first; the fork is trying to keep all of that working.
 
 Backends:
 * **NVIDIA CUDA** is the fork's optimization target, with special care for the DGX Spark.
@@ -41,7 +36,7 @@ memory. The implementation remains a narrow C/CUDA engine: every accepted
 architecture has an explicit metadata validator, tensor binder, prompt
 protocol, state lifecycle, and device kernel path.
 
-`v0.6.3-dfm` is based on Entrpi `v0.6.3`. The current `dfm` branch accepts
+`v0.6.5-dfm` is based on Entrpi `v0.6.5`. The current `dfm` branch accepts
 only the explicitly validated model families below:
 
 | Model family | GGUF architecture | Serving and state support |
