@@ -24,11 +24,18 @@ pub(super) fn run_owner_maybe_roll(
         return None;
     }
     let second = match jobs_rx.try_recv() {
-        Ok(next) => next,
-        Err(TryRecvError::Empty | TryRecvError::Disconnected) => {
-            run_owner_job(cfg, inner, engine, Some(exec), job);
-            return None;
+        Ok(next) => Some(next),
+        Err(TryRecvError::Disconnected) => None,
+        Err(TryRecvError::Empty) => {
+            let wait = super::owner_static::coalesce_wait_from_env();
+            (!wait.is_zero())
+                .then(|| jobs_rx.recv_timeout(wait).ok())
+                .flatten()
         }
+    };
+    let Some(second) = second else {
+        run_owner_job(cfg, inner, engine, Some(exec), job);
+        return None;
     };
     if cfg.max_queue_age_s > 0.0
         && second.prepared.arrived_at.elapsed().as_secs_f64() > cfg.max_queue_age_s
@@ -143,6 +150,10 @@ fn serve_pair(
         &mut bank_hold_retry,
         store,
     );
+    let served = result_a.is_ok() as usize + result_b.is_ok() as usize;
+    let fallback = matches!(&result_a, Err(GenerateError::Unsupported(_))) as usize
+        + matches!(&result_b, Err(GenerateError::Unsupported(_))) as usize;
+    eprintln!("ds4-server-rs: continuous batch path=cont served={served} fallback={fallback}");
     settle_roll_job(cfg, inner, engine, first, &id_a, result_a);
     settle_roll_job(cfg, inner, engine, second, &id_b, result_b);
 }

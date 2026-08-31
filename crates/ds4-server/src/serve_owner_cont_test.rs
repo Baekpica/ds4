@@ -112,6 +112,33 @@ fn owner_roll_pair_invokes_tick_roll_prefill() {
     let _ = drain_b.done.recv();
 }
 
+#[test]
+fn late_roll_sibling_joins_when_coalesce_wait_is_set() {
+    let cfg = ServerConfig {
+        have_engine: true,
+        default_tokens: 8,
+        ..ServerConfig::default()
+    };
+    let inner = Arc::new(Mutex::new(ServerInner::from_cfg(&cfg)));
+    let (job_a, drain_a) = cont_chat_job(&inner, "a");
+    let (job_b, drain_b) = cont_chat_job(&inner, "b");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        tx.send(job_b).unwrap();
+    });
+    let mut spy = RollSpy::default();
+    let mut engine = ScriptedDecode::from_pieces(&[b"serial-fallback"]);
+    std::env::set_var("DS4_SERVER_COALESCE_WAIT_MS", "100");
+    let leftover = run_owner_maybe_roll(&cfg, &inner, &mut engine, &mut spy, job_a, &rx);
+    std::env::remove_var("DS4_SERVER_COALESCE_WAIT_MS");
+
+    assert!(leftover.is_none());
+    assert_eq!(spy.generate_calls, 2);
+    let _ = drain_a.done.recv();
+    let _ = drain_b.done.recv();
+}
+
 struct StepperCont;
 
 impl ContExec for StepperCont {

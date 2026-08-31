@@ -73,7 +73,7 @@ fn static_route_env(cfg: &ServerConfig, exec: &dyn ContExec, prompt_len: i32) ->
     }
 }
 
-fn coalesce_wait_from_env() -> Duration {
+pub(super) fn coalesce_wait_from_env() -> Duration {
     // Same knob as C coalesce_gather: default 0 (drain only). A small
     // positive window lets two concurrent short HTTP jobs join n=2
     // instead of collapsing each to serial.

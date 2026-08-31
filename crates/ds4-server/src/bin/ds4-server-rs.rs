@@ -2,7 +2,7 @@
 //! native FFI when `-m` opens a model. Continuation registry is host-owned.
 //! Incremental live DSML tool projection is host-owned.
 
-use ds4_core::{Backend, DistributedConfig, DistributedRole, Model};
+use ds4_core::{Backend, DistributedConfig, DistributedRole, Model, ModelOpenOption};
 use ds4_server::kv_cli::DiskKvArgs;
 use ds4_server::{
     accept_loop, accept_loop_with_engine, accept_loop_with_engine_cont, listen,
@@ -42,6 +42,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2);
+    let mut model_options = Vec::new();
     let mut kv = DiskKvArgs::default();
     let mut dist = DistArgs::default();
     let mut args = std::env::args().skip(1);
@@ -87,12 +88,24 @@ fn main() {
                     }
                 };
             }
-            "--tokens" => {
+            "--cuda" => backend = Backend::Cuda,
+            "--tokens" | "-n" => {
                 cfg.default_tokens = args
                     .next()
                     .and_then(|v| v.parse().ok())
                     .unwrap_or_else(|| usage());
             }
+            "--mtp-draft" => model_options.push(ModelOpenOption::MtpDraftTokens(
+                args.next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage()),
+            )),
+            "--mtp-margin" => model_options.push(ModelOpenOption::MtpMargin(
+                args.next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| usage()),
+            )),
+            "--no-update-check" => {}
             "-c" | "--ctx" => {
                 cfg.ctx = args
                     .next()
@@ -138,10 +151,19 @@ fn main() {
     let model = match model_path.as_deref() {
         Some(path) => {
             let opened = match native_dist.as_ref() {
-                Some(config) => {
-                    Model::open_distributed(path, backend, n_threads, true, None, None, config)
+                Some(config) => Model::open_distributed_options(
+                    path,
+                    backend,
+                    n_threads,
+                    true,
+                    None,
+                    None,
+                    config,
+                    &model_options,
+                ),
+                None => {
+                    Model::open_configured(path, backend, n_threads, true, None, &model_options)
                 }
-                None => Model::open(path, backend, n_threads, true),
             };
             match opened {
                 Ok(m) => {
@@ -247,8 +269,8 @@ fn cli_error(message: &str) -> ! {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: ds4-server-rs [--host HOST] [--port PORT] [--listen HOST PORT] [--model-id ID] [-m GGUF] [--backend cuda|cpu|metal] [--tokens N] [-c N] [-t N] [--mem-floor-gb N] [--cors]\n\
-         Disk KV: [--kv-disk-dir DIR] [--kv-disk-space-mb N] [--kv-cache-min-tokens N]\n\
+        "usage: ds4-server-rs [--host HOST] [--port PORT] [--listen HOST PORT] [--model-id ID] [-m GGUF] [--backend cuda|cpu|metal|--cuda] [--tokens N|-n N] [-c N] [-t N] [--mtp-draft N] [--mtp-margin N] [--mem-floor-gb N] [--cors]\n\
+Disk KV: [--kv-disk-dir DIR] [--kv-disk-space-mb N] [--kv-cache-min-tokens N]\n\
          [--kv-cache-cold-max-tokens N] [--kv-cache-continued-interval-tokens N]\n\
          [--kv-cache-boundary-trim-tokens N]\n\
          [--kv-cache-boundary-align-tokens N]\n\
