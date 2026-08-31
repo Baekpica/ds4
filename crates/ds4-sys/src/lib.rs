@@ -10,6 +10,8 @@ use std::ffi::CString;
 use std::os::raw::{c_char, c_float, c_int, c_void};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::{io, net::TcpStream, os::fd::AsRawFd};
 
 unsafe extern "C" {
     fn atoi(value: *const c_char) -> c_int;
@@ -67,6 +69,32 @@ pub fn libc_strtoull10(value: &[u8]) -> u64 {
 
 pub fn libc_atof(value: &[u8]) -> f64 {
     CString::new(value).map_or(0.0, |value| unsafe { atof(value.as_ptr()) })
+}
+
+#[cfg(unix)]
+pub fn set_socket_send_buffer(stream: &TcpStream, bytes: i32) -> io::Result<()> {
+    if bytes <= 0 {
+        return Ok(());
+    }
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&bytes as *const i32).cast(),
+            std::mem::size_of::<i32>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+pub fn set_socket_send_buffer(_stream: &std::net::TcpStream, _bytes: i32) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[repr(C)]
@@ -790,4 +818,34 @@ pub struct ds4_bridge_cont_request {
     pub n_cached: i32,
     pub bank_used: *mut i32,
     pub fork_bank: i32,
+}
+
+#[cfg(all(test, unix))]
+mod socket_tests {
+    use super::set_socket_send_buffer;
+    use std::net::{TcpListener, TcpStream};
+    use std::os::fd::AsRawFd;
+
+    #[test]
+    fn send_buffer_adapter_accepts_a_connected_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+
+        set_socket_send_buffer(&server, 32 * 1024).unwrap();
+        let mut actual = 0i32;
+        let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                server.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&mut actual as *mut i32).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        assert!(actual >= 32 * 1024, "SO_SNDBUF={actual}");
+        drop(client);
+    }
 }

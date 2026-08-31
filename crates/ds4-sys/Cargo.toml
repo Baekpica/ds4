@@ -8,3 +8,6 @@ description = "Unsafe FFI bindings to native/bridge/ds4_bridge.h"
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"

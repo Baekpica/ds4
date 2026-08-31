@@ -73,6 +73,7 @@ pub struct ServerConfig {
     pub max_queue_age_s: f64,
     pub out_agg_cap_bytes: u64,
     pub out_agg_evict_min_bytes: u64,
+    pub client_sndbuf: i32,
     pub disconnect_abort: bool,
     pub continuous: bool,
     pub have_engine: bool,
@@ -173,6 +174,7 @@ impl Default for ServerConfig {
                 "DS4_SERVER_OUT_AGG_EVICT_MIN",
                 JOB_SINK_AGG_EVICT_MIN_BYTES,
             ),
+            client_sndbuf: env_i32_bound("DS4_SERVER_CLIENT_SNDBUF", 0),
             disconnect_abort: parse_default_on(
                 std::env::var_os("DS4_SERVER_DISCONNECT_ABORT").as_deref(),
             ),
@@ -1818,18 +1820,17 @@ pub fn accept_loop(listener: TcpListener, cfg: ServerConfig) {
         let inner = Arc::clone(&inner);
         let _ = thread::Builder::new().spawn(move || {
             let _ = stream.set_nodelay(true);
-            configure_client_socket(&stream);
+            configure_client_socket(&stream, cfg.client_sndbuf);
             handle_client_inner(&cfg, &inner, &mut stream, None, None);
         });
     }
     lock_inner(&inner).admit.stopping = true;
 }
 
-fn configure_client_socket(stream: &TcpStream) {
-    // Known C-parity gap: std::net::TcpStream has no safe send-buffer setter,
-    // so DS4_SERVER_CLIENT_SNDBUF remains unsupported without unsafe or a dependency.
+fn configure_client_socket(stream: &TcpStream, client_sndbuf: i32) {
     let _ = stream.set_read_timeout(Some(CLIENT_IO_TIMEOUT));
     let _ = stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT));
+    let _ = ds4_sys::set_socket_send_buffer(stream, client_sndbuf);
 }
 
 fn send_all_nonblocking(stream: &mut TcpStream, mut bytes: &[u8]) -> std::io::Result<()> {
@@ -1877,7 +1878,7 @@ fn client_disconnected(stream: &TcpStream) -> bool {
 }
 
 fn drain_job(mut stream: TcpStream, drain: JobDrain) {
-    configure_client_socket(&stream);
+    configure_client_socket(&stream, 0);
     loop {
         let mut buffer = drain.state.lock();
         if buffer.bytes.is_empty() && !buffer.closed && !buffer.gone {
@@ -1915,7 +1916,7 @@ fn queue_client(
     _client: ClientLease,
 ) {
     let _ = stream.set_nodelay(true);
-    configure_client_socket(&stream);
+    configure_client_socket(&stream, cfg.client_sndbuf);
     let Some(mut prepared) = prepare_client(&cfg, &inner, &mut stream) else {
         return;
     };
