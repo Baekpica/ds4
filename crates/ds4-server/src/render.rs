@@ -1,4 +1,4 @@
-//! Family chat render from `ds4_server.c` at v0.6.3-dfm, including
+//! Family chat render from `ds4_server.c` at v0.6.5-dfm, including
 //! tool-schema prompts and invoke reconstruct. Live tool stream
 //! machines are host-owned (`tool_stream`).
 
@@ -44,6 +44,12 @@ pub const SOLAR_THINK_START: &str = "<|think:start|>";
 pub const SOLAR_THINK_END: &str = "<|think:end|>";
 pub const SOLAR_TOOL_RESPONSE_START: &str = "<|tool_response:start|>";
 pub const SOLAR_TOOL_RESPONSE_END: &str = "<|tool_response:end|>";
+pub const QWEN_IM_START: &str = "<|im_start|>";
+pub const QWEN_IM_END: &str = "<|im_end|>";
+pub const QWEN_TOOL_CALL_START: &str = "<tool_call>";
+pub const QWEN_TOOL_CALL_END: &str = "</tool_call>";
+pub const QWEN_TOOL_RESPONSE_START: &str = "<tool_response>";
+pub const QWEN_TOOL_RESPONSE_END: &str = "</tool_response>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSyntax {
@@ -52,6 +58,7 @@ pub enum ModelSyntax {
     Motif3 = 3,
     Exaone = 4,
     Dots3 = 5,
+    Qwen4Exp = 6,
 }
 
 /// C `server_model_syntax_for_engine`.
@@ -61,6 +68,7 @@ pub fn syntax_for_model_id(model_id: i32) -> ModelSyntax {
         3 => ModelSyntax::Motif3,
         4 => ModelSyntax::Exaone,
         5 => ModelSyntax::Dots3,
+        6 => ModelSyntax::Qwen4Exp,
         _ => ModelSyntax::DeepSeek,
     }
 }
@@ -70,6 +78,7 @@ pub fn tool_start_marker(syntax: ModelSyntax) -> &'static str {
         ModelSyntax::SolarOpen2 => SOLAR_TOOL_CALLS,
         ModelSyntax::Motif3 | ModelSyntax::Exaone => MOTIF_TOOL_CALLS,
         ModelSyntax::Dots3 => DOTS3_TOOL_CALLS,
+        ModelSyntax::Qwen4Exp => QWEN_TOOL_CALL_START,
         ModelSyntax::DeepSeek => DSML_TOOL_CALLS,
     }
 }
@@ -397,6 +406,72 @@ fn append_solar_tool_calls_text(out: &mut Vec<u8>, m: &ChatMsg, orders: &[ToolSc
             out.push(b'\n');
         }
         put(out, SOLAR_TOOL_CALL_END);
+    }
+}
+
+fn append_qwen_arg(out: &mut Vec<u8>, arg: &crate::json::JsonArg) {
+    put(out, "<parameter=");
+    put(out, &arg.key);
+    put(out, ">\n");
+    put(out, &arg.value);
+    put(out, "\n</parameter>\n");
+}
+
+fn append_qwen_arguments_from_json(
+    out: &mut Vec<u8>,
+    json: &str,
+    order: Option<&ToolSchemaOrder>,
+) -> bool {
+    let Some(mut args) = json_args_parse(json) else {
+        return false;
+    };
+    if let Some(order) = order {
+        for prop in &order.prop {
+            if let Some(idx) = json_args_find_unused(&args, prop) {
+                append_qwen_arg(out, &args[idx]);
+                args[idx].used = true;
+            }
+        }
+    }
+    for arg in &args {
+        if !arg.used {
+            append_qwen_arg(out, arg);
+        }
+    }
+    true
+}
+
+fn append_qwen_tool_calls_text(out: &mut Vec<u8>, m: &ChatMsg, orders: &[ToolSchemaOrder]) {
+    if m.calls.is_empty() {
+        return;
+    }
+    if !m.raw_dsml.is_empty() {
+        put(out, &m.raw_dsml);
+        return;
+    }
+    for (i, tc) in m.calls.iter().enumerate() {
+        if i > 0 {
+            out.push(b'\n');
+        }
+        put(out, QWEN_TOOL_CALL_START);
+        put(out, "\n<function=");
+        put(out, &tc.name);
+        put(out, ">\n");
+        let order = tool_schema_orders_find(orders, &tc.name);
+        if !append_qwen_arguments_from_json(out, &tc.arguments, order) {
+            put(out, "<parameter=arguments>\n");
+            put(
+                out,
+                if tc.arguments.is_empty() {
+                    "{}"
+                } else {
+                    &tc.arguments
+                },
+            );
+            put(out, "\n</parameter>\n");
+        }
+        put(out, "</function>\n");
+        put(out, QWEN_TOOL_CALL_END);
     }
 }
 
@@ -1256,6 +1331,179 @@ pub fn render_solar_chat_ex(
     Ok(out)
 }
 
+fn qwen_reasoning_instruction(mode: ThinkMode) -> &'static str {
+    match mode {
+        ThinkMode::Low => concat!(
+            "Reasoning effort is set to low. Keep your thinking brief and focused, ",
+            "moving directly to the conclusion without unnecessary elaboration."
+        ),
+        ThinkMode::High | ThinkMode::Max => concat!(
+            "Reasoning effort is set to xhigh. Please think carefully through the task, ",
+            "validate key assumptions, consider plausible alternatives, and prioritize ",
+            "correctness, consistency, and clarity in the final answer."
+        ),
+        ThinkMode::None => "",
+    }
+}
+
+fn append_qwen_tools_prompt_text(out: &mut Vec<u8>, tool_schemas: &str) {
+    put(
+        out,
+        "# Tools\n\nYou have access to the following functions:\n\n<tools>",
+    );
+    let mut p = Json::new(tool_schemas);
+    while p.peek().is_some() {
+        p.ws();
+        if p.peek().is_none() {
+            break;
+        }
+        let Some(schema) = json_raw_value(&mut p) else {
+            break;
+        };
+        put(out, "\n{\"type\": \"function\", \"function\": ");
+        dots3_pyspace_json(out, &schema);
+        out.push(b'}');
+    }
+    put(
+        out,
+        concat!(
+            "\n</tools>",
+            "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:",
+            "\n\n<tool_call>\n<function=example_function_name>",
+            "\n<parameter=example_parameter_1>\nvalue_1\n</parameter>",
+            "\n<parameter=example_parameter_2>\nThis is the value for the second parameter",
+            "\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>",
+            "\n\n<IMPORTANT>\nReminder:",
+            "\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags",
+            "\n- Required parameters MUST be specified",
+            "\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after",
+            "\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls",
+            "\n</IMPORTANT>"
+        ),
+    );
+}
+
+pub(crate) fn append_qwen_tool_response_text(out: &mut Vec<u8>, s: &[u8]) {
+    let end = QWEN_TOOL_RESPONSE_END.as_bytes();
+    let mut i = 0;
+    while i < s.len() {
+        if s[i..].starts_with(end) {
+            out.extend_from_slice(b"&lt;");
+            i += 1;
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+}
+
+pub fn render_qwen_chat_ex(
+    msgs: &[ChatMsg],
+    tool_schemas: &str,
+    tool_orders: &[ToolSchemaOrder],
+    think_mode: ThinkMode,
+) -> Result<Vec<u8>, RenderError> {
+    let mut system = Vec::new();
+    for m in msgs.iter().filter(|m| role_is_system(&m.role)) {
+        if !system.is_empty() {
+            put(&mut system, "\n\n");
+        }
+        put_trimmed(&mut system, &m.content);
+    }
+
+    let instruction = qwen_reasoning_instruction(think_mode);
+    let mut out = Vec::new();
+    if !tool_schemas.is_empty() {
+        put(&mut out, QWEN_IM_START);
+        put(&mut out, "system\n");
+        if !instruction.is_empty() {
+            put(&mut out, instruction);
+            put(&mut out, "\n\n");
+        }
+        append_qwen_tools_prompt_text(&mut out, tool_schemas);
+        if !system.is_empty() {
+            put(&mut out, "\n\n");
+            out.extend_from_slice(&system);
+        }
+        put(&mut out, QWEN_IM_END);
+        out.push(b'\n');
+    } else if !system.is_empty() || !instruction.is_empty() {
+        put(&mut out, QWEN_IM_START);
+        put(&mut out, "system\n");
+        if !instruction.is_empty() {
+            put(&mut out, instruction);
+            if !system.is_empty() {
+                put(&mut out, "\n\n");
+            }
+        }
+        out.extend_from_slice(&system);
+        put(&mut out, QWEN_IM_END);
+        out.push(b'\n');
+    }
+
+    let mut i = 0;
+    while i < msgs.len() {
+        let m = &msgs[i];
+        if role_is_system(&m.role) {
+            i += 1;
+            continue;
+        }
+        if m.role == "user" && !chat_msg_is_model_tool_result(m) {
+            put(&mut out, QWEN_IM_START);
+            put(&mut out, "user\n");
+            put_trimmed(&mut out, &m.content);
+            put(&mut out, QWEN_IM_END);
+            out.push(b'\n');
+            i += 1;
+            continue;
+        }
+        if chat_msg_is_model_tool_result(m) {
+            let mut views = Vec::new();
+            while i < msgs.len() && chat_msg_is_model_tool_result(&msgs[i]) {
+                collect_tool_result_message(&msgs[i], &mut views);
+                i += 1;
+            }
+            if !views.is_empty() {
+                put(&mut out, QWEN_IM_START);
+                put(&mut out, "user");
+                for v in views {
+                    put(&mut out, "\n");
+                    put(&mut out, QWEN_TOOL_RESPONSE_START);
+                    put(&mut out, "\n");
+                    append_qwen_tool_response_text(&mut out, v.text);
+                    put(&mut out, "\n");
+                    put(&mut out, QWEN_TOOL_RESPONSE_END);
+                }
+                put(&mut out, QWEN_IM_END);
+                out.push(b'\n');
+            }
+            continue;
+        }
+        if m.role == "assistant" {
+            put(&mut out, QWEN_IM_START);
+            put(&mut out, "assistant\n<think>\n");
+            put_trimmed(&mut out, &m.reasoning);
+            put(&mut out, "\n</think>\n\n");
+            let content_start = out.len();
+            put_trimmed(&mut out, &m.content);
+            if !m.calls.is_empty() && out.len() > content_start {
+                put(&mut out, "\n\n");
+            }
+            append_qwen_tool_calls_text(&mut out, m, tool_orders);
+            put(&mut out, QWEN_IM_END);
+            out.push(b'\n');
+        }
+        i += 1;
+    }
+
+    put(&mut out, QWEN_IM_START);
+    put(&mut out, "assistant\n<think>\n");
+    if !think_mode_enabled(think_mode) {
+        put(&mut out, "\n</think>\n\n");
+    }
+    Ok(out)
+}
+
 pub fn render_chat(
     syntax: ModelSyntax,
     msgs: &[ChatMsg],
@@ -1287,6 +1535,7 @@ pub fn render_chat_choice(
         ModelSyntax::SolarOpen2 => {
             render_solar_chat_ex(msgs, tool_schemas, tool_orders, think_mode)
         }
+        ModelSyntax::Qwen4Exp => render_qwen_chat_ex(msgs, tool_schemas, tool_orders, think_mode),
         ModelSyntax::DeepSeek => {
             render_dsml_chat_choice(msgs, tool_schemas, think_mode, tool_choice)
         }

@@ -1,13 +1,14 @@
 //! Generated-message tool parse + serial semantic accumulator from
-//! `ds4_server.c` at v0.6.3-dfm. DSML greedy / required-prefix sampling
+//! `ds4_server.c` at v0.6.5-dfm. DSML greedy / required-prefix sampling
 //! and corrective retry (`retry`) are host-owned.
 
 use crate::dsml::{DsmlDecodeState, DsmlDecodeTracker, SampleOverride, SamplePolicy};
 use crate::json::{json_escape_bytes, json_minify_raw_value, json_raw_value, json_string, Json};
 use crate::parse::{ToolCall, ToolSchemaOrder};
 use crate::render::{
-    syntax_for_model_id, ModelSyntax, SOLAR_THINK_END, SOLAR_THINK_START, SOLAR_TOOL_ARG_END,
-    SOLAR_TOOL_ARG_START, SOLAR_TOOL_ARG_VALUE, SOLAR_TOOL_CALLS, SOLAR_TOOL_CALL_END,
+    syntax_for_model_id, ModelSyntax, QWEN_TOOL_CALL_END, QWEN_TOOL_CALL_START, SOLAR_THINK_END,
+    SOLAR_THINK_START, SOLAR_TOOL_ARG_END, SOLAR_TOOL_ARG_START, SOLAR_TOOL_ARG_VALUE,
+    SOLAR_TOOL_CALLS, SOLAR_TOOL_CALL_END,
 };
 use crate::stream::{think_end, think_start, ChatFormat};
 use std::collections::{HashMap, HashSet};
@@ -874,6 +875,136 @@ fn parse_solar_generated(
     })
 }
 
+fn parse_qwen_generated(
+    text: &[u8],
+    require_thinking_closed: bool,
+    orders: &[ToolSchemaOrder],
+) -> Option<ParsedGenerated> {
+    let mut tool_search = 0usize;
+    if require_thinking_closed {
+        match find_last_substr(text, b"</think>") {
+            None => {
+                let body = text.strip_prefix(b"<think>").unwrap_or(text);
+                return Some(ParsedGenerated {
+                    content: Vec::new(),
+                    reasoning: body.to_vec(),
+                    ok: true,
+                    ..Default::default()
+                });
+            }
+            Some(i) => tool_search = i + "</think>".len(),
+        }
+    }
+    let Some(rel) = find_substr(&text[tool_search..], QWEN_TOOL_CALL_START.as_bytes()) else {
+        let (content, reasoning) = split_reasoning_content(text, text.len(), ChatFormat::Qwen4Exp);
+        return Some(ParsedGenerated {
+            content,
+            reasoning,
+            ok: true,
+            ..Default::default()
+        });
+    };
+    let start = tool_search + rel;
+    let content_len = trim_tool_separator_ws(text, 0, start);
+    let mut p = start;
+    let mut raw_end = None;
+    let mut calls = Vec::new();
+    while text[p..].starts_with(QWEN_TOOL_CALL_START.as_bytes()) {
+        p += QWEN_TOOL_CALL_START.len();
+        p = skip_ws(text, p);
+        if !text[p..].starts_with(b"<function=") {
+            return None;
+        }
+        p += "<function=".len();
+        let name_end = text[p..].iter().position(|&c| c == b'>')?;
+        let name = trim_ascii_span(&text[p..p + name_end]);
+        if name.is_empty() {
+            return None;
+        }
+        let name_s = String::from_utf8_lossy(name).into_owned();
+        let order = tool_schema_orders_find(orders, &name_s);
+        p += name_end + 1;
+
+        let mut args = Vec::new();
+        let mut function_closed = false;
+        while p < text.len() {
+            p = skip_ws(text, p);
+            if text[p..].starts_with(b"</function>") {
+                p += "</function>".len();
+                function_closed = true;
+                break;
+            }
+            if !text[p..].starts_with(b"<parameter=") {
+                return None;
+            }
+            p += "<parameter=".len();
+            let arg_name_end = text[p..].iter().position(|&c| c == b'>')?;
+            let arg_name = trim_ascii_span(&text[p..p + arg_name_end]);
+            if arg_name.is_empty() {
+                return None;
+            }
+            p += arg_name_end + 1;
+            if text.get(p) == Some(&b'\r') {
+                p += 1;
+            }
+            if text.get(p) == Some(&b'\n') {
+                p += 1;
+            }
+            let arg_end = find_substr(&text[p..], b"</parameter>")?;
+            let mut value_end = p + arg_end;
+            if value_end > p && text[value_end - 1] == b'\n' {
+                value_end -= 1;
+            }
+            if value_end > p && text[value_end - 1] == b'\r' {
+                value_end -= 1;
+            }
+            let arg_name_s = String::from_utf8_lossy(arg_name).into_owned();
+            solar_tool_arg_json_add(
+                &mut args,
+                arg_name,
+                &text[p..value_end],
+                tool_schema_order_prop_type(order, &arg_name_s),
+            );
+            p += arg_end + "</parameter>".len();
+        }
+        if !function_closed {
+            return None;
+        }
+        p = skip_ws(text, p);
+        if !text[p..].starts_with(QWEN_TOOL_CALL_END.as_bytes()) {
+            return None;
+        }
+        p += QWEN_TOOL_CALL_END.len();
+        raw_end = Some(p);
+
+        let mut wrapped = vec![b'{'];
+        wrapped.extend_from_slice(&args);
+        wrapped.push(b'}');
+        calls.push(ToolCall {
+            name: name_s,
+            arguments: String::from_utf8_lossy(&wrapped).into_owned(),
+            ..Default::default()
+        });
+        let next = skip_ws(text, p);
+        if !text[next..].starts_with(QWEN_TOOL_CALL_START.as_bytes()) {
+            break;
+        }
+        p = next;
+    }
+    if calls.is_empty() {
+        return None;
+    }
+    let (content, reasoning) = split_reasoning_content(text, content_len, ChatFormat::Qwen4Exp);
+    Some(ParsedGenerated {
+        content,
+        reasoning,
+        calls,
+        raw_dsml: String::from_utf8_lossy(&text[start..raw_end.unwrap_or(p)]).into_owned(),
+        ok: true,
+        ..Default::default()
+    })
+}
+
 pub fn parse_generated_message(
     syntax: ModelSyntax,
     text: &[u8],
@@ -887,9 +1018,12 @@ pub fn parse_generated_message(
         }
         ModelSyntax::Dots3 => parse_dots3_generated(text, require_thinking_closed),
         ModelSyntax::SolarOpen2 => parse_solar_generated(text, require_thinking_closed, orders),
+        ModelSyntax::Qwen4Exp => parse_qwen_generated(text, require_thinking_closed, orders),
         ModelSyntax::DeepSeek => {
             if format == ChatFormat::SolarOpen2 {
                 parse_solar_generated(text, require_thinking_closed, orders)
+            } else if format == ChatFormat::Qwen4Exp {
+                parse_qwen_generated(text, require_thinking_closed, orders)
             } else {
                 parse_dsml_generated(text, require_thinking_closed)
             }
@@ -912,6 +1046,7 @@ pub fn parse_generated_for_model_id(
     let format = match syntax {
         ModelSyntax::SolarOpen2 => ChatFormat::SolarOpen2,
         ModelSyntax::Exaone => ChatFormat::Exaone,
+        ModelSyntax::Qwen4Exp => ChatFormat::Qwen4Exp,
         _ => ChatFormat::DeepSeek,
     };
     parse_generated_message(syntax, text, require_thinking_closed, format, orders)
@@ -998,6 +1133,7 @@ pub fn find_tool_start(s: &[u8], format: ChatFormat) -> Option<usize> {
     match format {
         ChatFormat::SolarOpen2 => find_substr(s, SOLAR_TOOL_CALLS.as_bytes()),
         ChatFormat::Exaone => find_substr(s, b"<tool_call>"),
+        ChatFormat::Qwen4Exp => find_substr(s, QWEN_TOOL_CALL_START.as_bytes()),
         ChatFormat::DeepSeek => {
             let cands = [
                 DSML_TOOL_CALLS_START.as_bytes(),
@@ -1015,6 +1151,7 @@ pub fn find_tool_end(s: &[u8], format: ChatFormat) -> Option<usize> {
     match format {
         ChatFormat::SolarOpen2 => find_substr(s, SOLAR_TOOL_CALL_END.as_bytes()),
         ChatFormat::Exaone => find_substr(s, b"</tool_call>"),
+        ChatFormat::Qwen4Exp => find_substr(s, QWEN_TOOL_CALL_END.as_bytes()),
         ChatFormat::DeepSeek => {
             let cands = [
                 DSML_TOOL_CALLS_END.as_bytes(),
@@ -1211,6 +1348,7 @@ fn tool_marker_stream_safe_len(text: &[u8], format: ChatFormat) -> usize {
     let marks: &[&[u8]] = match format {
         ChatFormat::SolarOpen2 => &[SOLAR_TOOL_CALLS.as_bytes()],
         ChatFormat::Exaone => &[b"<tool_call>"],
+        ChatFormat::Qwen4Exp => &[QWEN_TOOL_CALL_START.as_bytes()],
         ChatFormat::DeepSeek => &[
             DSML_TOOL_CALLS_START.as_bytes(),
             DSML_TOOL_CALLS_START_SHORT.as_bytes(),

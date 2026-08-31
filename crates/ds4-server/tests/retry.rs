@@ -1,6 +1,8 @@
 //! C↔Rust corrective-retry tapes (suffix / repair / decide). No model.
 
-use ds4_server::retry_dump_script;
+use ds4_server::{
+    retry::build_invalid_tool_error_suffix, retry_dump_script, ChatFormat, ThinkMode,
+};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -90,4 +92,22 @@ fn repair_and_decide_match_c() {
     );
     assert_eq!(retry_dump_script("decide-parse-retry").trim(), "true");
     assert_eq!(retry_dump_script("decide-parse-motif").trim(), "false");
+}
+
+#[test]
+fn qwen_invalid_tool_retry_uses_native_protocol() {
+    let suffix = build_invalid_tool_error_suffix(
+        ChatFormat::Qwen4Exp,
+        ThinkMode::None,
+        false,
+        b"<|im_start|>system\nStay precise.<|im_end|>\n",
+        "missing function",
+    );
+    let suffix = String::from_utf8(suffix).unwrap();
+    assert!(suffix.starts_with(
+        "<|im_end|>\n<|im_start|>user\n<tool_response>\nTool error: invalid Qwen tool call: missing function"
+    ));
+    assert!(suffix.contains("System prompt reminder:\nStay precise."));
+    assert!(suffix
+        .ends_with("\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"));
 }

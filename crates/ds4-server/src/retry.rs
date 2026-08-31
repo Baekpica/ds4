@@ -1,14 +1,15 @@
-//! Corrective tool-call retry from `ds4_server.c` at v0.6.3-dfm:
+//! Corrective tool-call retry from `ds4_server.c` at v0.6.5-dfm:
 //! tag-completion repair, model-visible tool-error suffix, and the
 //! `decode_again` decision. Session rewind/sync stays on `DecodeIo`.
 
 use crate::parse::ToolSchemaOrder;
 use crate::render::{
-    append_solar_tool_response_text, append_tool_result_text, solar_role_open, ModelSyntax,
-    SOLAR_IM_CONTENT, SOLAR_IM_END, SOLAR_IM_START, SOLAR_THINK_END, SOLAR_THINK_START,
-    SOLAR_TOOL_ARG_END, SOLAR_TOOL_ARG_START, SOLAR_TOOL_ARG_VALUE, SOLAR_TOOL_CALLS,
-    SOLAR_TOOL_CALL_END, SOLAR_TOOL_RESPONSE_END, SOLAR_TOOL_RESPONSE_START, THINK_HIGH_PREFIX,
-    THINK_MAX_PREFIX,
+    append_qwen_tool_response_text, append_solar_tool_response_text, append_tool_result_text,
+    solar_role_open, ModelSyntax, QWEN_IM_END, QWEN_IM_START, QWEN_TOOL_RESPONSE_END,
+    QWEN_TOOL_RESPONSE_START, SOLAR_IM_CONTENT, SOLAR_IM_END, SOLAR_IM_START, SOLAR_THINK_END,
+    SOLAR_THINK_START, SOLAR_TOOL_ARG_END, SOLAR_TOOL_ARG_START, SOLAR_TOOL_ARG_VALUE,
+    SOLAR_TOOL_CALLS, SOLAR_TOOL_CALL_END, SOLAR_TOOL_RESPONSE_END, SOLAR_TOOL_RESPONSE_START,
+    THINK_HIGH_PREFIX, THINK_MAX_PREFIX,
 };
 use crate::route::{think_mode_enabled, ThinkMode};
 use crate::stream::{think_end, ChatFormat};
@@ -116,6 +117,15 @@ pub fn rendered_solar_system_region(prompt: &[u8]) -> Vec<u8> {
 pub fn rendered_chat_system_region(format: ChatFormat, prompt: &[u8]) -> Vec<u8> {
     if format == ChatFormat::SolarOpen2 {
         rendered_solar_system_region(prompt)
+    } else if format == ChatFormat::Qwen4Exp {
+        let prefix = b"<|im_start|>system\n";
+        let Some(mut body) = prompt.strip_prefix(prefix) else {
+            return Vec::new();
+        };
+        if let Some(end) = find_substr(body, QWEN_IM_END.as_bytes()) {
+            body = &body[..end];
+        }
+        body.trim_ascii().to_vec()
     } else {
         rendered_dsml_system_region(prompt)
     }
@@ -250,7 +260,7 @@ pub fn try_repair_solar(s: &[u8]) -> Option<Vec<u8>> {
 pub fn try_repair_tool_call_format(format: ChatFormat, s: &[u8]) -> Option<Vec<u8>> {
     match format {
         ChatFormat::SolarOpen2 => try_repair_solar(s),
-        ChatFormat::Exaone => None,
+        ChatFormat::Exaone | ChatFormat::Qwen4Exp => None,
         ChatFormat::DeepSeek => try_repair_dsml(s),
     }
 }
@@ -268,10 +278,13 @@ pub fn build_invalid_tool_error_suffix(
     detail: &str,
 ) -> Vec<u8> {
     let solar = format == ChatFormat::SolarOpen2;
+    let qwen = format == ChatFormat::Qwen4Exp;
     let system = rendered_chat_system_region(format, prompt);
     let mut tool_error = Vec::new();
     if solar {
         tool_error.extend_from_slice(b"Tool error: invalid Solar tool call");
+    } else if qwen {
+        tool_error.extend_from_slice(b"Tool error: invalid Qwen tool call");
     } else {
         tool_error.extend_from_slice(b"Tool error: invalid DSML tool call");
     }
@@ -283,6 +296,11 @@ pub fn build_invalid_tool_error_suffix(
         tool_error.extend_from_slice(
             b"\nThe previous assistant output was not executed because the Solar tool syntax was malformed. \
 Emit a new valid native Solar tool call, or answer normally if no tool is needed.",
+        );
+    } else if qwen {
+        tool_error.extend_from_slice(
+            b"\nThe previous assistant output was not executed because the Qwen tool syntax was malformed. \
+Emit a new valid native Qwen tool call, or answer normally if no tool is needed.",
         );
     } else {
         tool_error.extend_from_slice(
@@ -313,6 +331,23 @@ Emit a new valid DSML tool call, or answer normally if no tool is needed.",
         suffix.extend_from_slice(SOLAR_THINK_START.as_bytes());
         if !think_mode_enabled(think_mode) {
             suffix.extend_from_slice(SOLAR_THINK_END.as_bytes());
+        }
+    } else if qwen {
+        suffix.extend_from_slice(QWEN_IM_END.as_bytes());
+        suffix.extend_from_slice(b"\n");
+        suffix.extend_from_slice(QWEN_IM_START.as_bytes());
+        suffix.extend_from_slice(b"user\n");
+        suffix.extend_from_slice(QWEN_TOOL_RESPONSE_START.as_bytes());
+        suffix.extend_from_slice(b"\n");
+        append_qwen_tool_response_text(&mut suffix, &tool_error);
+        suffix.extend_from_slice(b"\n");
+        suffix.extend_from_slice(QWEN_TOOL_RESPONSE_END.as_bytes());
+        suffix.extend_from_slice(QWEN_IM_END.as_bytes());
+        suffix.extend_from_slice(b"\n");
+        suffix.extend_from_slice(QWEN_IM_START.as_bytes());
+        suffix.extend_from_slice(b"assistant\n<think>\n");
+        if !think_mode_enabled(think_mode) {
+            suffix.extend_from_slice(b"\n</think>\n\n");
         }
     } else {
         suffix.extend_from_slice("<｜end▁of▁sentence｜><｜User｜><tool_result>".as_bytes());

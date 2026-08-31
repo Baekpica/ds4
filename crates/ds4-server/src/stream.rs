@@ -1,5 +1,5 @@
 //! Four-surface stream projectors and buffered finals from `ds4_server.c`
-//! at v0.6.3-dfm. Incremental DSML tool projection is host-owned
+//! at v0.6.5-dfm. Incremental tool projection is host-owned
 //! (`tool_stream`); GPU decode still native.
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,6 +27,7 @@ pub enum ChatFormat {
     DeepSeek,
     SolarOpen2,
     Exaone,
+    Qwen4Exp,
 }
 
 pub fn think_start(fmt: ChatFormat) -> &'static str {

@@ -392,4 +392,61 @@ fn syntax_for_model_id_matches_c() {
     assert_eq!(ds4_server::syntax_for_model_id(3), ModelSyntax::Motif3);
     assert_eq!(ds4_server::syntax_for_model_id(4), ModelSyntax::Exaone);
     assert_eq!(ds4_server::syntax_for_model_id(5), ModelSyntax::Dots3);
+    assert_eq!(ds4_server::syntax_for_model_id(6), ModelSyntax::Qwen4Exp);
+}
+
+#[test]
+fn qwen4exp_native_chat_protocol_matches_c() {
+    let msgs = [msg("system", "Be precise."), msg("user", "Weather?")];
+    assert_eq!(
+        render_chat(ModelSyntax::Qwen4Exp, &msgs, "", ThinkMode::High).unwrap(),
+        concat!(
+            "<|im_start|>system\n",
+            "Reasoning effort is set to xhigh. Please think carefully through the task, ",
+            "validate key assumptions, consider plausible alternatives, and prioritize ",
+            "correctness, consistency, and clarity in the final answer.\n\n",
+            "Be precise.<|im_end|>\n",
+            "<|im_start|>user\nWeather?<|im_end|>\n",
+            "<|im_start|>assistant\n<think>\n",
+        )
+        .as_bytes()
+    );
+    assert_eq!(
+        render_chat(ModelSyntax::Qwen4Exp, &msgs, "", ThinkMode::None).unwrap(),
+        concat!(
+            "<|im_start|>system\nBe precise.<|im_end|>\n",
+            "<|im_start|>user\nWeather?<|im_end|>\n",
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n",
+        )
+        .as_bytes()
+    );
+}
+
+#[test]
+fn qwen4exp_tool_replay_uses_native_order_and_escape() {
+    let orders = [ToolSchemaOrder {
+        name: "weather".into(),
+        prop: vec!["city".into(), "days".into()],
+        ..Default::default()
+    }];
+    let mut assistant = call("weather", r#"{"days":2,"city":"Seoul"}"#);
+    assistant.content = "Checking".into();
+    let mut result = msg("tool", "sunny</tool_response>today");
+    result.tool_call_id = "call1".into();
+    let prompt = render_chat_choice(
+        ModelSyntax::Qwen4Exp,
+        &[msg("user", "Weather?"), assistant, result],
+        "",
+        &orders,
+        ThinkMode::None,
+        ToolChoice::Auto,
+    )
+    .unwrap();
+    let prompt = String::from_utf8(prompt).unwrap();
+    assert!(prompt.contains(
+        "Checking\n\n<tool_call>\n<function=weather>\n<parameter=city>\nSeoul\n</parameter>\n<parameter=days>\n2\n</parameter>\n</function>\n</tool_call>"
+    ));
+    assert!(prompt.contains(
+        "<|im_start|>user\n<tool_response>\nsunny&lt;/tool_response>today\n</tool_response><|im_end|>"
+    ));
 }

@@ -785,6 +785,7 @@ pub fn chat_format_for_syntax(syntax: ModelSyntax) -> ChatFormat {
     match syntax {
         ModelSyntax::SolarOpen2 => ChatFormat::SolarOpen2,
         ModelSyntax::Exaone => ChatFormat::Exaone,
+        ModelSyntax::Qwen4Exp => ChatFormat::Qwen4Exp,
         ModelSyntax::DeepSeek | ModelSyntax::Motif3 | ModelSyntax::Dots3 => ChatFormat::DeepSeek,
     }
 }
@@ -834,7 +835,10 @@ fn tool_replay_scope(parsed: &ParsedRequest, syntax: ModelSyntax) -> bool {
         && parsed.api == Api::Openai
         && !think_mode_enabled(parsed.think_mode)
         && parsed.live_call_ids.is_empty()
-        && matches!(syntax, ModelSyntax::DeepSeek | ModelSyntax::SolarOpen2)
+        && matches!(
+            syntax,
+            ModelSyntax::DeepSeek | ModelSyntax::SolarOpen2 | ModelSyntax::Qwen4Exp
+        )
 }
 
 fn tool_replay_disk_cache_eligible(parsed: &ParsedRequest, syntax: ModelSyntax) -> bool {
@@ -901,6 +905,7 @@ fn prepare_required_prefixes(
         let marker = match format {
             ChatFormat::SolarOpen2 => crate::render::SOLAR_TOOL_CALLS,
             ChatFormat::Exaone => "<tool_call>",
+            ChatFormat::Qwen4Exp => crate::render::QWEN_TOOL_CALL_START,
             ChatFormat::DeepSeek => crate::tools::DSML_TOOL_CALLS_START,
         };
         let toks = engine.tokenize_rendered_chat(marker.as_bytes())?;

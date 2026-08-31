@@ -138,6 +138,45 @@ fn parse_solar_native_tool_call() {
 }
 
 #[test]
+fn parse_qwen_native_tool_call() {
+    let generated = b"<think>\nNeed weather.\n</think>\n\n\
+        <tool_call>\n<function=weather>\n\
+        <parameter=city>\nSeoul\n</parameter>\n\
+        <parameter=days>\n2\n</parameter>\n\
+        </function>\n</tool_call>";
+    let orders = [ToolSchemaOrder {
+        name: "weather".into(),
+        prop: vec!["city".into(), "days".into()],
+        prop_type: vec!["string".into(), "integer".into()],
+        ..Default::default()
+    }];
+    let p = parse_generated_message(
+        ModelSyntax::Qwen4Exp,
+        generated,
+        true,
+        ChatFormat::Qwen4Exp,
+        &orders,
+    );
+    assert!(p.ok);
+    assert_eq!(p.calls.len(), 1);
+    assert_eq!(p.calls[0].name, "weather");
+    assert_eq!(p.calls[0].arguments, "{\"city\": \"Seoul\", \"days\": 2}");
+    assert!(p.content.is_empty());
+    assert!(p.reasoning.windows(13).any(|s| s == b"Need weather."));
+    assert!(p.raw_dsml.contains("<function=weather>"));
+}
+
+#[test]
+fn qwen_stream_observes_native_tool_markers_without_dsml_verdict() {
+    let mut acc = SemAccum::init(true, true, false, ChatFormat::Qwen4Exp, b"");
+    let first = acc.feed(b"<tool_call>\n<function=weather>\n", &[]);
+    assert!(first.entered_tool_block && acc.saw_tool_start);
+    let last = acc.feed(b"</function>\n</tool_call>", &[]);
+    assert!(last.tool_block_closed && acc.saw_tool_end);
+    assert_eq!(acc.verdict, None);
+}
+
+#[test]
 fn no_tools_does_not_extract_calls() {
     let text = format!(
         "hi\n\n{DSML_START}\n{DSML_INVOKE} name=\"bash\">\n\
