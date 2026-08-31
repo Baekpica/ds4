@@ -235,7 +235,7 @@ fn json_escape(s: &str) -> String {
 
 fn json_f32(v: f32) -> String {
     if v.is_finite() {
-        format!("{v:.9}")
+        v.to_string()
     } else {
         "null".into()
     }
@@ -1043,6 +1043,11 @@ mod tests {
         assert_eq!(json_escape(r#"a"b"#), r#""a\"b""#);
         assert_eq!(json_f32(f32::NAN), "null");
         assert!(json_f32(1.5).starts_with("1.5"));
+        let small = f32::from_bits(3_152_357_376);
+        assert_eq!(
+            json_f32(small).parse::<f32>().unwrap().to_bits(),
+            small.to_bits()
+        );
     }
 
     /// C `ds4-bench --help` flags this shadow already parses (8.3 claimed modes).
