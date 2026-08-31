@@ -182,16 +182,16 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchArgs, S
     } else {
         parsed.ctx_max
     };
-    let live_tokens = measured_ctx
+    let decode_spare = i32::from(parsed.gen_tokens > 0);
+    let required_ctx = measured_ctx
         .checked_add(parsed.gen_tokens)
+        .and_then(|ctx| ctx.checked_add(decode_spare))
         .ok_or_else(|| "requested context is too large".to_string())?;
     if parsed.ctx_alloc == 0 {
-        parsed.ctx_alloc = live_tokens
-            .checked_add(1)
-            .ok_or_else(|| "requested context is too large".to_string())?;
+        parsed.ctx_alloc = required_ctx;
     }
-    if parsed.ctx_alloc <= live_tokens {
-        return Err("--ctx-alloc must be greater than measured context + gen-tokens".into());
+    if parsed.ctx_alloc < required_ctx {
+        return Err("--ctx-alloc is too small for the measured context and generation".into());
     }
     ds4_dist::prepare_engine_options(&parsed.dist)?;
     if parsed.dist.role == ds4_dist::Role::Worker {
@@ -985,6 +985,25 @@ mod tests {
             row.csv_line(),
             "2048,2048,123.46,128,10.00,9.50,0.1235,4096"
         );
+    }
+
+    #[test]
+    fn allows_exact_context_allocation_without_decode() {
+        let args = parse_args(argv(&[
+            "--prompt-file",
+            "prompt.txt",
+            "--ctx-start",
+            "262144",
+            "--ctx-max",
+            "262144",
+            "--ctx-alloc",
+            "262144",
+            "--gen-tokens",
+            "0",
+        ]))
+        .unwrap();
+
+        assert_eq!(args.ctx_alloc, 262144);
     }
 
     #[test]
