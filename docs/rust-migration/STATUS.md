@@ -2,11 +2,12 @@
 
 > **Freshness (2026-08-31 KST):** the post-promote campaign was reopened for
 > the `v0.6.5-dfm`/Qwen delta. Q5+Sidecar behavior, family fixtures, and
-> C→Rust→Rust→C ABBA are green at `6ca85c8`. Default names remain Rust and
-> C oracles remain `*-c`. The complete family/proof re-stamp, the Qwen-only
-> two-hour soak, and `SPLIT_READINESS.md` are still pending. DeepSeek keeps
-> its normal functional/parity/performance gates but does not repeat a long
-> soak in this campaign.
+> C→Rust→Rust→C ABBA are green. The Qwen-only two-hour soak, configured-262K
+> live smoke, exact 262K direct logits, KV four-way, MTP target, and static
+> lane are green through `8006198`. Default names remain Rust and C oracles
+> remain `*-c`. The complete cross-family/proof re-stamp and
+> `SPLIT_READINESS.md` are still pending. DeepSeek keeps its normal
+> functional/parity/performance gates but does not repeat a long soak.
 
 Update this table in the same commit that changes a subsystem’s
 state. Colors: `green` = gate passed, `yellow` = partial / in
@@ -26,7 +27,7 @@ frozen at C cut `4d40d97`.
 | session lifecycle | yes | partial (host ledger + DSV4 prefix, including bounded embedded-range restore; engine session, GPU/logits tail, and payload execution remain native) | C | synthetic C↔Rust green (`make test-session-parity`); range prefix/EOF + C seek/length/overflow oracle green; live same-model CUDA payload pending | — |
 | KV store | yes | envelope/policy crate with payload-free metadata index, bounded LCP text reads, a file-backed staged payload writer, and bounded KTM trailer memory; ordinary serial visible cold + evict/replay, final-sync/decode and DeepSeek intermediate-prefill continued checkpoints, scoped DeepSeek no-think tool-map replay, and scoped width-1 OpenAI Chat no-think/no-tools continuous-bank shutdown persistence/replay are production-integrated in `ds4-server-rs` | C | file-format 4-way + Rust streamed payload/trailer read by C + sparse 4 GiB indexing + embedded payload-range seam green; live same-model C/Rust ordinary 4-way save/load green; C-default 6,144-token cold partition exact; scoped continued 6,800-token bodies/four-way exact; DeepSeek 4,096-token intermediate-prefill bodies/four-way exact; DeepSeek tool-map producers have exact C/Rust text+payload bodies and all four reordered-history loader cells restore 424 cached tokens; width-1 bank-shutdown producers have exact 6,896-token text/payload bodies and all four cross-host loader cells restore 6,896 cached tokens | same-policy restore TTFT ABBA green; scoped cold, continued (final/decode and DeepSeek intermediate-prefill), tool-map, and width-1 bank correctness/cross-read green; scoped width-1 bank restore ABBA green; configured default-policy/full memory performance pending |
 | web utility | yes | isolated blocking-I/O crate; not production-integrated | C (`ds4-agent`) | encode/wire + mock CDP green | n/a |
-| server (four surfaces) | yes | Rust owns HTTP parsing/rendering, admission, metrics, FIFO owner, serial/continuous/static routing, continuation, and disk-KV policy over native execution | Rust host | CPU oracle suite green; Qwen Chat/Responses/Anthropic image requests, barrier width 2 (`served=2 fallback=0`), static width 2, serial fallback, image-aware live/disk KV, and 8,192-boundary image prefill are live-green; OpenAI Completions remains text-only by contract | Qwen ABBA green; full cross-family serving re-stamp pending |
+| server (four surfaces) | yes | Rust owns HTTP parsing/rendering, admission, metrics, FIFO owner, serial/continuous/static routing, continuation, and disk-KV policy over native execution | Rust host | CPU oracle suite green; Qwen Chat/Responses/Anthropic image requests, barrier width 2 (`served=2 fallback=0`), static width 2, serial fallback, image-aware live/disk KV, 8,192-boundary image prefill, KV four-way, and configured-262K live smoke are green; OpenAI Completions remains text-only by contract | Qwen ABBA + two-hour soak + 262K direct + MTP/static focused gates green; full cross-family serving re-stamp pending |
 | distributed runtime | yes | isolated codecs + blocking orchestration crate; not production-integrated | C | codecs + CLI/route/mock hop green | n/a |
 | CLI / bench / agent host | yes | partial: greedy/seeded-sampling `ds4-rs` with non-TTY thinking formatting, local non-MTP/non-distributed `ds4-bench-rs`, one-turn no-tool `ds4-agent-rs`, and `ds4-server-rs` | C | greedy, fixed-seed sampled, and fixed-seed thinking/non-thinking one-shot CLI stdout match C byte-for-byte; local benchmark ABBA green. Agent built-in prompt bytes, fixed datetime message, selected non-TTY projector tapes, and DSML refusal are green (`make test-agent-parity`), but live agent generation parity is not established | local benchmark green; full gate pending |
 | CPU reference backend | yes | no (not a cut-over blocker) | C | — | n/a |
@@ -51,8 +52,8 @@ Rust. They must not be read as production-path integration.
 | 6 | Distributed runtime port | **isolated parity green** (`make test-dist-parity`); production still uses C pipelined prefetch, snapshot, and `ds4_dist_session_*` |
 | 7 | Server shadow by feature | **Qwen re-stamp green; broader campaign partial** — CPU contracts plus Qwen serial/continuous/static, true width-2, Chat/Responses/Anthropic, image input, image-aware live/disk KV, MTP, and two-bank fork/partial behavior are green. Remaining cross-family/API and failure-path re-stamp stays open. |
 | 8 | `ds4.c` decomposition | **partial** — metadata, mmap catalogs, tokenizer (including family chat-transcript framing), and ledger slices are green; engine/model/session/scheduler execution and CUDA upload remain native |
-| 9 | Promote Rust binaries to default names | **names already promoted; v0.6.5 revalidation active**. Qwen is green at `6ca85c8`; the full pre/post family/proof/performance manifest and Qwen two-hour soak must be re-stamped before this phase is closed again. DeepSeek does not repeat a long soak. |
-| split | `SPLIT_READINESS.md` + `ds4-dfm-rs` code genesis | destination is metadata-only; blocked on remaining host work, the complete v0.6.5 family/proof re-stamp, and the Qwen two-hour soak |
+| 9 | Promote Rust binaries to default names | **names already promoted; v0.6.5 revalidation active**. Qwen is green through `8006198`, including its two-hour soak and 262K/focused gates; the full pre/post cross-family/proof/performance manifest must be re-stamped before this phase is closed again. DeepSeek does not repeat a long soak. |
+| split | `SPLIT_READINESS.md` + `ds4-dfm-rs` code genesis | destination is metadata-only; blocked on remaining host work and the complete v0.6.5 cross-family/proof re-stamp |
 
 ## Current default binaries
 
@@ -77,6 +78,11 @@ Q5 main GGUF plus shared SSD-PLE sidecars. C→Rust→Rust→C returned exact te
 and image outputs; Rust/C means were 99.97% prefill, 100.00% decode, +0.95%
 TTFT, +4.40% worker VmHWM, and identical worker GPU residency. All target
 processes exited before each cache clear; final `MemAvailable` was 119 GiB.
+The promotion hard gate then passed 3,610/3,610 requests over 7,202.3 seconds
+with 158 barrier batches and 79 image requests, exact four-way KV restore, and
+zero swap. Exact 262K C/Rust direct logits had 248,320 finite values, argmax
+198, and zero f32 mismatches; MTP improved token-per-step from 1.01 to 2.00
+with identical output, and forced static routing recorded static=2 only.
 
 The following Phase 3/7 Motif paragraph is retained as historical
 `v0.6.3-dfm` evidence. Phase 3/7 live Motif evidence is in

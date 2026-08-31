@@ -1,12 +1,14 @@
 # Parity matrix
 
 > **Freshness (2026-08-31 KST):** the Qwen delta from the `v0.6.5-dfm`
-> lineage is re-stamped at `6ca85c8`. Production defaults remain Rust.
-> The older post-promote matrix is retained as provenance; the complete
-> cross-family v0.6.5/proof re-stamp and Qwen-only two-hour soak are still
-> gates. DeepSeek keeps its normal gates but does not repeat a long soak.
+> lineage is re-stamped through `8006198`. Production defaults remain Rust.
+> The Qwen-only two-hour soak, exact 262K direct comparison, KV four-way,
+> MTP target, and forced static lane are green. The older post-promote matrix
+> is retained as provenance; the complete cross-family v0.6.5/proof re-stamp
+> remains a gate. DeepSeek keeps its normal gates but does not repeat a long
+> soak.
 
-## Qwen v0.6.5 delta re-stamp (`6ca85c8`)
+## Qwen v0.6.5 delta re-stamp (`8006198`)
 
 Full identities, artifact scope, commands, hashes, and raw-evidence paths are
 recorded in
@@ -18,7 +20,8 @@ recorded in
 | Token | Qwen tokenizer goldens PASS; C→Rust→Rust→C text and image outputs are exact |
 | KV | same-image reuse, changed-pixel rejection, cross-worker disk restore, two-bank disk/partial-fork lifecycle PASS |
 | Wire/API | image Chat, Responses, and Anthropic PASS; continuous width 2, static width 2, serial fallback, `/v1/models`, and `/v1/stats` PASS |
-| Performance | text prefill 99.97%, decode 100.00%, TTFT +0.95%, worker VmHWM +4.40%, GPU residency exact; image prefill 100.20%, TTFT +0.32% |
+| Performance | text ABBA: prefill 99.97%, decode 100.00%, TTFT +0.95%, worker VmHWM +4.40%, GPU residency exact; image prefill 100.20%, TTFT +0.32%; exact-262K prefill 99.64% |
+| Hard gates | 7,202.3-second Qwen soak: 3,610/3,610 requests, 158 barriers, 79 images, RSS drift 0.0011%/0.0%, swap 0; 262K direct: 248,320 finite logits, argmax 198 exact, f32 mismatches 0; KV 4-way, MTP 1.01→2.00 tok/step with exact output, forced static route 2/2 PASS |
 
 This is the requested Q5 main GGUF plus shared Sidecar scope. Safetensors,
 resident BF16, Q6, and their reference gates were intentionally not loaded.
@@ -37,8 +40,8 @@ PASS 55 + PASS* 5 (E-2..E-6) + FAIL 0 + BLOCKED 0.
 | Performance | Motif ABBA PASS (prefill 99.95%, decode 100%, TTFT +1.1%, HWM +1.0%); proofs smoke/long/opp-c/rust-opp-c PASS |
 
 The historical two-hour mixed DeepSeek soak is not repeated. This campaign's
-only long soak is the Qwen Q5+Sidecar two-bank gate; DeepSeek still runs the
-ordinary functional, parity, proof, and performance cells.
+only long soak was the now-green Qwen Q5+Sidecar two-bank gate; DeepSeek still
+runs the ordinary functional, parity, proof, and performance cells.
 
 “Rust works” is not `cargo build`. A host change is accepted only
 when all five axes that it can affect are green. CUDA optimization

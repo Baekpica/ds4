@@ -11,9 +11,13 @@ replace historical evidence for the other model families.
 | Release baseline | `v0.6.5-dfm` → `d02e2a4777a34a9f52fd987453b3ea1801fac52e` |
 | Qwen C golden cut | `4d40d97f1e575400237a6e5cef21d7f74404a38d` |
 | Merge into `rust-host` | `d0384d91a201a409118d811772a129985b44c6bf` |
-| Rust candidate | `6ca85c8534d3decd5b3a16b927a3257a074e8cc8` |
+| Qwen feature candidate | `6ca85c8534d3decd5b3a16b927a3257a074e8cc8` |
+| Soak/live candidate | `c03350f74fd5cacaa8b4af399800897258deaec1` |
+| 262K/focused candidate | `8006198e777c9521d0abd0d55af246e2dfe4b78f` |
 | C server SHA-256 | `b13a093b9232f61185a4e47fdbb5b3ca3babed0cb0a2d8f8eeae074da2b1aa2a` |
-| Rust server SHA-256 | `2bdbbc044216705bb1077feba279b48efa9028cba42207cd03ef4e7d1416635f` |
+| Soak/live Rust server SHA-256 | `2bdbbc044216705bb1077feba279b48efa9028cba42207cd03ef4e7d1416635f` |
+| Focused Rust server SHA-256 | `bd021db126e7add9fd700d3a720c4e339915cd37279dac1cce356b826ca8e385` |
+| C/Rust 262K bench SHA-256 | `e7d344dcebf008530436bf7b4a07f8a9eef175a075a72c6b4b59c721dbd9212d` / `62844f312b521cf3503bc719690b1135d9392e5e8a0dec15149d3812d9a1f431` |
 
 The annotated release tag predates the final image and two-bank Qwen
 increments. Therefore the observable Qwen oracle is the product-code cut
@@ -80,6 +84,39 @@ reclaim/hard guard and then shut down before the ABBA run.
 - `DS4_SERVER_CONTINUOUS=0` produced a two-request static batch and a separate
   serial request with zero sheds or faults.
 
+## Promotion hard gates
+
+The final Qwen-only gate is rooted at
+`scratch/rust-host-live/qwen-v065-restamp-20260831/hard-gate-20260831-154010/`.
+Only one production GGUF was resident at a time; every teardown checked both
+the process table and CUDA compute PIDs before `clear_cache`.
+
+- Configured-262,144 live smoke passed four text surfaces, stream/tool output,
+  three image surfaces, same-image reuse, changed-pixel rejection, an
+  18,321-token image source whose continuation crossed the 8,192 boundary,
+  width-2 barrier service (`served=2 fallback=0`), and invalid-input 400s.
+- C-save/C-load, C-save/Rust-load, Rust-save/C-load, and Rust-save/Rust-load
+  all restored 2,125 cached tokens and returned exact `RESTORED_OK`.
+- The Qwen-only two-hour soak ran 7,202.3 seconds: 3,610/3,610 requests,
+  794 loops, 158 width-2 barriers, and 79 image requests. Worker/owner RSS
+  drift was 0.0011%/0.0%; both remained at `VmSwap=0`. The server log contains
+  exactly 158 successful barrier records and the soak wrote a non-empty KV
+  checkpoint. Result: `QWEN_SOAK_PASS`.
+- At the exact 262,144-token frontier, C and Rust produced 248,320 finite
+  logits, argmax 198 in both, zero packed-f32 mismatches, and f32 SHA-256
+  `01fae9fe89063b70a7d05baa8fd0342df9f4afb8a8a83dd718e955c8810b7172`.
+  Prefill was 241.46 tok/s C and 240.58 tok/s Rust (99.64%). This gate exposed
+  and fixed the Rust-only no-decode allocation and exact-context session
+  boundaries in `8fe4813` and `8006198`; neither golden was refreshed.
+- On the current `8006198` server binary, MTP-off/on emitted the same 128-token
+  body (`2efb86c1...`) while token-per-step rose from 1.01 to 2.00. The forced
+  static lane recorded `serial=0, continuous=0, static=2`.
+
+Current focused evidence is under
+`scratch/rust-host-live/qwen-v065-restamp-20260831/focused-20260831-183929/`;
+the 262K direct run is
+`scratch/rust-host-live/qwen-v065-restamp-20260831/direct-ab-262144-20260831-181624/`.
+
 ## C → Rust → Rust → C ABBA
 
 Every cell used a fresh owner and worker, the same model, context 196,608,
@@ -125,7 +162,9 @@ GPU compute process and restored 119 GiB `MemAvailable` after `clear_cache`.
 
 ## Decision
 
-The Qwen Q5+Sidecar pre-migration gate is green at `6ca85c8`. This allows the
-host migration to continue. It does not make `SPLIT_READINESS.md` green: the
-remaining v0.6.5 family/proof/soak manifest and unresolved host ownership work
-still gate the `ds4-dfm-rs` split.
+The Qwen Q5+Sidecar migration gate is green through `8006198`, including the
+Qwen-only two-hour soak, exact 262K direct parity, MTP target, and forced static
+lane. It does not make `SPLIT_READINESS.md` green: the remaining v0.6.5
+cross-family/proof re-stamp and unresolved host ownership work still gate the
+`ds4-dfm-rs` split. DeepSeek retains its ordinary gates and does not repeat a
+two-hour soak.
