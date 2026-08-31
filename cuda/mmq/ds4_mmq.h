@@ -35,10 +35,13 @@ int ds4_mmq_init(int device);
 //
 // Wraps ggml_cuda_should_use_mmq. type_x uses ds4 quant codes which match
 // ggml's enum:
+//   6  = Q5_0
 //   8  = Q8_0
 //   10 = Q2_K
 //   11 = Q3_K
 //   12 = Q4_K
+//   13 = Q5_K
+//   14 = Q6_K
 //   16 = IQ2_XXS
 //
 //   ne11:      batch dimension (number of activation columns / tokens).
@@ -345,6 +348,74 @@ int ds4_mmq_q4_K_moe(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// Qwen3.8-Flash-Next high-precision routed experts. Q5_K/Q6_K cover
+// gate/up and the 512-wide down segment. Q5_0 covers the 128-wide down tail,
+// whose K dimension cannot be represented by a 256-value K-quant block.
+int ds4_mmq_q5_K_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q5_K_moe_bounded(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    int             max_rows_per_expert,
+    cudaStream_t    stream);
+
+int ds4_mmq_q6_K_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q5_0_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+// Expert-major Q5_0 path that keeps the activation in F32 and accumulates
+// into out_f32. x_stride/x_offset select the tail inside each activation row.
+int ds4_mmq_q5_0_f32_moe_accum(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             x_stride,
+    int             x_offset,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
 int ds4_mmq_q4_K_moe_bounded(
     const void    * W,
     const float   * X_f32,
@@ -605,6 +676,42 @@ int ds4_mmq_q3_K_moe_vec(
     cudaStream_t    stream);
 
 int ds4_mmq_q4_K_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q5_K_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q6_K_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+int ds4_mmq_q5_0_moe_vec(
     const void    * W,
     const float   * X_f32,
     const int32_t * ids,

@@ -17,12 +17,15 @@ DS4_MOTIF3_MODEL ?=
 DS4_MOTIF3_FIXTURES ?= ../motif-3-mixed-ds4/fixtures/official-final
 DS4_EXAONE_MODEL ?=
 DS4_DOTS3_MODEL ?=
+DS4_QWEN4EXP_MODEL ?=
+DS4_QWEN4EXP_ROOT ?=
+DS4_QWEN4EXP_SOURCE ?=
 CUDA_EXTRA_BINS :=
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_distributed.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
+CORE_OBJS = ds4.o ds4_ple.o ds4_distributed.o ds4_metal.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_ple.o ds4_distributed.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -65,8 +68,11 @@ MMQ_INCLUDES := -Icuda/mmq
 # -lcuda is required for the in-process VMM weight arena (CUDA driver API).
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -lcuda
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o cuda/mmq/ds4_fattn.o
-CORE_OBJS = ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o
+QWEN38_PLE_CUDA_OBJ := cuda/qwen38_ple.o
+DS4_CUDA_SUPPORT_OBJS := ds4_ple.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS) $(QWEN38_PLE_CUDA_OBJ)
+DS4_CUDA_CORE_OBJS := ds4.o $(DS4_CUDA_SUPPORT_OBJS)
+CORE_OBJS = $(DS4_CUDA_CORE_OBJS)
+CPU_CORE_OBJS = ds4_cpu.o ds4_ple.o ds4_distributed.o
 METAL_LDLIBS := $(LDLIBS)
 CUDA_EXTRA_BINS := ds4_weight_server
 endif
@@ -78,6 +84,14 @@ endif
         test-motif3-cuda test-motif3-resident test-motif3-batch \
         test-dots3-loader test-dots3-tokenizer \
         test-dots3-resident \
+        test-qwen4exp-loader test-qwen4exp-tokenizer \
+        test-qwen4exp-ple test-qwen4exp-ple-reference \
+        test-qwen4exp-ple-cuda test-qwen4exp-primitives \
+        test-qwen4exp-hc-forward \
+        test-qwen4exp-ple-compute test-qwen4exp-ple-forward \
+        test-qwen4exp-moe test-qwen4exp-moe-forward test-qwen4exp-gdn \
+        test-qwen4exp-gdn-forward test-qwen4exp-qsa \
+        test-qwen4exp-qsa-forward test-qwen4exp-batch \
         test-mmq-parity test-model-family-kernels \
         test-solar-loader test-solar-kda test-solar-kda-prefill \
         test-solar-kda-chunk \
@@ -277,7 +291,7 @@ proof-rust-cuda-opp-c: ds4 ds4-c
 			--work-dir "$$root/rust" --check-expected "$$expected"
 endif
 
-ds4.o: ds4.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h ds4_gpu.h vendor/stb_image.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 # Rust FFI seam: wraps ds4.h so crates/ds4-sys never bindgens the engine header.
@@ -493,6 +507,9 @@ ds4-bench-rs: ds4-bench
 ds4-server-rs: ds4-server
 	cp -f ds4-server $@
 
+ds4_ple.o: ds4_ple.c ds4_ple.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_ple.c
+
 ds4_cli.o: ds4_cli.c ds4.h ds4_mem_census.h ds4_model_catalog.h ds4_mem_gov.h ds4_distributed.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
@@ -547,6 +564,36 @@ tests/test_solar_kv.o: tests/test_solar_kv.c ds4_gpu.h
 
 tests/test_model_family_kernels.o: tests/test_model_family_kernels.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen4exp_primitives.o: tests/test_qwen4exp_primitives.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen4exp_hc_forward.o: tests/test_qwen4exp_hc_forward.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen4exp_ple_compute.o: tests/test_qwen4exp_ple_compute.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen4exp_ple_forward.o: tests/test_qwen4exp_ple_forward.c ds4.c ds4.h ds4_gpu.h ds4_ple.h cuda/qwen38_ple.h
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen4exp_moe.o: tests/test_qwen4exp_moe.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen4exp_moe_forward.o: tests/test_qwen4exp_moe_forward.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen4exp_gdn.o: tests/test_qwen4exp_gdn.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen4exp_gdn_forward.o: tests/test_qwen4exp_gdn_forward.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen4exp_qsa.o: tests/test_qwen4exp_qsa.c ds4_gpu.h
+	$(CC) $(CFLAGS) -fno-fast-math -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen4exp_qsa_forward.o: tests/test_qwen4exp_qsa_forward.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -fno-fast-math -Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 tests/test_solar_forward.o: tests/test_solar_forward.c ds4.c ds4.h ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
@@ -619,16 +666,16 @@ tests/test_repack_premapped: tests/test_repack_premapped.cu cuda/mmq/ds4_repack.
 test-repack-premapped: tests/test_repack_premapped
 	./tests/test_repack_premapped
 
-tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o $(DS4_CUDA_CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/test_solar_kda: tests/test_solar_kda.o ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_solar_kda: tests/test_solar_kda.o $(DS4_CUDA_CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-solar-kda: tests/test_solar_kda
 	./tests/test_solar_kda
 
-tests/test_solar_kda_prefill: tests/test_solar_kda_prefill.o ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_solar_kda_prefill: tests/test_solar_kda_prefill.o $(DS4_CUDA_CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-solar-kda-prefill: tests/test_solar_kda_prefill
@@ -637,19 +684,19 @@ test-solar-kda-prefill: tests/test_solar_kda_prefill
 tests/test_solar_kda_chunk.o: tests/test_solar_kda_chunk.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_solar_kda_chunk: tests/test_solar_kda_chunk.o ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_solar_kda_chunk: tests/test_solar_kda_chunk.o $(DS4_CUDA_CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-solar-kda-chunk: tests/test_solar_kda_chunk
 	./tests/test_solar_kda_chunk
 
-tests/test_solar_gates: tests/test_solar_gates.o ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_solar_gates: tests/test_solar_gates.o $(DS4_CUDA_CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-solar-gates: tests/test_solar_gates
 	./tests/test_solar_gates
 
-tests/test_solar_kv: tests/test_solar_kv.o ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_solar_kv: tests/test_solar_kv.o $(DS4_CUDA_CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-solar-kv: tests/test_solar_kv
@@ -658,22 +705,106 @@ test-solar-kv: tests/test_solar_kv
 cuda/mmq/test/test_mmq_parity.o: cuda/mmq/test/test_mmq_parity.cu cuda/mmq/ds4_mmq.h
 	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
 
-tests/test_mmq_parity: cuda/mmq/test/test_mmq_parity.o ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_mmq_parity: cuda/mmq/test/test_mmq_parity.o $(DS4_CUDA_CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-mmq-parity: tests/test_mmq_parity
 	./tests/test_mmq_parity
 
-tests/test_model_family_kernels: tests/test_model_family_kernels.o ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_model_family_kernels: tests/test_model_family_kernels.o $(DS4_CUDA_CORE_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-model-family-kernels: tests/test_model_family_kernels
 	./tests/test_model_family_kernels
 
+tests/test_qwen4exp_primitives: tests/test_qwen4exp_primitives.o $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen4exp-primitives: tests/test_qwen4exp_primitives
+	./tests/test_qwen4exp_primitives
+
+tests/test_qwen4exp_hc_forward: tests/test_qwen4exp_hc_forward.o $(DS4_CUDA_SUPPORT_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen4exp-hc-forward: tests/test_qwen4exp_hc_forward
+	./tests/test_qwen4exp_hc_forward
+
+tests/test_qwen4exp_ple_compute: tests/test_qwen4exp_ple_compute.o $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen4exp-ple-compute: tests/test_qwen4exp_ple_compute
+	./tests/test_qwen4exp_ple_compute
+
+tests/test_qwen4exp_ple_forward: tests/test_qwen4exp_ple_forward.o $(DS4_CUDA_SUPPORT_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen4exp-ple-forward: tests/test_qwen4exp_ple_forward
+	@test -n "$(DS4_QWEN4EXP_MODEL)" || \
+		{ echo "set DS4_QWEN4EXP_MODEL to the first SSD-PLE GGUF shard" >&2; exit 2; }
+	@test -n "$(DS4_QWEN4EXP_ROOT)" || \
+		{ echo "set DS4_QWEN4EXP_ROOT to the SSD-PLE artifact root" >&2; exit 2; }
+	@test -n "$(DS4_QWEN4EXP_BF16_MODEL)" || \
+		{ echo "set DS4_QWEN4EXP_BF16_MODEL to the first resident BF16 GGUF shard" >&2; exit 2; }
+	./tests/test_qwen4exp_ple_forward "$(DS4_QWEN4EXP_MODEL)" \
+		"$(DS4_QWEN4EXP_ROOT)" "$(DS4_QWEN4EXP_BF16_MODEL)"
+
+tests/test_qwen4exp_moe: tests/test_qwen4exp_moe.o $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen4exp-moe: tests/test_qwen4exp_moe
+	./tests/test_qwen4exp_moe
+
+tests/test_qwen4exp_moe_forward: tests/test_qwen4exp_moe_forward.o $(DS4_CUDA_SUPPORT_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen4exp-moe-forward: tests/test_qwen4exp_moe_forward
+	@test -n "$(DS4_QWEN4EXP_MODEL)" || \
+		{ echo "set DS4_QWEN4EXP_MODEL to the first SSD-PLE GGUF shard" >&2; exit 2; }
+	./tests/test_qwen4exp_moe_forward "$(DS4_QWEN4EXP_MODEL)"
+
+tests/test_qwen4exp_gdn: tests/test_qwen4exp_gdn.o $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen4exp-gdn: tests/test_qwen4exp_gdn
+	./tests/test_qwen4exp_gdn
+
+tests/test_qwen4exp_gdn_forward: tests/test_qwen4exp_gdn_forward.o $(DS4_CUDA_SUPPORT_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen4exp-gdn-forward: tests/test_qwen4exp_gdn_forward
+	@test -n "$(DS4_QWEN4EXP_MODEL)" || \
+		{ echo "set DS4_QWEN4EXP_MODEL to the first SSD-PLE GGUF shard" >&2; exit 2; }
+	./tests/test_qwen4exp_gdn_forward "$(DS4_QWEN4EXP_MODEL)"
+
+tests/test_qwen4exp_qsa: tests/test_qwen4exp_qsa.o $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen4exp-qsa: tests/test_qwen4exp_qsa
+	./tests/test_qwen4exp_qsa
+
+tests/test_qwen4exp_qsa_forward: tests/test_qwen4exp_qsa_forward.o $(DS4_CUDA_SUPPORT_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen4exp-qsa-forward: tests/test_qwen4exp_qsa_forward
+	@test -n "$(DS4_QWEN4EXP_MODEL)" || \
+		{ echo "set DS4_QWEN4EXP_MODEL to the first SSD-PLE GGUF shard" >&2; exit 2; }
+	./tests/test_qwen4exp_qsa_forward "$(DS4_QWEN4EXP_MODEL)"
+
+tests/test_qwen4exp_batch.o: tests/test_qwen4exp_batch.c ds4.h
+	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+tests/test_qwen4exp_batch: tests/test_qwen4exp_batch.o $(CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen4exp-batch: tests/test_qwen4exp_batch
+	@test -n "$(DS4_QWEN4EXP_MODEL)" || \
+		{ echo "set DS4_QWEN4EXP_MODEL to the first SSD-PLE GGUF shard" >&2; exit 2; }
+	./tests/test_qwen4exp_batch "$(DS4_QWEN4EXP_MODEL)"
+
 # The test includes ds4.c directly for its static graph seams, so it must
 # not also link ds4.o (duplicate externs); ds4_cuda.o resolves against the
 # test object's own copy.
-tests/test_solar_forward: tests/test_solar_forward.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_solar_forward: tests/test_solar_forward.o $(DS4_CUDA_SUPPORT_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-solar-forward: tests/test_solar_forward
@@ -705,7 +836,7 @@ ifneq ($(UNAME_S),Darwin)
 tests/test_exaone_ref.o: tests/test_exaone_ref.c ds4.c ds4.h ds4_gpu.h
 	$(CC) $(CFLAGS) -Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_exaone_ref: tests/test_exaone_ref.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_exaone_ref: tests/test_exaone_ref.o $(DS4_CUDA_SUPPORT_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-exaone-ref: tests/test_exaone_ref
@@ -716,7 +847,7 @@ test-exaone-ref: tests/test_exaone_ref
 tests/test_exaone_kernels.o: tests/test_exaone_kernels.c ds4.c ds4.h ds4_gpu.h
 	$(CC) $(CFLAGS) -Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_exaone_kernels: tests/test_exaone_kernels.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_exaone_kernels: tests/test_exaone_kernels.o $(DS4_CUDA_SUPPORT_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 test-exaone-kernels: tests/test_exaone_kernels
@@ -736,7 +867,7 @@ test-exaone-batch: tests/test_exaone_batch
 tests/test_exaone_forward.o: tests/test_exaone_forward.c ds4.c ds4.h ds4_gpu.h
 	$(CC) $(CFLAGS) -Wno-unused-function -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_exaone_forward: tests/test_exaone_forward.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_exaone_forward: tests/test_exaone_forward.o $(DS4_CUDA_SUPPORT_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_exaone_tokenizer.o: tests/test_exaone_tokenizer.c ds4.c ds4.h ds4_gpu.h
@@ -794,6 +925,64 @@ test-dots3-loader: tests/test_dots3_loader
 		{ echo "set DS4_DOTS3_MODEL to the first dots3 GGUF shard" >&2; exit 2; }
 	./tests/test_dots3_loader "$(DS4_DOTS3_MODEL)"
 
+tests/test_qwen4exp_loader: tests/test_qwen4exp_loader.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-qwen4exp-loader: tests/test_qwen4exp_loader
+	@test -n "$(DS4_QWEN4EXP_MODEL)" || \
+		{ echo "set DS4_QWEN4EXP_MODEL to the first Qwen4Exp GGUF shard" >&2; exit 2; }
+	./tests/test_qwen4exp_loader "$(DS4_QWEN4EXP_MODEL)"
+
+tests/test_qwen4exp_tokenizer: tests/test_qwen4exp_tokenizer.c ds4.c ds4.h
+	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
+		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
+
+test-qwen4exp-tokenizer: tests/test_qwen4exp_tokenizer
+	@test -n "$(DS4_QWEN4EXP_MODEL)" || \
+		{ echo "set DS4_QWEN4EXP_MODEL to the structural or completed Qwen4Exp GGUF" >&2; exit 2; }
+	./tests/test_qwen4exp_tokenizer "$(DS4_QWEN4EXP_MODEL)"
+
+tests/test_qwen4exp_ple: tests/test_qwen4exp_ple.c ds4_ple.c ds4_ple.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_qwen4exp_ple.c ds4_ple.c $(LDLIBS)
+
+test-qwen4exp-ple: tests/test_qwen4exp_ple
+	@test -n "$(DS4_QWEN4EXP_ROOT)" || \
+		{ echo "set DS4_QWEN4EXP_ROOT to the SSD-PLE artifact root" >&2; exit 2; }
+	./tests/test_qwen4exp_ple "$(DS4_QWEN4EXP_ROOT)"
+
+tests/libds4ple_test.so: ds4_ple.c ds4_ple.h
+	$(CC) $(CFLAGS) -fPIC -shared -I. -o $@ ds4_ple.c $(LDLIBS)
+
+test-qwen4exp-ple-reference: tests/libds4ple_test.so
+	@test -n "$(DS4_QWEN4EXP_ROOT)" || \
+		{ echo "set DS4_QWEN4EXP_ROOT to the SSD-PLE artifact root" >&2; exit 2; }
+	@test -n "$(DS4_QWEN4EXP_SOURCE)" || \
+		{ echo "set DS4_QWEN4EXP_SOURCE to the pinned safetensors root" >&2; exit 2; }
+	python3 tests/test_qwen4exp_ple_reference.py \
+		--library tests/libds4ple_test.so \
+		--artifact-root "$(DS4_QWEN4EXP_ROOT)" \
+		--source-root "$(DS4_QWEN4EXP_SOURCE)"
+
+ifeq ($(UNAME_S),Darwin)
+test-qwen4exp-ple-cuda:
+	@echo "test-qwen4exp-ple-cuda requires a CUDA build"
+else
+cuda/qwen38_ple.o: cuda/qwen38_ple.cu cuda/qwen38_ple.h ds4_ple.h
+	$(NVCC) $(NVCCFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen4exp_ple_cuda.o: tests/test_qwen4exp_ple_cuda.cu cuda/qwen38_ple.h ds4_ple.h
+	$(NVCC) $(NVCCFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen4exp_ple_cuda: tests/test_qwen4exp_ple_cuda.o cuda/qwen38_ple.o ds4_ple.o
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
+
+test-qwen4exp-ple-cuda: tests/test_qwen4exp_ple_cuda
+	@test -n "$(DS4_QWEN4EXP_ROOT)" || \
+		{ echo "set DS4_QWEN4EXP_ROOT to the SSD-PLE artifact root" >&2; exit 2; }
+	./tests/test_qwen4exp_ple_cuda "$(DS4_QWEN4EXP_ROOT)"
+endif
+
 tests/test_motif3_reference: tests/test_motif3_reference.c ds4.c ds4.h
 	$(CC) $(CFLAGS) -O0 -DDS4_NO_GPU -ffunction-sections -fdata-sections \
 		-Wno-unused-function -I. -o $@ $< -Wl,--gc-sections $(LDLIBS)
@@ -821,8 +1010,8 @@ test-motif3-tokenizer: tests/test_motif3_tokenizer
 		"$(DS4_MOTIF3_FIXTURES)/tokenizer-chat.ds4tok"
 
 ifneq ($(UNAME_S),Darwin)
-tests/test_motif3_cuda: tests/test_motif3_cuda.cu ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS)
-	$(NVCC) $(NVCCFLAGS) -I. -o $@ $< ds4.o ds4_distributed.o ds4_cuda.o $(MMQ_OBJS) $(CUDA_LDLIBS)
+tests/test_motif3_cuda: tests/test_motif3_cuda.cu $(DS4_CUDA_CORE_OBJS)
+	$(NVCC) $(NVCCFLAGS) -I. -o $@ $< $(DS4_CUDA_CORE_OBJS) $(CUDA_LDLIBS)
 
 test-motif3-cuda: tests/test_motif3_cuda
 	./tests/test_motif3_cuda "$(DS4_MOTIF3_FIXTURES)"
@@ -868,3 +1057,4 @@ endif
 clean:
 	rm -f ds4-agent-rs tests/parity/agent_c_oracle tests/parity/agent_c_oracle.o
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-c ds4-server-c ds4-bench-c ds4-agent-c ds4-rs ds4-bench-rs ds4-server-rs ds4-agent-rs ds4_weight_server tests/parity/shape_c_oracle tests/parity/shape_c_oracle.o tests/parity/catalog_c_oracle tests/parity/catalog_c_oracle.o tests/parity/tensor_c_oracle tests/parity/tensor_c_oracle.o tests/parity/bind_c_oracle tests/parity/bind_c_oracle.o tests/parity/bind_lookup_c_oracle tests/parity/bind_lookup_c_oracle.o tests/parity/load_c_oracle tests/parity/load_c_oracle.o tests/parity/validate_c_oracle tests/parity/validate_c_oracle.o tests/parity/layout_c_oracle tests/parity/layout_c_oracle.o tests/parity/vocab_c_oracle tests/parity/vocab_c_oracle.o tests/parity/tokenizer_c_oracle tests/parity/tokenizer_c_oracle.o tests/parity/session_c_oracle tests/parity/session_c_oracle.o tests/parity/payload_c_oracle tests/parity/payload_c_oracle.o tests/parity/kv_c_oracle tests/parity/kv_c_oracle.o tests/parity/kv_c_stubs.o tests/parity/web_c_oracle tests/parity/web_c_oracle.o tests/parity/dist_c_oracle tests/parity/dist_c_oracle.o tests/parity/route_c_oracle tests/parity/route_c_oracle.o tests/parity/server_c_oracle tests/parity/server_c_oracle.o tests/parity/parse_c_oracle tests/parity/parse_c_oracle.o tests/parity/stream_c_oracle tests/parity/stream_c_oracle.o tests/parity/tool_stream_c_oracle tests/parity/tool_stream_c_oracle.o tests/parity/dsml_c_oracle tests/parity/dsml_c_oracle.o tests/parity/retry_c_oracle tests/parity/retry_c_oracle.o tests/parity/admit_c_oracle tests/parity/admit_c_oracle.o tests/parity/render_c_oracle tests/parity/render_c_oracle.o tests/parity/bridge_null_oracle tests/parity/bridge_null_oracle.o tests/parity/bridge_null_stubs.o tests/parity/cont_c_oracle tests/parity/cont_c_oracle.o tests/parity/memgov_c_oracle tests/parity/memgov_c_oracle.o ds4_cpu ds4_native ds4_server_test ds4_test tests/test_motif3_loader tests/test_motif3_reference tests/test_motif3_tokenizer tests/test_motif3_cuda tests/test_motif3_resident tests/test_motif3_batch tests/test_motif3_long tests/test_motif3_resident.o tests/test_motif3_batch.o tests/test_motif3_long.o tests/test_exaone_ref tests/test_exaone_kernels tests/test_exaone_batch tests/test_exaone_ref.o tests/test_exaone_kernels.o tests/test_exaone_batch.o *.o cuda/mmq/test/test_mmq_parity.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_split_gguf tests/test_solar_loader tests/test_solar_tokenizer tests/test_repack_premapped tests/test_mmq_parity tests/test_model_family_kernels tests/test_model_family_kernels.o tests/test_solar_forward tests/test_solar_forward.o tests/test_solar_session tests/test_solar_session.o tests/test_solar_kda tests/test_solar_kda_prefill tests/test_solar_kda_chunk tests/test_solar_gates tests/test_solar_kv tests/test_solar_kda.o tests/test_solar_kda_prefill.o tests/test_solar_kda_chunk.o tests/test_solar_gates.o tests/test_solar_kv.o native/bridge/ds4_bridge.o
+	rm -f tests/test_qwen4exp_loader tests/test_qwen4exp_tokenizer tests/test_qwen4exp_ple tests/test_qwen4exp_ple_cuda tests/test_qwen4exp_ple_cuda.o tests/test_qwen4exp_primitives tests/test_qwen4exp_primitives.o tests/test_qwen4exp_hc_forward tests/test_qwen4exp_hc_forward.o tests/test_qwen4exp_ple_compute tests/test_qwen4exp_ple_compute.o tests/test_qwen4exp_ple_forward tests/test_qwen4exp_ple_forward.o tests/test_qwen4exp_moe tests/test_qwen4exp_moe_forward tests/test_qwen4exp_gdn tests/test_qwen4exp_gdn_forward tests/test_qwen4exp_qsa tests/test_qwen4exp_qsa_forward tests/test_qwen4exp_batch tests/test_qwen4exp_batch.o tests/libds4ple_test.so cuda/qwen38_ple.o

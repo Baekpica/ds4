@@ -114,6 +114,24 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
+/* GGUF Q5_0 is the only block format that can represent Qwen3.8's
+ * 128-column expert-down tail without padding it to a 256-value K block. */
+typedef struct {
+    uint16_t d;
+    uint8_t qh[4];
+    uint8_t qs[16];
+} cuda_block_q5_0;
+
+typedef struct {
+    uint16_t d;
+    int8_t qs[32];
+} cuda_block_q8_0;
+
+static_assert(sizeof(cuda_block_q5_0) == 22,
+              "GGUF Q5_0 block layout must remain byte exact");
+static_assert(sizeof(cuda_block_q8_0) == 34,
+              "GGUF Q8_0 block layout must remain byte exact");
+
 #include "ds4_iq2_tables_cuda.inc"
 
 static const void *g_model_host_base;
@@ -5931,7 +5949,7 @@ typedef struct {
     uint32_t name_len;
     uint32_t type;
     uint32_t ndim;
-    uint64_t dims[4];
+    uint64_t dims[8];
     uint64_t offset;
     uint64_t bytes;
 } ds4_gpu_tensor_record;
@@ -6157,7 +6175,7 @@ extern "C" int ds4_gpu_build_derived_artifacts_from_records(
     records.reserve(count);
     for (uint32_t i = 0; i < count; i++) {
         const ds4_gpu_tensor_record &r = records_in[i];
-        if (!r.name || r.name_len == 0 || r.ndim == 0 || r.ndim > 4u ||
+        if (!r.name || r.name_len == 0 || r.ndim == 0 || r.ndim > 8u ||
             r.offset > model_size || r.bytes > model_size - r.offset) {
             g_derived_artifact_none_reason =
                 "merged GGUF catalog has an invalid tensor record";
@@ -6168,7 +6186,7 @@ extern "C" int ds4_gpu_build_derived_artifacts_from_records(
         t.type = r.type;
         t.ndim = r.ndim;
         t.elements = 1;
-        for (uint32_t d = 0; d < r.ndim && d < 4u; d++) {
+        for (uint32_t d = 0; d < r.ndim && d < 8u; d++) {
             t.dims[d] = r.dims[d];
             if (r.dims[d] != 0 && t.elements > UINT64_MAX / r.dims[d]) {
                 g_derived_artifact_none_reason = "merged GGUF catalog dimension overflow";
@@ -8206,6 +8224,7 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
         const float *xscale,
         uint64_t in_dim,
         uint64_t out_dim,
+        uint64_t out_stride,
         uint64_t n_tok,
         uint64_t blocks,
         int use_dp4a) {
@@ -8228,7 +8247,7 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
         acc += __half2float(*scale_h) * xsr[b] * (float)dot;
     }
     acc = warp_sum_f32(acc);
-    if (lane == 0) out[tok * out_dim + row] = acc;
+    if (lane == 0) out[tok * out_stride + row] = acc;
 }
 
 __global__ static void matmul_q8_0_preq_n2_warp8_kernel(
@@ -8539,6 +8558,990 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     float scale = rsqrtf(partial[0] / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
         orow[i] = xr[i] * scale * w[i];
+    }
+}
+
+/* Qwen4ExpTextRMSNorm differs in two load-bearing ways from the generic
+ * kernel above: normalization is independent for each hidden-size group and
+ * the learned parameter is zero-centred, so the multiplier is (1 + w).
+ * One block owns one [row, group] slice.  This also makes in-place execution
+ * safe: all source values used by the reduction are consumed before any
+ * thread starts writing that same slice. */
+__global__ static void qwen4exp_group_rms_norm_kernel(
+        float *out, const float *x, const float *w,
+        uint32_t width, uint32_t group_size,
+        uint32_t groups_per_row, uint32_t shared_weight, float eps) {
+    const uint64_t group_id = (uint64_t)blockIdx.x;
+    const uint32_t group = (uint32_t)(group_id % groups_per_row);
+    const uint32_t row = (uint32_t)(group_id / groups_per_row);
+    const uint64_t base = (uint64_t)row * width +
+                          (uint64_t)group * group_size;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < group_size; i += blockDim.x) {
+        const float v = x[base + i];
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)group_size + eps);
+    const uint32_t weight_base = shared_weight ? 0u : group * group_size;
+    for (uint32_t i = threadIdx.x; i < group_size; i += blockDim.x) {
+        out[base + i] = x[base + i] * scale * (1.0f + w[weight_base + i]);
+    }
+}
+
+__global__ static void qwen4exp_hc_down_silu_kernel(
+        float *out, const float *projected, uint64_t count,
+        float inv_hc_count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float v = projected[i] * inv_hc_count;
+    out[i] = v / (1.0f + expf(-v));
+}
+
+__global__ static void qwen4exp_hc_mix_kernel(
+        float *mixed, const float *normed, const float *mix_logits,
+        uint32_t hidden_size, uint32_t hc_count, uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t d = (uint32_t)(i % hidden_size);
+    const uint32_t row = (uint32_t)(i / hidden_size);
+    const uint64_t row_base = (uint64_t)row * hc_count * hidden_size;
+    float sum = 0.0f;
+    for (uint32_t hc = 0; hc < hc_count; hc++) {
+        const uint64_t at = row_base + (uint64_t)hc * hidden_size + d;
+        const float weight = 1.0f / (1.0f + expf(-mix_logits[at]));
+        sum += weight * normed[at];
+    }
+    mixed[i] = sum / (float)hc_count;
+}
+
+__global__ static void qwen4exp_hc_injection_kernel(
+        float *injection, const float *inject_logits,
+        uint64_t count, float inv_hc_count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float v = inject_logits[i] * inv_hc_count;
+    injection[i] = 2.0f / (1.0f + expf(-v));
+}
+
+__global__ static void qwen4exp_hc_residual_kernel(
+        float *out, const float *hyper_input, const float *block_output,
+        const float *injection, uint32_t hidden_size, uint32_t hc_count,
+        uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t d = (uint32_t)(i % hidden_size);
+    const uint64_t row_hc = i / hidden_size;
+    const uint32_t hc = (uint32_t)(row_hc % hc_count);
+    const uint32_t row = (uint32_t)(row_hc / hc_count);
+    out[i] = hyper_input[i] +
+             block_output[(uint64_t)row * hidden_size + d] *
+             injection[(uint64_t)row * hc_count + hc];
+}
+
+__global__ static void qwen4exp_bf16_to_f32_kernel(
+        float *out, const __nv_bfloat16 *input, uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = __bfloat162float(input[i]);
+}
+
+/* One block owns one [token, HC lane]. The dot reduction follows the
+ * reference gate exactly: divide by sqrt(hidden), signed sqrt after a 1e-6
+ * absolute clamp, then sigmoid and broadcast over the shared value vector. */
+__global__ static void qwen4exp_ple_gate_kernel(
+        float *gated_value, float *transformed_gate,
+        const float *key_normed, const float *query_normed,
+        const float *value, uint32_t hidden_size, uint32_t hc_count) {
+    const uint64_t lane_id = (uint64_t)blockIdx.x;
+    const uint32_t hc = (uint32_t)(lane_id % hc_count);
+    const uint32_t row = (uint32_t)(lane_id / hc_count);
+    const uint64_t lane_base =
+        ((uint64_t)row * hc_count + hc) * hidden_size;
+    float dot = 0.0f;
+    for (uint32_t d = threadIdx.x; d < hidden_size; d += blockDim.x)
+        dot += key_normed[lane_base + d] * query_normed[lane_base + d];
+    __shared__ float partial[256];
+    partial[threadIdx.x] = dot;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    __shared__ float gate_weight;
+    if (threadIdx.x == 0) {
+        const float raw = partial[0] * rsqrtf((float)hidden_size);
+        const float sign = (float)((raw > 0.0f) - (raw < 0.0f));
+        const float gate = sqrtf(fmaxf(fabsf(raw), 1.0e-6f)) * sign;
+        if (transformed_gate) transformed_gate[lane_id] = gate;
+        gate_weight = 1.0f / (1.0f + expf(-gate));
+    }
+    __syncthreads();
+    const uint64_t value_base = (uint64_t)row * hidden_size;
+    for (uint32_t d = threadIdx.x; d < hidden_size; d += blockDim.x)
+        gated_value[lane_base + d] = gate_weight * value[value_base + d];
+}
+
+__global__ static void qwen4exp_ple_conv_kernel(
+        float *out, const float *state, const float *input,
+        const __nv_bfloat16 *weight, uint32_t rows, uint32_t width,
+        uint32_t kernel_size, uint32_t dilation, uint32_t state_len,
+        uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t channel = (uint32_t)(i % width);
+    const uint32_t token = (uint32_t)(i / width);
+    float sum = 0.0f;
+    for (uint32_t tap = 0; tap < kernel_size; tap++) {
+        const int64_t source_token = (int64_t)token - (int64_t)state_len +
+                                     (int64_t)tap * dilation;
+        const float source = source_token >= 0
+            ? input[(uint64_t)source_token * width + channel]
+            : state[(uint64_t)channel * state_len +
+                    (uint32_t)((int64_t)state_len + source_token)];
+        sum += source *
+               __bfloat162float(weight[(uint64_t)channel * kernel_size + tap]);
+    }
+    out[i] = sum / (1.0f + expf(-sum));
+}
+
+/* A single thread owns each channel so the short-chunk shift cannot race
+ * another state-slot update. Qwen's production state_len is nine; the host
+ * entry caps the generic form at sixteen. */
+__global__ static void qwen4exp_ple_conv_state_update_kernel(
+        float *state, const float *input, uint32_t rows, uint32_t width,
+        uint32_t state_len) {
+    const uint32_t channel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (channel >= width) return;
+    float prior[16];
+#pragma unroll
+    for (uint32_t i = 0; i < 16; i++) prior[i] = 0.0f;
+    for (uint32_t i = 0; i < state_len; i++)
+        prior[i] = state[(uint64_t)channel * state_len + i];
+    for (uint32_t slot = 0; slot < state_len; slot++) {
+        const int64_t combined = (int64_t)rows + slot - state_len;
+        state[(uint64_t)channel * state_len + slot] = combined >= 0
+            ? input[(uint64_t)combined * width + channel]
+            : prior[(uint32_t)((int64_t)state_len + combined)];
+    }
+}
+
+/* Qwen3.8-Flash-Next Gated DeltaNet keeps four raw QKV samples per channel
+ * in the Transformers cache even though a width-four causal convolution only
+ * consumes the newest three past samples plus the current sample.  Keeping
+ * that apparently redundant oldest slot is intentional: cache crop/rollback
+ * and chunked continuation must expose the same state representation as the
+ * reference implementation. */
+__global__ static void qwen4exp_gdn_conv_kernel(
+        float *out, const float *state, const float *input,
+        const __nv_bfloat16 *weight, uint32_t rows, uint32_t width,
+        uint32_t kernel_size, uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t channel = (uint32_t)(i % width);
+    const uint32_t token = (uint32_t)(i / width);
+    float sum = 0.0f;
+    for (uint32_t tap = 0; tap < kernel_size; tap++) {
+        const int64_t source_token =
+            (int64_t)token - (int64_t)(kernel_size - 1u) + (int64_t)tap;
+        const float source = source_token >= 0
+            ? input[(uint64_t)source_token * width + channel]
+            : state[(uint64_t)channel * kernel_size +
+                    (uint32_t)((int64_t)kernel_size + source_token)];
+        sum += source *
+               __bfloat162float(weight[(uint64_t)channel * kernel_size + tap]);
+    }
+    out[i] = sum / (1.0f + expf(-sum));
+}
+
+__device__ static __forceinline__ float qwen4exp_softplus(float x) {
+    /* torch.nn.functional.softplus uses a threshold of 20 by default. */
+    return x > 20.0f ? x : log1pf(expf(x));
+}
+
+/* Convert the two learned time-step projections to the exact controls used
+ * by the recurrent rule. `beta == b` and `g == a` are deliberately legal so
+ * the graph can transform both projection buffers in place. */
+__global__ static void qwen4exp_gdn_controls_kernel(
+        float *beta, float *g, const float *b, const float *a,
+        const float *a_log, const float *dt_bias, uint32_t heads,
+        uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t head = (uint32_t)(i % heads);
+    const float bv = b[i];
+    const float av = a[i] + dt_bias[head];
+    beta[i] = bv >= 0.0f
+        ? 1.0f / (1.0f + expf(-bv))
+        : expf(bv) / (1.0f + expf(bv));
+    g[i] = -expf(a_log[head]) * qwen4exp_softplus(av);
+}
+
+/* Correctness-first recurrent Gated Delta rule. One CUDA block owns one value
+ * head, and one thread owns a complete state column. That makes arbitrary
+ * chunk boundaries bit-stable: a token is fully committed before the block
+ * advances to the next token. Q/K heads are repeated contiguously over value
+ * heads (48 / 16 == 3 in the production checkpoint). */
+__global__ static void qwen4exp_gdn_recurrent_kernel(
+        float *out0, float *state0, const float *mixed_qkv0,
+        const float *beta0, const float *g0,
+        float *out1, float *state1, const float *mixed_qkv1,
+        const float *beta1, const float *g1, uint32_t rows,
+        uint32_t key_heads, uint32_t value_heads, uint32_t head_dim,
+        uint32_t key_dim, uint32_t value_dim, uint32_t repeat) {
+    const uint32_t value_head = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (value_head >= value_heads) return;
+    float *out = blockIdx.y == 0u ? out0 : out1;
+    float *state = blockIdx.y == 0u ? state0 : state1;
+    const float *mixed_qkv = blockIdx.y == 0u ? mixed_qkv0 : mixed_qkv1;
+    const float *beta = blockIdx.y == 0u ? beta0 : beta1;
+    const float *g = blockIdx.y == 0u ? g0 : g1;
+
+    extern __shared__ float shared[];
+    float *q_raw = shared;
+    float *k_raw = q_raw + head_dim;
+    const uint32_t key_head = value_head / repeat;
+    const float inv_sqrt_dim = rsqrtf((float)head_dim);
+    const uint64_t state_head_base =
+        (uint64_t)value_head * head_dim * head_dim;
+
+    if (head_dim == 128u && blockDim.x == 512u) {
+        constexpr uint32_t groups = 4u;
+        const uint32_t group = tid / head_dim;
+        const uint32_t v = tid % head_dim;
+        float *partial = k_raw + head_dim;
+        float *delta_shared = partial + groups * head_dim;
+
+        for (uint32_t token = 0; token < rows; token++) {
+            const uint64_t row_base =
+                (uint64_t)token * (2u * key_dim + value_dim);
+            if (tid < head_dim) {
+                const float qv = mixed_qkv[
+                    row_base + (uint64_t)key_head * head_dim + tid];
+                const float kv = mixed_qkv[
+                    row_base + key_dim +
+                    (uint64_t)key_head * head_dim + tid];
+                q_raw[tid] = qv;
+                k_raw[tid] = kv;
+                float q2 = qv * qv;
+                float k2 = kv * kv;
+                for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+                    q2 += __shfl_down_sync(0xffffffffu, q2, offset);
+                    k2 += __shfl_down_sync(0xffffffffu, k2, offset);
+                }
+                if ((tid & 31u) == 0u) {
+                    partial[tid >> 5u] = q2;
+                    delta_shared[tid >> 5u] = k2;
+                }
+            }
+            __syncthreads();
+            if (tid < 32u) {
+                float q2 = tid < 4u ? partial[tid] : 0.0f;
+                float k2 = tid < 4u ? delta_shared[tid] : 0.0f;
+                for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+                    q2 += __shfl_down_sync(0xffffffffu, q2, offset);
+                    k2 += __shfl_down_sync(0xffffffffu, k2, offset);
+                }
+                if (tid == 0u) {
+                    partial[0] = q2;
+                    delta_shared[0] = k2;
+                }
+            }
+            __syncthreads();
+
+            const float q_inv =
+                rsqrtf(partial[0] + 1.0e-6f) * inv_sqrt_dim;
+            const float k_inv = rsqrtf(delta_shared[0] + 1.0e-6f);
+            const uint64_t control_at =
+                (uint64_t)token * value_heads + value_head;
+            const float decay = expf(g[control_at]);
+            const uint64_t state_col = state_head_base + v;
+            float kv_mem = 0.0f;
+            for (uint32_t k = group; k < head_dim; k += groups) {
+                const uint64_t at = state_col + (uint64_t)k * head_dim;
+                kv_mem += state[at] * decay * (k_raw[k] * k_inv);
+            }
+            partial[(uint64_t)group * head_dim + v] = kv_mem;
+            __syncthreads();
+            if (group == 0u) {
+                kv_mem = partial[v] + partial[head_dim + v] +
+                         partial[2u * head_dim + v] +
+                         partial[3u * head_dim + v];
+                const float value = mixed_qkv[
+                    row_base + 2u * key_dim +
+                    (uint64_t)value_head * head_dim + v];
+                delta_shared[v] =
+                    (value - kv_mem) * beta[control_at];
+            }
+            __syncthreads();
+
+            const float delta = delta_shared[v];
+            float result = 0.0f;
+            for (uint32_t k = group; k < head_dim; k += groups) {
+                const uint64_t at = state_col + (uint64_t)k * head_dim;
+                const float sv = state[at] * decay +
+                                 (k_raw[k] * k_inv) * delta;
+                state[at] = sv;
+                result += sv * (q_raw[k] * q_inv);
+            }
+            partial[(uint64_t)group * head_dim + v] = result;
+            __syncthreads();
+            if (group == 0u) {
+                out[((uint64_t)token * value_heads + value_head) *
+                    head_dim + v] =
+                    partial[v] + partial[head_dim + v] +
+                    partial[2u * head_dim + v] +
+                    partial[3u * head_dim + v];
+            }
+        }
+        return;
+    }
+
+    const uint32_t v = tid;
+    if (v >= head_dim) return;
+    float *q_sum = k_raw + head_dim;
+    float *k_sum = q_sum + head_dim;
+
+    for (uint32_t token = 0; token < rows; token++) {
+        const uint64_t row_base =
+            (uint64_t)token * (2u * key_dim + value_dim);
+        const float qv = mixed_qkv[
+            row_base + (uint64_t)key_head * head_dim + v];
+        const float kv = mixed_qkv[
+            row_base + key_dim + (uint64_t)key_head * head_dim + v];
+        q_raw[v] = qv;
+        k_raw[v] = kv;
+        if (head_dim >= 32u) {
+            const uint32_t lane = v & 31u;
+            const uint32_t warp = v >> 5u;
+            const uint32_t warps = head_dim >> 5u;
+            float q2 = qv * qv;
+            float k2 = kv * kv;
+            for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+                q2 += __shfl_down_sync(0xffffffffu, q2, offset);
+                k2 += __shfl_down_sync(0xffffffffu, k2, offset);
+            }
+            if (lane == 0u) {
+                q_sum[warp] = q2;
+                k_sum[warp] = k2;
+            }
+            __syncthreads();
+            if (warp == 0u) {
+                q2 = lane < warps ? q_sum[lane] : 0.0f;
+                k2 = lane < warps ? k_sum[lane] : 0.0f;
+                for (uint32_t offset = 16u; offset > 0u; offset >>= 1u) {
+                    q2 += __shfl_down_sync(0xffffffffu, q2, offset);
+                    k2 += __shfl_down_sync(0xffffffffu, k2, offset);
+                }
+                if (lane == 0u) {
+                    q_sum[0] = q2;
+                    k_sum[0] = k2;
+                }
+            }
+            __syncthreads();
+        } else {
+            q_sum[v] = qv * qv;
+            k_sum[v] = kv * kv;
+            __syncthreads();
+            for (uint32_t stride = head_dim >> 1; stride > 0;
+                 stride >>= 1) {
+                if (v < stride) {
+                    q_sum[v] += q_sum[v + stride];
+                    k_sum[v] += k_sum[v + stride];
+                }
+                __syncthreads();
+            }
+        }
+
+        const float q_inv = rsqrtf(q_sum[0] + 1.0e-6f) * inv_sqrt_dim;
+        const float k_inv = rsqrtf(k_sum[0] + 1.0e-6f);
+        const uint64_t control_at =
+            (uint64_t)token * value_heads + value_head;
+        const float decay = expf(g[control_at]);
+        const float beta_value = beta[control_at];
+        float kv_mem = 0.0f;
+        const uint64_t state_col = state_head_base + v;
+        for (uint32_t k = 0; k < head_dim; k++) {
+            const uint64_t at = state_col + (uint64_t)k * head_dim;
+            const float sv = state[at] * decay;
+            kv_mem += sv * (k_raw[k] * k_inv);
+        }
+        const float value = mixed_qkv[
+            row_base + 2u * key_dim +
+            (uint64_t)value_head * head_dim + v];
+        const float delta = (value - kv_mem) * beta_value;
+        float result = 0.0f;
+        for (uint32_t k = 0; k < head_dim; k++) {
+            const uint64_t at = state_col + (uint64_t)k * head_dim;
+            const float sv = state[at] * decay +
+                             (k_raw[k] * k_inv) * delta;
+            state[at] = sv;
+            result += sv * (q_raw[k] * q_inv);
+        }
+        out[((uint64_t)token * value_heads + value_head) * head_dim + v] =
+            result;
+        /* Every state column is independent, but all threads must finish
+         * consuming the shared Q/K row before the next row overwrites it. */
+        __syncthreads();
+    }
+}
+
+/* Qwen3.8 pins output_gate_type="sigmoid": RMS-normalize each 128-value
+ * head, multiply the learned (non-zero-centered) weight, then sigmoid(z). */
+__global__ static void qwen4exp_gdn_gated_rms_norm_kernel(
+        float *out, const float *core, const float *z, const float *weight,
+        uint32_t head_dim, float eps, uint64_t head_rows) {
+    const uint64_t row = blockIdx.x;
+    if (row >= head_rows) return;
+    const uint32_t d = threadIdx.x;
+    const uint64_t base = row * head_dim;
+    const float x = core[base + d];
+    extern __shared__ float sum[];
+    sum[d] = x * x;
+    __syncthreads();
+    for (uint32_t stride = head_dim >> 1; stride > 0; stride >>= 1) {
+        if (d < stride) sum[d] += sum[d + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(sum[0] / (float)head_dim + eps);
+    const float gate = z[base + d];
+    const float sigmoid = 1.0f / (1.0f + expf(-gate));
+    out[base + d] = x * scale * weight[d] * sigmoid;
+}
+
+/* QSA index projection layout is [four query heads, one raw key]. Store the
+ * raw key at its absolute token position and compact the query heads into a
+ * standalone tensor for zero-centred RMSNorm and RoPE. */
+__global__ static void qwen4exp_qsa_split_index_kernel(
+        float *query, float *raw_key_cache, const float *qk,
+        uint32_t rows, uint32_t pos0, uint32_t q_heads,
+        uint32_t head_dim, uint32_t cache_cap, uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t width = q_heads * head_dim;
+    const uint32_t d = (uint32_t)(i % width);
+    const uint32_t row = (uint32_t)(i / width);
+    query[i] = qk[(uint64_t)row * (width + head_dim) + d];
+    if (d < head_dim) {
+        raw_key_cache[(uint64_t)(pos0 + row) * head_dim + d] =
+            qk[(uint64_t)row * (width + head_dim) + width + d];
+    }
+}
+
+/* q_proj is laid out per head as [query[head_dim], gate[head_dim]]. */
+__global__ static void qwen4exp_qsa_split_q_gate_kernel(
+        float *query, float *gate, const float *projected,
+        uint32_t heads, uint32_t head_dim, uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t d = (uint32_t)(i % head_dim);
+    const uint64_t head_row = i / head_dim;
+    const uint64_t source = head_row * (2u * head_dim) + d;
+    query[i] = projected[source];
+    gate[i] = projected[source + head_dim];
+    (void)heads;
+}
+
+/* --use_fast_math maps sinf/cosf to fast intrinsics whose native argument
+ * reduction loses visible phase accuracy once text positions reach a few
+ * thousand radians. Reduce the already-rounded F32 angle with a split 2*pi
+ * constant first; __sincosf is then only asked to cover [-pi, pi]. */
+__device__ __forceinline__ static void qwen4exp_reduced_sincos(
+        float theta, float *s, float *c) {
+    const float turns = nearbyintf(theta * 0.15915494309189533577f);
+    float reduced = fmaf(-turns, 6.28125f, theta);
+    reduced = fmaf(-turns, 0.00193530717958647693f, reduced);
+    __sincosf(reduced, s, c);
+}
+
+#define QWEN4EXP_QSA_MAX_ROTARY_DIM 256u
+typedef struct {
+    float inv_freq[QWEN4EXP_QSA_MAX_ROTARY_DIM / 2u];
+} qwen4exp_rope_freqs;
+
+/* The reference constructs inv_freq in F32 on the host and only then moves
+ * it to the accelerator. Passing the small table by value both preserves
+ * those semantics and avoids hundreds of device powf calls per token. */
+static bool qwen4exp_rope_freqs_init(qwen4exp_rope_freqs *out,
+        uint32_t rotary_dim, float freq_base) {
+    if (!out || rotary_dim == 0u ||
+        rotary_dim > QWEN4EXP_QSA_MAX_ROTARY_DIM || (rotary_dim & 1u) ||
+        !isfinite(freq_base) || freq_base <= 0.0f) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    for (uint32_t d = 0; d < rotary_dim / 2u; d++)
+        out->inv_freq[d] =
+            1.0f / powf(freq_base, (2.0f * (float)d) / (float)rotary_dim);
+    return true;
+}
+
+/* Qwen rotates the FIRST rotary_dim values using half-split pairs, unlike
+ * DS4's older tail/adjacent-pair RoPE kernels. For text positions the three
+ * MRoPE axes coincide, so one scalar position reproduces the reference. */
+__global__ static void qwen4exp_rope_first_kernel(
+        float *x, uint32_t rows, uint32_t heads, uint32_t head_dim,
+        uint32_t rotary_dim, uint32_t pos0, qwen4exp_rope_freqs freqs,
+        uint64_t pairs) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pairs) return;
+    const uint32_t half = rotary_dim / 2u;
+    const uint32_t pair = (uint32_t)(i % half);
+    const uint64_t head_row = i / half;
+    const uint32_t row = (uint32_t)(head_row / heads);
+    const uint64_t base = head_row * head_dim;
+    const float theta = (float)(pos0 + row) * freqs.inv_freq[pair];
+    float c, s;
+    qwen4exp_reduced_sincos(theta, &s, &c);
+    const float x0 = x[base + pair];
+    const float x1 = x[base + pair + half];
+    x[base + pair] = x0 * c - x1 * s;
+    x[base + pair + half] = x1 * c + x0 * s;
+    (void)rows;
+}
+
+__global__ static void qwen4exp_mrope_first_kernel(
+        float *x, const int32_t *positions, uint32_t rows,
+        uint32_t heads, uint32_t head_dim, uint32_t rotary_dim,
+        uint32_t pos0, qwen4exp_rope_freqs freqs, uint64_t pairs) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pairs) return;
+    const uint32_t half = rotary_dim / 2u;
+    const uint32_t pair = (uint32_t)(i % half);
+    const uint64_t head_row = i / half;
+    const uint32_t row = (uint32_t)(head_row / heads);
+    const uint64_t base = head_row * head_dim;
+    /* mrope_section=[11,11,10] is interleaved THW; the final pair (31)
+     * naturally lands on H. */
+    const uint32_t axis = pair % 3u;
+    const int32_t position = positions[(uint64_t)(pos0 + row) * 3u + axis];
+    const float theta = (float)position * freqs.inv_freq[pair];
+    float c, s;
+    qwen4exp_reduced_sincos(theta, &s, &c);
+    const float x0 = x[base + pair];
+    const float x1 = x[base + pair + half];
+    x[base + pair] = x0 * c - x1 * s;
+    x[base + pair + half] = x1 * c + x0 * s;
+    (void)rows;
+}
+
+/* Materialize each completed four-token index block exactly once. The raw
+ * key mean is accumulated in F32, followed by Qwen's zero-centred RMSNorm
+ * and RoPE at the first token position of the group. */
+__global__ static void qwen4exp_qsa_pool_blocks_kernel(
+        float *pooled_cache, const float *raw_key_cache, const float *weight,
+        const int32_t *positions,
+        uint32_t first_block, uint32_t n_blocks, uint32_t ratio,
+        uint32_t head_dim, uint32_t rotary_dim, qwen4exp_rope_freqs freqs,
+        float eps) {
+    const uint32_t local_block = blockIdx.x;
+    const uint32_t d = threadIdx.x;
+    if (local_block >= n_blocks || d >= head_dim) return;
+    const uint32_t block = first_block + local_block;
+    float mean = 0.0f;
+    for (uint32_t r = 0; r < ratio; r++)
+        mean += raw_key_cache[((uint64_t)block * ratio + r) * head_dim + d];
+    mean /= (float)ratio;
+    extern __shared__ float shared[];
+    float *value = shared;
+    float *sum = value + head_dim;
+    value[d] = mean;
+    sum[d] = mean * mean;
+    __syncthreads();
+    for (uint32_t stride = head_dim >> 1; stride > 0; stride >>= 1) {
+        if (d < stride) sum[d] += sum[d + stride];
+        __syncthreads();
+    }
+    value[d] = mean * rsqrtf(sum[0] / (float)head_dim + eps) *
+               (1.0f + weight[d]);
+    __syncthreads();
+    const uint64_t out_base = (uint64_t)block * head_dim;
+    const uint32_t half = rotary_dim / 2u;
+    if (d < half) {
+        const uint32_t axis = d % 3u;
+        const float pos = positions
+            ? (float)positions[(uint64_t)block * ratio * 3u + axis]
+            : (float)(block * ratio);
+        const float theta = pos * freqs.inv_freq[d];
+        float c, s;
+        qwen4exp_reduced_sincos(theta, &s, &c);
+        const float x0 = value[d];
+        const float x1 = value[d + half];
+        pooled_cache[out_base + d] = x0 * c - x1 * s;
+        pooled_cache[out_base + d + half] = x1 * c + x0 * s;
+    } else if (d >= rotary_dim) {
+        pooled_cache[out_base + d] = value[d];
+    }
+}
+
+/* Score every block visible to each query. Invalid future blocks are -inf so
+ * the existing exact top-k dispatcher can use one fixed band for a prefill
+ * chunk whose rows have different causal horizons. */
+__global__ static void qwen4exp_qsa_block_scores_kernel(
+        float *scores, const float *query, const float *pooled_cache,
+        uint32_t rows, uint32_t pos0, uint32_t max_blocks,
+        uint32_t q_heads, uint32_t head_dim, uint32_t ratio) {
+    const uint32_t block = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    const uint32_t d = threadIdx.x;
+    if (row >= rows || block >= max_blocks || d >= head_dim) return;
+    const uint32_t visible_blocks = (pos0 + row + 1u) / ratio;
+    if (block >= visible_blocks) {
+        if (d == 0u)
+            scores[(uint64_t)row * max_blocks + block] = -INFINITY;
+        return;
+    }
+    extern __shared__ float partial[];
+    const float key = pooled_cache[(uint64_t)block * head_dim + d];
+    const uint64_t qbase = (uint64_t)row * q_heads * head_dim;
+    for (uint32_t h = 0; h < q_heads; h++)
+        partial[(uint64_t)h * head_dim + d] =
+            query[qbase + (uint64_t)h * head_dim + d] * key;
+    __syncthreads();
+    for (uint32_t stride = head_dim >> 1; stride > 0; stride >>= 1) {
+        if (d < stride) {
+            for (uint32_t h = 0; h < q_heads; h++)
+                partial[(uint64_t)h * head_dim + d] +=
+                    partial[(uint64_t)h * head_dim + d + stride];
+        }
+        __syncthreads();
+    }
+    if (d == 0u) {
+        float score = 0.0f;
+        for (uint32_t h = 0; h < q_heads; h++)
+            score += fmaxf(partial[(uint64_t)h * head_dim], 0.0f);
+        scores[(uint64_t)row * max_blocks + block] =
+            score * rsqrtf((float)head_dim);
+    }
+}
+
+/* Top-k block order is score order, whereas the reference converts selection
+ * to a boolean mask and main attention consumes keys in token-position order.
+ * Sort its at-most-512-entry power-of-two band in parallel before expansion. */
+__global__ static void qwen4exp_qsa_expand_selection_kernel(
+        int32_t *tokens, uint32_t *counts, const uint32_t *selected_blocks,
+        uint32_t rows, uint32_t pos0, uint32_t max_blocks,
+        uint32_t topk_blocks, uint32_t ratio, uint32_t token_budget,
+        uint32_t selected_cap) {
+    const uint32_t row = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    if (row >= rows) return;
+    int32_t *out = tokens + (uint64_t)row * selected_cap;
+    const uint32_t visible = pos0 + row + 1u;
+    const uint32_t visible_blocks = visible / ratio;
+    uint32_t sort_cap = 1u;
+    while (sort_cap < topk_blocks) sort_cap <<= 1u;
+    __shared__ uint32_t ids[512];
+    __shared__ uint32_t selected_count;
+    for (uint32_t i = tid; i < selected_cap; i += blockDim.x)
+        out[i] = -1;
+    for (uint32_t i = tid; i < sort_cap; i += blockDim.x) {
+        const uint32_t id = i < topk_blocks && selected_blocks
+            ? selected_blocks[(uint64_t)row * topk_blocks + i]
+            : UINT32_MAX;
+        ids[i] = id < visible_blocks && id < max_blocks ? id : UINT32_MAX;
+    }
+    __syncthreads();
+    for (uint32_t size = 2u; size <= sort_cap; size <<= 1u) {
+        for (uint32_t stride = size >> 1u; stride > 0u; stride >>= 1u) {
+            for (uint32_t i = tid; i < sort_cap; i += blockDim.x) {
+                const uint32_t other = i ^ stride;
+                if (other > i) {
+                    const uint32_t a = ids[i];
+                    const uint32_t b = ids[other];
+                    const bool ascending = (i & size) == 0u;
+                    if ((ascending && a > b) || (!ascending && a < b)) {
+                        ids[i] = b;
+                        ids[other] = a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    if (tid == 0u) {
+        uint32_t n_ids = 0u;
+        while (n_ids < topk_blocks && ids[n_ids] != UINT32_MAX) n_ids++;
+        const uint32_t max_ids = token_budget / ratio;
+        selected_count = (n_ids < max_ids ? n_ids : max_ids) * ratio;
+    }
+    __syncthreads();
+    for (uint32_t i = tid; i < selected_count; i += blockDim.x) {
+        const uint32_t block_slot = i / ratio;
+        out[i] = (int32_t)(ids[block_slot] * ratio + i % ratio);
+    }
+    if (tid == 0u) {
+        uint32_t count = selected_count;
+        const uint32_t tail_start = visible_blocks * ratio;
+        for (uint32_t token = tail_start;
+             token < visible && count < selected_cap; token++) {
+            out[count++] = (int32_t)token;
+        }
+        counts[row] = count;
+    }
+}
+
+__global__ static void qwen4exp_qsa_store_kv_kernel(
+        float *k_cache, float *v_cache, const float *key, const float *value,
+        uint32_t pos0, uint32_t kv_dim, uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const uint32_t d = (uint32_t)(i % kv_dim);
+    const uint32_t row = (uint32_t)(i / kv_dim);
+    const uint64_t dst = (uint64_t)(pos0 + row) * kv_dim + d;
+    k_cache[dst] = key[i];
+    v_cache[dst] = value[i];
+}
+
+__global__ static void qwen4exp_qsa_attention_scores_kernel(
+        float *scores, const float *query, const float *k_cache,
+        const int32_t *selected, const uint32_t *counts,
+        uint32_t rows, uint32_t heads, uint32_t kv_heads,
+        uint32_t head_dim, uint32_t selected_cap, uint32_t cache_cap) {
+    const uint32_t slot = blockIdx.x;
+    const uint32_t head = blockIdx.y;
+    const uint32_t row = blockIdx.z;
+    const uint32_t d = threadIdx.x;
+    if (row >= rows || head >= heads || slot >= selected_cap ||
+        d >= head_dim) return;
+    const uint64_t score_at =
+        ((uint64_t)row * heads + head) * selected_cap + slot;
+    if (slot >= counts[row]) {
+        if (d == 0u) scores[score_at] = -INFINITY;
+        return;
+    }
+    const int32_t token = selected[(uint64_t)row * selected_cap + slot];
+    if (token < 0 || (uint32_t)token >= cache_cap) {
+        if (d == 0u) scores[score_at] = -INFINITY;
+        return;
+    }
+    const uint32_t kv_head = head / (heads / kv_heads);
+    const uint32_t kv_dim = kv_heads * head_dim;
+    const float product =
+        query[((uint64_t)row * heads + head) * head_dim + d] *
+        k_cache[(uint64_t)(uint32_t)token * kv_dim +
+                (uint64_t)kv_head * head_dim + d];
+    extern __shared__ float partial[];
+    partial[d] = product;
+    __syncthreads();
+    for (uint32_t stride = head_dim >> 1; stride >= 32u; stride >>= 1) {
+        if (d < stride) partial[d] += partial[d + stride];
+        if (stride > 32u) __syncthreads();
+    }
+    if (d < 32u) {
+        const unsigned mask = __activemask();
+        __syncwarp(mask);
+        float sum = partial[d];
+        for (uint32_t stride = min(16u, head_dim >> 1); stride > 0u;
+             stride >>= 1) {
+            const float other = __shfl_down_sync(mask, sum, stride);
+            if (d < stride) sum += other;
+        }
+        if (d == 0u) scores[score_at] = sum * rsqrtf((float)head_dim);
+    }
+}
+
+/* Qwen's 24-query/2-KV GQA shape shares one key across twelve query heads.
+ * Four warps each score three heads without a block barrier or shared-memory
+ * reduction. */
+__global__ static void qwen4exp_qsa_attention_scores_gqa12_kernel(
+        float *scores, const float *query, const float *k_cache,
+        const int32_t *selected, const uint32_t *counts,
+        uint32_t rows, uint32_t selected_cap, uint32_t cache_cap) {
+    const uint32_t slot = blockIdx.x;
+    const uint32_t kv_head = blockIdx.y;
+    const uint32_t row = blockIdx.z;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    if (row >= rows || kv_head >= 2u || slot >= selected_cap || warp >= 4u)
+        return;
+    if (slot >= counts[row]) {
+        if (lane == 0u) {
+            for (uint32_t h = warp; h < 12u; h += 4u)
+                scores[((uint64_t)row * 24u + kv_head * 12u + h) *
+                       selected_cap + slot] = -INFINITY;
+        }
+        return;
+    }
+    const int32_t token = selected[(uint64_t)row * selected_cap + slot];
+    if (token < 0 || (uint32_t)token >= cache_cap) {
+        if (lane == 0u) {
+            for (uint32_t h = warp; h < 12u; h += 4u)
+                scores[((uint64_t)row * 24u + kv_head * 12u + h) *
+                       selected_cap + slot] = -INFINITY;
+        }
+        return;
+    }
+    const float *key = k_cache +
+        (uint64_t)(uint32_t)token * 512u + (uint64_t)kv_head * 256u;
+    for (uint32_t h = warp; h < 12u; h += 4u) {
+        const uint32_t head = kv_head * 12u + h;
+        const float *q = query + ((uint64_t)row * 24u + head) * 256u;
+        float sum = 0.0f;
+#pragma unroll
+        for (uint32_t d = lane; d < 256u; d += 32u)
+            sum += q[d] * key[d];
+#pragma unroll
+        for (uint32_t stride = 16u; stride > 0u; stride >>= 1u)
+            sum += __shfl_down_sync(0xffffffffu, sum, stride);
+        if (lane == 0u)
+            scores[((uint64_t)row * 24u + head) * selected_cap + slot] =
+                sum * 0.0625f;
+    }
+}
+
+__global__ static void qwen4exp_qsa_attention_reduce_kernel(
+        float *out, float *scores, const float *gate, const float *v_cache,
+        const int32_t *selected, const uint32_t *counts,
+        uint32_t heads, uint32_t kv_heads, uint32_t head_dim,
+        uint32_t selected_cap) {
+    const uint64_t head_row = blockIdx.x;
+    const uint32_t head = (uint32_t)(head_row % heads);
+    const uint32_t row = (uint32_t)(head_row / heads);
+    const uint32_t d = threadIdx.x;
+    const uint32_t count = counts[row];
+    const uint64_t score_base = head_row * selected_cap;
+    extern __shared__ float partial[];
+    float maximum = -INFINITY;
+    for (uint32_t slot = d; slot < count; slot += blockDim.x)
+        maximum = fmaxf(maximum, scores[score_base + slot]);
+    partial[d] = maximum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (d < stride) partial[d] = fmaxf(partial[d], partial[d + stride]);
+        __syncthreads();
+    }
+    maximum = partial[0];
+    float sum = 0.0f;
+    for (uint32_t slot = d; slot < count; slot += blockDim.x) {
+        const float weight = expf(scores[score_base + slot] - maximum);
+        scores[score_base + slot] = weight;
+        sum += weight;
+    }
+    partial[d] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (d < stride) partial[d] += partial[d + stride];
+        __syncthreads();
+    }
+    const float inv_sum = count > 0u ? 1.0f / partial[0] : 0.0f;
+    const uint32_t kv_head = head / (heads / kv_heads);
+    const uint32_t kv_dim = kv_heads * head_dim;
+    float value = 0.0f;
+    for (uint32_t slot = 0; slot < count; slot++) {
+        const uint32_t token =
+            (uint32_t)selected[(uint64_t)row * selected_cap + slot];
+        value += scores[score_base + slot] * inv_sum *
+            v_cache[(uint64_t)token * kv_dim +
+                    (uint64_t)kv_head * head_dim + d];
+    }
+    const uint64_t at = head_row * head_dim + d;
+    const float gate_value = gate[at];
+    const float gate_scale = gate_value >= 0.0f
+        ? 1.0f / (1.0f + expf(-gate_value))
+        : expf(gate_value) / (1.0f + expf(gate_value));
+    out[at] = value * gate_scale;
+}
+
+/* Qwen's twelve query heads share each KV head.  Reduce them in one block so
+ * the selected value is fetched once instead of twelve times. */
+__global__ static void qwen4exp_qsa_attention_reduce_gqa12_kernel(
+        float *out, float *scores, const float *gate, const float *v_cache,
+        const int32_t *selected, const uint32_t *counts,
+        uint32_t selected_cap) {
+    const uint32_t kv_head = blockIdx.x;
+    const uint32_t row = blockIdx.y;
+    const uint32_t d = threadIdx.x;
+    const uint32_t count = counts[row];
+    const uint64_t first_head = (uint64_t)row * 24u + kv_head * 12u;
+    const uint64_t selected_base = (uint64_t)row * selected_cap;
+    extern __shared__ float partial[];
+    float maximum[12];
+#pragma unroll
+    for (uint32_t h = 0; h < 12u; h++) maximum[h] = -INFINITY;
+    for (uint32_t slot = d; slot < count; slot += blockDim.x) {
+#pragma unroll
+        for (uint32_t h = 0; h < 12u; h++) {
+            const uint64_t score_base =
+                (first_head + h) * selected_cap;
+            maximum[h] = fmaxf(maximum[h], scores[score_base + slot]);
+        }
+    }
+#pragma unroll
+    for (uint32_t h = 0; h < 12u; h++)
+        partial[(uint64_t)h * blockDim.x + d] = maximum[h];
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (d < stride) {
+#pragma unroll
+            for (uint32_t h = 0; h < 12u; h++) {
+                const uint64_t at = (uint64_t)h * blockDim.x + d;
+                partial[at] = fmaxf(partial[at], partial[at + stride]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (uint32_t h = 0; h < 12u; h++) maximum[h] = partial[h * blockDim.x];
+
+    float sum[12] = {0.0f};
+    for (uint32_t slot = d; slot < count; slot += blockDim.x) {
+#pragma unroll
+        for (uint32_t h = 0; h < 12u; h++) {
+            const uint64_t score_at =
+                (first_head + h) * selected_cap + slot;
+            const float weight = expf(scores[score_at] - maximum[h]);
+            scores[score_at] = weight;
+            sum[h] += weight;
+        }
+    }
+#pragma unroll
+    for (uint32_t h = 0; h < 12u; h++)
+        partial[(uint64_t)h * blockDim.x + d] = sum[h];
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0u; stride >>= 1u) {
+        if (d < stride) {
+#pragma unroll
+            for (uint32_t h = 0; h < 12u; h++) {
+                const uint64_t at = (uint64_t)h * blockDim.x + d;
+                partial[at] += partial[at + stride];
+            }
+        }
+        __syncthreads();
+    }
+    float inv_sum[12];
+#pragma unroll
+    for (uint32_t h = 0; h < 12u; h++)
+        inv_sum[h] = count > 0u ? 1.0f / partial[h * blockDim.x] : 0.0f;
+
+    float value[12] = {0.0f};
+    for (uint32_t slot = 0; slot < count; slot++) {
+        const uint32_t token = (uint32_t)selected[selected_base + slot];
+        const float v = v_cache[
+            ((uint64_t)token * 2u + kv_head) * 256u + d];
+#pragma unroll
+        for (uint32_t h = 0; h < 12u; h++) {
+            const uint64_t score_at =
+                (first_head + h) * selected_cap + slot;
+            value[h] += scores[score_at] * inv_sum[h] * v;
+        }
+    }
+#pragma unroll
+    for (uint32_t h = 0; h < 12u; h++) {
+        const uint64_t at = (first_head + h) * 256u + d;
+        const float gate_value = gate[at];
+        const float gate_scale = gate_value >= 0.0f
+            ? 1.0f / (1.0f + expf(-gate_value))
+            : expf(gate_value) / (1.0f + expf(gate_value));
+        out[at] = value[h] * gate_scale;
     }
 }
 
@@ -15973,6 +16976,219 @@ __global__ static void sigmoid_topk_router_kernel(
     }
 }
 
+/* Qwen4Exp routes with a full float softmax followed by top-k and a second
+ * normalization over the selected experts. The first softmax denominator
+ * cancels algebraically, so retaining logits here is both exact in semantics
+ * and avoids an unnecessary 512-way exponential pass. Strict `>` and an
+ * ascending scan give deterministic lower-expert tie breaking. */
+__global__ static void qwen4exp_softmax_topk_router_kernel(
+        int32_t *selected,
+        float *weights,
+        const float *logits,
+        uint32_t n_expert,
+        uint32_t n_used) {
+    const uint32_t token = blockIdx.x;
+    const uint32_t tid = threadIdx.x;
+    extern __shared__ float score[];
+    const float *row = logits + (uint64_t)token * n_expert;
+
+    for (uint32_t expert = tid; expert < n_expert; expert += blockDim.x) {
+        const float value = row[expert];
+        /* Keep a malformed router row bounded and deterministic. Finite model
+         * output follows the reference equations exactly. */
+        score[expert] = isfinite(value) ? value : -3.402823466e+38F;
+    }
+    __syncthreads();
+
+    if (tid == 0u) {
+        int32_t *ids = selected + (uint64_t)token * n_used;
+        float *out_weights = weights + (uint64_t)token * n_used;
+        float max_selected = -INFINITY;
+        for (uint32_t slot = 0; slot < n_used; slot++) {
+            int32_t best = -1;
+            float best_score = -INFINITY;
+            for (uint32_t expert = 0; expert < n_expert; expert++) {
+                if (score[expert] > best_score) {
+                    best_score = score[expert];
+                    best = (int32_t)expert;
+                }
+            }
+            ids[slot] = best;
+            out_weights[slot] = best_score;
+            max_selected = fmaxf(max_selected, best_score);
+            score[(uint32_t)best] = -INFINITY;
+        }
+
+        float sum = 0.0f;
+        for (uint32_t slot = 0; slot < n_used; slot++) {
+            const float value = __expf(out_weights[slot] - max_selected);
+            out_weights[slot] = value;
+            sum += value;
+        }
+        if (!(sum > 0.0f) || !isfinite(sum)) {
+            const float uniform = 1.0f / (float)n_used;
+            for (uint32_t slot = 0; slot < n_used; slot++)
+                out_weights[slot] = uniform;
+        } else {
+            const float inv_sum = 1.0f / sum;
+            for (uint32_t slot = 0; slot < n_used; slot++)
+                out_weights[slot] *= inv_sum;
+        }
+    }
+}
+
+__global__ static void qwen4exp_shared_expert_gate_kernel(
+        float *out,
+        const float *shared,
+        const float *gate_logits,
+        uint32_t hidden_size,
+        uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const float logit = gate_logits[i / hidden_size];
+    const float gate = logit >= 0.0f
+        ? 1.0f / (1.0f + __expf(-logit))
+        : __expf(logit) / (1.0f + __expf(logit));
+    out[i] = shared[i] * gate;
+}
+
+/* The high-precision recipe stores expert-down as a semantic 512+128 split.
+ * Routed MMQ needs contiguous K rows, so compact the main columns after the
+ * weighted SwiGLU while preserving the original 640-wide activation for the
+ * tail accumulator below. */
+__global__ static void qwen4exp_pack_expert_down_main_kernel(
+        float *packed,
+        const float *mid,
+        uint32_t mid_width,
+        uint32_t main_dim,
+        uint64_t count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    packed[i] = mid[(i / main_dim) * mid_width + i % main_dim];
+}
+
+/* Accumulate the 128-column Q5_0 tail directly into the Q6_K main result.
+ * A separate routed-MMQ output would cost assignments*2560 extra F32 bytes;
+ * this small-K reduction keeps the split memory-neutral for prefill. */
+__global__ static void qwen4exp_q5_0_tail_accum_kernel(
+        float *down0,
+        const float *mid0,
+        const int32_t *ids0,
+        float *down1,
+        const float *mid1,
+        const int32_t *ids1,
+        const cuda_block_q5_0 *weights,
+        uint32_t mid_width,
+        uint32_t main_dim,
+        uint32_t tail_dim,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint64_t assignments) {
+    constexpr uint32_t warps_per_block = 8u;
+    constexpr uint32_t rows_per_warp = 8u;
+    constexpr uint32_t rows_per_block = warps_per_block * rows_per_warp;
+    const uint32_t output_tiles = (out_dim + rows_per_block - 1u) /
+                                  rows_per_block;
+    const uint64_t assignment = (uint64_t)blockIdx.x / output_tiles;
+    if (assignment >= assignments) return;
+    float *down = blockIdx.y == 0u ? down0 : down1;
+    const float *mid = blockIdx.y == 0u ? mid0 : mid1;
+    const int32_t *ids = blockIdx.y == 0u ? ids0 : ids1;
+    const uint32_t tile = (uint32_t)blockIdx.x % output_tiles;
+    const int32_t expert_i32 = ids[assignment];
+    if (expert_i32 < 0 || (uint32_t)expert_i32 >= n_expert) return;
+    const uint32_t expert = (uint32_t)expert_i32;
+    const uint32_t blocks_per_row = tail_dim / 32u;
+    const float *input = mid + assignment * mid_width + main_dim;
+
+    extern __shared__ float input_tail[];
+    for (uint32_t k = threadIdx.x; k < tail_dim; k += blockDim.x)
+        input_tail[k] = input[k];
+    __syncthreads();
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    for (uint32_t local_row = warp; local_row < rows_per_block;
+         local_row += warps_per_block) {
+        const uint32_t out_row = tile * rows_per_block + local_row;
+        if (out_row >= out_dim) break;
+        const cuda_block_q5_0 *row = weights +
+            ((uint64_t)expert * out_dim + out_row) * blocks_per_row;
+        float sum = 0.0f;
+        for (uint32_t block_i = 0; block_i < blocks_per_row; block_i++) {
+            const cuda_block_q5_0 *block = row + block_i;
+            const uint32_t qh = (uint32_t)block->qh[0] |
+                                ((uint32_t)block->qh[1] << 8u) |
+                                ((uint32_t)block->qh[2] << 16u) |
+                                ((uint32_t)block->qh[3] << 24u);
+            const uint8_t packed = block->qs[lane & 15u];
+            const uint32_t low = lane < 16u ? packed & 15u : packed >> 4u;
+            const uint32_t quant = low | (((qh >> lane) & 1u) << 4u);
+            const __half scale_h =
+                *reinterpret_cast<const __half *>(&block->d);
+            sum += input_tail[block_i * 32u + lane] *
+                   __half2float(scale_h) * ((float)quant - 16.0f);
+        }
+        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        if (lane == 0u)
+            down[assignment * out_dim + out_row] += sum;
+    }
+}
+
+__global__ static void qwen4exp_q8_0_tail_accum_kernel(
+        float *down,
+        const float *mid,
+        const int32_t *ids,
+        const cuda_block_q8_0 *weights,
+        uint32_t mid_width,
+        uint32_t main_dim,
+        uint32_t tail_dim,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint64_t assignments) {
+    constexpr uint32_t warps_per_block = 8u;
+    constexpr uint32_t rows_per_warp = 8u;
+    constexpr uint32_t rows_per_block = warps_per_block * rows_per_warp;
+    const uint32_t output_tiles = (out_dim + rows_per_block - 1u) /
+                                  rows_per_block;
+    const uint64_t assignment = (uint64_t)blockIdx.x / output_tiles;
+    if (assignment >= assignments) return;
+    const uint32_t tile = (uint32_t)blockIdx.x % output_tiles;
+    const int32_t expert_i32 = ids[assignment];
+    if (expert_i32 < 0 || (uint32_t)expert_i32 >= n_expert) return;
+    const uint32_t expert = (uint32_t)expert_i32;
+    const uint32_t blocks_per_row = tail_dim / 32u;
+    const float *input = mid + assignment * mid_width + main_dim;
+
+    extern __shared__ float input_tail[];
+    for (uint32_t k = threadIdx.x; k < tail_dim; k += blockDim.x)
+        input_tail[k] = input[k];
+    __syncthreads();
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    for (uint32_t local_row = warp; local_row < rows_per_block;
+         local_row += warps_per_block) {
+        const uint32_t out_row = tile * rows_per_block + local_row;
+        if (out_row >= out_dim) break;
+        const cuda_block_q8_0 *row = weights +
+            ((uint64_t)expert * out_dim + out_row) * blocks_per_row;
+        float sum = 0.0f;
+        for (uint32_t block_i = 0; block_i < blocks_per_row; block_i++) {
+            const cuda_block_q8_0 *block = row + block_i;
+            const __half scale_h =
+                *reinterpret_cast<const __half *>(&block->d);
+            sum += input_tail[block_i * 32u + lane] *
+                   __half2float(scale_h) * (float)block->qs[lane];
+        }
+        for (uint32_t offset = 16u; offset > 0u; offset >>= 1u)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+        if (lane == 0u)
+            down[assignment * out_dim + out_row] += sum;
+    }
+}
+
 __global__ static void swiglu_weighted_kernel(
         float *mid,
         const float *gate,
@@ -22162,7 +23378,12 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
         if (q8_aligned_nc_en < 0)
             q8_aligned_nc_en = getenv("DS4_CUDA_NO_Q8_ALIGNED_NC") == NULL;
         int rc = -1;
-        if ((n_tok == 1u || (n_tok <= 8u && q8_aligned_nc_en)) &&
+        /* Qwen recurrent-state replay requires the N=2..8 continuation to
+         * use the same raw MMVQ arithmetic as its cold serial oracle. */
+        const bool qwen_replay_nc =
+            n_tok > 1u && in_dim == 6144u && out_dim == 2560u;
+        if ((n_tok == 1u ||
+             (n_tok <= 8u && q8_aligned_nc_en && !qwen_replay_nc)) &&
             in_dim % 1024u == 0 && cuda_q8_aligned_enabled()) {
             const uint64_t q8_al_bytes = ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim);
             const char *w_aligned = q8_al_bytes != 0
@@ -22491,6 +23712,7 @@ static int cuda_matmul_q8_0_tensor_labeled_impl(ds4_gpu_tensor *out, const void 
                 xq,
                 xscale,
                 in_dim,
+                out_dim,
                 out_dim,
                 n_tok,
                 blocks,
@@ -22974,7 +24196,11 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
          * (raw q8 stays served — additive artifacts, safe fallback). */
         const char *w0_al = NULL;
         const char *w1_al = NULL;
-        if (in_dim % 1024u == 0 && cuda_q8_aligned_enabled()) {
+        const bool qwen_shared_pair =
+            in_dim == 2560u && out0_dim == 640u && out1_dim == 640u;
+        if ((in_dim % 1024u == 0 || qwen_shared_pair) &&
+            cuda_q8_aligned_enabled() &&
+            getenv("DS4_CUDA_NO_Q8_PAIR_ALIGNED") == NULL) {
             const uint64_t b0 = ds4_mmq_q8_0_aligned_bytes((int)out0_dim, (int)in_dim);
             const uint64_t b1 = ds4_mmq_q8_0_aligned_bytes((int)out1_dim, (int)in_dim);
             if (b0 != 0 && b1 != 0) {
@@ -23025,7 +24251,11 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         dim3 grid(((unsigned)max_out + 7u) / 8u, (unsigned)n_tok, 1);
         const char *w0_al = NULL;
         const char *w1_al = NULL;
-        if (in_dim % 1024u == 0 && cuda_q8_aligned_enabled()) {
+        const bool qwen_shared_pair =
+            in_dim == 2560u && out0_dim == 640u && out1_dim == 640u;
+        if ((in_dim % 1024u == 0 || qwen_shared_pair) &&
+            cuda_q8_aligned_enabled() &&
+            getenv("DS4_CUDA_NO_Q8_PAIR_ALIGNED") == NULL) {
             const uint64_t b0 = ds4_mmq_q8_0_aligned_bytes((int)out0_dim, (int)in_dim);
             const uint64_t b1 = ds4_mmq_q8_0_aligned_bytes((int)out1_dim, (int)in_dim);
             if (b0 != 0 && b1 != 0) {
@@ -23045,6 +24275,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
             const int force_coalesced =
                 getenv("DS4_CUDA_FORCE_Q8_PAIR_COALESCED") != NULL;
             if (getenv("DS4_CUDA_NO_Q8_PAIR_COALESCED") == NULL &&
+                blocks % 32u == 0 &&
                 (max_out <= 2048u || force_coalesced)) {
                 matmul_q8_0_pair_preq_batch_aligned_coalesced_warp8_kernel<<<
                     grid, 256, 0, ds4_current_stream()>>>(
@@ -23073,19 +24304,50 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                         "ds4: q8 pair prefill using aligned Q8_0 artifacts\n");
             }
         } else {
-            matmul_q8_0_pair_preq_batch_warp8_kernel<<<grid, 256, 0, ds4_current_stream()>>>(
-                    (float *)out0->ptr,
-                    (float *)out1->ptr,
-                    reinterpret_cast<const unsigned char *>(w0),
-                    reinterpret_cast<const unsigned char *>(w1),
-                    xq,
-                    xscale,
-                    in_dim,
-                    out0_dim,
-                    out1_dim,
-                    n_tok,
-                    blocks,
-                    use_dp4a);
+            /* PLE key is four times wider than value: keep the paired prefix,
+             * then run the key-only tail without a dead second accumulator. */
+            const bool qwen_ple_asymmetric =
+                in_dim == 2560u && out0_dim == 10240u && out1_dim == 2560u &&
+                n_tok >= 64u &&
+                getenv("DS4_CUDA_NO_Q8_PAIR_ASYM_SPLIT") == NULL;
+            if (qwen_ple_asymmetric) {
+                dim3 pair_grid(((unsigned)out1_dim + 7u) / 8u,
+                               (unsigned)n_tok, 1);
+                matmul_q8_0_pair_preq_batch_warp8_kernel<<<
+                    pair_grid, 256, 0, ds4_current_stream()>>>(
+                        (float *)out0->ptr,
+                        (float *)out1->ptr,
+                        reinterpret_cast<const unsigned char *>(w0),
+                        reinterpret_cast<const unsigned char *>(w1),
+                        xq, xscale, in_dim, out0_dim, out1_dim, n_tok,
+                        blocks, use_dp4a);
+
+                const uint64_t tail_dim = out0_dim - out1_dim;
+                dim3 tail_grid(((unsigned)tail_dim + 7u) / 8u,
+                               (unsigned)n_tok, 1);
+                matmul_q8_0_preq_batch_warp8_kernel<<<
+                    tail_grid, 256, 0, ds4_current_stream()>>>(
+                        (float *)out0->ptr + out1_dim,
+                        reinterpret_cast<const unsigned char *>(w0) +
+                            out1_dim * blocks * 34u,
+                        xq, xscale, in_dim, tail_dim, out0_dim, n_tok,
+                        blocks, use_dp4a);
+            } else {
+                matmul_q8_0_pair_preq_batch_warp8_kernel<<<
+                    grid, 256, 0, ds4_current_stream()>>>(
+                        (float *)out0->ptr,
+                        (float *)out1->ptr,
+                        reinterpret_cast<const unsigned char *>(w0),
+                        reinterpret_cast<const unsigned char *>(w1),
+                        xq,
+                        xscale,
+                        in_dim,
+                        out0_dim,
+                        out1_dim,
+                        n_tok,
+                        blocks,
+                        use_dp4a);
+            }
         }
     }
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
@@ -23463,7 +24725,7 @@ static int cuda_matmul_f16_tensor_impl(ds4_gpu_tensor *out, const void *model_ma
     return cuda_ok(cudaGetLastError(), "matmul_f16 launch");
 }
 
-extern "C" int ds4_gpu_matmul_bf16_tensor(
+static int cuda_matmul_bf16_tensor_impl(
         ds4_gpu_tensor *out,
         const void *model_map,
         uint64_t model_size,
@@ -23471,7 +24733,8 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(
         uint64_t in_dim,
         uint64_t out_dim,
         const ds4_gpu_tensor *x,
-        uint64_t n_tok) {
+        uint64_t n_tok,
+        bool stable_rows) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0 ||
         weight_offset > model_size || out_dim > UINT64_MAX / in_dim) {
         return 0;
@@ -23502,7 +24765,8 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(
             xb, (const float *)x->ptr, x_count);
     if (!cuda_ok(cudaGetLastError(), "bf16 activation convert launch")) return 0;
 
-    if (g_cublas_ready && in_dim <= INT_MAX && out_dim <= INT_MAX && n_tok <= INT_MAX) {
+    if (g_cublas_ready && !stable_rows &&
+        in_dim <= INT_MAX && out_dim <= INT_MAX && n_tok <= INT_MAX) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
         const cublasStatus_t st = cublasGemmEx(
@@ -23532,6 +24796,34 @@ extern "C" int ds4_gpu_matmul_bf16_tensor(
     matmul_bf16_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
             (float *)out->ptr, w, xb, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_bf16 launch");
+}
+
+extern "C" int ds4_gpu_matmul_bf16_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    return cuda_matmul_bf16_tensor_impl(
+        out, model_map, model_size, weight_offset,
+        in_dim, out_dim, x, n_tok, false);
+}
+
+extern "C" int ds4_gpu_matmul_bf16_stable_rows_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok) {
+    return cuda_matmul_bf16_tensor_impl(
+        out, model_map, model_size, weight_offset,
+        in_dim, out_dim, x, n_tok, true);
 }
 
 /* P3-Inc1: batched f16 matmul with the input rms_norm folded into the
@@ -23762,7 +25054,10 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     return cuda_ok(cudaGetLastError(), "matmul_f16_pair_ordered_chunks launch");
 }
 
-extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+static int cuda_matmul_f32_tensor_impl(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok, bool stable_rows) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 || n_tok == 0) return 0;
     if (weight_offset > model_size || out_dim > UINT64_MAX / in_dim) return 0;
     uint64_t weight_elems = out_dim * in_dim;
@@ -23774,7 +25069,7 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f32");
     if (!wptr) return 0;
     const float *w = (const float *)wptr;
-    if (g_cublas_ready && n_tok > 1) {
+    if (g_cublas_ready && n_tok > 1 && !stable_rows) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
         cublasStatus_t st = cublasSgemm(g_cublas,
@@ -23796,6 +25091,24 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     matmul_f32_kernel<<<grid, 256, 0, ds4_current_stream()>>>((float *)out->ptr, w, (const float *)x->ptr, in_dim, out_dim, n_tok);
     return cuda_ok(cudaGetLastError(), "matmul_f32 launch");
+}
+
+extern "C" int ds4_gpu_matmul_f32_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return cuda_matmul_f32_tensor_impl(
+        out, model_map, model_size, weight_offset,
+        in_dim, out_dim, x, n_tok, false);
+}
+
+extern "C" int ds4_gpu_matmul_f32_stable_rows_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return cuda_matmul_f32_tensor_impl(
+        out, model_map, model_size, weight_offset,
+        in_dim, out_dim, x, n_tok, true);
 }
 
 extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *row, uint32_t n_embd, uint32_t n_hc) {
@@ -23856,6 +25169,1259 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     cuda_norm_q8_invalidate(out->ptr);  /* p5c: this write has no q8 emit */
     rms_norm_weight_kernel<<<rows, 256, 0, ds4_current_stream()>>>((float *)out->ptr, (const float *)x->ptr, w, n, rows, eps);
     return cuda_ok(cudaGetLastError(), "rms_norm_weight launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_group_rms_norm_rows_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t width, uint32_t group_size,
+        uint32_t rows, float eps) {
+    if (!out || !x || !model_map || width == 0 || group_size == 0 ||
+        rows == 0 || width % group_size != 0 || !isfinite(eps) || eps < 0.0f ||
+        weight_offset > model_size ||
+        (uint64_t)width * sizeof(float) > model_size - weight_offset) {
+        return 0;
+    }
+    const uint64_t values = (uint64_t)rows * width;
+    if (values > UINT64_MAX / sizeof(float) ||
+        out->bytes < values * sizeof(float) ||
+        x->bytes < values * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t groups_per_row = width / group_size;
+    const uint64_t blocks = (uint64_t)rows * groups_per_row;
+    if (blocks == 0 || blocks > (uint64_t)INT_MAX) return 0;
+    const char *wptr = cuda_model_range_ptr(
+            model_map, weight_offset, (uint64_t)width * sizeof(float),
+            "Qwen4Exp zero-centered RMSNorm");
+    if (!wptr) return 0;
+    cuda_norm_q8_invalidate(out->ptr);
+    qwen4exp_group_rms_norm_kernel<<<(unsigned)blocks, 256, 0,
+            ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)x->ptr,
+            (const float *)wptr, width, group_size, groups_per_row, 0u, eps);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp grouped RMSNorm launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_shared_group_rms_norm_rows_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t width, uint32_t group_size,
+        uint32_t rows, float eps) {
+    if (!out || !x || !model_map || width == 0u || group_size == 0u ||
+        rows == 0u || width % group_size != 0u ||
+        !isfinite(eps) || eps < 0.0f || weight_offset > model_size ||
+        (uint64_t)group_size * sizeof(float) > model_size - weight_offset) {
+        return 0;
+    }
+    const uint64_t values = (uint64_t)rows * width;
+    if (values > UINT64_MAX / sizeof(float) ||
+        out->bytes < values * sizeof(float) ||
+        x->bytes < values * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t groups_per_row = width / group_size;
+    const uint64_t blocks = (uint64_t)rows * groups_per_row;
+    if (blocks == 0u || blocks > (uint64_t)INT_MAX) return 0;
+    const char *wptr = cuda_model_range_ptr(
+        model_map, weight_offset, (uint64_t)group_size * sizeof(float),
+        "Qwen4Exp shared grouped RMSNorm");
+    if (!wptr) return 0;
+    cuda_norm_q8_invalidate(out->ptr);
+    qwen4exp_group_rms_norm_kernel<<<(unsigned)blocks, 256, 0,
+            ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)x->ptr,
+            (const float *)wptr, width, group_size, groups_per_row, 1u, eps);
+    return cuda_ok(cudaGetLastError(),
+                   "Qwen4Exp shared grouped RMSNorm launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_hc_down_silu_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *projected,
+        uint64_t count, uint32_t hc_count) {
+    if (!out || !projected || count == 0 || hc_count == 0 ||
+        count > UINT64_MAX / sizeof(float) ||
+        (count + 255u) / 256u > (uint64_t)INT_MAX ||
+        out->bytes < count * sizeof(float) ||
+        projected->bytes < count * sizeof(float)) {
+        return 0;
+    }
+    qwen4exp_hc_down_silu_kernel<<<(count + 255u) / 256u, 256, 0,
+            ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)projected->ptr, count,
+            1.0f / (float)hc_count);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp HC down SiLU launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_hc_mix_inject_tensor(
+        ds4_gpu_tensor *mixed, ds4_gpu_tensor *injection,
+        const ds4_gpu_tensor *normed, const ds4_gpu_tensor *mix_logits,
+        const ds4_gpu_tensor *inject_logits, uint32_t rows,
+        uint32_t hidden_size, uint32_t hc_count) {
+    if (!mixed || !normed || !mix_logits || rows == 0 || hidden_size == 0 ||
+        hc_count == 0 || ((injection == NULL) != (inject_logits == NULL))) {
+        return 0;
+    }
+    const uint64_t mixed_values = (uint64_t)rows * hidden_size;
+    if (mixed_values > UINT64_MAX / hc_count) return 0;
+    const uint64_t hc_values = mixed_values * hc_count;
+    if (mixed_values > UINT64_MAX / sizeof(float) ||
+        hc_values > UINT64_MAX / sizeof(float) ||
+        (mixed_values + 255u) / 256u > (uint64_t)INT_MAX ||
+        mixed->bytes < mixed_values * sizeof(float) ||
+        normed->bytes < hc_values * sizeof(float) ||
+        mix_logits->bytes < hc_values * sizeof(float)) {
+        return 0;
+    }
+    uint64_t inject_values = 0;
+    if (injection) {
+        inject_values = (uint64_t)rows * hc_count;
+        if (inject_values > UINT64_MAX / sizeof(float) ||
+            (inject_values + 255u) / 256u > (uint64_t)INT_MAX ||
+            injection->bytes < inject_values * sizeof(float) ||
+            inject_logits->bytes < inject_values * sizeof(float)) {
+            return 0;
+        }
+    }
+    qwen4exp_hc_mix_kernel<<<(mixed_values + 255u) / 256u, 256, 0,
+            ds4_current_stream()>>>(
+            (float *)mixed->ptr, (const float *)normed->ptr,
+            (const float *)mix_logits->ptr, hidden_size, hc_count,
+            mixed_values);
+    if (!cuda_ok(cudaGetLastError(), "Qwen4Exp HC mix launch")) return 0;
+    if (injection) {
+        qwen4exp_hc_injection_kernel<<<(inject_values + 255u) / 256u, 256,
+                0, ds4_current_stream()>>>(
+                (float *)injection->ptr,
+                (const float *)inject_logits->ptr, inject_values,
+                1.0f / (float)hc_count);
+        if (!cuda_ok(cudaGetLastError(), "Qwen4Exp HC injection launch"))
+            return 0;
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_qwen4exp_hc_residual_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *hyper_input,
+        const ds4_gpu_tensor *block_output,
+        const ds4_gpu_tensor *injection, uint32_t rows,
+        uint32_t hidden_size, uint32_t hc_count) {
+    if (!out || !hyper_input || !block_output || !injection || rows == 0 ||
+        hidden_size == 0 || hc_count == 0) {
+        return 0;
+    }
+    const uint64_t block_values = (uint64_t)rows * hidden_size;
+    if (block_values > UINT64_MAX / hc_count) return 0;
+    const uint64_t hc_values = block_values * hc_count;
+    const uint64_t inject_values = (uint64_t)rows * hc_count;
+    if (hc_values > UINT64_MAX / sizeof(float) ||
+        block_values > UINT64_MAX / sizeof(float) ||
+        inject_values > UINT64_MAX / sizeof(float) ||
+        (hc_values + 255u) / 256u > (uint64_t)INT_MAX ||
+        out->bytes < hc_values * sizeof(float) ||
+        hyper_input->bytes < hc_values * sizeof(float) ||
+        block_output->bytes < block_values * sizeof(float) ||
+        injection->bytes < inject_values * sizeof(float)) {
+        return 0;
+    }
+    qwen4exp_hc_residual_kernel<<<(hc_values + 255u) / 256u, 256, 0,
+            ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)hyper_input->ptr,
+            (const float *)block_output->ptr,
+            (const float *)injection->ptr, hidden_size, hc_count, hc_values);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp HC residual launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_bf16_to_f32_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *input_bf16,
+        uint64_t count) {
+    if (!out || !input_bf16 || count == 0 ||
+        count > UINT64_MAX / sizeof(float) ||
+        count > UINT64_MAX / sizeof(uint16_t) ||
+        (count + 255u) / 256u > (uint64_t)INT_MAX ||
+        out->bytes < count * sizeof(float) ||
+        input_bf16->bytes < count * sizeof(uint16_t)) {
+        return 0;
+    }
+    qwen4exp_bf16_to_f32_kernel<<<(count + 255u) / 256u, 256, 0,
+            ds4_current_stream()>>>(
+            (float *)out->ptr,
+            (const __nv_bfloat16 *)input_bf16->ptr, count);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp BF16 activation promote launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_ple_gate_tensor(
+        ds4_gpu_tensor *gated_value, ds4_gpu_tensor *transformed_gate,
+        const ds4_gpu_tensor *key_normed,
+        const ds4_gpu_tensor *query_normed,
+        const ds4_gpu_tensor *value, uint32_t rows,
+        uint32_t hidden_size, uint32_t hc_count) {
+    if (!gated_value || !key_normed || !query_normed || !value || rows == 0 ||
+        hidden_size == 0 || hc_count == 0) {
+        return 0;
+    }
+    const uint64_t value_count = (uint64_t)rows * hidden_size;
+    if (value_count > UINT64_MAX / hc_count) return 0;
+    const uint64_t hc_values = value_count * hc_count;
+    const uint64_t lanes = (uint64_t)rows * hc_count;
+    if (value_count > UINT64_MAX / sizeof(float) ||
+        hc_values > UINT64_MAX / sizeof(float) || lanes > (uint64_t)INT_MAX ||
+        gated_value->bytes < hc_values * sizeof(float) ||
+        key_normed->bytes < hc_values * sizeof(float) ||
+        query_normed->bytes < hc_values * sizeof(float) ||
+        value->bytes < value_count * sizeof(float) ||
+        (transformed_gate &&
+         transformed_gate->bytes < lanes * sizeof(float)) ||
+        gated_value->ptr == key_normed->ptr ||
+        gated_value->ptr == query_normed->ptr ||
+        gated_value->ptr == value->ptr) {
+        return 0;
+    }
+    qwen4exp_ple_gate_kernel<<<(unsigned)lanes, 256, 0,
+            ds4_current_stream()>>>(
+            (float *)gated_value->ptr,
+            transformed_gate ? (float *)transformed_gate->ptr : NULL,
+            (const float *)key_normed->ptr,
+            (const float *)query_normed->ptr,
+            (const float *)value->ptr, hidden_size, hc_count);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp PLE gate launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_ple_conv_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *input, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t rows,
+        uint32_t width, uint32_t kernel_size, uint32_t dilation) {
+    if (!out || !state || !input || !model_map || rows == 0 || width == 0 ||
+        kernel_size == 0 || dilation == 0 || kernel_size > 8u ||
+        weight_offset > model_size || out->ptr == input->ptr ||
+        state->ptr == input->ptr || state->ptr == out->ptr) {
+        return 0;
+    }
+    const uint64_t state_len64 = (uint64_t)(kernel_size - 1u) * dilation;
+    if (state_len64 == 0 || state_len64 > 16u ||
+        width > UINT64_MAX / kernel_size) {
+        return 0;
+    }
+    const uint64_t weight_values = (uint64_t)width * kernel_size;
+    if (weight_values > UINT64_MAX / sizeof(uint16_t)) return 0;
+    const uint64_t weight_bytes = weight_values * sizeof(uint16_t);
+    if (weight_bytes > model_size - weight_offset) return 0;
+    const uint64_t count = (uint64_t)rows * width;
+    const uint64_t state_values = (uint64_t)width * state_len64;
+    if (count > UINT64_MAX / sizeof(float) ||
+        state_values > UINT64_MAX / sizeof(float) ||
+        (count + 255u) / 256u > (uint64_t)INT_MAX ||
+        out->bytes < count * sizeof(float) ||
+        input->bytes < count * sizeof(float) ||
+        state->bytes < state_values * sizeof(float)) {
+        return 0;
+    }
+    const char *wptr = cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes,
+            "Qwen4Exp PLE dilated depthwise convolution");
+    if (!wptr) return 0;
+    const uint32_t state_len = (uint32_t)state_len64;
+    qwen4exp_ple_conv_kernel<<<(count + 255u) / 256u, 256, 0,
+            ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)state->ptr,
+            (const float *)input->ptr,
+            (const __nv_bfloat16 *)wptr, rows, width, kernel_size,
+            dilation, state_len, count);
+    if (!cuda_ok(cudaGetLastError(), "Qwen4Exp PLE convolution launch"))
+        return 0;
+    qwen4exp_ple_conv_state_update_kernel<<<(width + 255u) / 256u, 256, 0,
+            ds4_current_stream()>>>(
+            (float *)state->ptr, (const float *)input->ptr,
+            rows, width, state_len);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp PLE convolution state update launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_gdn_conv_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *input, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset, uint32_t rows,
+        uint32_t width, uint32_t kernel_size) {
+    if (!out || !state || !input || !model_map || rows == 0u || width == 0u ||
+        kernel_size < 2u || kernel_size > 16u ||
+        weight_offset > model_size || out->ptr == input->ptr ||
+        state->ptr == input->ptr || state->ptr == out->ptr ||
+        width > UINT64_MAX / kernel_size) {
+        return 0;
+    }
+    const uint64_t weight_values = (uint64_t)width * kernel_size;
+    if (weight_values > UINT64_MAX / sizeof(uint16_t)) return 0;
+    const uint64_t weight_bytes = weight_values * sizeof(uint16_t);
+    if (weight_bytes > model_size - weight_offset ||
+        rows > UINT64_MAX / width) {
+        return 0;
+    }
+    const uint64_t count = (uint64_t)rows * width;
+    const uint64_t state_values = (uint64_t)width * kernel_size;
+    if (count > UINT64_MAX / sizeof(float) ||
+        state_values > UINT64_MAX / sizeof(float) ||
+        (count + 255u) / 256u > (uint64_t)INT_MAX ||
+        out->bytes < count * sizeof(float) ||
+        input->bytes < count * sizeof(float) ||
+        state->bytes < state_values * sizeof(float)) {
+        return 0;
+    }
+    const char *wptr = cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes,
+            "Qwen4Exp Gated DeltaNet depthwise convolution");
+    if (!wptr) return 0;
+    qwen4exp_gdn_conv_kernel<<<(count + 255u) / 256u, 256u, 0,
+            ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)state->ptr,
+            (const float *)input->ptr, (const __nv_bfloat16 *)wptr,
+            rows, width, kernel_size, count);
+    if (!cuda_ok(cudaGetLastError(),
+                 "Qwen4Exp Gated DeltaNet convolution launch")) {
+        return 0;
+    }
+    qwen4exp_ple_conv_state_update_kernel<<<
+            (width + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+            (float *)state->ptr, (const float *)input->ptr,
+            rows, width, kernel_size);
+    return cuda_ok(cudaGetLastError(),
+                   "Qwen4Exp Gated DeltaNet convolution state update launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_gdn_controls_tensor(
+        ds4_gpu_tensor *beta, ds4_gpu_tensor *g,
+        const ds4_gpu_tensor *b, const ds4_gpu_tensor *a,
+        const void *model_map, uint64_t model_size,
+        uint64_t a_log_offset, uint64_t dt_bias_offset,
+        uint32_t rows, uint32_t value_heads) {
+    if (!beta || !g || !b || !a || !model_map || rows == 0u ||
+        value_heads == 0u || beta->ptr == g->ptr ||
+        a_log_offset > model_size || dt_bias_offset > model_size ||
+        rows > UINT64_MAX / value_heads) {
+        return 0;
+    }
+    const uint64_t control_bytes = (uint64_t)value_heads * sizeof(float);
+    const uint64_t count = (uint64_t)rows * value_heads;
+    if (control_bytes > model_size - a_log_offset ||
+        control_bytes > model_size - dt_bias_offset ||
+        count > UINT64_MAX / sizeof(float) ||
+        (count + 255u) / 256u > (uint64_t)INT_MAX ||
+        beta->bytes < count * sizeof(float) ||
+        g->bytes < count * sizeof(float) ||
+        b->bytes < count * sizeof(float) ||
+        a->bytes < count * sizeof(float)) {
+        return 0;
+    }
+    const float *a_log = (const float *)cuda_model_range_ptr(
+            model_map, a_log_offset, control_bytes,
+            "Qwen4Exp Gated DeltaNet A_log");
+    const float *dt_bias = (const float *)cuda_model_range_ptr(
+            model_map, dt_bias_offset, control_bytes,
+            "Qwen4Exp Gated DeltaNet dt_bias");
+    if (!a_log || !dt_bias) return 0;
+    qwen4exp_gdn_controls_kernel<<<
+            (count + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+            (float *)beta->ptr, (float *)g->ptr,
+            (const float *)b->ptr, (const float *)a->ptr,
+            a_log, dt_bias, value_heads, count);
+    return cuda_ok(cudaGetLastError(),
+                   "Qwen4Exp Gated DeltaNet controls launch");
+}
+
+static bool qwen4exp_gdn_recurrent_tensors_valid(
+        const ds4_gpu_tensor *out, const ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *mixed_qkv, const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *g, uint64_t out_values,
+        uint64_t input_values, uint64_t state_values,
+        uint64_t control_values) {
+    return out && state && mixed_qkv && beta && g &&
+           out->ptr != state->ptr && out->ptr != mixed_qkv->ptr &&
+           state->ptr != mixed_qkv->ptr && state->ptr != beta->ptr &&
+           state->ptr != g->ptr &&
+           out->bytes >= out_values * sizeof(float) &&
+           mixed_qkv->bytes >= input_values * sizeof(float) &&
+           state->bytes >= state_values * sizeof(float) &&
+           beta->bytes >= control_values * sizeof(float) &&
+           g->bytes >= control_values * sizeof(float);
+}
+
+static int qwen4exp_gdn_recurrent_launch(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *state0,
+        const ds4_gpu_tensor *mixed_qkv0,
+        const ds4_gpu_tensor *beta0, const ds4_gpu_tensor *g0,
+        ds4_gpu_tensor *out1, ds4_gpu_tensor *state1,
+        const ds4_gpu_tensor *mixed_qkv1,
+        const ds4_gpu_tensor *beta1, const ds4_gpu_tensor *g1,
+        uint32_t banks, uint32_t rows, uint32_t key_heads,
+        uint32_t value_heads, uint32_t head_dim) {
+    if ((banks != 1u && banks != 2u) || rows == 0u || key_heads == 0u ||
+        value_heads == 0u || head_dim == 0u || head_dim > 1024u ||
+        (head_dim & (head_dim - 1u)) != 0u ||
+        value_heads % key_heads != 0u || value_heads > (uint32_t)INT_MAX) {
+        return 0;
+    }
+    const uint64_t key_dim64 = (uint64_t)key_heads * head_dim;
+    const uint64_t value_dim64 = (uint64_t)value_heads * head_dim;
+    if (key_dim64 > UINT32_MAX || value_dim64 > UINT32_MAX ||
+        key_dim64 > (UINT64_MAX - value_dim64) / 2u) {
+        return 0;
+    }
+    const uint64_t conv_dim = 2u * key_dim64 + value_dim64;
+    const uint64_t out_values = (uint64_t)rows * value_dim64;
+    const uint64_t input_values = (uint64_t)rows * conv_dim;
+    const uint64_t state_values = value_dim64 * head_dim;
+    const uint64_t control_values = (uint64_t)rows * value_heads;
+    if (out_values > UINT64_MAX / sizeof(float) ||
+        input_values > UINT64_MAX / sizeof(float) ||
+        state_values > UINT64_MAX / sizeof(float) ||
+        control_values > UINT64_MAX / sizeof(float) ||
+        !qwen4exp_gdn_recurrent_tensors_valid(
+            out0, state0, mixed_qkv0, beta0, g0, out_values,
+            input_values, state_values, control_values) ||
+        (banks == 2u &&
+         (!qwen4exp_gdn_recurrent_tensors_valid(
+              out1, state1, mixed_qkv1, beta1, g1, out_values,
+              input_values, state_values, control_values) ||
+          out0->ptr == out1->ptr || state0->ptr == state1->ptr ||
+          out0->ptr == state1->ptr || out1->ptr == state0->ptr))) {
+        return 0;
+    }
+    const uint32_t threads = head_dim == 128u ? 512u : head_dim;
+    const uint32_t shared_values = head_dim == 128u
+        ? 7u * head_dim : 4u * head_dim;
+    const uint32_t shared_bytes = shared_values * (uint32_t)sizeof(float);
+    qwen4exp_gdn_recurrent_kernel<<<
+            dim3(value_heads, banks), threads, shared_bytes,
+            ds4_current_stream()>>>(
+            (float *)out0->ptr, (float *)state0->ptr,
+            (const float *)mixed_qkv0->ptr, (const float *)beta0->ptr,
+            (const float *)g0->ptr,
+            banks == 2u ? (float *)out1->ptr : nullptr,
+            banks == 2u ? (float *)state1->ptr : nullptr,
+            banks == 2u ? (const float *)mixed_qkv1->ptr : nullptr,
+            banks == 2u ? (const float *)beta1->ptr : nullptr,
+            banks == 2u ? (const float *)g1->ptr : nullptr,
+            rows, key_heads, value_heads, head_dim,
+            (uint32_t)key_dim64, (uint32_t)value_dim64,
+            value_heads / key_heads);
+    return cuda_ok(cudaGetLastError(),
+                   "Qwen4Exp recurrent Gated Delta rule launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_gdn_recurrent_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state,
+        const ds4_gpu_tensor *mixed_qkv,
+        const ds4_gpu_tensor *beta, const ds4_gpu_tensor *g,
+        uint32_t rows, uint32_t key_heads, uint32_t value_heads,
+        uint32_t head_dim) {
+    return qwen4exp_gdn_recurrent_launch(
+        out, state, mixed_qkv, beta, g, nullptr, nullptr, nullptr, nullptr,
+        nullptr, 1u, rows, key_heads, value_heads, head_dim);
+}
+
+extern "C" int ds4_gpu_qwen4exp_gdn_recurrent_bank2_tensor(
+        ds4_gpu_tensor *out0, ds4_gpu_tensor *state0,
+        const ds4_gpu_tensor *mixed_qkv0,
+        const ds4_gpu_tensor *beta0, const ds4_gpu_tensor *g0,
+        ds4_gpu_tensor *out1, ds4_gpu_tensor *state1,
+        const ds4_gpu_tensor *mixed_qkv1,
+        const ds4_gpu_tensor *beta1, const ds4_gpu_tensor *g1,
+        uint32_t rows, uint32_t key_heads, uint32_t value_heads,
+        uint32_t head_dim) {
+    return qwen4exp_gdn_recurrent_launch(
+        out0, state0, mixed_qkv0, beta0, g0,
+        out1, state1, mixed_qkv1, beta1, g1,
+        2u, rows, key_heads, value_heads, head_dim);
+}
+
+extern "C" int ds4_gpu_qwen4exp_gdn_gated_rms_norm_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *core,
+        const ds4_gpu_tensor *z, const void *model_map,
+        uint64_t model_size, uint64_t weight_offset,
+        uint32_t rows, uint32_t value_heads, uint32_t head_dim, float eps) {
+    if (!out || !core || !z || !model_map || rows == 0u ||
+        value_heads == 0u || head_dim == 0u || head_dim > 1024u ||
+        (head_dim & (head_dim - 1u)) != 0u || !isfinite(eps) || eps <= 0.0f ||
+        weight_offset > model_size ||
+        (uint64_t)rows > UINT64_MAX / value_heads) {
+        return 0;
+    }
+    const uint64_t weight_bytes = (uint64_t)head_dim * sizeof(float);
+    const uint64_t head_rows = (uint64_t)rows * value_heads;
+    if (weight_bytes > model_size - weight_offset ||
+        head_rows > (uint64_t)INT_MAX || head_rows > UINT64_MAX / head_dim) {
+        return 0;
+    }
+    const uint64_t values = head_rows * head_dim;
+    if (values > UINT64_MAX / sizeof(float) ||
+        out->bytes < values * sizeof(float) ||
+        core->bytes < values * sizeof(float) ||
+        z->bytes < values * sizeof(float)) {
+        return 0;
+    }
+    const float *weight = (const float *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes,
+            "Qwen4Exp Gated DeltaNet output norm");
+    if (!weight) return 0;
+    qwen4exp_gdn_gated_rms_norm_kernel<<<
+            (unsigned)head_rows, head_dim,
+            head_dim * (uint32_t)sizeof(float), ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)core->ptr,
+            (const float *)z->ptr, weight, head_dim, eps, head_rows);
+    return cuda_ok(cudaGetLastError(),
+                   "Qwen4Exp Gated DeltaNet gated RMSNorm launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_split_index_tensor(
+        ds4_gpu_tensor *query, ds4_gpu_tensor *raw_key_cache,
+        const ds4_gpu_tensor *qk, uint32_t rows, uint32_t pos0,
+        uint32_t cache_cap, uint32_t q_heads, uint32_t head_dim) {
+    if (!query || !raw_key_cache || !qk || rows == 0u || q_heads == 0u ||
+        head_dim == 0u || pos0 > cache_cap || rows > cache_cap - pos0 ||
+        query->ptr == qk->ptr || raw_key_cache->ptr == qk->ptr) {
+        return 0;
+    }
+    const uint64_t q_width = (uint64_t)q_heads * head_dim;
+    const uint64_t qk_width = q_width + head_dim;
+    const uint64_t count = (uint64_t)rows * q_width;
+    if (q_width > UINT32_MAX || count > UINT64_MAX / sizeof(float) ||
+        (uint64_t)rows * qk_width > UINT64_MAX / sizeof(float) ||
+        (uint64_t)cache_cap * head_dim > UINT64_MAX / sizeof(float) ||
+        (count + 255u) / 256u > (uint64_t)INT_MAX ||
+        query->bytes < count * sizeof(float) ||
+        qk->bytes < (uint64_t)rows * qk_width * sizeof(float) ||
+        raw_key_cache->bytes <
+            (uint64_t)cache_cap * head_dim * sizeof(float)) {
+        return 0;
+    }
+    qwen4exp_qsa_split_index_kernel<<<
+        (count + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)query->ptr, (float *)raw_key_cache->ptr,
+        (const float *)qk->ptr, rows, pos0, q_heads, head_dim,
+        cache_cap, count);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp QSA index split/store launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_split_q_gate_tensor(
+        ds4_gpu_tensor *query, ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *projected, uint32_t rows,
+        uint32_t heads, uint32_t head_dim) {
+    if (!query || !gate || !projected || rows == 0u || heads == 0u ||
+        head_dim == 0u || query->ptr == gate->ptr ||
+        query->ptr == projected->ptr || gate->ptr == projected->ptr ||
+        (uint64_t)rows > UINT64_MAX / heads / head_dim) {
+        return 0;
+    }
+    const uint64_t count = (uint64_t)rows * heads * head_dim;
+    if (count > UINT64_MAX / sizeof(float) ||
+        (count + 255u) / 256u > (uint64_t)INT_MAX ||
+        query->bytes < count * sizeof(float) ||
+        gate->bytes < count * sizeof(float) ||
+        projected->bytes < 2u * count * sizeof(float)) {
+        return 0;
+    }
+    qwen4exp_qsa_split_q_gate_kernel<<<
+        (count + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)query->ptr, (float *)gate->ptr,
+        (const float *)projected->ptr, heads, head_dim, count);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp QSA query/gate split launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_rope_tensor(
+        ds4_gpu_tensor *x, uint32_t rows, uint32_t heads,
+        uint32_t head_dim, uint32_t rotary_dim, uint32_t pos0,
+        float freq_base) {
+    if (!x || rows == 0u || heads == 0u || head_dim == 0u ||
+        rotary_dim == 0u || rotary_dim > head_dim ||
+        rotary_dim > QWEN4EXP_QSA_MAX_ROTARY_DIM || (rotary_dim & 1u) ||
+        !isfinite(freq_base) || freq_base <= 0.0f ||
+        (uint64_t)rows > UINT64_MAX / heads / head_dim) {
+        return 0;
+    }
+    const uint64_t values = (uint64_t)rows * heads * head_dim;
+    const uint64_t pairs = (uint64_t)rows * heads * (rotary_dim / 2u);
+    if (values > UINT64_MAX / sizeof(float) ||
+        pairs == 0u || (pairs + 255u) / 256u > (uint64_t)INT_MAX ||
+        x->bytes < values * sizeof(float)) {
+        return 0;
+    }
+    qwen4exp_rope_freqs freqs;
+    if (!qwen4exp_rope_freqs_init(&freqs, rotary_dim, freq_base)) return 0;
+    qwen4exp_rope_first_kernel<<<
+        (pairs + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)x->ptr, rows, heads, head_dim, rotary_dim,
+        pos0, freqs, pairs);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp first-dimension RoPE launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_mrope_tensor(
+        ds4_gpu_tensor *x, const ds4_gpu_tensor *positions,
+        uint32_t rows, uint32_t heads, uint32_t head_dim,
+        uint32_t rotary_dim, uint32_t pos0, float freq_base) {
+    if (!x || !positions || rows == 0u || heads == 0u || head_dim == 0u ||
+        rotary_dim == 0u || rotary_dim > head_dim ||
+        rotary_dim > QWEN4EXP_QSA_MAX_ROTARY_DIM || (rotary_dim & 1u) ||
+        !isfinite(freq_base) || freq_base <= 0.0f ||
+        (uint64_t)rows > UINT64_MAX / heads / head_dim) return 0;
+    const uint64_t values = (uint64_t)rows * heads * head_dim;
+    const uint64_t pairs = (uint64_t)rows * heads * (rotary_dim / 2u);
+    const uint64_t position_rows = (uint64_t)pos0 + rows;
+    if (values > UINT64_MAX / sizeof(float) ||
+        position_rows > UINT64_MAX / 3u / sizeof(int32_t) ||
+        pairs == 0u || (pairs + 255u) / 256u > (uint64_t)INT_MAX ||
+        x->bytes < values * sizeof(float) ||
+        positions->bytes < position_rows * 3u * sizeof(int32_t)) return 0;
+    qwen4exp_rope_freqs freqs;
+    if (!qwen4exp_rope_freqs_init(&freqs, rotary_dim, freq_base)) return 0;
+    qwen4exp_mrope_first_kernel<<<
+        (pairs + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)x->ptr, (const int32_t *)positions->ptr,
+        rows, heads, head_dim, rotary_dim, pos0, freqs, pairs);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp M-RoPE launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_pool_blocks_tensor(
+        ds4_gpu_tensor *pooled_cache,
+        const ds4_gpu_tensor *raw_key_cache,
+        const ds4_gpu_tensor *positions,
+        const void *model_map, uint64_t model_size,
+        uint64_t norm_weight_offset, uint32_t first_block,
+        uint32_t n_blocks, uint32_t block_cap, uint32_t ratio,
+        uint32_t head_dim, uint32_t rotary_dim, float freq_base, float eps) {
+    if (!pooled_cache || !raw_key_cache || !model_map || n_blocks == 0u ||
+        ratio == 0u || head_dim == 0u || head_dim > 1024u ||
+        (head_dim & (head_dim - 1u)) != 0u || rotary_dim == 0u ||
+        rotary_dim > head_dim ||
+        rotary_dim > QWEN4EXP_QSA_MAX_ROTARY_DIM || (rotary_dim & 1u) ||
+        first_block > block_cap || n_blocks > block_cap - first_block ||
+        !isfinite(freq_base) || freq_base <= 0.0f ||
+        !isfinite(eps) || eps <= 0.0f || norm_weight_offset > model_size) {
+        return 0;
+    }
+    const uint64_t weight_bytes = (uint64_t)head_dim * sizeof(float);
+    const uint64_t pooled_values = (uint64_t)block_cap * head_dim;
+    const uint64_t raw_values = (uint64_t)block_cap * ratio * head_dim;
+    if (weight_bytes > model_size - norm_weight_offset ||
+        pooled_values > UINT64_MAX / sizeof(float) ||
+        raw_values > UINT64_MAX / sizeof(float) ||
+        pooled_cache->bytes < pooled_values * sizeof(float) ||
+        raw_key_cache->bytes < raw_values * sizeof(float) ||
+        (positions && positions->bytes <
+            (uint64_t)(first_block + n_blocks) * ratio * 3u * sizeof(int32_t))) {
+        return 0;
+    }
+    const float *weight = (const float *)cuda_model_range_ptr(
+        model_map, norm_weight_offset, weight_bytes,
+        "Qwen4Exp QSA pooled-key norm");
+    if (!weight) return 0;
+    qwen4exp_rope_freqs freqs;
+    if (!qwen4exp_rope_freqs_init(&freqs, rotary_dim, freq_base)) return 0;
+    qwen4exp_qsa_pool_blocks_kernel<<<
+        n_blocks, head_dim, 2u * head_dim * sizeof(float),
+        ds4_current_stream()>>>(
+        (float *)pooled_cache->ptr, (const float *)raw_key_cache->ptr,
+        weight, positions ? (const int32_t *)positions->ptr : NULL,
+        first_block, n_blocks, ratio, head_dim, rotary_dim,
+        freqs, eps);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp QSA pooled blocks launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_block_scores_tensor(
+        ds4_gpu_tensor *scores, const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *pooled_cache, uint32_t rows,
+        uint32_t pos0, uint32_t max_blocks, uint32_t q_heads,
+        uint32_t head_dim, uint32_t ratio) {
+    if (!scores || !query || !pooled_cache || rows == 0u ||
+        max_blocks == 0u || q_heads == 0u || head_dim == 0u ||
+        head_dim > 1024u || (head_dim & (head_dim - 1u)) != 0u ||
+        ratio == 0u || max_blocks > (pos0 + rows) / ratio) {
+        return 0;
+    }
+    const uint64_t score_count = (uint64_t)rows * max_blocks;
+    const uint64_t query_count = (uint64_t)rows * q_heads * head_dim;
+    const uint64_t pooled_count = (uint64_t)max_blocks * head_dim;
+    if (score_count > UINT64_MAX / sizeof(float) ||
+        query_count > UINT64_MAX / sizeof(float) ||
+        pooled_count > UINT64_MAX / sizeof(float) ||
+        scores->bytes < score_count * sizeof(float) ||
+        query->bytes < query_count * sizeof(float) ||
+        pooled_cache->bytes < pooled_count * sizeof(float)) {
+        return 0;
+    }
+    dim3 grid(max_blocks, rows, 1u);
+    qwen4exp_qsa_block_scores_kernel<<<
+        grid, head_dim, q_heads * head_dim * sizeof(float),
+        ds4_current_stream()>>>(
+        (float *)scores->ptr, (const float *)query->ptr,
+        (const float *)pooled_cache->ptr, rows, pos0, max_blocks,
+        q_heads, head_dim, ratio);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp QSA block scores launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_expand_selection_tensor(
+        ds4_gpu_tensor *tokens, ds4_gpu_tensor *counts,
+        const ds4_gpu_tensor *selected_blocks, uint32_t rows,
+        uint32_t pos0, uint32_t max_blocks, uint32_t topk_blocks,
+        uint32_t ratio, uint32_t token_budget) {
+    if (!tokens || !counts || rows == 0u || ratio == 0u ||
+        token_budget == 0u || token_budget % ratio != 0u ||
+        topk_blocks > 512u || topk_blocks > max_blocks ||
+        (topk_blocks != 0u && !selected_blocks)) {
+        return 0;
+    }
+    const uint32_t selected_cap = token_budget + ratio - 1u;
+    if (selected_cap < token_budget ||
+        (uint64_t)rows * selected_cap > UINT64_MAX / sizeof(int32_t) ||
+        tokens->bytes <
+            (uint64_t)rows * selected_cap * sizeof(int32_t) ||
+        counts->bytes < (uint64_t)rows * sizeof(uint32_t) ||
+        (selected_blocks && selected_blocks->bytes <
+            (uint64_t)rows * topk_blocks * sizeof(uint32_t))) {
+        return 0;
+    }
+    qwen4exp_qsa_expand_selection_kernel<<<
+        rows, 256u, 0, ds4_current_stream()>>>(
+        (int32_t *)tokens->ptr, (uint32_t *)counts->ptr,
+        selected_blocks ? (const uint32_t *)selected_blocks->ptr : NULL,
+        rows, pos0, max_blocks, topk_blocks, ratio, token_budget,
+        selected_cap);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp QSA selection expansion launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_store_kv_tensor(
+        ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *key, const ds4_gpu_tensor *value,
+        uint32_t rows, uint32_t pos0, uint32_t cache_cap,
+        uint32_t kv_heads, uint32_t head_dim) {
+    if (!k_cache || !v_cache || !key || !value || rows == 0u ||
+        kv_heads == 0u || head_dim == 0u || pos0 > cache_cap ||
+        rows > cache_cap - pos0 || k_cache->ptr == v_cache->ptr) {
+        return 0;
+    }
+    const uint64_t kv_dim = (uint64_t)kv_heads * head_dim;
+    const uint64_t count = (uint64_t)rows * kv_dim;
+    const uint64_t cache_values = (uint64_t)cache_cap * kv_dim;
+    if (kv_dim > UINT32_MAX || count > UINT64_MAX / sizeof(float) ||
+        cache_values > UINT64_MAX / sizeof(float) ||
+        (count + 255u) / 256u > (uint64_t)INT_MAX ||
+        key->bytes < count * sizeof(float) ||
+        value->bytes < count * sizeof(float) ||
+        k_cache->bytes < cache_values * sizeof(float) ||
+        v_cache->bytes < cache_values * sizeof(float)) {
+        return 0;
+    }
+    qwen4exp_qsa_store_kv_kernel<<<
+        (count + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)k_cache->ptr, (float *)v_cache->ptr,
+        (const float *)key->ptr, (const float *)value->ptr,
+        pos0, (uint32_t)kv_dim, count);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp QSA KV store launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_qsa_attention_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *score_scratch,
+        const ds4_gpu_tensor *query, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *counts,
+        uint32_t rows, uint32_t heads, uint32_t kv_heads,
+        uint32_t head_dim, uint32_t selected_cap, uint32_t cache_cap) {
+    if (!out || !score_scratch || !query || !gate || !k_cache || !v_cache ||
+        !selected || !counts || rows == 0u || heads == 0u || kv_heads == 0u ||
+        heads % kv_heads != 0u || head_dim == 0u || head_dim > 1024u ||
+        (head_dim & (head_dim - 1u)) != 0u || selected_cap == 0u ||
+        cache_cap == 0u) {
+        return 0;
+    }
+    const uint64_t values = (uint64_t)rows * heads * head_dim;
+    const uint64_t score_count = (uint64_t)rows * heads * selected_cap;
+    const uint64_t selected_count = (uint64_t)rows * selected_cap;
+    const uint64_t cache_values =
+        (uint64_t)cache_cap * kv_heads * head_dim;
+    if (values > UINT64_MAX / sizeof(float) ||
+        score_count > UINT64_MAX / sizeof(float) ||
+        selected_count > UINT64_MAX / sizeof(int32_t) ||
+        cache_values > UINT64_MAX / sizeof(float) ||
+        out->bytes < values * sizeof(float) ||
+        query->bytes < values * sizeof(float) ||
+        gate->bytes < values * sizeof(float) ||
+        score_scratch->bytes < score_count * sizeof(float) ||
+        selected->bytes < selected_count * sizeof(int32_t) ||
+        counts->bytes < (uint64_t)rows * sizeof(uint32_t) ||
+        k_cache->bytes < cache_values * sizeof(float) ||
+        v_cache->bytes < cache_values * sizeof(float)) {
+        return 0;
+    }
+    if (heads == 24u && kv_heads == 2u && head_dim == 256u) {
+        dim3 score_grid(selected_cap, kv_heads, rows);
+        qwen4exp_qsa_attention_scores_gqa12_kernel<<<
+            score_grid, 128u, 0, ds4_current_stream()>>>(
+            (float *)score_scratch->ptr, (const float *)query->ptr,
+            (const float *)k_cache->ptr, (const int32_t *)selected->ptr,
+            (const uint32_t *)counts->ptr, rows, selected_cap, cache_cap);
+    } else {
+        dim3 score_grid(selected_cap, heads, rows);
+        qwen4exp_qsa_attention_scores_kernel<<<
+            score_grid, head_dim, head_dim * sizeof(float),
+            ds4_current_stream()>>>(
+            (float *)score_scratch->ptr, (const float *)query->ptr,
+            (const float *)k_cache->ptr, (const int32_t *)selected->ptr,
+            (const uint32_t *)counts->ptr, rows, heads, kv_heads,
+            head_dim, selected_cap, cache_cap);
+    }
+    if (!cuda_ok(cudaGetLastError(), "Qwen4Exp QSA attention scores launch"))
+        return 0;
+    if (heads == 24u && kv_heads == 2u && head_dim == 256u) {
+        dim3 reduce_grid(kv_heads, rows);
+        qwen4exp_qsa_attention_reduce_gqa12_kernel<<<
+            reduce_grid, head_dim, 12u * head_dim * sizeof(float),
+            ds4_current_stream()>>>(
+            (float *)out->ptr, (float *)score_scratch->ptr,
+            (const float *)gate->ptr, (const float *)v_cache->ptr,
+            (const int32_t *)selected->ptr,
+            (const uint32_t *)counts->ptr, selected_cap);
+    } else {
+        qwen4exp_qsa_attention_reduce_kernel<<<
+            rows * heads, head_dim, head_dim * sizeof(float),
+            ds4_current_stream()>>>(
+            (float *)out->ptr, (float *)score_scratch->ptr,
+            (const float *)gate->ptr, (const float *)v_cache->ptr,
+            (const int32_t *)selected->ptr,
+            (const uint32_t *)counts->ptr, heads, kv_heads, head_dim,
+            selected_cap);
+    }
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp QSA attention reduce launch");
+}
+
+__global__ static void qwen4exp_vision_patch_position_kernel(
+        float *hidden, const float *bias,
+        const cuda_block_q8_0 *position,
+        const int32_t *indices, const float *weights,
+        uint32_t rows, uint32_t dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t count = (uint64_t)rows * dim;
+    if (i >= count) return;
+    const uint32_t row = (uint32_t)(i / dim);
+    const uint32_t d = (uint32_t)(i - (uint64_t)row * dim);
+    const uint32_t blocks = dim / 32u;
+    float p = 0.0f;
+    for (uint32_t k = 0; k < 4u; k++) {
+        const uint32_t index = (uint32_t)indices[4u * row + k];
+        const cuda_block_q8_0 *b = position +
+            (uint64_t)index * blocks + d / 32u;
+        p += weights[4u * row + k] *
+             __half2float(*(const __half *)&b->d) * (float)b->qs[d & 31u];
+    }
+    hidden[i] += bias[d] + p;
+}
+
+__global__ static void qwen4exp_vision_layernorm_kernel(
+        float *out, const float *in, const float *weight, const float *bias,
+        uint32_t rows, uint32_t dim, float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= rows) return;
+    const float *src = in + (uint64_t)row * dim;
+    float *dst = out + (uint64_t)row * dim;
+    __shared__ float red[256];
+    float sum = 0.0f;
+    for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) sum += src[d];
+    red[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t off = blockDim.x >> 1u; off; off >>= 1u) {
+        if (threadIdx.x < off) red[threadIdx.x] += red[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float mean = red[0] / (float)dim;
+    float sq = 0.0f;
+    for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x) {
+        const float v = src[d] - mean;
+        sq += v * v;
+    }
+    red[threadIdx.x] = sq;
+    __syncthreads();
+    for (uint32_t off = blockDim.x >> 1u; off; off >>= 1u) {
+        if (threadIdx.x < off) red[threadIdx.x] += red[threadIdx.x + off];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(red[0] / (float)dim + eps);
+    for (uint32_t d = threadIdx.x; d < dim; d += blockDim.x)
+        dst[d] = (src[d] - mean) * inv * weight[d] + bias[d];
+}
+
+__global__ static void qwen4exp_vision_bias_kernel(
+        float *x, const float *bias, uint64_t count, uint32_t dim,
+        int activation) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    float v = x[i] + bias[i % dim];
+    if (activation == 1) {
+        const float c = 0.7978845608028654f;
+        v = 0.5f * v * (1.0f + tanhf(c * (v + 0.044715f * v * v * v)));
+    } else if (activation == 2) {
+        v = 0.5f * v * (1.0f + erff(v * 0.7071067811865475f));
+    }
+    x[i] = v;
+}
+
+__global__ static void qwen4exp_vision_bias_residual_kernel(
+        float *residual, const float *x, const float *bias,
+        uint64_t count, uint32_t dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) residual[i] += x[i] + bias[i % dim];
+}
+
+__global__ static void qwen4exp_vision_rope_kernel(
+        float *qkv, const int32_t *height, const int32_t *width,
+        uint32_t rows, uint32_t heads, uint32_t head_dim, float freq_base) {
+    const uint32_t half = head_dim / 2u;
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t pairs = (uint64_t)rows * heads * half;
+    if (i >= pairs) return;
+    const uint32_t f = (uint32_t)(i % half);
+    const uint64_t rh = i / half;
+    const uint32_t row = (uint32_t)(rh / heads);
+    const uint32_t head = (uint32_t)(rh - (uint64_t)row * heads);
+    const uint32_t axis_half = half / 2u;
+    const uint32_t pos = f < axis_half ? (uint32_t)height[row]
+                                        : (uint32_t)width[row];
+    const uint32_t fi = f < axis_half ? f : f - axis_half;
+    const float angle = (float)pos * powf(freq_base,
+        -(2.0f * (float)fi) / (float)half);
+    float sine, cosine;
+    sincosf(angle, &sine, &cosine);
+    const uint64_t row_base = (uint64_t)row * 3u * heads * head_dim;
+    for (uint32_t qk = 0; qk < 2u; qk++) {
+        float *base = qkv + row_base +
+            (uint64_t)(qk * heads + head) * head_dim;
+        const float a = base[f];
+        const float b = base[f + half];
+        base[f] = a * cosine - b * sine;
+        base[f + half] = b * cosine + a * sine;
+    }
+}
+
+__device__ __forceinline__ static void qwen4exp_vision_attention_row(
+        float *out, const float *qkv,
+        const int32_t *segment_start, const int32_t *segment_end,
+        uint32_t row, uint32_t head, uint32_t heads, uint32_t head_dim) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t width = heads * head_dim;
+    const float *q = qkv + (uint64_t)row * 3u * width +
+                     (uint64_t)head * head_dim;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+    const int32_t begin = segment_start[row];
+    const int32_t end = segment_end[row];
+    for (int32_t key_row = begin; key_row < end; key_row++) {
+        const float *k = qkv + (uint64_t)key_row * 3u * width + width +
+                         (uint64_t)head * head_dim;
+        float dot = 0.0f;
+        if (lane < head_dim) dot += q[lane] * k[lane];
+        if (lane + 32u < head_dim) dot += q[lane + 32u] * k[lane + 32u];
+        if (lane + 64u < head_dim) dot += q[lane + 64u] * k[lane + 64u];
+        dot = warp_sum_f32(dot);
+        dot = __shfl_sync(0xffffffffu, dot, 0) * rsqrtf((float)head_dim);
+        const float next_m = fmaxf(m, dot);
+        const float alpha = isfinite(m) ? expf(m - next_m) : 0.0f;
+        const float beta = expf(dot - next_m);
+        const float *v = qkv + (uint64_t)key_row * 3u * width + 2u * width +
+                         (uint64_t)head * head_dim;
+        if (lane < head_dim) acc0 = acc0 * alpha + v[lane] * beta;
+        if (lane + 32u < head_dim)
+            acc1 = acc1 * alpha + v[lane + 32u] * beta;
+        if (lane + 64u < head_dim)
+            acc2 = acc2 * alpha + v[lane + 64u] * beta;
+        l = l * alpha + beta;
+        m = next_m;
+    }
+    float *dst = out + (uint64_t)row * width +
+                 (uint64_t)head * head_dim;
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    if (lane < head_dim) dst[lane] = acc0 * inv;
+    if (lane + 32u < head_dim) dst[lane + 32u] = acc1 * inv;
+    if (lane + 64u < head_dim) dst[lane + 64u] = acc2 * inv;
+}
+
+__global__ static void qwen4exp_vision_attention_naive_kernel(
+        float *out, const float *qkv,
+        const int32_t *segment_start, const int32_t *segment_end,
+        uint32_t rows, uint32_t heads, uint32_t head_dim) {
+    const uint32_t item = blockIdx.x;
+    const uint32_t row = item / heads;
+    const uint32_t head = item - row * heads;
+    if (row >= rows || threadIdx.x >= 32u) return;
+    qwen4exp_vision_attention_row(
+        out, qkv, segment_start, segment_end,
+        row, head, heads, head_dim);
+}
+
+/* Eight query warps share each 32-key K/V tile.  The online-softmax order is
+ * unchanged, but K/V global traffic is amortized across the query rows. */
+__global__ static void qwen4exp_vision_attention_tiled_kernel(
+        float *out, const float *qkv,
+        const int32_t *segment_start, const int32_t *segment_end,
+        uint32_t rows, uint32_t heads, uint32_t head_dim) {
+    constexpr uint32_t query_tile = 8u;
+    constexpr uint32_t key_tile = 32u;
+    extern __shared__ float kv_tile[];
+    float *key = kv_tile;
+    float *value = key + key_tile * head_dim;
+    __shared__ int32_t begin, end;
+    __shared__ int same_segment;
+
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row0 = blockIdx.x * query_tile;
+    const uint32_t row = row0 + warp;
+    const uint32_t head = blockIdx.y;
+    const bool active = row < rows;
+    if (threadIdx.x == 0u) {
+        begin = segment_start[row0];
+        end = segment_end[row0];
+        same_segment = 1;
+        const uint32_t row_end = row0 + query_tile < rows
+            ? row0 + query_tile : rows;
+        for (uint32_t r = row0 + 1u; r < row_end; r++) {
+            if (segment_start[r] != begin || segment_end[r] != end) {
+                same_segment = 0;
+                break;
+            }
+        }
+    }
+    __syncthreads();
+    if (!same_segment) {
+        if (active) qwen4exp_vision_attention_row(
+            out, qkv, segment_start, segment_end,
+            row, head, heads, head_dim);
+        return;
+    }
+
+    const uint32_t width = heads * head_dim;
+    const float *q = active
+        ? qkv + (uint64_t)row * 3u * width +
+          (uint64_t)head * head_dim
+        : nullptr;
+    const float q0 = active && lane < head_dim ? q[lane] : 0.0f;
+    const float q1 = active && lane + 32u < head_dim ? q[lane + 32u] : 0.0f;
+    const float q2 = active && lane + 64u < head_dim ? q[lane + 64u] : 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f;
+    float m = -INFINITY;
+    float l = 0.0f;
+    const float scale = rsqrtf((float)head_dim);
+
+    for (int32_t key_base = begin; key_base < end; key_base += key_tile) {
+        const uint32_t valid = end - key_base < (int32_t)key_tile
+            ? (uint32_t)(end - key_base) : key_tile;
+        const uint32_t tile_values = valid * head_dim;
+        for (uint32_t i = threadIdx.x; i < 2u * tile_values;
+             i += blockDim.x) {
+            const bool is_value = i >= tile_values;
+            const uint32_t local = is_value ? i - tile_values : i;
+            const uint32_t key_row = local / head_dim;
+            const uint32_t d = local - key_row * head_dim;
+            const uint64_t source =
+                (uint64_t)(key_base + (int32_t)key_row) * 3u * width +
+                (uint64_t)(is_value ? 2u : 1u) * width +
+                (uint64_t)head * head_dim + d;
+            (is_value ? value : key)[local] = qkv[source];
+        }
+        __syncthreads();
+        if (active) {
+            for (uint32_t k = 0u; k < valid; k++) {
+                const float *tile_key = key + k * head_dim;
+                float dot = 0.0f;
+                if (lane < head_dim) dot += q0 * tile_key[lane];
+                if (lane + 32u < head_dim)
+                    dot += q1 * tile_key[lane + 32u];
+                if (lane + 64u < head_dim)
+                    dot += q2 * tile_key[lane + 64u];
+                dot = __shfl_sync(
+                    0xffffffffu, warp_sum_f32(dot), 0) * scale;
+                const float next_m = fmaxf(m, dot);
+                const float alpha = isfinite(m) ? expf(m - next_m) : 0.0f;
+                const float beta = expf(dot - next_m);
+                const float *tile_value = value + k * head_dim;
+                if (lane < head_dim)
+                    acc0 = acc0 * alpha + tile_value[lane] * beta;
+                if (lane + 32u < head_dim)
+                    acc1 = acc1 * alpha + tile_value[lane + 32u] * beta;
+                if (lane + 64u < head_dim)
+                    acc2 = acc2 * alpha + tile_value[lane + 64u] * beta;
+                l = l * alpha + beta;
+                m = next_m;
+            }
+        }
+        __syncthreads();
+    }
+    if (!active) return;
+    float *dst = out + (uint64_t)row * width +
+                 (uint64_t)head * head_dim;
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    if (lane < head_dim) dst[lane] = acc0 * inv;
+    if (lane + 32u < head_dim) dst[lane + 32u] = acc1 * inv;
+    if (lane + 64u < head_dim) dst[lane + 64u] = acc2 * inv;
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_patch_position_tensor(
+        ds4_gpu_tensor *hidden, const void *model_map, uint64_t model_size,
+        uint64_t patch_bias_offset, uint64_t position_weight_offset,
+        const ds4_gpu_tensor *position_indices,
+        const ds4_gpu_tensor *position_weights,
+        uint32_t rows, uint32_t hidden_dim) {
+    const uint64_t values = (uint64_t)rows * hidden_dim;
+    const uint64_t bias_bytes = (uint64_t)hidden_dim * sizeof(float);
+    const uint64_t pos_bytes =
+        (uint64_t)2304u * (hidden_dim / 32u) * sizeof(cuda_block_q8_0);
+    if (!hidden || !model_map || !position_indices || !position_weights ||
+        rows == 0u || hidden_dim == 0u || hidden_dim % 32u != 0u ||
+        values > UINT64_MAX / sizeof(float) ||
+        hidden->bytes < values * sizeof(float) ||
+        position_indices->bytes < (uint64_t)rows * 4u * sizeof(int32_t) ||
+        position_weights->bytes < (uint64_t)rows * 4u * sizeof(float) ||
+        patch_bias_offset > model_size || bias_bytes > model_size - patch_bias_offset ||
+        position_weight_offset > model_size || pos_bytes > model_size - position_weight_offset)
+        return 0;
+    const float *bias = (const float *)cuda_model_range_ptr(
+        model_map, patch_bias_offset, bias_bytes, "Qwen vision patch bias");
+    const cuda_block_q8_0 *position =
+        (const cuda_block_q8_0 *)cuda_model_range_ptr(
+            model_map, position_weight_offset, pos_bytes,
+            "Qwen vision position embedding");
+    if (!bias || !position) return 0;
+    qwen4exp_vision_patch_position_kernel<<<
+        (values + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)hidden->ptr, bias, position,
+        (const int32_t *)position_indices->ptr,
+        (const float *)position_weights->ptr, rows, hidden_dim);
+    return cuda_ok(cudaGetLastError(), "Qwen vision patch/position launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_layernorm_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
+        const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t bias_offset,
+        uint32_t rows, uint32_t dim, float eps) {
+    const uint64_t values = (uint64_t)rows * dim;
+    const uint64_t bytes = (uint64_t)dim * sizeof(float);
+    if (!out || !in || !model_map || rows == 0u || dim == 0u || dim > 65536u ||
+        values > UINT64_MAX / sizeof(float) ||
+        out->bytes < values * sizeof(float) || in->bytes < values * sizeof(float) ||
+        weight_offset > model_size || bytes > model_size - weight_offset ||
+        bias_offset > model_size || bytes > model_size - bias_offset) return 0;
+    const float *weight = (const float *)cuda_model_range_ptr(
+        model_map, weight_offset, bytes, "Qwen vision LayerNorm weight");
+    const float *bias = (const float *)cuda_model_range_ptr(
+        model_map, bias_offset, bytes, "Qwen vision LayerNorm bias");
+    if (!weight || !bias) return 0;
+    qwen4exp_vision_layernorm_kernel<<<
+        rows, 256u, 0, ds4_current_stream()>>>(
+        (float *)out->ptr, (const float *)in->ptr, weight, bias, rows, dim, eps);
+    return cuda_ok(cudaGetLastError(), "Qwen vision LayerNorm launch");
+}
+
+static int qwen4exp_vision_bias_common(
+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+        uint64_t bias_offset, uint32_t rows, uint32_t dim, int activation) {
+    const uint64_t values = (uint64_t)rows * dim;
+    const uint64_t bytes = (uint64_t)dim * sizeof(float);
+    if (!x || !model_map || rows == 0u || dim == 0u ||
+        values > UINT64_MAX / sizeof(float) || x->bytes < values * sizeof(float) ||
+        bias_offset > model_size || bytes > model_size - bias_offset) return 0;
+    const float *bias = (const float *)cuda_model_range_ptr(
+        model_map, bias_offset, bytes, "Qwen vision bias");
+    if (!bias) return 0;
+    qwen4exp_vision_bias_kernel<<<
+        (values + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)x->ptr, bias, values, dim, activation);
+    return cuda_ok(cudaGetLastError(), "Qwen vision bias/activation launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_bias_gelu_tensor(
+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+        uint64_t bias_offset, uint32_t rows, uint32_t dim, int tanh_approx) {
+    return qwen4exp_vision_bias_common(
+        x, model_map, model_size, bias_offset, rows, dim,
+        tanh_approx ? 1 : 2);
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_bias_tensor(
+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+        uint64_t bias_offset, uint32_t rows, uint32_t dim) {
+    return qwen4exp_vision_bias_common(
+        x, model_map, model_size, bias_offset, rows, dim, 0);
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_bias_residual_tensor(
+        ds4_gpu_tensor *residual, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t bias_offset,
+        uint32_t rows, uint32_t dim) {
+    const uint64_t values = (uint64_t)rows * dim;
+    const uint64_t bytes = (uint64_t)dim * sizeof(float);
+    if (!residual || !x || !model_map || rows == 0u || dim == 0u ||
+        values > UINT64_MAX / sizeof(float) ||
+        residual->bytes < values * sizeof(float) || x->bytes < values * sizeof(float) ||
+        bias_offset > model_size || bytes > model_size - bias_offset) return 0;
+    const float *bias = (const float *)cuda_model_range_ptr(
+        model_map, bias_offset, bytes, "Qwen vision residual bias");
+    if (!bias) return 0;
+    qwen4exp_vision_bias_residual_kernel<<<
+        (values + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)residual->ptr, (const float *)x->ptr, bias, values, dim);
+    return cuda_ok(cudaGetLastError(), "Qwen vision residual launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_qkv_rope_tensor(
+        ds4_gpu_tensor *qkv, const void *model_map, uint64_t model_size,
+        uint64_t bias_offset, const ds4_gpu_tensor *height_positions,
+        const ds4_gpu_tensor *width_positions, uint32_t rows,
+        uint32_t heads, uint32_t head_dim, float freq_base) {
+    const uint32_t dim = 3u * heads * head_dim;
+    if (!qkv || !height_positions || !width_positions || rows == 0u ||
+        heads == 0u || head_dim == 0u || (head_dim & 3u) != 0u ||
+        height_positions->bytes < (uint64_t)rows * sizeof(int32_t) ||
+        width_positions->bytes < (uint64_t)rows * sizeof(int32_t) ||
+        !isfinite(freq_base) || freq_base <= 0.0f ||
+        !qwen4exp_vision_bias_common(qkv, model_map, model_size,
+                                     bias_offset, rows, dim, 0)) return 0;
+    const uint64_t pairs = (uint64_t)rows * heads * (head_dim / 2u);
+    qwen4exp_vision_rope_kernel<<<
+        (pairs + 255u) / 256u, 256u, 0, ds4_current_stream()>>>(
+        (float *)qkv->ptr,
+        (const int32_t *)height_positions->ptr,
+        (const int32_t *)width_positions->ptr,
+        rows, heads, head_dim, freq_base);
+    return cuda_ok(cudaGetLastError(), "Qwen vision QKV RoPE launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_vision_attention_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *segment_start,
+        const ds4_gpu_tensor *segment_end,
+        uint32_t rows, uint32_t heads, uint32_t head_dim) {
+    const uint64_t values = (uint64_t)rows * heads * head_dim;
+    if (!out || !qkv || !segment_start || !segment_end || rows == 0u ||
+        heads == 0u || head_dim == 0u || head_dim > 96u ||
+        values > UINT64_MAX / sizeof(float) ||
+        out->bytes < values * sizeof(float) ||
+        qkv->bytes < 3u * values * sizeof(float) ||
+        segment_start->bytes < (uint64_t)rows * sizeof(int32_t) ||
+        segment_end->bytes < (uint64_t)rows * sizeof(int32_t) ||
+        (uint64_t)rows * heads > (uint64_t)INT_MAX) return 0;
+    if (getenv("DS4_CUDA_NO_QWEN_VISION_TILE") != NULL) {
+        qwen4exp_vision_attention_naive_kernel<<<
+            rows * heads, 32u, 0, ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)qkv->ptr,
+            (const int32_t *)segment_start->ptr,
+            (const int32_t *)segment_end->ptr, rows, heads, head_dim);
+    } else {
+        dim3 grid((rows + 7u) / 8u, heads);
+        const uint32_t shared = 2u * 32u * head_dim * sizeof(float);
+        qwen4exp_vision_attention_tiled_kernel<<<
+            grid, 256u, shared, ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)qkv->ptr,
+            (const int32_t *)segment_start->ptr,
+            (const int32_t *)segment_end->ptr, rows, heads, head_dim);
+    }
+    return cuda_ok(cudaGetLastError(), "Qwen vision attention launch");
 }
 
 extern "C" int ds4_gpu_rms_norm_weight_rows_q8_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, uint32_t rows, float eps) {
@@ -27553,6 +30119,321 @@ extern "C" int ds4_gpu_sigmoid_topk_router_tensor(
     return cuda_ok(cudaGetLastError(), "sigmoid top-k router launch");
 }
 
+extern "C" int ds4_gpu_qwen4exp_softmax_topk_router_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_expert,
+        uint32_t                n_used,
+        uint32_t                n_tokens) {
+    if (!selected || !weights || !logits || n_expert == 0u ||
+        n_expert > 4096u || n_used == 0u || n_used > n_expert ||
+        n_tokens == 0u || n_tokens > (uint32_t)INT_MAX ||
+        selected->bytes < (uint64_t)n_tokens * n_used * sizeof(int32_t) ||
+        weights->bytes < (uint64_t)n_tokens * n_used * sizeof(float) ||
+        logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float)) {
+        return 0;
+    }
+    const uint32_t shared_bytes = n_expert * (uint32_t)sizeof(float);
+    qwen4exp_softmax_topk_router_kernel<<<
+        n_tokens, 128u, shared_bytes, ds4_current_stream()>>>(
+            (int32_t *)selected->ptr, (float *)weights->ptr,
+            (const float *)logits->ptr, n_expert, n_used);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp softmax top-k router launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_shared_expert_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *shared,
+        const ds4_gpu_tensor *gate_logits,
+        uint32_t                rows,
+        uint32_t                hidden_size) {
+    if (!out || !shared || !gate_logits || rows == 0u || hidden_size == 0u ||
+        (uint64_t)rows > UINT64_MAX / hidden_size) {
+        return 0;
+    }
+    const uint64_t count = (uint64_t)rows * hidden_size;
+    if (count > UINT64_MAX / sizeof(float) ||
+        count > (uint64_t)UINT_MAX * 256u ||
+        out->bytes < count * sizeof(float) ||
+        shared->bytes < count * sizeof(float) ||
+        gate_logits->bytes < (uint64_t)rows * sizeof(float)) {
+        return 0;
+    }
+    qwen4exp_shared_expert_gate_kernel<<<
+        (unsigned)((count + 255u) / 256u), 256u, 0, ds4_current_stream()>>>(
+            (float *)out->ptr, (const float *)shared->ptr,
+            (const float *)gate_logits->ptr, hidden_size, count);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp shared-expert gate launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_pack_expert_down_main_tensor(
+        ds4_gpu_tensor       *packed_main,
+        const ds4_gpu_tensor *mid,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim) {
+    if (!packed_main || !mid || packed_main->ptr == mid->ptr ||
+        assignments == 0u || main_dim == 0u || main_dim > mid_width ||
+        assignments > UINT64_MAX / mid_width ||
+        assignments > UINT64_MAX / main_dim) {
+        return 0;
+    }
+    const uint64_t source_count = assignments * mid_width;
+    const uint64_t count = assignments * main_dim;
+    if (source_count > UINT64_MAX / sizeof(float) ||
+        count > UINT64_MAX / sizeof(float) ||
+        count > (uint64_t)UINT_MAX * 256u ||
+        mid->bytes < source_count * sizeof(float) ||
+        packed_main->bytes < count * sizeof(float)) {
+        return 0;
+    }
+    qwen4exp_pack_expert_down_main_kernel<<<
+        (unsigned)((count + 255u) / 256u), 256u, 0, ds4_current_stream()>>>(
+            (float *)packed_main->ptr, (const float *)mid->ptr,
+            mid_width, main_dim, count);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp expert-down main pack launch");
+}
+
+static int qwen4exp_q5_0_tail_args_valid(
+        ds4_gpu_tensor       *down,
+        const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        uint64_t               *blocks_out) {
+    if (!down || !mid || !ids || !blocks_out || down->ptr == mid->ptr ||
+        assignments == 0u || mid_width == 0u || main_dim == 0u ||
+        tail_dim == 0u || tail_dim % 32u != 0u || out_dim == 0u ||
+        n_expert == 0u || main_dim > mid_width ||
+        tail_dim > mid_width - main_dim ||
+        mid_width > INT_MAX || main_dim > INT_MAX || tail_dim > INT_MAX ||
+        n_expert > INT_MAX ||
+        assignments > UINT64_MAX / mid_width ||
+        assignments > UINT64_MAX / out_dim ||
+        (uint64_t)n_expert > UINT64_MAX / out_dim) {
+        return 0;
+    }
+    const uint64_t mid_count = assignments * mid_width;
+    const uint64_t tasks = assignments * out_dim;
+    const uint64_t rows = (uint64_t)n_expert * out_dim;
+    const uint64_t blocks_per_row = tail_dim / 32u;
+    if (rows > UINT64_MAX / blocks_per_row ||
+        rows * blocks_per_row > UINT64_MAX / sizeof(cuda_block_q5_0) ||
+        mid_count > UINT64_MAX / sizeof(float) ||
+        tasks > UINT64_MAX / sizeof(float) || tasks > (uint64_t)INT_MAX) {
+        return 0;
+    }
+    const uint64_t required_bytes =
+        rows * blocks_per_row * sizeof(cuda_block_q5_0);
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        weight_bytes < required_bytes ||
+        mid->bytes < mid_count * sizeof(float) ||
+        ids->bytes < assignments * sizeof(int32_t) ||
+        down->bytes < tasks * sizeof(float)) {
+        return 0;
+    }
+    constexpr uint64_t rows_per_block = 64u;
+    *blocks_out = assignments *
+        ((out_dim + rows_per_block - 1u) / rows_per_block);
+    return 1;
+}
+
+static int qwen4exp_q5_0_tail_accum_launch_one(
+        ds4_gpu_tensor       *down,
+        const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids,
+        const cuda_block_q5_0 *tail_weights,
+        uint64_t                blocks,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert,
+        int                     use_expert_major) {
+    if (use_expert_major &&
+        ds4_mmq_q5_0_f32_moe_accum(
+            tail_weights, (const float *)mid->ptr,
+            (const int32_t *)ids->ptr, (float *)down->ptr,
+            (int)out_dim, (int)tail_dim, (int)mid_width, (int)main_dim,
+            (int)assignments, (int)n_expert, 1,
+            ds4_current_stream()) == 0) {
+        return 1;
+    }
+    qwen4exp_q5_0_tail_accum_kernel<<<
+        dim3((unsigned)blocks, 1u), 256u,
+        tail_dim * sizeof(float), ds4_current_stream()>>>(
+            (float *)down->ptr, (const float *)mid->ptr,
+            (const int32_t *)ids->ptr, nullptr, nullptr, nullptr,
+            tail_weights, mid_width, main_dim, tail_dim, out_dim,
+            n_expert, assignments);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp Q5_0 tail accumulate launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
+        ds4_gpu_tensor       *down,
+        const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert) {
+    uint64_t blocks = 0u;
+    if (!model_map || !qwen4exp_q5_0_tail_args_valid(
+            down, mid, ids, model_size, weight_offset, weight_bytes,
+            assignments, mid_width, main_dim, tail_dim, out_dim, n_expert,
+            &blocks)) {
+        return 0;
+    }
+    const cuda_block_q5_0 *tail_weights =
+        (const cuda_block_q5_0 *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes,
+            "qwen4exp_q5_0_expert_down_tail");
+    if (!tail_weights) return 0;
+    const char *expert_major = getenv("DS4_QWEN_Q5_TAIL_EXPERT_MAJOR");
+    const int use_expert_major =
+        !(expert_major && expert_major[0] == '0') &&
+        (assignments >= (uint64_t)n_expert * 8u ||
+         (expert_major && expert_major[0] == '1'));
+    return qwen4exp_q5_0_tail_accum_launch_one(
+        down, mid, ids, tail_weights, blocks, assignments, mid_width,
+        main_dim, tail_dim, out_dim, n_expert, use_expert_major);
+}
+
+extern "C" int ds4_gpu_qwen4exp_q5_0_tail_accum_bank2_tensor(
+        ds4_gpu_tensor       *down0,
+        const ds4_gpu_tensor *mid0,
+        const ds4_gpu_tensor *ids0,
+        ds4_gpu_tensor       *down1,
+        const ds4_gpu_tensor *mid1,
+        const ds4_gpu_tensor *ids1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert) {
+    uint64_t blocks0 = 0u, blocks1 = 0u;
+    if (!model_map || down0 == down1 ||
+        !qwen4exp_q5_0_tail_args_valid(
+            down0, mid0, ids0, model_size, weight_offset, weight_bytes,
+            assignments, mid_width, main_dim, tail_dim, out_dim, n_expert,
+            &blocks0) ||
+        !qwen4exp_q5_0_tail_args_valid(
+            down1, mid1, ids1, model_size, weight_offset, weight_bytes,
+            assignments, mid_width, main_dim, tail_dim, out_dim, n_expert,
+            &blocks1) ||
+        down0->ptr == down1->ptr || down0->ptr == mid1->ptr ||
+        down1->ptr == mid0->ptr || blocks0 != blocks1) {
+        return 0;
+    }
+    const cuda_block_q5_0 *tail_weights =
+        (const cuda_block_q5_0 *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes,
+            "qwen4exp_q5_0_expert_down_tail_bank2");
+    if (!tail_weights) return 0;
+    const char *expert_major = getenv("DS4_QWEN_Q5_TAIL_EXPERT_MAJOR");
+    const int use_expert_major =
+        !(expert_major && expert_major[0] == '0') &&
+        (assignments >= (uint64_t)n_expert * 8u ||
+         (expert_major && expert_major[0] == '1'));
+    if (use_expert_major) {
+        return qwen4exp_q5_0_tail_accum_launch_one(
+                   down0, mid0, ids0, tail_weights, blocks0, assignments,
+                   mid_width, main_dim, tail_dim, out_dim, n_expert, 1) &&
+               qwen4exp_q5_0_tail_accum_launch_one(
+                   down1, mid1, ids1, tail_weights, blocks1, assignments,
+                   mid_width, main_dim, tail_dim, out_dim, n_expert, 1);
+    }
+    qwen4exp_q5_0_tail_accum_kernel<<<
+        dim3((unsigned)blocks0, 2u), 256u,
+        tail_dim * sizeof(float), ds4_current_stream()>>>(
+            (float *)down0->ptr, (const float *)mid0->ptr,
+            (const int32_t *)ids0->ptr,
+            (float *)down1->ptr, (const float *)mid1->ptr,
+            (const int32_t *)ids1->ptr, tail_weights, mid_width, main_dim,
+            tail_dim, out_dim, n_expert, assignments);
+    return cuda_ok(cudaGetLastError(),
+                   "Qwen4Exp paired Q5_0 tail accumulate launch");
+}
+
+extern "C" int ds4_gpu_qwen4exp_q8_0_tail_accum_tensor(
+        ds4_gpu_tensor       *down,
+        const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert) {
+    if (!down || !mid || !ids || !model_map || down->ptr == mid->ptr ||
+        assignments == 0u || mid_width == 0u || main_dim == 0u ||
+        tail_dim == 0u || tail_dim % 32u != 0u || out_dim == 0u ||
+        n_expert == 0u || main_dim > mid_width ||
+        tail_dim > mid_width - main_dim ||
+        assignments > UINT64_MAX / mid_width ||
+        assignments > UINT64_MAX / out_dim ||
+        (uint64_t)n_expert > UINT64_MAX / out_dim) {
+        return 0;
+    }
+    const uint64_t mid_count = assignments * mid_width;
+    const uint64_t tasks = assignments * out_dim;
+    const uint64_t rows = (uint64_t)n_expert * out_dim;
+    const uint64_t blocks_per_row = tail_dim / 32u;
+    if (rows > UINT64_MAX / blocks_per_row ||
+        rows * blocks_per_row > UINT64_MAX / sizeof(cuda_block_q8_0) ||
+        mid_count > UINT64_MAX / sizeof(float) ||
+        tasks > UINT64_MAX / sizeof(float) || tasks > (uint64_t)INT_MAX) {
+        return 0;
+    }
+    const uint64_t required_bytes =
+        rows * blocks_per_row * sizeof(cuda_block_q8_0);
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset ||
+        weight_bytes < required_bytes ||
+        mid->bytes < mid_count * sizeof(float) ||
+        ids->bytes < assignments * sizeof(int32_t) ||
+        down->bytes < tasks * sizeof(float)) {
+        return 0;
+    }
+    const cuda_block_q8_0 *tail_weights =
+        (const cuda_block_q8_0 *)cuda_model_range_ptr(
+            model_map, weight_offset, weight_bytes,
+            "qwen4exp_q8_0_expert_down_tail");
+    if (!tail_weights) return 0;
+    constexpr uint64_t rows_per_block = 64u;
+    const uint64_t blocks = assignments *
+        ((out_dim + rows_per_block - 1u) / rows_per_block);
+    qwen4exp_q8_0_tail_accum_kernel<<<
+        (unsigned)blocks, 256u, tail_dim * sizeof(float), ds4_current_stream()>>>(
+            (float *)down->ptr, (const float *)mid->ptr,
+            (const int32_t *)ids->ptr, tail_weights, mid_width, main_dim,
+            tail_dim, out_dim, n_expert, assignments);
+    return cuda_ok(cudaGetLastError(), "Qwen4Exp Q8_0 tail accumulate launch");
+}
+
 extern "C" int ds4_gpu_swiglu_weighted_tensor(
         ds4_gpu_tensor       *mid,
         const ds4_gpu_tensor *gate,
@@ -27592,7 +30473,7 @@ static int routed_matmul_tensor_impl(
         uint32_t                n_expert_used,
         uint32_t                max_rows_per_expert) {
     if (!out || !x || !ids || !model_map || in_dim == 0u ||
-        (in_dim & 255u) != 0u || out_dim == 0u || n_expert == 0u ||
+        out_dim == 0u || n_expert == 0u ||
         n_tokens == 0u || n_expert_used == 0u ||
         n_expert_used > n_expert || in_dim > (uint32_t)INT_MAX ||
         out_dim > (uint32_t)INT_MAX || n_tokens > (uint32_t)INT_MAX ||
@@ -27618,10 +30499,13 @@ static int routed_matmul_tensor_impl(
     uint32_t block_size = 0u;
     uint32_t block_width = 256u;
     switch (weight_type) {
+    case 6u:  block_size = 22u; block_width = 32u; break;  /* Q5_0 */
     case 8u:  block_size = 34u; block_width = 32u; break;  /* Q8_0 */
     case 10u: block_size = 84u; break;                     /* Q2_K */
     case 11u: block_size = 110u; break;                    /* Q3_K */
     case 12u: block_size = 144u; break;                    /* Q4_K */
+    case 13u: block_size = 176u; break;                    /* Q5_K */
+    case 14u: block_size = 210u; break;                    /* Q6_K */
     case 16u: block_size = 66u; break;                     /* IQ2_XXS */
     default:
         fprintf(stderr, "ds4: routed matmul unsupported weight type %u\n",
@@ -27658,7 +30542,8 @@ static int routed_matmul_tensor_impl(
     const char *bound_global = getenv("DS4_MMQ_EXPERT_BOUND");
     const char *bound_type = weight_type == 11u
         ? getenv("DS4_MMQ_Q3_BOUND")
-        : weight_type == 12u ? getenv("DS4_MMQ_Q4_BOUND") : NULL;
+        : weight_type == 12u ? getenv("DS4_MMQ_Q4_BOUND")
+        : weight_type == 13u ? getenv("DS4_MMQ_Q5_BOUND") : NULL;
     const bool use_bucket_bound =
         !use_vec && max_rows_per_expert > 0u &&
         !(bound_global && bound_global[0] == '0') &&
@@ -27666,6 +30551,11 @@ static int routed_matmul_tensor_impl(
     const cudaStream_t stream = ds4_current_stream();
     int rc = -1;
     switch (weight_type) {
+    case 6u:
+        rc = use_vec
+            ? ds4_mmq_q5_0_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
+            : ds4_mmq_q5_0_moe(weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        break;
     case 8u:
         rc = use_vec
             ? ds4_mmq_q8_0_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
@@ -27717,6 +30607,32 @@ static int routed_matmul_tensor_impl(
                         max_rows_per_expert);
             }
         }
+        break;
+    case 13u:
+        rc = use_vec
+            ? ds4_mmq_q5_K_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
+            : use_bucket_bound
+                ? ds4_mmq_q5_K_moe_bounded(
+                      weights, xp, idp, op, M, K, NT, NE, NU,
+                      (int)max_rows_per_expert, stream)
+                : ds4_mmq_q5_K_moe(
+                      weights, xp, idp, op, M, K, NT, NE, NU, stream);
+        if (use_bucket_bound) {
+            static bool logged_q5_bound = false;
+            if (!logged_q5_bound) {
+                logged_q5_bound = true;
+                fprintf(stderr,
+                        "ds4: Q5_K routed MMQ expert-bucket bound active "
+                        "(rows=%llu bound=%u)\n",
+                        (unsigned long long)assignments,
+                        max_rows_per_expert);
+            }
+        }
+        break;
+    case 14u:
+        rc = use_vec
+            ? ds4_mmq_q6_K_moe_vec(weights, xp, idp, op, M, K, NT, NE, NU, stream)
+            : ds4_mmq_q6_K_moe(weights, xp, idp, op, M, K, NT, NE, NU, stream);
         break;
     case 16u:
         rc = use_vec

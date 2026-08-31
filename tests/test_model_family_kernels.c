@@ -17,6 +17,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+_Static_assert(sizeof(((ds4_gpu_tensor_record *)0)->dims) / sizeof(uint64_t) == 8,
+               "derived catalog must preserve every GGUF dimension");
+
 enum {
     T_VOCAB = 17,
     T_EMBD = 128,

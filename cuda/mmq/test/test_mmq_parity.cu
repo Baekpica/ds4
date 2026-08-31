@@ -346,6 +346,113 @@ void dequantize_row_q4_K_cpu(const block_q4_K * x, float * y, int K) {
     }
 }
 
+// --------------------------------------------------------------------------
+// Qwen3.8 high-precision expert formats: Q5_K/Q6_K gate/up and down-main,
+// plus the 32-value-block Q5_0 down tail (the tail's real input width is 128).
+// --------------------------------------------------------------------------
+
+void generate_random_block_q5_K(block_q5_K *blk, std::mt19937 &rng) {
+    std::uniform_int_distribution<int> u8(0, 255);
+    for (int i = 0; i < K_SCALE_SIZE; ++i) blk->scales[i] = (uint8_t)u8(rng);
+    for (int i = 0; i < QK_K_LOCAL/8; ++i) blk->qh[i] = (uint8_t)u8(rng);
+    for (int i = 0; i < QK_K_LOCAL/2; ++i) blk->qs[i] = (uint8_t)u8(rng);
+    std::uniform_real_distribution<float> ud(0.003f, 0.012f);
+    set_half_from_u16(blk->data.d, float_to_fp16(ud(rng)));
+    set_half_from_u16(blk->data.dmin, float_to_fp16(ud(rng)));
+}
+
+void dequantize_row_q5_K_cpu(const block_q5_K *x, float *y, int K) {
+    const int nb = K / QK_K_LOCAL;
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_float(u16_from_half(x[i].data.d));
+        const float dmin = fp16_to_float(u16_from_half(x[i].data.dmin));
+        const uint8_t *ql = x[i].qs;
+        const uint8_t *qh = x[i].qh;
+        int is = 0;
+        uint8_t u1 = 1u, u2 = 2u;
+        for (int j = 0; j < QK_K_LOCAL; j += 64) {
+            (void)j;
+            uint8_t sc, m;
+            get_scale_min_k4_cpu(is + 0, x[i].scales, &sc, &m);
+            const float d1 = d * sc, m1 = dmin * m;
+            get_scale_min_k4_cpu(is + 1, x[i].scales, &sc, &m);
+            const float d2 = d * sc, m2 = dmin * m;
+            for (int l = 0; l < 32; ++l) {
+                const int q1 = (ql[l] & 0x0f) + ((qh[l] & u1) ? 16 : 0);
+                const int q2 = (ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0);
+                y[l] = d1 * q1 - m1;
+                y[l + 32] = d2 * q2 - m2;
+            }
+            y += 64;
+            ql += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+    }
+}
+
+void generate_random_block_q6_K(block_q6_K *blk, std::mt19937 &rng) {
+    std::uniform_int_distribution<int> u8(0, 255);
+    std::uniform_int_distribution<int> scale(-24, 24);
+    for (int i = 0; i < QK_K_LOCAL/2; ++i) blk->ql[i] = (uint8_t)u8(rng);
+    for (int i = 0; i < QK_K_LOCAL/4; ++i) blk->qh[i] = (uint8_t)u8(rng);
+    for (int i = 0; i < QK_K_LOCAL/16; ++i) blk->scales[i] = (int8_t)scale(rng);
+    std::uniform_real_distribution<float> ud(0.003f, 0.012f);
+    set_half_from_u16(blk->d, float_to_fp16(ud(rng)));
+}
+
+void dequantize_row_q6_K_cpu(const block_q6_K *x, float *y, int K) {
+    const int nb = K / QK_K_LOCAL;
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_float(u16_from_half(x[i].d));
+        const uint8_t *ql = x[i].ql;
+        const uint8_t *qh = x[i].qh;
+        const int8_t *sc = x[i].scales;
+        for (int n = 0; n < QK_K_LOCAL; n += 128) {
+            (void)n;
+            for (int l = 0; l < 32; ++l) {
+                const int q1 = (ql[l] & 0x0f) | (((qh[l] >> 0) & 3) << 4);
+                const int q2 = (ql[l + 32] & 0x0f) | (((qh[l] >> 2) & 3) << 4);
+                const int q3 = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+                const int q4 = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+                y[l + 0] = d * sc[l/16 + 0] * (q1 - 32);
+                y[l + 32] = d * sc[l/16 + 2] * (q2 - 32);
+                y[l + 64] = d * sc[l/16 + 4] * (q3 - 32);
+                y[l + 96] = d * sc[l/16 + 6] * (q4 - 32);
+            }
+            y += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+}
+
+void generate_random_block_q5_0(block_q5_0 *blk, std::mt19937 &rng) {
+    std::uniform_int_distribution<int> u8(0, 255);
+    for (int i = 0; i < 4; ++i) blk->qh[i] = (uint8_t)u8(rng);
+    for (int i = 0; i < QK5_0/2; ++i) blk->qs[i] = (uint8_t)u8(rng);
+    std::uniform_real_distribution<float> ud(0.02f, 0.10f);
+    set_half_from_u16(blk->d, float_to_fp16(ud(rng)));
+}
+
+void dequantize_row_q5_0_cpu(const block_q5_0 *x, float *y, int K) {
+    const int nb = K / QK5_0;
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_float(u16_from_half(x[i].d));
+        uint32_t qh;
+        std::memcpy(&qh, x[i].qh, sizeof(qh));
+        for (int j = 0; j < QK5_0/2; ++j) {
+            const int q0 = (x[i].qs[j] & 0x0f) | (((qh >> j) & 1u) << 4);
+            const int q1 = (x[i].qs[j] >> 4) | (((qh >> (j + 16)) & 1u) << 4);
+            y[j] = d * (q0 - 16);
+            y[j + QK5_0/2] = d * (q1 - 16);
+        }
+        y += QK5_0;
+    }
+}
+
 // Port of dequantize_row_iq2_xxs from ggml/src/ggml-quants.c:2412.  The
 // CPU-side lookup tables live in iq2_host_tables.h - generated from the
 // canonical bit-patterns in cuda/mmq/ggml-common.h.
@@ -551,6 +658,62 @@ bool run_q8_0_dense_d2r(int M, int N, int K, uint32_t seed) {
 
     const float abs_tol = 0.05f * std::sqrt((float)K);
     const bool ok = check_close(got, ref, abs_tol, 0.05f);
+    fprintf(stderr, "%s\n\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+bool run_q8_0_dense_vec_row2(int M, int K, uint32_t seed) {
+    fprintf(stderr, "=== Q8_0/DENSE_VEC_ROW2 M=%d K=%d seed=%u ===\n",
+            M, K, seed);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+
+    const int blocks_per_row = K / QK8_0;
+    const size_t nblocks = (size_t)M * blocks_per_row;
+    std::vector<float> W_src((size_t)M * K);
+    std::vector<cpu_block_q8_0> W_blk(nblocks);
+    for (auto &v : W_src) v = nd(rng);
+    for (int row = 0; row < M; row++)
+        quantize_row_q8_0_cpu(&W_src[(size_t)row * K],
+                              &W_blk[(size_t)row * blocks_per_row], K);
+
+    std::vector<float> X((size_t)2 * K);
+    for (auto &v : X) v = nd(rng);
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    void *dW = nullptr;
+    float *dX = nullptr, *dPair = nullptr, *dSingle = nullptr;
+    cudaMalloc(&dW, W_blk.size() * sizeof(cpu_block_q8_0));
+    cudaMalloc(&dX, X.size() * sizeof(float));
+    cudaMalloc(&dPair, (size_t)2 * M * sizeof(float));
+    cudaMalloc(&dSingle, (size_t)2 * M * sizeof(float));
+    cudaMemcpyAsync(dW, W_blk.data(),
+                    W_blk.size() * sizeof(cpu_block_q8_0),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dX, X.data(), X.size() * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+
+    const int pair_rc = ds4_mmq_q8_0_dense_vec(
+        dW, dX, dPair, M, 2, K, stream);
+    const int row0_rc = ds4_mmq_q8_0_dense_vec(
+        dW, dX, dSingle, M, 1, K, stream);
+    const int row1_rc = ds4_mmq_q8_0_dense_vec(
+        dW, dX + K, dSingle + M, M, 1, K, stream);
+
+    std::vector<float> pair((size_t)2 * M), single((size_t)2 * M);
+    cudaMemcpyAsync(pair.data(), dPair, pair.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(single.data(), dSingle, single.size() * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    cudaFree(dW);
+    cudaFree(dX);
+    cudaFree(dPair);
+    cudaFree(dSingle);
+    cudaStreamDestroy(stream);
+
+    const bool ok = pair_rc == 0 && row0_rc == 0 && row1_rc == 0 &&
+                    check_close(pair, single, 0.0f, 0.0f);
     fprintf(stderr, "%s\n\n", ok ? "PASS" : "FAIL");
     return ok;
 }
@@ -1150,6 +1313,81 @@ bool run_q4_K_moe_bounded(
         q4_K_moe_bounded_test_entry, ds4_mmq_q4_K_moe);
 }
 
+template <typename BlockT, typename GenerateFn, typename DequantFn>
+bool run_qwen_high_precision_moe(
+        const char *tag, int block_width, int M, int K, int nt, int ne,
+        int nu, uint32_t seed, GenerateFn generate, DequantFn dequant,
+        moe_entry_fn entry, moe_entry_fn equivalence_entry = nullptr) {
+    auto fn = [generate, dequant, block_width](BlockT *blk, float *out,
+                                  int n_experts, int rows, int cols,
+                                  int blocks_per_expert, std::mt19937 &rng) {
+        const int blocks_per_row = cols / block_width;
+        for (int e = 0; e < n_experts; ++e) {
+            BlockT *eblk = blk + (size_t)e * blocks_per_expert;
+            for (int row = 0; row < rows; ++row) {
+                for (int b = 0; b < blocks_per_row; ++b)
+                    generate(&eblk[row * blocks_per_row + b], rng);
+                dequant(&eblk[row * blocks_per_row],
+                        out + ((size_t)e * rows + row) * cols, cols);
+            }
+        }
+    };
+    return run_moe_generic<BlockT>(
+        tag, block_width, M, K, nt, ne, nu, seed, 0.20f, fn, entry,
+        equivalence_entry);
+}
+
+bool run_q5_K_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    return run_qwen_high_precision_moe<block_q5_K>(
+        "Q5_K/MOE", QK_K_LOCAL, M, K, nt, ne, nu, seed,
+        generate_random_block_q5_K, dequantize_row_q5_K_cpu,
+        ds4_mmq_q5_K_moe);
+}
+
+static int q5_K_moe_bounded_test_entry(
+        const void *w, const float *x, const int32_t *ids, float *out,
+        int M, int K, int nt, int ne, int nu, cudaStream_t stream) {
+    return ds4_mmq_q5_K_moe_bounded(
+        w, x, ids, out, M, K, nt, ne, nu, nt, stream);
+}
+
+bool run_q5_K_moe_bounded(
+        int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    return run_qwen_high_precision_moe<block_q5_K>(
+        "Q5_K/MOE_BOUNDED", QK_K_LOCAL, M, K, nt, ne, nu, seed,
+        generate_random_block_q5_K, dequantize_row_q5_K_cpu,
+        q5_K_moe_bounded_test_entry, ds4_mmq_q5_K_moe);
+}
+
+bool run_q6_K_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    return run_qwen_high_precision_moe<block_q6_K>(
+        "Q6_K/MOE", QK_K_LOCAL, M, K, nt, ne, nu, seed,
+        generate_random_block_q6_K, dequantize_row_q6_K_cpu,
+        ds4_mmq_q6_K_moe);
+}
+
+bool run_q5_0_moe(int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    return run_qwen_high_precision_moe<block_q5_0>(
+        "Q5_0/MOE", QK5_0, M, K, nt, ne, nu, seed,
+        generate_random_block_q5_0, dequantize_row_q5_0_cpu,
+        ds4_mmq_q5_0_moe);
+}
+
+static int q5_0_f32_moe_accum_test_entry(
+        const void *w, const float *x, const int32_t *ids, float *out,
+        int M, int K, int nt, int ne, int nu, cudaStream_t stream) {
+    return ds4_mmq_q5_0_f32_moe_accum(
+        w, x, ids, out, M, K, K, 0, nt, ne, nu, stream);
+}
+
+bool run_q5_0_f32_moe_accum(
+        int M, int K, int nt, int ne, int nu, uint32_t seed) {
+    return run_qwen_high_precision_moe<block_q5_0>(
+        "Q5_0/F32_MOE_ACCUM", QK5_0, M, K, nt, ne, nu, seed,
+        generate_random_block_q5_0, dequantize_row_q5_0_cpu,
+        q5_0_f32_moe_accum_test_entry);
+}
+
 static int q4_K_moe_pair_bounded_test_entry(
         const void *wa, const void *wb, const float *x,
         const int32_t *ids, float *out_a, float *out_b,
@@ -1478,6 +1716,8 @@ int main(int argc, char ** argv) {
         /*M=*/128, /*N=*/129, /*K=*/128, 0xD2A00128);
     all_ok &= run_q8_0_dense_d2r(
         /*M=*/128, /*N=*/4, /*K=*/128, 0xD2A00004);
+    all_ok &= run_q8_0_dense_vec_row2(
+        /*M=*/257, /*K=*/2560, 0xA11E0002);
 
     // Q2_K - V4 Flash ffn_down_exps per-expert shape is (K=2048, N=4096).
     all_ok &= run_q2_K(/*M=*/64,   /*N=*/4,   /*K=*/256,  0x02C0FFEE);
@@ -1537,6 +1777,25 @@ int main(int argc, char ** argv) {
     all_ok &= run_q4_K_moe_bounded(
         /*M=*/128, /*K=*/512, /*nt=*/32, /*nexp=*/64, /*nused=*/6,
         0xC4B008);
+
+    // Qwen3.8 high-precision recipe. Decode routes top-10, so even one token
+    // crosses the <=8 assignment MMVQ threshold and exercises the production
+    // MMQ path. The Q5_0 case is the exact 128-wide down-tail contract.
+    all_ok &= run_q5_K_moe(
+        /*M=*/128, /*K=*/256, /*nt=*/1, /*nexp=*/16, /*nused=*/10,
+        0xC5FE01);
+    all_ok &= run_q5_K_moe_bounded(
+        /*M=*/128, /*K=*/512, /*nt=*/32, /*nexp=*/64, /*nused=*/10,
+        0xC5B008);
+    all_ok &= run_q6_K_moe(
+        /*M=*/128, /*K=*/512, /*nt=*/1, /*nexp=*/16, /*nused=*/10,
+        0xC6FE01);
+    all_ok &= run_q5_0_moe(
+        /*M=*/128, /*K=*/128, /*nt=*/1, /*nexp=*/16, /*nused=*/10,
+        0xC50F01);
+    all_ok &= run_q5_0_f32_moe_accum(
+        /*M=*/128, /*K=*/128, /*nt=*/32, /*nexp=*/64, /*nused=*/10,
+        0xC50F32);
 
     // Step 3 - paired MoE (one quantize, two matmuls).  Each call asserts
     // bit-identity vs two back-to-back single-W moe calls over the same

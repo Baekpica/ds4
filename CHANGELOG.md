@@ -5,6 +5,124 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
 [antirez/ds4](https://github.com/antirez/ds4); upstream fork point `e16ead1`
 (2026-05-29). Upstream's own changes are not repeated here.
 
+## v0.6.5-dfm — 2026-08-28
+
+- Absorbs Entrpi `v0.6.5`, including reasoning-effort compatibility,
+  mixed-spelling DSML parsing, reasoning replay control, tool-slip
+  diagnostics/resampling, and the depth-gated tool-call reminder.
+- Keeps the DFM model-family paths for Solar Open2, Motif-3, Qwen3.8,
+  dots3-note, and EXAONE, including their native Chat Completions,
+  Responses, and Anthropic Messages handling.
+
+## v0.6.5 — 2026-08-27
+
+- **`--tool-call-reminder on|off`, default on** (env
+  `DS4_TOOL_CALL_REMINDER=0` disables,
+  `DS4_TOOL_CALL_REMINDER_MIN_BYTES` retunes the gate) — the
+  reference-faithful fix for the deep tool-protocol slip. At depth the
+  2.4-bpw quant answers some tools-armed turns with a prose completion
+  report instead of a tool call (measured: 50% of turns at 70-80K
+  prompt tokens; every observed slip fired right after a successful
+  tool result). Past ~96KB of rendered conversation (~30K+ tokens),
+  every tool result in a tools-armed chat now carries a short protocol
+  reminder. Measured: 0/72 sampled slips with the reminder vs 6/72
+  without at the exact captured slip states, and the failing agent task
+  end to end went from three dead runs to submitted and
+  harness-resolved in 57 calls with zero slips — with reasoning traces
+  kept, no resample spent, and no format deviation. The reminder is
+  injected on every qualifying result (not just the last) so the
+  rendered history is byte-stable across turns and warm prefix reuse is
+  unaffected; shallow conversations are never touched, so
+  chat-with-tools flows that legitimately answer in prose after a tool
+  result see no change. Disclosure: default-on means benchmark runs
+  carry it unless disabled; runs reporting benchmark numbers should say
+  which position the knob was in.
+
+## v0.6.4 — 2026-08-26
+
+The issue-#18 residual-gap release: with `--reasoning-replay drop
+--tool-slip-resample`, a SWE-rebench agent instance that llama.cpp
+resolves and that this engine previously failed three ways
+(harness-graded, identical scaffold and request shape) is now submitted
+and resolved identically to llama.cpp.
+
+- **`--reasoning-replay keep|drop`** (env `DS4_REASONING_REPLAY=drop`) —
+  agent scaffolds that echo assistant messages verbatim re-send
+  `reasoning_content`, and the tool-context chat render re-emits it
+  inside `<think>` blocks. That is the V4 reference format: the
+  reference encoding disables thinking-drop whenever tools are present,
+  and DeepSeek's API requires the echo in tool loops (it returns 400
+  when `reasoning_content` is not passed back). llama-server's template
+  default drops it, a deviation from the reference format, and on the
+  identical conversation that deviation runs 16-28% shallower per turn.
+  Depth is where the 2.4-bpw quant's tool-protocol adherence slips
+  (measured: 50% of turns settle as prose completion reports instead of
+  tool calls at 70-80K prompt tokens), so on low-bit quants the
+  deviation pays. `drop` reproduces it opt-in: history assistant turns
+  render in the lean `</think>` replay form; assistant turns being
+  continued (after the last user-like message) always keep their
+  reasoning. Measured steady-state cost: a one-turn-tail re-prefill
+  (~270 tokens / ~0.6 s) absorbed by the cont bank's partial-prefix
+  admission. The default stays `keep`, which is both the byte-identical
+  prior behavior and the reference-faithful one; `drop` is the
+  recommended setting for long agent loops on low-bit quants.
+  (Correction note, 2026-08-26: this entry originally claimed
+  DeepSeek's API rejects replayed reasoning; the opposite is true in
+  tool loops, per their thinking-mode guide.)
+- **`--tool-slip-resample`** (env `DS4_TOOL_SLIP_RESAMPLE=1`, off by
+  default) — when a continuously-batched non-streaming tools-armed chat
+  turn settles at `finish=stop` with no tool calls, the request is
+  requeued once at the FIFO head for a fresh draw before anything is
+  written to the client; the just-retired bank warm-admits the full
+  prompt, so the retry costs one generation. Pinned seeds are perturbed
+  (+1) for the redraw; `length`/`error` settles, streaming turns, and
+  the serial lane are never resampled; retries are exempt from the
+  queue-age shed while keeping the original arrival stamp for honest
+  latency. Disclosure: this knob changes benchmark behavior by
+  construction (it retries the engine's own sampler before the harness
+  sees the turn) — in the validating run, 6 slips across 142 turns were
+  all rescued invisibly and the task went from three dead runs to
+  submitted-and-resolved. Runs that report benchmark numbers should say
+  whether it was on.
+- **`--tool-slip-dump DIR`** (env `DS4_TOOL_SLIP_DUMP_DIR`) — forensic
+  instrument: every tools-armed chat completion that settles without
+  tool calls dumps one self-contained JSON file (raw request body,
+  full generated text, parse verdict, lane), on both the
+  continuous-batching and serial lanes. Each dump is a byte-exact
+  replay fixture. `--trace` usage text now documents that session
+  tracing covers the serial lane only.
+
+## v0.6.3.1 — 2026-08-25
+
+- **Client reasoning_effort compat-mapping (field issue #18)** — the
+  OpenAI-surface `reasoning_effort` field no longer reaches the
+  checkpoint's prefixed tiers by default: client `high`/`xhigh`/`max`
+  resolve to prefix-free `low`. The v0.5.3 tier rename made a client
+  `"high"` start injecting DeepSeek's position-0 "write out your entire
+  deliberation" preamble (verbatim reference-encoder text), and a
+  controlled needle matrix shows that preamble degrades deep-context
+  tool calling: 6/50 completion-protocol failures at ≥96K tokens with
+  the prefix (including a deterministic greedy flip) vs 0/100 without,
+  on both v0.5.2 and v0.6.2. Agent frameworks send the field meaning
+  the OpenAI "think more" knob; llama.cpp and pre-rename engines no-op
+  it, which is the behavior restored as the default. Operators opt back
+  into the native tiers with `--reasoning-effort-native`
+  (env `DS4_REASONING_EFFORT_NATIVE=1`); the `--reasoning-effort`
+  operator default is honored as written either way. Applies to every
+  client surface (OpenAI chat/completions/responses and the Anthropic
+  `output_config.effort`); disabling thinking (`none`/`off`) stays
+  client-reachable.
+- **Mixed-spelling DSML tool-call parsing** — at depth the model
+  sometimes frays tag spellings inside one tool block (measured live at
+  ~96K: DSML envelope with plain-XML `<parameter>` tags; the issue-#18
+  capture's death loop is the model retrying exactly such calls after
+  the parser demoted them to content text and the harness answered "no
+  tool calls found"). The generated-message parser now matches each
+  element (block end, invoke open/close, parameter open/close)
+  against all three spellings independently, and a parameter value runs
+  to the earliest end-tag spelling, so mixed open/close pairs still
+  terminate. Canonical DSML parses byte-identically to before
+  (regression-tested).
 ## v0.6.3-dfm — 2026-08-24
 
 - Absorbs Entrpi `v0.6.3` (typed refusal for schema-constrained
@@ -25,7 +143,7 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
   the server-side fence covers every family's serial lane; best-fit
   trim victims operate on the VMM slab lane (family banks keep fixed
   CUDA allocations); the full-1M HG dispatch is DeepSeek MLA-only
-  (head_dim-512 guard).  The shared surfaces — typed refusal, chunked
+  (head_dim-512 guard). The shared surfaces — typed refusal, chunked
   bodies, think counters, cont completion line — apply to every family
   through the common request machinery.
 - Gates on this binary (GB10, driver 610.43.02, CUDA 13.3, `sm_121a`
@@ -35,12 +153,12 @@ Fork: [Entrpi/ds4](https://github.com/Entrpi/ds4) of
   (including the new substrate overflow leg), Motif
   loader/tokenizer/reference/CUDA, EXAONE kernels/ref, Solar
   loader/tokenizer/KDA/KDA-prefill/KDA-chunk/gates/KV/forward, and
-  dots3 loader/tokenizer — all passed.  A live VMM owner + worker gate
+  dots3 loader/tokenizer — all passed. A live VMM owner + worker gate
   on the Motif MQ87-88 artifact answered all four API surfaces on the
   continuous route (4 requests, 0 failures, 32 banks at `-c 2048`);
   the typed `response_format` refusal answered 400 in the native
   envelope on the family lane, and the new cont completion line and
-  `ds4_requests_think_total` counters were observed live.  Bare
+  `ds4_requests_think_total` counters were observed live. Bare
   `ds4_test` model-dependent DeepSeek GPU tests were not rerun (no
   DeepSeek GGUF on this host, as in previous cuts).
 - Published Motif-3 and Solar performance numbers are unchanged; no

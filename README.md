@@ -41,16 +41,17 @@ memory. The implementation remains a narrow C/CUDA engine: every accepted
 architecture has an explicit metadata validator, tensor binder, prompt
 protocol, state lifecycle, and device kernel path.
 
-`v0.6.2-dfm` is based on Entrpi `v0.6.2` and currently integrates these
-deployed families:
+`v0.6.3-dfm` is based on Entrpi `v0.6.3`. The current `dfm` branch accepts
+only the explicitly validated model families below:
 
-| Model family | GGUF architecture | Serving runtime |
+| Model family | GGUF architecture | Serving and state support |
 |---|---|---|
-| DeepSeek V4 Flash | `deepseek4` | Entrpi continuous-batch core; optional DSpark drafter |
-| Solar Open2 250B | `solar-open2` | Native recurrent/GQA persistent banks |
-| K-EXAONE 236B A23B | `exaone-moe` | Native LLLG persistent banks with shared prefill scratch |
-| Motif-3 | `motif3` | Native latent-KV persistent banks |
-| dots3-note Preview | `dots3-note` | Native dual-geometry latent serial sessions |
+| DeepSeek V4 Flash / PRO | `deepseek4` | Serial or continuous; disk KV and live partial-prefix forks; optional external MTP/DSpark |
+| Solar Open2 250B | `solar-open2` | Recurrent/GQA persistent banks; disk KV and live partial-prefix forks; plain decode |
+| K-EXAONE 236B A23B | `exaone-moe` | LLLG persistent banks with shared prefill scratch; disk KV and exact-frontier reuse; plain decode |
+| Motif-3 | `motif3` | Latent-KV persistent banks; disk KV and live partial-prefix forks; plain decode |
+| dots3-note Preview | `dots3-note` | Dual-geometry latent serial sessions and disk KV; embedded MTP is validation-only |
+| Qwen3.8-Flash-Next SSD-PLE | `qwen4exp` | CUDA serial or opt-in two-bank serving; bounded SSD-PLE, recurrent disk KV, live partial-prefix forks, target-verified embedded MTP, and base64 PNG/JPEG image input with decoded-pixel cache identity |
 
 The serving command and HTTP contract do not change with the family; only the
 GGUF path and the matching weight-owner manifest change:
@@ -67,22 +68,249 @@ The server exposes OpenAI Chat Completions, OpenAI Completions, OpenAI
 Responses, and Anthropic Messages at `/v1/chat/completions`,
 `/v1/completions`, `/v1/responses`, and `/v1/messages`. Model-specific
 tokenization, chat rendering, tool syntax, stop tokens, and recurrent/KV state
-stay behind this common surface. DeepSeek-only MTP and DSpark support models
-are rejected for the other families instead of entering an incompatible graph.
-Serial checkpoints and idle continuous banks from every listed family can be
-saved to the same disk-KV service and restored after an inference-worker
-restart. Disk persistence avoids repeated prefill; it does not reduce the
-resident memory required by each active bank.
+stay behind this common surface. A model-family integration is not complete
+until Chat Completions, Responses, and Anthropic Messages pass their native
+response-shape and tool-continuation gates; loading the GGUF alone is not that
+acceptance. External MTP and DSpark support GGUFs remain
+DeepSeek-only and are rejected for every other family. Qwen instead uses the
+MTP block embedded in its main GGUF when `--mtp-draft 2` is selected; that
+target-verified path applies to greedy scalar/session decode and the opt-in
+two-bank lane. Serial checkpoints, and idle
+continuous banks for families that have them, can be saved to the same disk-KV
+service and restored after an inference-worker restart. Disk persistence avoids
+repeated prefill; it does not reduce the resident memory required by each active
+bank.
 
-All five families above have been loaded from their production mixed-quant
-GGUFs and exercised through the same server binary on the reference DGX Spark.
+Qwen image input is normalized across Chat Completions `image_url`, Responses
+`input_image`, and Anthropic base64 image blocks. It accepts at most four PNG
+or JPEG data URIs (10 MiB of base64-decoded payload each, 20 MiB per request),
+applies the pinned
+`Qwen3VLProcessor`/`Qwen2VLImageProcessorFast` geometry, runs the GGUF's embedded
+27-layer vision tower, and carries exact three-axis M-RoPE through decode.
+Image serving requires the persistent bank path (`DS4_QWEN_BATCH=1`).
+Network/file URLs and video are rejected. Image V2 hashes decoded RGB pixels
+and source geometry into an internal-only replay key, so identical images can
+reuse exact live frontiers, recurrent partial checkpoints, and disk-KV records.
+The marker is never tokenized or exposed through an API. Different pixels are
+isolated even when geometry and image-pad token IDs are identical, and a byte
+prefix that ends inside the marker is clamped before that image.
+
+All six family ports above have production-artifact server evidence in this
+repository's history on the reference DGX Spark; adding the Qwen features did
+not require rerunning the other five models. Qwen's `MQ-Q5-SSD-PLE-BF16`
+artifact most recently passed a real-weight recurrent-state/disk-KV round trip,
+exact and divergent partial forks between two banks, image-aware live/disk
+reuse, and target-stream-identical embedded-MTP checks. A guarded
+196,608-context API run completed 7/7 requests
+with no failures, including a three-request continuous epoch with
+`served=3 fallback=0`; this was a configured-context serving check, not a
+196,608-token prompt run. Qwen batching remains opt-in with
+`DS4_QWEN_BATCH=1` and is capped at two banks.
+
+The Q5 artifact was subsequently served at a 262,144-token context with two
+banks, 8,192-token prefill chunks, partial-prefix reuse, and a 32 GiB disk-KV
+budget. Concurrent Chat Completions and Anthropic Messages requests returned
+their native HTTP 200 shapes. A later guarded `--no-serial` check streamed a
+low-reasoning Responses function call on a Qwen bank, then replayed that
+`function_call` without its hidden reasoning and appended only the new
+`function_call_output`. The directed continuation completed on the same bank
+with 395 cached tokens plus a 27-token suffix. `/v1/stats` reported two
+continuous Responses requests, zero serial requests, one continuous bank
+continuation, and zero request, batch, or governor failures. This proves the
+live bank-owned reasoning/tool continuation path; buffered first tool-generation
+requests still need the serial lane for their model-visible corrective retry.
+A three-bank 262K trial was not retained on the 128 GiB reference host because
+the earlier serial continuation reduced `MemAvailable` to 1.12 GiB; two banks
+are the guarded production setting.
+
+The two-bank MTP path was checked on the same Q5 artifact with four fixed cold
+API prompts. Plain decode averaged 23.65 tok/s; `--mtp-draft 2` averaged
+28.65 tok/s (**+21.1%**) with an 84.98% draft acceptance rate. Mean TTFT was
+260.7 versus 261.1 ms and prefill was 225.38 versus 223.35 tok/s. Device-live
+memory increased by about 0.98 GiB. A synchronized two-request run and Chat,
+Responses, and Anthropic Messages smokes completed with zero request or
+governor failures. This establishes target-verified two-bank operation, not
+true row-batched kernel throughput; acceptance and speed remain content
+dependent.
+
+The later Qwen decode path performs one actual two-row token-embedding and
+Hyper-Connection operation whenever both banks are ready. Stateful PLE, Gated
+DeltaNet, QSA, routed MoE, and output projection work initially remained per
+bank. The real-Q5 regression covered a two-row-to-one-row transition and
+retained exact MTP target verification; a same-process 3-by-3
+short-generation A/B measured
+22.67 tok/s with the row path versus 20.86 tok/s with scalar bank calls
+(+8.65%). `DS4_QWEN_NO_ROW_BATCH=1` restores the scalar path. This is bounded,
+state-safe row batching, not a claim that the complete Qwen graph is batched.
+
+Nine later increments pair the independent Gated DeltaNet recurrent updates
+in one two-dimensional CUDA grid, run the final Q8 output projection through
+the existing two-row dense path, and gather both banks' SSD-PLE rows in one
+descriptor batch before bit-exact BF16 promotion. The fourth pairs only the
+assignment-major Q5_0 expert-down tail. The fifth batches only the QSA Q/gate
+Q8 projection; index/KV history, RoPE, attention, and output stay bank-owned.
+The sixth keeps router, top-k, gate/up, and weighted-SwiGLU arithmetic per bank,
+then combines the two packed Q5_K expert-down main worklists; shared-expert
+arithmetic remains independent. The seventh keeps both F32 router projections
+independent, then runs the existing router top-k kernel across the two logits
+rows before returning each bank's selected IDs and normalized weights.
+The eighth runs the four Gated DeltaNet Q8 input projections (`qkv`, `z`,
+`in_b`, and `in_a`) over the shared two-row HC input, then returns bank 1's
+rows to its state-owned convolution and control path.
+The ninth runs the F32 router projection once over that same two-row HC input
+with row-stable reduction order, then reuses the already-combined top-k path.
+The same-process 3-by-3
+real-Q5 checks measured 23.24 versus 22.80 tok/s for the recurrent update (+1.96%), then
+23.70 versus 23.15 tok/s for the output projection (+2.35%), and 23.98 versus
+23.82 tok/s for the PLE gather (+0.64%). The tail check measured 24.62 versus
+24.20 tok/s (+1.74%), and the QSA projection check measured 25.15 versus
+24.65 tok/s (+2.01%). The routed-main check measured 25.40 versus 24.91 tok/s
+(+1.95%), and the router top-k check measured 25.74 versus 25.37 tok/s
+(+1.48%). The Gated DeltaNet projection check measured 27.45 versus 25.65
+tok/s (+7.03%); all three paired rounds were faster.
+The F32 router-projection check measured 27.68 versus 27.57 tok/s (+0.40%);
+all three paired rounds were faster. The raw Q8 path
+matched two one-row calls bit-for-bit at the production 2,560 input width, and
+the QSA Q/gate path matched 98,304 output bytes bit-for-bit. The real-weight
+routed-main check matched both 10-by-2,560 output tables bit-for-bit. Four
+distinct 512-expert router rows also matched their one-row top-k calls
+bit-for-bit, including the F32 router logits and normalized weights. The
+real-weight Gated DeltaNet check matched both 2,560-value
+output rows bit-for-bit. In all cases,
+the full two-bank MTP/disk-KV/partial-fork regression retained
+its exact target token streams. PLE projection/convolution, the remaining QSA
+work, shared MoE work, and the remaining GDN state/finish stages are still
+bank-owned.
+`DS4_QWEN_NO_GDN_PROJ_BANK2=1` restores four independent Gated DeltaNet input
+projections while retaining the paired recurrent update.
+`DS4_QWEN_NO_PLE_GATHER_BANK2=1` restores two independent gathers for
+diagnostic A/B runs.
+`DS4_QWEN_NO_QSA_QPROJ_BANK2=1` restores two independent QSA Q/gate
+projections for diagnostic A/B runs.
+`DS4_QWEN_NO_Q5_TAIL_BANK2=1` restores two independent MoE paths for the
+tail-specific A/B.
+`DS4_QWEN_NO_MOE_MAIN_BANK2=1` restores two independent Q5_K routed-main
+worklists while retaining the paired Q5_0 tail.
+`DS4_QWEN_NO_MOE_TOPK_BANK2=1` restores two independent router top-k launches
+while retaining the other accepted two-bank paths.
+`DS4_QWEN_NO_MOE_ROUTER_BANK2=1` restores two independent F32 router
+projections while retaining the combined top-k path.
+
+The same Q5 artifact then passed guarded still-image serving at a configured
+262,144-token context with 8,192-token prefill chunks. Chat Completions,
+Responses, and Anthropic Messages all exercised the real vision tower; a
+synchronized Responses/Anthropic pair completed as `served=2 fallback=0`.
+An 8,243-token request placed the 64 projected image rows across the chunk
+boundary and completed at 489.4 prefill tok/s, 17.232 s TTFT, and 22.5 decode
+tok/s. These content-specific numbers are integration evidence, not a vision
+throughput benchmark. The post-gate worker reported zero request, census, or
+governor failures under the external 115 GiB guard.
+
+Image V2 was subsequently checked with decoded-pixel identity enabled. A
+same-image continuation reused 90 of 110 prompt tokens while a same-geometry
+different-pixel request stayed cold. After a worker restart, an image-bearing
+1,890-token bank was restored from disk and a 1,909-token follow-up reused all
+1,890 stored tokens. A separate same-image divergent 20,087-token request
+restored the 16,384-token recurrent checkpoint and computed only 3,703 prompt
+tokens. All requests returned the requested deterministic answer; the final
+server counters showed zero request, continuous-batch, census, and governor
+failures. These checks establish cache identity and state reuse, not image
+quality or large-image vision throughput.
+
+The vision attention path was then changed from one warp rereading K/V for
+every query to an 8-query by 32-key shared-memory tile while retaining the
+same online-softmax order and avoiding an N-by-N score allocation. A 67-row,
+two-segment check at the model's actual 16 heads and 72-value head width was
+bit-exact against the previous kernel. NCU measured 24.67 us for the tiled
+kernel versus 31.81 us for the previous path on that check (-22.4%). A
+same-binary 3-by-3 API A/B used a 4,408-patch document image, 1,159 prompt
+tokens, 64 output tokens, and disabled live/disk prefix reuse:
+
+| Vision attention | Prefill | TTFT | Decode |
+|---|---:|---:|---:|
+| 8-query / 32-key tiled | 494.47 tok/s | 10.262 s | 13.77 tok/s |
+| Previous per-query path | 494.50 tok/s | 14.143 s | 14.70 tok/s |
+
+The controlled result is a 27.45% TTFT reduction for this image size. Decode
+is reported for completeness but is not attributed to the vision kernel; the
+64-token MTP tails were thermally variable. The tiled path still performs
+exact full attention with O(P^2) arithmetic and is not presented as a
+tensor-core FlashAttention implementation.
+
+The bounded SSD-PLE cache was then tuned with identical fixed 8,192-token
+direct runs (`--gen-tokens=0`, three runs per setting). With 16 page-read
+workers, 512, 1,024, and 2,048 MiB caches averaged 252.17, 397.72, and 450.26
+prefill tok/s. At 2,048 MiB, 16, 32, and 64 workers averaged 450.19, 464.67,
+and 466.88 tok/s; 32 workers retained nearly all of the 64-worker result with
+less host submission overhead and is now the default. A cold 9,854-prompt /
+64-output API check with the new defaults measured 467.2 prefill tok/s,
+21.111 s TTFT, and 25.4 decode tok/s. A synchronized two-request check
+completed as `served=2 fallback=0`; all four API requests completed with zero
+request, census, or governor failures under the external 115 GiB guard. The
+minimum observed system-available memory was 8.07 GiB. Direct runs do not
+measure TTFT or decode throughput.
+
+A separate teacher-forced full-model comparison scored 2,048 tokens from each
+of two fixed text fixtures on the higher-precision MQ-Q6 artifact and the
+target MQ-Q5 artifact:
+
+| Fixed slice | MQ-Q6 avg NLL / PPL | MQ-Q5 avg NLL / PPL | Q5-Q6 avg NLL |
+|---|---:|---:|---:|
+| Long-form essay | 2.184138 / 8.882991 | 2.140368 / 8.502567 | -0.043770 (-2.00%) |
+| Repetitive structured security fixture | 0.068999 / 1.071435 | 0.081061 / 1.084437 | +0.012062 (+17.48%) |
+| Equal-token aggregate (4,096 tokens) | 1.126569 / 3.085053 | 1.110714 / 3.036527 | -0.015854 (-1.41%) |
+
+The two slices show no Q5 quality collapse in this narrow regression, but they
+are not a representative evaluation suite and do not establish general Q5
+superiority. The structured fixture is highly repetitive, so its low absolute
+perplexity is useful only for the paired comparison.
+
+The same Q5 artifact then completed an exact 262,144-token direct prefill with
+`--gen-tokens=0`, an 8,192-token Qwen chunk, the 2,048 MiB bounded PLE cache,
+and 32 PLE workers. It sustained 277.06 prefill tok/s. The dumped final output
+contained all 248,320 finite logits; the recorded and independently recomputed
+argmax were both token 264. The run completed under the external 115 GiB memory
+guard with `DS4_MEMGOV=observe`; the lowest sampled system-available memory was
+7.8 GiB. This establishes full-window prefill and final-logit production, not
+full-window API generation or decode throughput.
+
+A follow-up incremental full-window sweep enabled
+`DS4_PLE_LATENCY_STATS=1` with the same Q5 artifact, prompt, chunk, cache,
+worker count, and 115 GiB guard. Each row adds exactly 32,768 prompt tokens to
+the retained session:
+
+| Context frontier | Added tokens | Segment prefill |
+|---:|---:|---:|
+| 32,768 | 32,768 | 427.31 tok/s |
+| 65,536 | 32,768 | 361.80 tok/s |
+| 98,304 | 32,768 | 334.40 tok/s |
+| 131,072 | 32,768 | 294.62 tok/s |
+| 163,840 | 32,768 | 271.04 tok/s |
+| 196,608 | 32,768 | 247.79 tok/s |
+| 229,376 | 32,768 | 218.73 tok/s |
+| 262,144 | 32,768 | 198.27 tok/s |
+
+The token-weighted rate was 277.49 tok/s, within 0.2% of the preceding
+uninstrumented 277.06 tok/s run. The SSD counters include the engine's
+512-token/two-gather boot prewarm, so 34 gather samples cover 262,656 tokens.
+They recorded 706,922 successful aligned 4 KiB reads (2.6967 GiB physical),
+with 220.801 us mean latency, p50 <= 262.144 us, p95 <= 524.288 us,
+p99 <= 1,048.576 us, and a 37.413 ms maximum. Among classified page accesses,
+90.15% were ready hits, 1.96% inflight hits, and 7.89% misses; there were
+390,767 evictions. The gather-level host wait for all PLE row leases averaged
+2.144 s per 8,192-token chunk, with p50 <= 2.147 s, p95 <= 4.295 s,
+p99 <= 8.590 s, and a 4.770 s observed maximum. Percentiles are conservative
+power-of-two histogram upper bounds; gather wait excludes the CUDA projection
+that follows acquisition. This direct run has no API TTFT or decode result.
+
 Motif-3 also completed a strict OpenAI Chat gate at the 262,144-token context
 limit: 262,080 prompt tokens at 175.61 tok/s followed by 43 decoded tokens at
 2.52 tok/s, with all three retrieval sentinels exact. Solar Open2 serves 8K
 prompts at 1,050.7 tok/s prefill with 19.05 tok/s decode on the same host. See
 [the DFM model-family guide](docs/ds4-dfm-model-families.md) for the pinned
-implementation, measurement conditions, Nsight evidence, weight-owner
-lifecycle, integration matrix, and current limits.
+pre-Qwen family evidence, measurement conditions, Nsight evidence, weight-owner
+lifecycle, integration matrix, and current limits; the Qwen artifact card holds
+its SSD-PLE-specific verification and performance record.
 
 ## Quick start
 
@@ -368,6 +596,61 @@ values, including file contents and edit text, use the request's normal sampling
 settings. That separation is important: deterministic decoding is helpful for
 syntax, but can create repeated text when applied to long code or file bodies.
 
+### Replayed reasoning and agent-loop robustness
+
+Three knobs target long agent loops (measured on SWE-rebench-class
+workloads; see the changelog for the receipts):
+
+**`--tool-call-reminder on|off`, default on** (v0.6.5; env
+`DS4_TOOL_CALL_REMINDER=0` disables). At depth, low-bit quants answer
+some tools-armed turns with a prose completion report instead of a tool
+call — measured at 50% of turns in the 70-80K band, always right after a
+successful tool result, and agent harnesses abandon tasks over it. Past
+~96KB of rendered conversation (~30K+ tokens), every tool result now
+carries a short protocol reminder. At the exact captured slip states the
+reminder measured 0/72 sampled slips vs 6/72 without, and it fixed the
+failing agent task end to end (submitted and harness-resolved, zero
+slips) with reasoning traces kept and no format deviation — the
+reference-faithful fix. Shallow conversations are never touched, so
+chat-with-tools flows that legitimately answer in prose after a tool
+result are unaffected. The injection is byte-stable across turns, so
+warm prefix reuse is unchanged.
+
+**`--reasoning-replay keep|drop`** (env `DS4_REASONING_REPLAY=drop`).
+Most OpenAI-style agent scaffolds echo each assistant message back
+verbatim, including `reasoning_content`. That is what DeepSeek specifies
+for this model family: the V4 reference encoding keeps reasoning for
+every turn whenever tools are present, and DeepSeek's API requires the
+echo in tool loops (it returns 400 when `reasoning_content` is not
+passed back). Under the default `keep`, the tool-context render honors
+that format and re-emits the reasoning inside `<think>` blocks, which
+also keeps the rendered prefix byte-aligned with the live KV (warm
+in-place reuse, no re-prefill). The cost is depth: llama-server's
+template default drops replayed reasoning, a deviation from the
+reference format, and on the identical conversation that deviation runs
+16-28% shallower per turn. Depth is where low-bit quants start missing
+the tool-call protocol, so on this ship quant the deviation pays.
+`drop` reproduces it opt-in, rendering history assistant turns in the
+lean `</think>` replay form; the bank's partial-prefix admission absorbs
+the divergence at the cost of a one-turn-tail re-prefill (~270 tokens
+measured). An assistant turn being continued (after the last user-like
+message) always keeps its reasoning. For long agent loops on low-bit
+quants, `drop` is the recommended setting; the default stays `keep`,
+the reference-faithful behavior.
+
+**`--tool-slip-resample`** (env `DS4_TOOL_SLIP_RESAMPLE=1`, off by
+default). At depth a quantized model occasionally answers a tools-armed
+turn with a prose completion report instead of a tool call; agent
+harnesses reject the turn, and their retry rules can convert a few such
+slips into a dead task. With this knob, a continuously-batched
+non-streaming chat turn that settles at `finish=stop` with no tool calls
+is requeued once for a fresh draw before anything reaches the client; the
+just-retired bank warm-admits the full prompt, so the retry costs one
+generation. `length`/`error` finishes, streaming turns, and the serial
+lane are never resampled. Note the obvious disclosure: this retries the
+server's own sampler before the harness sees the turn, so benchmark
+results should say whether it was on.
+
 ### Continuation registry and trust domain
 
 For the Anthropic and Responses endpoints — whose protocols let a client send
@@ -385,15 +668,17 @@ and short grace/TTL windows (`DS4_CONT_GRACE_S`, `DS4_CONT_TTL_S`,
 before its follow-up arrives.
 
 **Streaming tool turns ride the batched lane.** Anthropic and Responses
-STREAMING tool requests are served on the continuous-batching lane: the tool
+streaming tool requests are served on the continuous-batching lane: the tool
 turn's registry record is owned by its KV bank, and an output-only follow-up
 continues that bank in place after the same generation/frontier equality
-check. Buffered tool requests deliberately stay on the serial lane — its
-model-visible corrective retry (feeding a malformed tool call back to the
+check, including a Responses replay that omits the bank's hidden reasoning.
+Buffered first tool-generation requests deliberately stay on the serial lane —
+its model-visible corrective retry (feeding a malformed tool call back to the
 model as a tool error) has no per-row equivalent in the batched loop, and a
 parse-time boolean cannot predict a semantic failure discovered after
-generation. A mixed client that streams the tool turn but sends the follow-up
-buffered gets the honest `409` + full-replay path. Per-surface kill switches
+generation. An output-only follow-up may itself be streaming or buffered; a
+buffered follow-up that redeclares tools requests the same corrective contract
+and therefore stays serial. Per-surface kill switches
 `DS4_SERVER_CONT_TOOLS_ANTHROPIC=0` / `DS4_SERVER_CONT_TOOLS_RESPONSES=0`
 restore the previous all-serial tool behavior (kept for one release, like the
 Inc 3 stateless switches they compose with).
@@ -427,6 +712,16 @@ higher than the `--ctx` value you started the server with:
 ```sh
 ./ds4-server --ctx 524288 --kv-disk-dir /tmp/ds4-kv --kv-disk-space-mb 8192
 ```
+
+For long agent loops on quantized weights: since v0.6.5 the deep
+tool-protocol reminder is on by default (the measured fix for agent
+tasks dying to prose slips at depth), and two optional levers remain,
+`--reasoning-replay drop` (keep scaffold-echoed reasoning out of the
+prompt; conversations run 16-28% shallower at the cost of llama.cpp-style
+format deviation) and `--tool-slip-resample` (one retry when a
+tools-armed turn still settles as prose). See
+[Replayed reasoning and agent-loop robustness](#replayed-reasoning-and-agent-loop-robustness)
+for the mechanics and measurements.
 
 You can use larger context and larger cache if you wish. Full context of
 1M tokens is going to use more or less 26GB of memory (compressed indexer
@@ -665,7 +960,13 @@ than refusing). The knobs:
 | `DS4_MEMGOV` | unset (the governor's verdicts are binding) | Set to `observe` to fall back to the pre-v0.6 memory formulas: the governor keeps evaluating and reporting on `/metrics`, but stops deciding. The one-word escape hatch if a memory decision ever looks wrong. |
 | `DS4_MEM_RECONCILE_TOL_MB` | `256` | When idle, the server reconciles the box's available-memory drop since boot against what its own allocation ledger explains and logs the residual (`mem reconcile:` line, also on `/v1/stats` and `/metrics`); a residual beyond this many MiB is marked `FLAGGED`. `DS4_MEM_RECONCILE_STRICT=1` adds a distinct `mem reconcile STRICT` line for gate scripts to assert on; `DS4_MEM_RECONCILE_WARMUP_MB` pins the named one-time warmup charge instead of letting the first idle pass self-calibrate it. Pure reporting — no admission decision reads it. |
 | `DS4_CONT_PREFILL_CHUNK` / `DS4_CONT_PREFILL_CHUNK_LIVE` | `4096` / `512` | Long prompts are ingested this many tokens at a time so a big admission never blocks the server. The `_LIVE` value applies while other requests are actively decoding: smaller keeps live decode smoother, larger ingests faster. |
-| `DS4_SERVER_FORK_PARTIAL` | `1` | Reuse the longest safe prefix when a prompt diverges inside a retained conversation. Set to `0` for a true cold-control path: Solar then reserves and captures no KDA checkpoints, and Motif-3 no SWA-window checkpoints. `DS4_SERVER_FORK_PARTIAL_MIN` (default 192 tokens, floor 136) skips tiny partial matches. |
+| `DS4_SERVER_FORK_PARTIAL` | `1` | Reuse the longest safe prefix when a prompt diverges inside a retained conversation. Set to `0` for a true cold-control path: Solar then reserves no KDA checkpoints, Motif-3 no SWA-window checkpoints, and Qwen no recurrent-state checkpoints. `DS4_SERVER_FORK_PARTIAL_MIN` (default 192 tokens, floor 136) skips tiny partial matches. |
+| `DS4_QWEN_BATCH` | unset (off) | Set to `1` to enable Qwen's persistent two-bank lane. It supports exact-frontier and partial-prefix forks, bank disk-KV persistence, target-verified embedded MTP with `--mtp-draft 2`, image requests with decoded-pixel cache identity, bounded two-row token-embedding/Hyper-Connection/Q8-output decode, GDN Q8 input projections and paired recurrent, QSA Q/gate projection, F32 router projection/top-k, Q5_K routed-main, and Q5_0 tail launches, plus a combined SSD-PLE gather. PLE compute, remaining QSA work, shared MoE work, and the remaining GDN state/finish stages stay bank-owned. |
+| `DS4_QWEN_PREFILL_CHUNK` | `256` (range 1..16384) | Qwen serial and bank prefill width. `8192` is the production serving setting used for the published Spark results; larger values need enough graph memory. |
+| `DS4_QWEN_PLE_CACHE_MB` | `2048` (allowed: 512, 1024, 2048) | Bound for Qwen's pinned SSD-PLE page cache. The full 95.37 GiB sidecar remains outside the unified-memory resident set. |
+| `DS4_QWEN_PLE_WORKERS` | `32` (range 1..64) | Asynchronous SSD-PLE page-read workers. On the reference DGX Spark, 32 retained nearly all of 64 workers' 8K prefill gain with less host submission overhead. |
+| `DS4_PLE_LATENCY_STATS` | unset (off) | Set to `1` for per-read SSD timing and shutdown-time read/layer-wait mean, p50, p95, p99, and maximum logs. Quantiles are power-of-two upper bounds. Leave it unset for normal serving so page workers avoid the two clock reads per I/O. |
+| `DS4_CUDA_NO_QWEN_VISION_TILE` | unset (tiled) | Set to `1` only to restore the previous per-query vision-attention kernel for controlled A/B diagnosis. |
 | `DS4_SERVER_CONTINUOUS` | `1` (continuous batching on) | Set to `0` to serve one request at a time on the old serial path. Only worth considering for single-user, latency-critical setups. |
 | `DS4_BATCH_VMM_BUDGET_MB` | unset: sized automatically (the bank plan's allowance, capped to measured capacity at boot, floored at two full-depth **packed** working sets — what two full banks actually commit at the admission-charged rate, not their virtual extents; `DS4_BATCH_VMM_FLOOR_PACKED=0` restores the old virtual-extent floor) | Hard cap on the KV pool, in MiB. Set it to pin the pool to a known size; either way the boot ledger prints `budget=[chosen] [plan X, capacity Y]` plus the work floor that applied, and a separate line whenever the floor is what ruled. |
 | `DS4_BATCH_VMM_TRIM` | `1` (reclaim allowed) | When an admission does not fit, the engine may release idle banks' memory to fund it; the reclaimed conversation then needs a disk restore or re-prefill when it returns. Set to `0` to forbid that: resident context is never sacrificed, and the admission is refused instead. Victims are chosen like warm-record eviction — invalid content first, then the longest-idle bank (shortest history breaks ties) — and the log names each victim with its bytes, history length, and recency; `DS4_BATCH_TRIM_VICTIM=hist` restores the old shortest-history-only order. When one victim's release would cover the whole remaining deficit, the engine now picks the smallest such victim in the same validity class instead of the first in recency order — so a deep trunk no longer dies for a deficit a small idle bank could fund (the `best-fit victim` log line discloses the substitution, and the trim summary reports released vs wanted); `DS4_BATCH_TRIM_BESTFIT=0` restores the pure recency order. |
@@ -692,13 +993,28 @@ on a stripped headless Spark.
 ## Thinking Modes
 
 DeepSeek V4 Flash has distinct non-thinking, thinking, and Think Max modes.
-The server defaults to thinking mode. `reasoning_effort=max` requests Think
-Max, but it is only applied when the context size is large enough for the model
-card recommendation; smaller contexts fall back to normal thinking. OpenAI
-`reasoning_effort=xhigh` still maps to normal thinking, not Think Max.
+The server defaults to thinking mode. The checkpoint's high and max tiers
+are not just decode budgets: they inject DeepSeek's effort preamble
+(verbatim reference-encoder text) at position 0, ahead of the system
+prompt.
 
-For direct replies, use `thinking: {"type":"disabled"}`, `think:false`, or a
-non-thinking model alias such as `deepseek-chat`.
+Since v0.6.3.1, a client-sent `reasoning_effort` field cannot reach those
+prefixed tiers by default: client `high`/`xhigh`/`max` compat-map to the
+prefix-free level. Agent frameworks send the field meaning the OpenAI
+"think more" knob, and a controlled needle matrix showed the injected
+preamble measurably degrades deep-context tool calling (6/50
+completion-protocol failures at 96K+ tokens with the prefix vs 0/100
+without — the field issue #18 regression). llama.cpp and pre-v0.5.3
+engines silently ignore the field for this GGUF, which is the behavior the
+default restores. Operators opt back into the native tiers with
+`--reasoning-effort-native` (env `DS4_REASONING_EFFORT_NATIVE=1`), and the
+operator's own `--reasoning-effort low|high|max|off` server default is
+always honored as written: setting it is the opt-in for that level.
+Disabling thinking stays client-reachable either way.
+
+For direct replies, use `thinking: {"type":"disabled"}`, `think:false`,
+`reasoning_effort:"off"`, or a non-thinking model alias such as
+`deepseek-chat`.
 
 ## Disk KV Cache
 
@@ -1383,6 +1699,7 @@ first answer:
 ./ds4 --dump-logprobs /tmp/out.json --logprobs-top-k 20 --temp 0 -p "..."
 ./ds4 --dump-logits /tmp/logits.json --metal --nothink --prompt-file prompt.txt
 ./ds4-server --trace /tmp/ds4-trace.txt ...
+./ds4-server --tool-slip-dump /tmp/ds4-slips ...
 ```
 
 - `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
@@ -1393,7 +1710,15 @@ first answer:
   alternatives at each step, which helps separate sampling choices from
   logit/model issues.
 - `ds4-server --trace` writes the rendered prompts, cache decisions, generated
-  text, and tool-parser events for a whole agent session.
+  text, and tool-parser events for a whole agent session. Serial lane only:
+  continuously-batched rows (the default serving lane) do not trace yet.
+- `ds4-server --tool-slip-dump DIR` covers the batched lane's blind spot for
+  tool-protocol failures: every tools-armed chat completion that settles
+  without tool calls dumps one JSON file with the raw request body, the full
+  generated text, and the parse verdict. Agent harnesses discard rejected
+  responses, so this is usually the only byte-exact record of what the model
+  actually said; each dump replays directly against a server as a regression
+  fixture.
 
 ## About this fork
 

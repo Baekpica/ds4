@@ -541,7 +541,7 @@ typedef struct {
     uint32_t name_len;
     uint32_t type;
     uint32_t ndim;
-    uint64_t dims[4];
+    uint64_t dims[8];
     uint64_t offset;
     uint64_t bytes;
 } ds4_gpu_tensor_record;
@@ -992,6 +992,18 @@ int ds4_gpu_matmul_bf16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+/* Native reduction used when recurrent decode must keep N=1 and N=2
+ * arithmetic identical. */
+int ds4_gpu_matmul_bf16_stable_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 /* P3-Inc1: f16 matmul with the input rms_norm folded into the activation
  * convert (f16 activations bit-identical to the unfused rms_norm_plain +
  * f32_to_f16 chain).  Returns 0 with `out` untouched on any precondition
@@ -1054,6 +1066,16 @@ int ds4_gpu_matmul_f32_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+int ds4_gpu_matmul_f32_stable_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
 int ds4_gpu_repeat_hc_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *row,
@@ -1101,6 +1123,336 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         uint32_t                n,
         uint32_t                rows,
         float                   eps);
+
+/* Qwen3.8-Flash-Next uses a zero-centred RMSNorm: each hidden-size group is
+ * normalized independently and multiplied by (1 + weight), not weight.
+ * Checkpoint/converter policy keeps these numerical weights in F32 even when
+ * the surrounding projections are BF16 or quantized. */
+int ds4_gpu_qwen4exp_group_rms_norm_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                width,
+        uint32_t                group_size,
+        uint32_t                rows,
+        float                   eps);
+
+/* QSA head norms share one group_size-wide learned vector across every
+ * query/key head, unlike hyper-connection norms whose learned vector spans
+ * the full width. */
+int ds4_gpu_qwen4exp_shared_group_rms_norm_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                width,
+        uint32_t                group_size,
+        uint32_t                rows,
+        float                   eps);
+
+/* Hyper-connection elementwise stages from Qwen4ExpTextGatedResidual.
+ * Projection GEMMs stay on ds4_gpu_matmul_bf16_tensor; these entries preserve
+ * the model-specific divisions, sigmoid/SiLU transforms, four-lane mean, and
+ * residual injection without borrowing DeepSeek/Motif HC semantics. */
+int ds4_gpu_qwen4exp_hc_down_silu_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *projected,
+        uint64_t                count,
+        uint32_t                hc_count);
+
+int ds4_gpu_qwen4exp_hc_mix_inject_tensor(
+        ds4_gpu_tensor       *mixed,
+        ds4_gpu_tensor       *injection,
+        const ds4_gpu_tensor *normed,
+        const ds4_gpu_tensor *mix_logits,
+        const ds4_gpu_tensor *inject_logits,
+        uint32_t                rows,
+        uint32_t                hidden_size,
+        uint32_t                hc_count);
+
+int ds4_gpu_qwen4exp_hc_residual_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *hyper_input,
+        const ds4_gpu_tensor *block_output,
+        const ds4_gpu_tensor *injection,
+        uint32_t                rows,
+        uint32_t                hidden_size,
+        uint32_t                hc_count);
+
+/* SSD PLE compute stages. The gather subsystem writes raw BF16 rows into a
+ * device tensor; the first entry promotes that bounded output to DS4's F32
+ * activation representation. The gate implements Qwen's dot/sqrt/sigmoid
+ * rule. The convolution owns a channel-major [width, state_len] F32 state and
+ * updates it only after producing the complete causal chunk. */
+int ds4_gpu_qwen4exp_bf16_to_f32_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *input_bf16,
+        uint64_t                count);
+
+int ds4_gpu_qwen4exp_ple_gate_tensor(
+        ds4_gpu_tensor       *gated_value,
+        ds4_gpu_tensor       *transformed_gate,
+        const ds4_gpu_tensor *key_normed,
+        const ds4_gpu_tensor *query_normed,
+        const ds4_gpu_tensor *value,
+        uint32_t                rows,
+        uint32_t                hidden_size,
+        uint32_t                hc_count);
+
+int ds4_gpu_qwen4exp_ple_conv_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        const ds4_gpu_tensor *input,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                rows,
+        uint32_t                width,
+        uint32_t                kernel_size,
+        uint32_t                dilation);
+
+/* Qwen3.8 Gated DeltaNet stages. The convolution cache is channel-major
+ * [conv_dim, kernel_size] (four slots in the production model), matching the
+ * official cache representation. The recurrent state is F32
+ * [value_heads, head_dim, head_dim] and is updated in place in token order.
+ * Control conversion accepts beta==b and g==a for scratch reuse. */
+int ds4_gpu_qwen4exp_gdn_conv_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        const ds4_gpu_tensor *input,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                rows,
+        uint32_t                width,
+        uint32_t                kernel_size);
+
+int ds4_gpu_qwen4exp_gdn_controls_tensor(
+        ds4_gpu_tensor       *beta,
+        ds4_gpu_tensor       *g,
+        const ds4_gpu_tensor *b,
+        const ds4_gpu_tensor *a,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                a_log_offset,
+        uint64_t                dt_bias_offset,
+        uint32_t                rows,
+        uint32_t                value_heads);
+
+int ds4_gpu_qwen4exp_gdn_recurrent_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *state,
+        const ds4_gpu_tensor *mixed_qkv,
+        const ds4_gpu_tensor *beta,
+        const ds4_gpu_tensor *g,
+        uint32_t                rows,
+        uint32_t                key_heads,
+        uint32_t                value_heads,
+        uint32_t                head_dim);
+
+int ds4_gpu_qwen4exp_gdn_recurrent_bank2_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *state0,
+        const ds4_gpu_tensor *mixed_qkv0,
+        const ds4_gpu_tensor *beta0,
+        const ds4_gpu_tensor *g0,
+        ds4_gpu_tensor       *out1,
+        ds4_gpu_tensor       *state1,
+        const ds4_gpu_tensor *mixed_qkv1,
+        const ds4_gpu_tensor *beta1,
+        const ds4_gpu_tensor *g1,
+        uint32_t                rows,
+        uint32_t                key_heads,
+        uint32_t                value_heads,
+        uint32_t                head_dim);
+
+int ds4_gpu_qwen4exp_gdn_gated_rms_norm_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *core,
+        const ds4_gpu_tensor *z,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                rows,
+        uint32_t                value_heads,
+        uint32_t                head_dim,
+        float                   eps);
+
+/* Qwen Sparse Attention (QSA) text path. These entries preserve the
+ * reference's four-token index blocks, score-sorted selection converted back
+ * to ascending token order, first-dimension half-split RoPE, GQA KV mapping,
+ * and sigmoid output gate. Caches and activations are F32 in this
+ * correctness-first implementation; packed storage is a later optimization. */
+int ds4_gpu_qwen4exp_qsa_split_index_tensor(
+        ds4_gpu_tensor       *query,
+        ds4_gpu_tensor       *raw_key_cache,
+        const ds4_gpu_tensor *qk,
+        uint32_t                rows,
+        uint32_t                pos0,
+        uint32_t                cache_cap,
+        uint32_t                q_heads,
+        uint32_t                head_dim);
+
+int ds4_gpu_qwen4exp_qsa_split_q_gate_tensor(
+        ds4_gpu_tensor       *query,
+        ds4_gpu_tensor       *gate,
+        const ds4_gpu_tensor *projected,
+        uint32_t                rows,
+        uint32_t                heads,
+        uint32_t                head_dim);
+
+int ds4_gpu_qwen4exp_rope_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t          rows,
+        uint32_t          heads,
+        uint32_t          head_dim,
+        uint32_t          rotary_dim,
+        uint32_t          pos0,
+        float             freq_base);
+
+int ds4_gpu_qwen4exp_mrope_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *positions,
+        uint32_t              rows,
+        uint32_t              heads,
+        uint32_t              head_dim,
+        uint32_t              rotary_dim,
+        uint32_t              pos0,
+        float                 freq_base);
+
+int ds4_gpu_qwen4exp_qsa_pool_blocks_tensor(
+        ds4_gpu_tensor       *pooled_cache,
+        const ds4_gpu_tensor *raw_key_cache,
+        const ds4_gpu_tensor *positions,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                norm_weight_offset,
+        uint32_t                first_block,
+        uint32_t                n_blocks,
+        uint32_t                block_cap,
+        uint32_t                ratio,
+        uint32_t                head_dim,
+        uint32_t                rotary_dim,
+        float                   freq_base,
+        float                   eps);
+
+int ds4_gpu_qwen4exp_qsa_block_scores_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *pooled_cache,
+        uint32_t                rows,
+        uint32_t                pos0,
+        uint32_t                max_blocks,
+        uint32_t                q_heads,
+        uint32_t                head_dim,
+        uint32_t                ratio);
+
+int ds4_gpu_qwen4exp_qsa_expand_selection_tensor(
+        ds4_gpu_tensor       *tokens,
+        ds4_gpu_tensor       *counts,
+        const ds4_gpu_tensor *selected_blocks,
+        uint32_t                rows,
+        uint32_t                pos0,
+        uint32_t                max_blocks,
+        uint32_t                topk_blocks,
+        uint32_t                ratio,
+        uint32_t                token_budget);
+
+int ds4_gpu_qwen4exp_qsa_store_kv_tensor(
+        ds4_gpu_tensor       *k_cache,
+        ds4_gpu_tensor       *v_cache,
+        const ds4_gpu_tensor *key,
+        const ds4_gpu_tensor *value,
+        uint32_t                rows,
+        uint32_t                pos0,
+        uint32_t                cache_cap,
+        uint32_t                kv_heads,
+        uint32_t                head_dim);
+
+int ds4_gpu_qwen4exp_qsa_attention_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *score_scratch,
+        const ds4_gpu_tensor *query,
+        const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache,
+        const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *counts,
+        uint32_t                rows,
+        uint32_t                heads,
+        uint32_t                kv_heads,
+        uint32_t                head_dim,
+        uint32_t                selected_cap,
+        uint32_t                cache_cap);
+
+/* Qwen4Exp embedded vision tower.  The public runtime keeps image decoding on
+ * the host; these small entries cover only operations not already expressible
+ * through the existing BF16/Q8 matrix helpers. */
+int ds4_gpu_qwen4exp_vision_patch_position_tensor(
+        ds4_gpu_tensor       *hidden,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              patch_bias_offset,
+        uint64_t              position_weight_offset,
+        const ds4_gpu_tensor *position_indices,
+        const ds4_gpu_tensor *position_weights,
+        uint32_t              rows,
+        uint32_t              hidden_dim);
+int ds4_gpu_qwen4exp_vision_layernorm_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *in,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              bias_offset,
+        uint32_t              rows,
+        uint32_t              dim,
+        float                 eps);
+int ds4_gpu_qwen4exp_vision_qkv_rope_tensor(
+        ds4_gpu_tensor       *qkv,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              bias_offset,
+        const ds4_gpu_tensor *height_positions,
+        const ds4_gpu_tensor *width_positions,
+        uint32_t              rows,
+        uint32_t              heads,
+        uint32_t              head_dim,
+        float                 freq_base);
+int ds4_gpu_qwen4exp_vision_attention_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *qkv,
+        const ds4_gpu_tensor *segment_start,
+        const ds4_gpu_tensor *segment_end,
+        uint32_t              rows,
+        uint32_t              heads,
+        uint32_t              head_dim);
+int ds4_gpu_qwen4exp_vision_bias_gelu_tensor(
+        ds4_gpu_tensor *x,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        bias_offset,
+        uint32_t        rows,
+        uint32_t        dim,
+        int             tanh_approx);
+int ds4_gpu_qwen4exp_vision_bias_residual_tensor(
+        ds4_gpu_tensor       *residual,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              bias_offset,
+        uint32_t              rows,
+        uint32_t              dim);
+int ds4_gpu_qwen4exp_vision_bias_tensor(
+        ds4_gpu_tensor *x,
+        const void     *model_map,
+        uint64_t        model_size,
+        uint64_t        bias_offset,
+        uint32_t        rows,
+        uint32_t        dim);
 
 /* CUDA prefill producer: writes the same f32 RMS-norm result as the classic
  * rows entry and, when profitable, also publishes its exact internal Q8_1
@@ -1997,6 +2349,83 @@ int ds4_gpu_sigmoid_topk_router_tensor(
         uint32_t                n_tokens,
         float                   weight_scale);
 
+/* Qwen4Exp router: float softmax, top-k, then normalization over the selected
+ * experts (norm_topk_prob=true). Selection is deterministic on equal logits. */
+int ds4_gpu_qwen4exp_softmax_topk_router_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_expert,
+        uint32_t                n_used,
+        uint32_t                n_tokens);
+
+/* Multiply the completed shared-expert output by sigmoid(shared gate logit),
+ * one scalar gate per token. `out == shared` is supported. */
+int ds4_gpu_qwen4exp_shared_expert_gate_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *shared,
+        const ds4_gpu_tensor *gate_logits,
+        uint32_t                rows,
+        uint32_t                hidden_size);
+
+/* Qwen4Exp's expert-down activation is 640-wide but the recipe stores the
+ * weights as a 512+128 split. Pack the contiguous main input for MMQ, then
+ * accumulate the Q5_0 base or Q8_0 MTP tail directly into that MMQ output. */
+int ds4_gpu_qwen4exp_pack_expert_down_main_tensor(
+        ds4_gpu_tensor       *packed_main,
+        const ds4_gpu_tensor *mid,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim);
+
+int ds4_gpu_qwen4exp_q5_0_tail_accum_tensor(
+        ds4_gpu_tensor       *down,
+        const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert);
+
+int ds4_gpu_qwen4exp_q5_0_tail_accum_bank2_tensor(
+        ds4_gpu_tensor       *down0,
+        const ds4_gpu_tensor *mid0,
+        const ds4_gpu_tensor *ids0,
+        ds4_gpu_tensor       *down1,
+        const ds4_gpu_tensor *mid1,
+        const ds4_gpu_tensor *ids1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert);
+
+int ds4_gpu_qwen4exp_q8_0_tail_accum_tensor(
+        ds4_gpu_tensor       *down,
+        const ds4_gpu_tensor *mid,
+        const ds4_gpu_tensor *ids,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                weight_bytes,
+        uint64_t                assignments,
+        uint32_t                mid_width,
+        uint32_t                main_dim,
+        uint32_t                tail_dim,
+        uint32_t                out_dim,
+        uint32_t                n_expert);
+
 /* silu(gate) * up * weights[flat_index / n_ff]. */
 int ds4_gpu_swiglu_weighted_tensor(
         ds4_gpu_tensor       *mid,
@@ -2008,8 +2437,9 @@ int ds4_gpu_swiglu_weighted_tensor(
 
 /* Quantized routed-expert matmul with the common [token, slot, row] output
  * contract. The executor selects mmvq for at most eight assignments and MMQ
- * above that; supported raw GGUF types are Q8_0, Q2_K, Q3_K, Q4_K and
- * IQ2_XXS. Router weighting is intentionally a separate epilogue. */
+ * above that; supported raw GGUF types are Q5_0, Q8_0, Q2_K, Q3_K, Q4_K,
+ * Q5_K, Q6_K and IQ2_XXS. Router weighting is intentionally a separate
+ * epilogue. */
 int ds4_gpu_routed_matmul_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *x,
