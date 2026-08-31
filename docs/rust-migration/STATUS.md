@@ -3,8 +3,10 @@
 > **Freshness (2026-08-31 KST):** the post-promote campaign was reopened for
 > the `v0.6.5-dfm`/Qwen delta. Q5+Sidecar behavior, family fixtures, and
 > C→Rust→Rust→C ABBA are green at `6ca85c8`. Default names remain Rust and
-> C oracles remain `*-c`. The complete family/proof/soak re-stamp and
-> `SPLIT_READINESS.md` are still pending.
+> C oracles remain `*-c`. The complete family/proof re-stamp, the Qwen-only
+> two-hour soak, and `SPLIT_READINESS.md` are still pending. DeepSeek keeps
+> its normal functional/parity/performance gates but does not repeat a long
+> soak in this campaign.
 
 Update this table in the same commit that changes a subsystem’s
 state. Colors: `green` = gate passed, `yellow` = partial / in
@@ -49,8 +51,8 @@ Rust. They must not be read as production-path integration.
 | 6 | Distributed runtime port | **isolated parity green** (`make test-dist-parity`); production still uses C pipelined prefetch, snapshot, and `ds4_dist_session_*` |
 | 7 | Server shadow by feature | **Qwen re-stamp green; broader campaign partial** — CPU contracts plus Qwen serial/continuous/static, true width-2, Chat/Responses/Anthropic, image input, image-aware live/disk KV, MTP, and two-bank fork/partial behavior are green. Remaining cross-family/API and failure-path re-stamp stays open. |
 | 8 | `ds4.c` decomposition | **partial** — metadata, mmap catalogs, tokenizer (including family chat-transcript framing), and ledger slices are green; engine/model/session/scheduler execution and CUDA upload remain native |
-| 9 | Promote Rust binaries to default names | **names already promoted; v0.6.5 revalidation active**. Qwen is green at `6ca85c8`; the full pre/post family/proof/performance/soak manifest must be re-stamped before this phase is closed again. |
-| split | `SPLIT_READINESS.md` + `ds4-dfm-rs` code genesis | destination is metadata-only; blocked on remaining host work and the complete v0.6.5 family/proof/soak re-stamp |
+| 9 | Promote Rust binaries to default names | **names already promoted; v0.6.5 revalidation active**. Qwen is green at `6ca85c8`; the full pre/post family/proof/performance manifest and Qwen two-hour soak must be re-stamped before this phase is closed again. DeepSeek does not repeat a long soak. |
+| split | `SPLIT_READINESS.md` + `ds4-dfm-rs` code genesis | destination is metadata-only; blocked on remaining host work, the complete v0.6.5 family/proof re-stamp, and the Qwen two-hour soak |
 
 ## Current default binaries
 

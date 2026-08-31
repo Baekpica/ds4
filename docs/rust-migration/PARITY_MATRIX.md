@@ -3,7 +3,8 @@
 > **Freshness (2026-08-31 KST):** the Qwen delta from the `v0.6.5-dfm`
 > lineage is re-stamped at `6ca85c8`. Production defaults remain Rust.
 > The older post-promote matrix is retained as provenance; the complete
-> cross-family v0.6.5/proof/soak re-stamp is still a gate.
+> cross-family v0.6.5/proof re-stamp and Qwen-only two-hour soak are still
+> gates. DeepSeek keeps its normal gates but does not repeat a long soak.
 
 ## Qwen v0.6.5 delta re-stamp (`6ca85c8`)
 
@@ -35,7 +36,9 @@ PASS 55 + PASS* 5 (E-2..E-6) + FAIL 0 + BLOCKED 0.
 | Wire/API | DeepSeek 4 surfaces × serial/cont/static PASS (C=`ds4-server-c`, Rust=`ds4-server`); barrier width=2 PASS |
 | Performance | Motif ABBA PASS (prefill 99.95%, decode 100%, TTFT +1.1%, HWM +1.0%); proofs smoke/long/opp-c/rust-opp-c PASS |
 
-Soak (2h mixed DeepSeek) is not in this table.
+The historical two-hour mixed DeepSeek soak is not repeated. This campaign's
+only long soak is the Qwen Q5+Sidecar two-bank gate; DeepSeek still runs the
+ordinary functional, parity, proof, and performance cells.
 
 “Rust works” is not `cargo build`. A host change is accepted only
 when all five axes that it can affect are green. CUDA optimization
