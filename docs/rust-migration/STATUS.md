@@ -1,18 +1,18 @@
 # Migration status
 
-> **Freshness (2026-08-26 22:40 KST):** restamped from post-promote §10
-> CAND `cb11c0b` (`task-53-rerun-cb11c0b.txt`, FAIL=0 BLOCKED=0,
-> PASS* = E-2..E-6). Default names are Rust. C oracles are `*-c`.
-> `ds4-eval` stays C. Soak (T1.8) and `SPLIT_READINESS.md` are still
-> pending. Engine gaps live in [ENGINE_GAPS.md](ENGINE_GAPS.md).
+> **Freshness (2026-08-31 KST):** the post-promote campaign was reopened for
+> the `v0.6.5-dfm`/Qwen delta. Q5+Sidecar behavior, family fixtures, and
+> C→Rust→Rust→C ABBA are green at `6ca85c8`. Default names remain Rust and
+> C oracles remain `*-c`. The complete family/proof/soak re-stamp and
+> `SPLIT_READINESS.md` are still pending.
 
 Update this table in the same commit that changes a subsystem’s
 state. Colors: `green` = gate passed, `yellow` = partial / in
 progress, `—` = not started or not applicable, `n/a` = axis does
 not apply.
 
-C golden baseline: `v0.6.3-dfm`
-(`516456fe35510e4fb8350396c9d88807ac1f760b`).
+C golden baseline: `v0.6.5-dfm` (`d02e2a4`), with Qwen observable behavior
+frozen at C cut `4d40d97`.
 
 ## Subsystem matrix
 
@@ -20,16 +20,16 @@ C golden baseline: `v0.6.3-dfm`
 |---|---|---|---|---|---|
 | model metadata | yes | yes (catalog + DeepSeek select + arch dispatch + bind names + MTP/DSpark sibling catalogs + host `config_validate` + host `weights_validate_layout`) | C (`ds4_bridge_model_open`) | catalog + bind-name + MTP/DSpark support + validate + layout token dump green (`make test-catalog-parity`) | n/a |
 | GGUF loading (mmap) | yes | metadata mmap + identify + tensor inventory + split-shard remap + host `weights_bind` catalog / bind-plan check + host tensor-dir apply (native skips `parse_tensors` when installed) + host `config_validate` (native applies pinned shape/compress and skips C validate when installed) + host vocab apply (native skips `vocab_load` when installed) + host bind map (native skips the `model_find_tensor` name walk when installed) + host `weights_validate_layout` (native skips the main-model layout check when the bind map is installed) + host MTP/DSpark sibling name/layout catalogs + sibling BindPlan resolve/validate + **sibling bind map FFI** (`Model::open_with_support` / `opt->mtp_path|dspark_path|mtp_bind|dspark_bind`: native swaps each sibling map into the active slot around its own open+bind window and skips that sibling's C layout check; sibling pointer assignment stays C); host tables are cleared after base `weights_bind` so sibling `model_open` does not reuse the base GGUF tables; CUDA weight upload still C | C (`ds4_bridge_model_open` upload) | synthetic v3 identify + tensor/nbytes/sibling + bind-name/check/match + MTP/DSpark support dump + consume/apply tapes + validate token tapes + vocab apply tapes + bind lookup tapes + layout SPEC/check/support tapes green (`make test-catalog-parity`); live Motif-3-MQ87-88-FIT identify/validate/open green; live DeepSeek-V4-Flash + DSpark-drafter-Q2K-Q8 (81/81 slots FOUND, `dspark-flash` catalog): C env-fallback run kept the strict C validate (`Hi`, 29.27/21.27 t/s), Rust `--dspark` open bound the drafter through the host map + layout skip and decoded 9 ids (`scratch/rust-host-live/{c,rust}-dspark.log`) | — |
-| tokenizer | yes | yes (host-owned encode/decode/special/stop and family chat-transcript token framing + host vocab apply so native skips `vocab_load` when installed; `Model` tokenize/stop/eos/`token_text` use host `Vocab`; `ds4-server-rs` uses `Model::vocab`; FFI tokenize remains for the C engine path) | C | synthetic C↔Rust encode/decode/stop + apply tapes green; chat transcripts match C across five families and all four think modes (`make test-tokenizer-parity`); live Motif specials + encode `hi`→8320 on the production GGUF | — |
+| tokenizer | yes | yes (host-owned encode/decode/special/stop and family chat-transcript token framing + host vocab apply so native skips `vocab_load` when installed; `Model` tokenize/stop/eos/`token_text` use host `Vocab`; `ds4-server-rs` uses `Model::vocab`; FFI tokenize remains for the C engine path) | C | synthetic C↔Rust encode/decode/stop + apply tapes green; family chat transcripts match C; Qwen official text/chat goldens and stop set pass on the production Q5 GGUF; live Motif specials + encode `hi`→8320 | — |
 | session lifecycle | yes | partial (host ledger + DSV4 prefix, including bounded embedded-range restore; engine session, GPU/logits tail, and payload execution remain native) | C | synthetic C↔Rust green (`make test-session-parity`); range prefix/EOF + C seek/length/overflow oracle green; live same-model CUDA payload pending | — |
 | KV store | yes | envelope/policy crate with payload-free metadata index, bounded LCP text reads, a file-backed staged payload writer, and bounded KTM trailer memory; ordinary serial visible cold + evict/replay, final-sync/decode and DeepSeek intermediate-prefill continued checkpoints, scoped DeepSeek no-think tool-map replay, and scoped width-1 OpenAI Chat no-think/no-tools continuous-bank shutdown persistence/replay are production-integrated in `ds4-server-rs` | C | file-format 4-way + Rust streamed payload/trailer read by C + sparse 4 GiB indexing + embedded payload-range seam green; live same-model C/Rust ordinary 4-way save/load green; C-default 6,144-token cold partition exact; scoped continued 6,800-token bodies/four-way exact; DeepSeek 4,096-token intermediate-prefill bodies/four-way exact; DeepSeek tool-map producers have exact C/Rust text+payload bodies and all four reordered-history loader cells restore 424 cached tokens; width-1 bank-shutdown producers have exact 6,896-token text/payload bodies and all four cross-host loader cells restore 6,896 cached tokens | same-policy restore TTFT ABBA green; scoped cold, continued (final/decode and DeepSeek intermediate-prefill), tool-map, and width-1 bank correctness/cross-read green; scoped width-1 bank restore ABBA green; configured default-policy/full memory performance pending |
 | web utility | yes | isolated blocking-I/O crate; not production-integrated | C (`ds4-agent`) | encode/wire + mock CDP green | n/a |
-| server (four surfaces) | yes | partial (`route_decide` + HTTP door + parsers + projectors + admission + metrics + render/tool/continuation machinery + scripted/FFI decode + bounded FIFO single inference owner + per-client parse/drain + stable continuation pins + ordered terminal publication + ordinary serial visible disk replay + scoped width-1 bank lifecycle) | C | owner-FIFO, queue/TTFT, disconnect/slow-reader, terminal, and C-oracle CPU contracts green (`make test-server-parity`); live Motif serial/width-1 continuous, scoped ordinary KV restart/cross-read, scoped DeepSeek intermediate-prefill/tool-map four-way, and scoped width-1 bank shutdown four-way green; post-fix native continuous timing reports C-equivalent 12.3 tok/s and 1.25 tok/step on the short bank restore; static lane, live multi-client continuous batching, and Anthropic/Responses continuous are not implemented | n/a |
+| server (four surfaces) | yes | Rust owns HTTP parsing/rendering, admission, metrics, FIFO owner, serial/continuous/static routing, continuation, and disk-KV policy over native execution | Rust host | CPU oracle suite green; Qwen Chat/Responses/Anthropic image requests, barrier width 2 (`served=2 fallback=0`), static width 2, serial fallback, image-aware live/disk KV, and 8,192-boundary image prefill are live-green; OpenAI Completions remains text-only by contract | Qwen ABBA green; full cross-family serving re-stamp pending |
 | distributed runtime | yes | isolated codecs + blocking orchestration crate; not production-integrated | C | codecs + CLI/route/mock hop green | n/a |
 | CLI / bench / agent host | yes | partial: greedy/seeded-sampling `ds4-rs` with non-TTY thinking formatting, local non-MTP/non-distributed `ds4-bench-rs`, one-turn no-tool `ds4-agent-rs`, and `ds4-server-rs` | C | greedy, fixed-seed sampled, and fixed-seed thinking/non-thinking one-shot CLI stdout match C byte-for-byte; local benchmark ABBA green. Agent built-in prompt bytes, fixed datetime message, selected non-TTY projector tapes, and DSML refusal are green (`make test-agent-parity`), but live agent generation parity is not established | local benchmark green; full gate pending |
 | CPU reference backend | yes | no (not a cut-over blocker) | C | — | n/a |
 | Metal backend | native | unchanged | native | — | n/a |
-| CUDA / MMQ / VMM | native | unchanged | native | green (C baseline) | green (published band) |
+| CUDA / MMQ / VMM | native | unchanged | native | Qwen Q5 loader/PLE/QSA/MoE/GDN/batch + shared MMQ green | Qwen C/Rust text+image ABBA green; complete family/proof re-stamp pending |
 | FFI bridge (`ds4_bridge`) | n/a | broad C-host bridge; not the final narrow CUDA ABI | n/a | FFI error path + bounded payload seek/length/EOF/overflow oracle green; legacy sync ABI plus additive same-thread prefill progress callback, cleanup/error/panic/exact-prefix oracles green; opaque bank snapshot/load/save and native continuous decode duration/token/step callback oracles green | — |
 | proof harness on Rust path | C binaries | partial | C | Rust smoke 2/2 and long 6/6 green; same-host C→Rust OPP-C 5/5 green. The GB10 `sm_121a` native snapshot is frozen separately: detached `v0.6.3-dfm` and current C both pass 5/5 with the same stable plan/token oracle | — |
 
@@ -47,10 +47,10 @@ Rust. They must not be read as production-path integration.
 | 4 | KV store port + 4-way matrix | **format/policy + payload-free index + embedded range seam + replacement-safe staged writer green** (`make test-kv-parity`, focused core/bridge oracles). Ordinary serial Motif-3 no-think/no-tools visible save/evict/restart restore is wired; live C→Rust, Rust→C, Rust→Rust, and C→C are green at the shared `cold=0, continued=0` policy. Restore TTFT ABBA and timing-count/rate scope are green after deferred boot prewarm. C-default cold checkpoints are live cross-read green. The scoped final-sync/decode continued slice is four-way live-green at 6,800 tokens. The scoped DeepSeek ordinary-serial intermediate-prefill slice is four-way live-green from a 4,096-token durable frontier inside a 6,782-token prompt. The scoped DeepSeek OpenAI Chat no-think tool-map slice is four-way live-green with reordered JSON arguments and 424 cached tokens. The scoped Motif-3 width-1 OpenAI Chat no-think/no-tools bank-shutdown slice is four-way live-green with exact C/Rust bodies and a green 114-token restore ABBA; post-fix short-response timing also matches C. Default configured 10,000/effective aligned 10,240 periodic checkpoints, live bank-evict evidence, multi-bank fork/partial ownership, and full default-policy ABBA remain pending |
 | 5 | Web utility port | **isolated parity green** (`make test-web-parity`); production `ds4-agent` still uses C `ds4_web.c` |
 | 6 | Distributed runtime port | **isolated parity green** (`make test-dist-parity`); production still uses C pipelined prefetch, snapshot, and `ds4_dist_session_*` |
-| 7 | Server shadow by feature | **partial** — bounded owner-FIFO/terminal/disconnect CPU contract is green at `6545d44`; fixtures, live Motif serial/width-1 continuous, scoped ordinary serial Motif disk replay, scoped DeepSeek intermediate-prefill replay, scoped DeepSeek tool-map four-way, and scoped width-1 bank shutdown/replay are green, but static, live multi-client continuous batching, multi-bank fork/partial semantics, Anthropic/Responses continuous, and the remaining KV policies/surfaces are missing |
+| 7 | Server shadow by feature | **Qwen re-stamp green; broader campaign partial** — CPU contracts plus Qwen serial/continuous/static, true width-2, Chat/Responses/Anthropic, image input, image-aware live/disk KV, MTP, and two-bank fork/partial behavior are green. Remaining cross-family/API and failure-path re-stamp stays open. |
 | 8 | `ds4.c` decomposition | **partial** — metadata, mmap catalogs, tokenizer (including family chat-transcript framing), and ledger slices are green; engine/model/session/scheduler execution and CUDA upload remain native |
-| 9 | Promote Rust binaries to default names | **names promoted** (`cb11c0b`). Makefile copies Cargo `*-rs` bins onto `ds4` / `ds4-server` / `ds4-bench` / `ds4-agent`. C oracles are `ds4-c` / `ds4-server-c` / `ds4-bench-c` / `ds4-agent-c`. Post-promote §10 GREEN. Soak not yet run. |
-| split | `SPLIT_READINESS.md` + `dfm-rs` genesis | blocked on soak (T1.8); do not seed `dfm-rs` yet |
+| 9 | Promote Rust binaries to default names | **names already promoted; v0.6.5 revalidation active**. Qwen is green at `6ca85c8`; the full pre/post family/proof/performance/soak manifest must be re-stamped before this phase is closed again. |
+| split | `SPLIT_READINESS.md` + `ds4-dfm-rs` code genesis | destination is metadata-only; blocked on remaining host work and the complete v0.6.5 family/proof/soak re-stamp |
 
 ## Current default binaries
 
@@ -68,7 +68,24 @@ Rust. They must not be read as production-path integration.
 | `ds4-rs` / `ds4-server-rs` / … | Deprecated aliases (copy of the Rust defaults) |
 | `ds4_weight_server` | native CUDA (unchanged) |
 
-Phase 3/7 live Motif evidence is in `scratch/rust-host-live/` (tmux + workspace-local `../scripts/guarded-run.sh`, outside this repository; sequential C then Rust, `clear_cache` between loads). Production defaults stay C. Live CUDA census on `ds4-server-rs` is green (`census_supported=1`, epoch 1636, weight_artifact 86.07 GiB, observation ok). Live DSpark sibling FFI is green (DeepSeek-V4-Flash-IQ2XXS + DSpark-drafter-Q2K-Q8: C env fallback `Hi` 29.27/21.27 t/s with strict C validate; Rust `--dspark` host-map bind + layout skip, 9 decode ids; sequential, teardown + `clear_cache`). The Rust server has a continuous lane (`--cont-width`, default 2; one active job behind the FIFO owner): `ds4_bridge_batch_ctx_create_fit` + `ds4_bridge_continuous_generate` drive the native rolling scheduler, the host owns per-token stop/tool/think semantics (`ContStepper`), and live Motif routes `openai_chat_continuous` with `Hi.` / stop / 13+2 — byte-equal to C. Client ingress is now concurrent, but the owner still runs each job to completion, so multi-client rolling width is not yet live-proven. Same-lane ABBA is recorded (PARITY_MATRIX: Rust 590.8/592.9 t/s prefill vs C 579.2/633.9; decode within 1%; all four completions byte-identical).
+The resumed Qwen evidence is in
+[QWEN_V065_RESTAMP_2026-08-31.md](QWEN_V065_RESTAMP_2026-08-31.md) and
+`scratch/rust-host-live/qwen-v065-restamp-20260831/`. It uses only the primary
+Q5 main GGUF plus shared SSD-PLE sidecars. C→Rust→Rust→C returned exact text
+and image outputs; Rust/C means were 99.97% prefill, 100.00% decode, +0.95%
+TTFT, +4.40% worker VmHWM, and identical worker GPU residency. All target
+processes exited before each cache clear; final `MemAvailable` was 119 GiB.
+
+The following Phase 3/7 Motif paragraph is retained as historical
+`v0.6.3-dfm` evidence. Phase 3/7 live Motif evidence is in
+`scratch/rust-host-live/` (tmux + workspace-local `../scripts/guarded-run.sh`,
+outside this repository; sequential C then Rust, `clear_cache` between loads).
+Live CUDA census on `ds4-server-rs` is green (`census_supported=1`, epoch 1636,
+weight_artifact 86.07 GiB, observation ok). Live DSpark sibling FFI is green
+(DeepSeek-V4-Flash-IQ2XXS + DSpark-drafter-Q2K-Q8: C env fallback `Hi`
+29.27/21.27 t/s with strict C validate; Rust `--dspark` host-map bind + layout
+skip, 9 decode ids; sequential, teardown + `clear_cache`). The Rust server
+continuous lane produced byte-equal output in the recorded same-lane ABBA.
 
 Phase 4 live ordinary replay evidence is under `scratch/rust-host-live/rust-kv-no-think-final-IHtJue/`. With Motif-3 MQ87-88, ctx 8192, temp 0, no thinking, no tools, and the shared `cold=0, continued=0` policy, C and Rust produced the same 114-token answer and a byte-identical visible-text/payload KVC body (301,972,392 bytes). C→Rust, Rust→C, Rust→Rust, and C→C restart loads all returned `RESTORED_OK` with 6,896 cached + 15 newly evaluated prompt tokens. Rust binary `dae70ae2...` ran the four-way matrix; post-fix `52471e49...` also matches C timing counts (`prefill_tokens=15`, `prefill_cached_tokens=6896`). The initial Rust 1,590--1,715 ms TTFT regression was the deferred native boot prewarm never being called. Commit `f4a632e` restored C's `batch fit → prewarm → listen` ordering; `scratch/rust-host-live/prewarm-restore-LH1LIp/` records C→Rust→Rust→C TTFT 880.9/836.0/860.4/897.5 ms (Rust mean 4.61% below C). Commit `4fc8ef4` also narrowed reported prefill time to the computed suffix sync; the live Rust result is 69.2 tok/s versus C 68.2--69.0.
 

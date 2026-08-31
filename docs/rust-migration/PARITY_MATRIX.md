@@ -1,11 +1,28 @@
 # Parity matrix
 
-> **Freshness (2026-08-26 22:40 KST):** restamped from post-promote §10
-> CAND `cb11c0b`. Live authority remains the campaign status doc.
-> Production defaults are Rust. Historical phase-gate notes below are
-> kept as provenance; the 60-cell table is the gate.
+> **Freshness (2026-08-31 KST):** the Qwen delta from the `v0.6.5-dfm`
+> lineage is re-stamped at `6ca85c8`. Production defaults remain Rust.
+> The older post-promote matrix is retained as provenance; the complete
+> cross-family v0.6.5/proof/soak re-stamp is still a gate.
 
-## Post-promote §10 (`cb11c0b`)
+## Qwen v0.6.5 delta re-stamp (`6ca85c8`)
+
+Full identities, artifact scope, commands, hashes, and raw-evidence paths are
+recorded in
+[QWEN_V065_RESTAMP_2026-08-31.md](QWEN_V065_RESTAMP_2026-08-31.md).
+
+| Axis | Result |
+|---|---|
+| Numerical | Q5 loader, SSD-PLE, QSA, MoE, GDN, two-bank batch, embedded MTP, and shared MMQ gates PASS |
+| Token | Qwen tokenizer goldens PASS; C→Rust→Rust→C text and image outputs are exact |
+| KV | same-image reuse, changed-pixel rejection, cross-worker disk restore, two-bank disk/partial-fork lifecycle PASS |
+| Wire/API | image Chat, Responses, and Anthropic PASS; continuous width 2, static width 2, serial fallback, `/v1/models`, and `/v1/stats` PASS |
+| Performance | text prefill 99.97%, decode 100.00%, TTFT +0.95%, worker VmHWM +4.40%, GPU residency exact; image prefill 100.20%, TTFT +0.32% |
+
+This is the requested Q5 main GGUF plus shared Sidecar scope. Safetensors,
+resident BF16, Q6, and their reference gates were intentionally not loaded.
+
+## Historical post-promote §10 (`cb11c0b`)
 
 Evidence: `.omo/evidence/task-53-rerun-cb11c0b.txt`.
 PASS 55 + PASS* 5 (E-2..E-6) + FAIL 0 + BLOCKED 0.
@@ -501,6 +518,7 @@ Makefile variables, not flags:
 | Solar | `test-solar-{loader,tokenizer,forward,session,kda,kda-prefill,kda-chunk,gates,kv}` |
 | K-EXAONE | `test-exaone-{ref,kernels,batch}` |
 | dots3-note | `test-dots3-{loader,tokenizer,resident}` |
+| Qwen3.8 Flash Next | `test-qwen4exp-{loader,tokenizer,ple,ple-cuda,primitives,hc-forward,ple-compute,qsa,qsa-forward,moe,moe-forward,gdn,gdn-forward,batch}` on Q5+Sidecar |
 | Shared | `test-model-family-kernels`, `test-mmq-parity` |
 
 Resident tests load real weights. Use tmux + workspace-local
@@ -520,6 +538,29 @@ C → Rust → Rust → C
 or ABBA. Publish SHA + GGUF identity + command/env with the numbers.
 Unexplained 2–3% is a fail even if it sits inside the provisional
 percent table.
+
+### Recorded ABBA (2026-08-31, Qwen Q5+Sidecar)
+
+Candidate `6ca85c8`, C Qwen cut `4d40d97`, Q5 three-shard main GGUF plus the
+shared four-file SSD-PLE Sidecar, ctx 196,608, two banks, prefill chunk 8,192,
+embedded MTP draft 2, temperature 0. Every cell used a fresh owner/worker pair;
+C and Rust were never resident together, and `clear_cache` ran only after both
+PIDs exited.
+
+All text cells returned the same 64-token output (SHA-256 `3ab21f93...`):
+
+| Cell | Prefill tok/s | Decode tok/s | TTFT ms | Worker VmHWM KiB | Worker GPU MiB |
+|---|---:|---:|---:|---:|---:|
+| C #1 | 519.7 | 14.4 | 7,954.7 | 1,852,404 | 23,471 |
+| Rust #1 | 518.6 | 14.5 | 8,044.9 | 1,933,444 | 23,471 |
+| Rust #2 | 518.8 | 14.4 | 8,041.3 | 1,929,004 | 23,471 |
+| C #2 | 518.0 | 14.5 | 7,979.9 | 1,847,240 | 23,471 |
+
+Rust/C means were 99.97% prefill, 100.00% decode, +0.95% TTFT, +4.40%
+worker VmHWM, and identical GPU residency. All four image cells returned
+`MEN WALK ON MOON` (SHA-256 `991530ac...`); Rust/C means were 100.20% image
+prefill and +0.32% image TTFT. The six-token image decode sample is not used
+as a performance gate.
 
 ### Recorded ABBA (2026-08-24, cross-lane)
 

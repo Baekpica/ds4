@@ -1,7 +1,9 @@
 # C golden baseline
 
-`v0.6.3-dfm` is not a convenience tag. It is the immutable correctness
-oracle for every Rust host change on `rust-host`.
+The resumed campaign uses the `v0.6.5-dfm` release lineage as its immutable
+correctness oracle. Qwen behavior is frozen at the final C feature cut
+`4d40d97`; see
+[QWEN_V065_RESTAMP_2026-08-31.md](QWEN_V065_RESTAMP_2026-08-31.md).
 
 Do not treat the C tree as “legacy reference only” while porting.
 If Rust and C disagree, Rust is wrong until a documented C bug is
@@ -10,25 +12,28 @@ fixed in C first, identified as its own commit, and then ported.
 ## Frozen identity
 
 ```text
-C baseline tag:     v0.6.3-dfm
-C baseline commit:  516456fe35510e4fb8350396c9d88807ac1f760b
-VERSION file:       v0.6.3-dfm
-git describe:       v0.6.3-dfm
-Annotated tag:      c2a6802facb89f2a3366aa534fd6637a912118a8
-                    (peels to 516456f)
-Parent merge:       e633543 Merge Entrpi v0.6.3 into ds4-dfm as v0.6.3-dfm
-Upstream absorbed:  Entrpi v0.6.3 (d92d93a)
+C baseline tag:     v0.6.5-dfm
+C baseline commit:  d02e2a4777a34a9f52fd987453b3ea1801fac52e
+VERSION file:       v0.6.5-dfm
+git describe:       v0.6.5-dfm
+Annotated tag:      07a7fc7a5d68e32170cb320b7a4d69042c85bb3a
+                    (peels to d02e2a4)
+Parent merge:       d02e2a4 Merge Entrpi v0.6.5 into ds4-dfm as v0.6.5-dfm
+Upstream absorbed:  Entrpi v0.6.5 (addc0c4)
+Qwen golden cut:    4d40d97 (post-tag image and two-bank completion)
+rust-host import:   d0384d9 (parents 09e33bf + 4d40d97)
 ```
 
-`rust-host` was created with:
+The original `rust-host` branch was created from `v0.6.3-dfm`. The baseline
+was deliberately advanced by the two-parent merge `d0384d9`; later `dfm`
+tips remain outside the frozen oracle.
 
 ```bash
-git checkout v0.6.3-dfm
-git checkout -b rust-host
+git merge --no-ff 4d40d97
 ```
 
-The `dfm` branch must not be merged into `rust-host`. Semantics are
-frozen at this SHA.
+The `dfm` branch must not be merged again into `rust-host`. Semantics are
+frozen at the identities above.
 
 ## Host recorded at branch creation
 
@@ -53,7 +58,8 @@ failure.
 
 ## GB10 OPP-C golden
 
-The architecture-specific native drift snapshot is:
+The existing architecture-specific native drift snapshot is retained as
+historical provenance:
 
 ```text
 tests/proof/expected/cuda-opp-c-full-sm121a-v0.6.3-dfm.json
@@ -74,6 +80,10 @@ replacing the older generic golden, which remains untouched.
 
 With the persisted `CUDA_ARCH=sm_121` build configuration,
 `make proof-cuda-opp-c` selects this GB10 golden automatically.
+
+That snapshot proves the older `v0.6.3-dfm` native path. It is not silently
+relabelled as a `v0.6.5-dfm` result; the current C-native and Rust-host proof
+manifest must be re-run before split readiness.
 
 ## What `v0.6.3-dfm` itself proved
 
@@ -187,6 +197,7 @@ Paths are host-local; identities are from the family doc.
 | Solar Open2 | `Solar-Open2-250B-MXQ-v1` 11 shards (95,533,532,160 bytes) |
 | K-EXAONE | 3-shard MXQ (85.56 GiB) |
 | dots3-note | `dots3-note-prev-MQ87` 10 shards (80.156 GiB) |
+| Qwen3.8 Flash Next | `MQ-Q5-SSD-PLE-BF16` 3 shards (83,274,984,384 bytes) + shared 4-file SSD-PLE sidecar |
 
 ## Re-measure checklist (before Phase 3 performance sign-off)
 

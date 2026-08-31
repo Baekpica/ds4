@@ -4,20 +4,22 @@ This directory is the working contract for moving the **production host
 runtime** of `ds4-dfm` from C to Rust. It does not redesign inference,
 CUDA, or the wire API.
 
-The C implementation at tag `v0.6.3-dfm` is the golden oracle. Rust
-reproduces that observable behavior. Architectural freedom belongs to
-the later independent `dfm-rs` repository, not to this branch.
+The C implementation in the `v0.6.5-dfm` release lineage is the golden
+oracle. The release tag peels to `d02e2a4`; Qwen behavior is frozen at the
+post-tag C cut `4d40d97`. Rust reproduces that observable behavior.
+Architectural freedom belongs to the later independent `ds4-dfm-rs`
+repository, not to this branch.
 
 ## Status
 
 | Item | Value |
 |---|---|
 | Branch | `rust-host` |
-| C golden baseline | `v0.6.3-dfm` (`516456fe35510e4fb8350396c9d88807ac1f760b`) |
-| Current phase | Phase 4 production KV integration is active. The isolated Store has a replacement-safe staged payload writer and C-read streamed trailer parity; ordinary serial Motif-3 no-think/no-tools visible replay is wired and the live C/Rust 4-way save/load matrix is green at the common `cold=0, continued=0` policy. Deferred boot prewarm now matches C placement ordering, and same-policy restore TTFT ABBA is green (C 880.9/897.5 ms, Rust 836.0/860.4 ms). C-default cold checkpoints are wired for this ordinary serial lane. For continued checkpoints, final-sync call ordering is CPU-green and the decode frontier is live-green: C and Rust wrote the same 6,800-token text/payload bodies, and C→Rust, Rust→C, Rust→Rust, and C→C restart cells each restored 6,800 cached tokens and returned the same output. The scoped DeepSeek CUDA ordinary-serial no-think/no-tools intermediate-prefill slice is also four-way live-green: a 6,782-token prompt produced exact C/Rust 4,096-token text/payload bodies and every loader restored 4,096 cached tokens. The scoped DeepSeek OpenAI Chat no-think tool-map lane is four-way live-green with deliberately reordered replay arguments and 424 cached tokens. Continuous-bank checkpoints and the full default-policy performance gate remain pending. Phase 7/8 host slices remain partial: sibling pointer assignment, CUDA weight upload, `ds4_engine_open`, model/session/scheduler execution, static serving, live multi-client batching, and Anthropic/Responses continuous are still native or missing. Rust proof smoke 2/2, long 6/6, same-host OPP-C 5/5, and the GB10 native oracle 5/5 are green. |
-| Default production path | C (`ds4`, `ds4-server`, `ds4-bench`, `ds4-agent`) |
+| C golden baseline | `v0.6.5-dfm` (`d02e2a4`), Qwen cut `4d40d97` |
+| Current phase | Post-promotion revalidation is active after importing the v0.6.5/Qwen delta. Q5+Sidecar text, image, three API surfaces, continuous/static/serial routing, image-aware live/disk KV, component/batch gates, and C→Rust→Rust→C ABBA are green at `6ca85c8`. Remaining host ownership work plus the complete family/proof/soak manifest still gate the split. |
+| Default production path | Rust host names over the unchanged native CUDA/MMQ backend; explicit `*-c` oracles retained |
 | Target production path | Rust host + unchanged native CUDA/MMQ backend |
-| Repo split | **not started**. Requires `SPLIT_READINESS.md` green. |
+| Repo split | Destination `../ds4-dfm-rs` exists with README/gitignore only; production-code genesis has not started and requires `SPLIT_READINESS.md` green. |
 
 Live subsystem progress lives in [STATUS.md](STATUS.md).
 
@@ -30,8 +32,9 @@ Live subsystem progress lives in [STATUS.md](STATUS.md).
 | [FFI_CONTRACT.md](FFI_CONTRACT.md) | Narrow opaque ABI; what Rust must never see |
 | [PARITY_MATRIX.md](PARITY_MATRIX.md) | Numerical / token / KV / wire / performance gates |
 | [STATUS.md](STATUS.md) | Subsystem matrix (always current) |
-| [DFM_RS_SPLIT_PLAN.md](DFM_RS_SPLIT_PLAN.md) | Post-split work instruction (§0–§60): non-fork `Baekpica/dfm-rs`, lineage/license preservation, v0.1.0 parity release. Execute only after `SPLIT_READINESS.md` is green. |
-| `SPLIT_READINESS.md` | Last artifact before `Baekpica/dfm-rs`. Do not create until green. |
+| [QWEN_V065_RESTAMP_2026-08-31.md](QWEN_V065_RESTAMP_2026-08-31.md) | Q5+Sidecar Rust live gate, family tests, and ABBA evidence |
+| [DFM_RS_SPLIT_PLAN.md](DFM_RS_SPLIT_PLAN.md) | Post-split work instruction (§0–§60), lineage/license preservation, and v0.1.0 parity release. Execute only after `SPLIT_READINESS.md` is green; the destination name is now `ds4-dfm-rs`. |
+| `SPLIT_READINESS.md` | Last artifact before production code enters `ds4-dfm-rs`. Do not create until green. |
 
 Related frozen oracles outside this directory:
 
@@ -68,7 +71,7 @@ Do not do any of the following on `rust-host`:
 - Clean up HTTP IDs, `finish_reason`, stream event order, or error envelopes
 - `git merge dfm` (that makes the oracle a moving target)
 - Mix a port commit with an optimization commit
-- Create `Baekpica/dfm-rs` before `SPLIT_READINESS.md` is green
+- Import production code into `ds4-dfm-rs` before `SPLIT_READINESS.md` is green
 
 If `dfm` later lands a CUDA correctness or performance fix, identify
 that commit, cherry-pick it onto `rust-host` on purpose, and rerun the
@@ -76,7 +79,7 @@ parity matrix. Do not absorb the whole branch.
 
 ## Phase order (fixed)
 
-0. Freeze `v0.6.3-dfm` and write these documents (this commit).
+0. Freeze the `v0.6.5-dfm` lineage and the Qwen C cut.
 1. Rust workspace + `native/bridge` FFI skeleton. No C port.
 2. Safe `ds4-core` wrappers. `unsafe` stays in `ds4-sys`.
 3. Shadow binaries `ds4-rs` / `ds4-bench-rs` calling the same C core.
@@ -112,8 +115,9 @@ Known remaining C dependency:
 
 ## Definition of done (pre-split)
 
-`v0.6.3-dfm` observable behavior remains the oracle; CUDA/MMQ stays
+The frozen `v0.6.5-dfm` lineage observable behavior remains the oracle;
+CUDA/MMQ stays
 native; Rust owns model / session / KV / server / distributed
 orchestration; numerical, token, KV, wire, and GB10 performance
 parity are proven. Then write `SPLIT_READINESS.md`. Only that green
-commit is the `dfm-rs` genesis point.
+commit is the `ds4-dfm-rs` genesis point.

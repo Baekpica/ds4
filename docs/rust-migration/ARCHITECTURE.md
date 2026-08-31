@@ -1,8 +1,9 @@
 # Architecture
 
 Rust owns host orchestration. Native CUDA/MMQ stays the GPU backend.
-The C tree at `v0.6.3-dfm` remains the behavior oracle until a
-subsystem has passed the parity matrix and is promoted.
+The C tree in the `v0.6.5-dfm` lineage remains the behavior oracle until a
+subsystem has passed the parity matrix and is promoted. Qwen behavior is
+frozen at the post-tag C cut `4d40d97`.
 
 ## Strangler, not rewrite
 
@@ -152,7 +153,7 @@ lifecycle; Rust must speak the same IPC manifest contract.
 
 Use `std::thread`, channels, `Mutex` / `Condvar`, and blocking
 sockets. Do not introduce Tokio, an async scheduler, or a new HTTP
-stack until `dfm-rs` exists. Language migration and concurrency
+stack until `ds4-dfm-rs` exists. Language migration and concurrency
 redesign must be separable.
 
 The current Rust server shadow lets client threads read/parse and drain
