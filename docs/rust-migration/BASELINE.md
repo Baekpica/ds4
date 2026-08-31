@@ -56,7 +56,7 @@ Rust toolchain (host, not yet in tree): rustc 1.98.0 / cargo 1.98.0
 `sm_121a`. `-arch=sm_121a` alone is the documented silent-wrong-arch
 failure.
 
-## GB10 OPP-C golden
+## GB10 OPP-C goldens
 
 The existing architecture-specific native drift snapshot is retained as
 historical provenance:
@@ -79,11 +79,31 @@ all five cells matched in both runs. This validates provenance without
 replacing the older generic golden, which remains untouched.
 
 With the persisted `CUDA_ARCH=sm_121` build configuration,
-`make proof-cuda-opp-c` selects this GB10 golden automatically.
+the historical file remains available by its explicit path.
 
 That snapshot proves the older `v0.6.3-dfm` native path. It is not silently
-relabelled as a `v0.6.5-dfm` result; the current C-native and Rust-host proof
-manifest must be re-run before split readiness.
+relabelled as a `v0.6.5-dfm` result.
+
+The active resumed-campaign snapshot is separate:
+
+```text
+tests/proof/expected/cuda-opp-c-full-sm121a-v0.6.5-dfm-4d40d97.json
+```
+
+It was generated from the detached Qwen C golden cut
+`4d40d97f1e575400237a6e5cef21d7f74404a38d` with all embedded cubins verified
+as `sm_121a`. The frozen C binary SHA-256 is
+`c175d9a302194417442673a2d8b1ec35af0b3f6dbdc71b788f0c5e5da5d8d164`.
+Its five 512-token cells use expanded-plan SHA-256
+`7072c94b00a68e4a9dd9bc52f06a235aeb5670de46902370167aa50d61539b8c`;
+all selected-token streams retain MD5 `6f1a24a5adf105053e9bed63fded9337`.
+
+The frozen binary first wrote the new file and then independently checked it
+5/5 under the 109/115 GiB memory guard. Evidence is under
+`scratch/rust-host-live/v065-full-restamp-20260831-184200/c-oracle-oppc{,-check}/`.
+With `CUDA_ARCH=sm_121`, `make proof-cuda-opp-c` now selects this v0.6.5 file.
+The current C-native and Rust-host proof manifest must still be re-run before
+split readiness.
 
 ## What `v0.6.3-dfm` itself proved
 

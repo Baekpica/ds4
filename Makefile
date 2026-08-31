@@ -243,7 +243,7 @@ cuda-regression: tests/cuda_long_context_smoke
 #     path. This complements, and never replaces, the committed native golden.
 DS4_PROOF_REQUIRE_BASE = @if [ -z "$$DS4_PROOF_BASE" ]; then echo "$@: set DS4_PROOF_BASE to a base model gguf path" >&2; exit 2; fi
 ifeq ($(strip $(CUDA_ARCH)),sm_121)
-DS4_PROOF_OPPC_EXPECTED := tests/proof/expected/cuda-opp-c-full-sm121a-v0.6.3-dfm.json
+DS4_PROOF_OPPC_EXPECTED := tests/proof/expected/cuda-opp-c-full-sm121a-v0.6.5-dfm-4d40d97.json
 else
 DS4_PROOF_OPPC_EXPECTED := tests/proof/expected/cuda-opp-c-full.json
 endif
