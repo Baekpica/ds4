@@ -106,17 +106,17 @@ impl PendingQueue {
         self.inner.lock().expect("forward queue").depth
     }
 
-    pub fn enqueue(&self, job: PendingRequest) -> bool {
+    pub fn enqueue(&self, job: PendingRequest) -> Result<(), &'static str> {
         let mut g = self.inner.lock().expect("forward queue");
         while !g.closing && g.queued >= g.depth {
             g = self.not_full.wait(g).expect("forward queue");
         }
         if g.closing {
-            return false;
+            return Err(ERR_NEXT_CLOSED);
         }
         g.jobs.push_back(job);
         g.queued += 1;
-        true
+        Ok(())
     }
 
     pub fn pop(&self) -> Option<PendingRequest> {

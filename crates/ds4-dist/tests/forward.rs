@@ -86,12 +86,12 @@ fn forwarder_strings_match_c() {
 fn pending_queue_blocks_at_window_and_pop_unblocks() {
     let q = PendingQueue::new(2);
     assert_eq!(q.depth(), 2);
-    assert!(q.enqueue(pending(1)));
-    assert!(q.enqueue(pending(2)));
+    assert!(q.enqueue(pending(1)).is_ok());
+    assert!(q.enqueue(pending(2)).is_ok());
     let (tx, rx) = mpsc::channel();
     thread::scope(|s| {
         s.spawn(|| {
-            assert!(q.enqueue(pending(3)));
+            assert!(q.enqueue(pending(3)).is_ok());
             tx.send(()).unwrap();
         });
         thread::sleep(Duration::from_millis(30));
@@ -107,8 +107,8 @@ fn pending_queue_blocks_at_window_and_pop_unblocks() {
 #[test]
 fn pending_queue_remove_and_note_send_done() {
     let q = PendingQueue::new(4);
-    assert!(q.enqueue(pending(9)));
-    assert!(q.enqueue(pending(10)));
+    assert!(q.enqueue(pending(9)).is_ok());
+    assert!(q.enqueue(pending(10)).is_ok());
     q.note_send_done(10, 42, 1.5);
     assert!(q.remove(9));
     let got = q.pop().unwrap();
@@ -122,7 +122,7 @@ fn pending_queue_remove_and_note_send_done() {
 fn pending_queue_close_rejects_enqueue() {
     let q = PendingQueue::new(2);
     q.close();
-    assert!(!q.enqueue(pending(1)));
+    assert_eq!(q.enqueue(pending(1)), Err(ERR_NEXT_CLOSED));
     q.clear();
     assert!(q.pop().is_none());
 }

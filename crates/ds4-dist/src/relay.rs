@@ -10,8 +10,7 @@ use std::time::Instant;
 use crate::codec::{Telemetry, MSG_RESULT};
 use crate::forward::{
     opened_forwarder_message, PendingQueue, PendingRequest, ERR_FORWARD, ERR_INVALID_RESULT,
-    ERR_NEXT_CLOSED, ERR_OOM_TRACK, ERR_RESULT_METADATA, ERR_RESULT_TOO_LARGE,
-    ERR_TELEMETRY_TOO_LARGE,
+    ERR_NEXT_CLOSED, ERR_RESULT_METADATA, ERR_RESULT_TOO_LARGE, ERR_TELEMETRY_TOO_LARGE,
 };
 use crate::reconnect::connect_endpoint;
 use crate::route::RouteEntry;
@@ -105,9 +104,7 @@ impl Forwarder {
 
     pub fn send_work(&self, request: PendingRequest, frame: &[u8]) -> Result<(), &'static str> {
         let request_id = request.request_id;
-        if !self.queue.enqueue(request) {
-            return Err(ERR_OOM_TRACK);
-        }
+        self.queue.enqueue(request)?;
         let send_t0 = now_sec();
         let write_rc = self.writer.lock().expect("forward send").write_all(frame);
         let send_t1 = now_sec();
