@@ -325,9 +325,11 @@ int main(int argc, char **argv) {
     size_t free_256_before = 0, free_256_after = 0, total_256 = 0;
     ds4_session *session_256k = NULL;
     int cache_256k_ok =
+        setenv("DS4_SESSION_LAZY_GRAPH", "0", 1) == 0 &&
         cudaMemGetInfo(&free_256_before, &total_256) == cudaSuccess &&
         ds4_session_create(&session_256k, engine, 262144) == 0 &&
         cudaMemGetInfo(&free_256_after, &total_256) == cudaSuccess;
+    unsetenv("DS4_SESSION_LAZY_GRAPH");
     const uint64_t cache_256k_delta =
         cache_256k_ok && free_256_before >= free_256_after
             ? (uint64_t)(free_256_before - free_256_after) : 0;

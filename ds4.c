@@ -62162,6 +62162,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 *out = NULL;
                 return 1;
             }
+            if (weight_ipc_base) model_release_mapping_cache(&e->model);
             if (weight_ipc_mtp &&
                 e->mtp_ready &&
                 !ds4_gpu_import_model_ipc_manifest(e->mtp_model.map,
@@ -62174,20 +62175,24 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 *out = NULL;
                 return 1;
             }
+            if (weight_ipc_mtp && e->mtp_ready)
+                model_release_mapping_cache(&e->mtp_model);
             /* DSpark drafter ranges ride the same manifest when the server was
              * booted with --drafter.  Soft-fail on absence: without imported
              * ranges the drafter reads stay on the unpinned host mmap (the
              * ~10-15 GB/s fragmented-folio path), which is slow but correct,
              * so a base+mtp-only manifest must not abort startup. */
             if (e->dspark_ready &&
-                getenv("DS4_CUDA_WEIGHT_IPC_NO_DRAFTER") == NULL &&
-                !ds4_gpu_import_model_ipc_manifest(e->dspark_model.map,
-                                                   e->dspark_model.size,
-                                                   weight_ipc_manifest,
-                                                   "drafter"))
-            {
-                fprintf(stderr, "ds4: CUDA shared drafter weight cache unavailable; "
-                                "DSpark drafter reads stay on the host mmap path\n");
+                getenv("DS4_CUDA_WEIGHT_IPC_NO_DRAFTER") == NULL) {
+                if (!ds4_gpu_import_model_ipc_manifest(e->dspark_model.map,
+                                                       e->dspark_model.size,
+                                                       weight_ipc_manifest,
+                                                       "drafter")) {
+                    fprintf(stderr, "ds4: CUDA shared drafter weight cache unavailable; "
+                                    "DSpark drafter reads stay on the host mmap path\n");
+                } else {
+                    model_release_mapping_cache(&e->dspark_model);
+                }
             }
         }
         /* One canonical boot line for the aligned-artifact perf tier, plus
