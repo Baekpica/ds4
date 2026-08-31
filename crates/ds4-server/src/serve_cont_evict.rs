@@ -70,6 +70,7 @@ mod tests {
         WarmBank {
             record: Some(WarmRecord {
                 text: text.as_bytes().to_vec(),
+                cache_text: None,
                 generation: 3,
                 ext_flags: 0,
                 trailer: Vec::new(),

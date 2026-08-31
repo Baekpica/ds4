@@ -377,6 +377,36 @@ int ds4_cont_last_done_stats(const ds4_batch_ctx *ctx,
     return 1;
 }
 
+int ds4_qwen_image_probe(const uint8_t *data, size_t data_len,
+                         ds4_qwen_image_info *info,
+                         char *err, size_t errlen) {
+    if (!data || data_len != 3 || !info) {
+        if (err && errlen) snprintf(err, errlen, "bad image probe");
+        return 1;
+    }
+    *info = (ds4_qwen_image_info){
+        .source_width = 1,
+        .source_height = 2,
+        .resized_width = 256,
+        .resized_height = 512,
+        .grid_h = 32,
+        .grid_w = 16,
+        .token_count = 128,
+    };
+    return 0;
+}
+
+int ds4_qwen_image_pixel_hash(const uint8_t *data, size_t data_len,
+                              uint64_t *hash,
+                              char *err, size_t errlen) {
+    if (!data || data_len != 3 || !hash) {
+        if (err && errlen) snprintf(err, errlen, "bad image hash");
+        return 1;
+    }
+    *hash = UINT64_C(0x0123456789abcdef);
+    return 0;
+}
+
 int ds4_gpu_mem_census_read(int consumer_class, int domain, ds4_mem_cell *out) {
     (void)consumer_class; (void)domain; (void)out;
     return 1;

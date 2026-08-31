@@ -5,8 +5,8 @@
 //! section is ignored the way `kv_tool_map_load_from_pos` returns 0.
 
 use crate::format::{
-    Record, EXT_BANK_REPLAY_V1, EXT_RESPONSES_VISIBLE, EXT_SESSION_TITLE, EXT_THINKING_VISIBLE,
-    EXT_TOOL_MAP,
+    Record, EXT_BANK_REPLAY_V1, EXT_IMAGE_PIXELS_V2, EXT_RESPONSES_VISIBLE, EXT_SESSION_TITLE,
+    EXT_THINKING_VISIBLE, EXT_TOOL_MAP,
 };
 
 pub const KTM_MAGIC: [u8; 3] = [b'K', b'T', b'M'];
@@ -66,7 +66,8 @@ impl Record {
 /// Bank persist always sets `EXT_BANK_REPLAY_V1`. Responses/title bits on
 /// the incoming header survive; thinking and KTM are applied from `ext`.
 pub fn bank_persist_ext_flags(keep: u8, thinking_visible: bool, has_trailer: bool) -> u8 {
-    let mut flags = EXT_BANK_REPLAY_V1 | (keep & (EXT_RESPONSES_VISIBLE | EXT_SESSION_TITLE));
+    let mut flags = EXT_BANK_REPLAY_V1
+        | (keep & (EXT_RESPONSES_VISIBLE | EXT_SESSION_TITLE | EXT_IMAGE_PIXELS_V2));
     if thinking_visible {
         flags |= EXT_THINKING_VISIBLE;
     }
@@ -203,13 +204,13 @@ mod tests {
     }
 
     #[test]
-    fn persist_bank_extensions_keeps_responses_visible_and_session_title() {
+    fn persist_bank_extensions_keeps_identity_responses_and_title() {
         // Given: a bank record that already carries Responses/title bits
         let mut rec = Record {
             header: crate::format::Header {
                 quant_bits: 2,
                 reason: crate::format::Reason::BankEvict,
-                ext_flags: EXT_RESPONSES_VISIBLE | EXT_SESSION_TITLE,
+                ext_flags: EXT_RESPONSES_VISIBLE | EXT_SESSION_TITLE | EXT_IMAGE_PIXELS_V2,
                 model_id: 1,
                 tokens: 8,
                 hits: 0,
@@ -234,7 +235,11 @@ mod tests {
         // Then: BANK_REPLAY_V1 + thinking land, and the two prior bits survive
         assert_eq!(
             rec.header.ext_flags,
-            EXT_BANK_REPLAY_V1 | EXT_THINKING_VISIBLE | EXT_RESPONSES_VISIBLE | EXT_SESSION_TITLE
+            EXT_BANK_REPLAY_V1
+                | EXT_THINKING_VISIBLE
+                | EXT_RESPONSES_VISIBLE
+                | EXT_SESSION_TITLE
+                | EXT_IMAGE_PIXELS_V2
         );
     }
 }

@@ -26,8 +26,9 @@ mod tok;
 mod validate;
 
 pub use batch::{
-    cont_sample_token, BankSnapshot, BatchCtx, ContAdmit, ContDriver, StaticBatchFinish,
-    StaticBatchRequest, StaticBatchResult, CONT_SAMPLE_GREEDY, CONT_SAMPLE_NONE,
+    cont_sample_token, qwen_image_pixel_hash, qwen_image_probe, BankSnapshot, BatchCtx, ContAdmit,
+    ContDriver, QwenImageInfo, QwenImageInput, StaticBatchFinish, StaticBatchRequest,
+    StaticBatchResult, CONT_SAMPLE_GREEDY, CONT_SAMPLE_NONE,
 };
 pub use bind::{
     bind_dspark_names, bind_mtp_names, bind_names, catalog_from_bind_name,

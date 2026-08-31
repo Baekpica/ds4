@@ -1203,6 +1203,41 @@ uint64_t ds4_bridge_mem_substrate_outstanding(void)
     return ds4_gpu_substrate_outstanding();
 }
 
+int ds4_bridge_qwen_image_probe(const uint8_t *data, size_t data_len,
+                                ds4_bridge_qwen_image_info *info,
+                                char *err, size_t errlen)
+{
+    ds4_qwen_image_info native;
+    int rc;
+
+    if (!info) {
+        set_err(err, errlen, "image info is NULL");
+        return 1;
+    }
+    memset(&native, 0, sizeof(native));
+    rc = ds4_qwen_image_probe(data, data_len, &native, err, errlen);
+    if (rc != 0) return rc;
+    info->source_width = native.source_width;
+    info->source_height = native.source_height;
+    info->resized_width = native.resized_width;
+    info->resized_height = native.resized_height;
+    info->grid_h = native.grid_h;
+    info->grid_w = native.grid_w;
+    info->token_count = native.token_count;
+    return 0;
+}
+
+int ds4_bridge_qwen_image_pixel_hash(const uint8_t *data, size_t data_len,
+                                     uint64_t *hash,
+                                     char *err, size_t errlen)
+{
+    if (!hash) {
+        set_err(err, errlen, "image hash is NULL");
+        return 1;
+    }
+    return ds4_qwen_image_pixel_hash(data, data_len, hash, err, errlen);
+}
+
 struct ds4_bridge_batch_ctx {
     ds4_batch_ctx *ctx;
 };
@@ -1580,6 +1615,15 @@ static int cont_tramp_admit(void *ud, ds4_cont_request *req)
     memset(req, 0, sizeof(*req));
     req->tokens = br.tokens;
     req->n = br.n;
+    if (br.image_count > 4u) return 0;
+    for (uint32_t i = 0; i < br.image_count; i++) {
+        req->images[i].data = br.images[i].data;
+        req->images[i].data_len = br.images[i].data_len;
+        req->images[i].token_offset = br.images[i].token_offset;
+        req->images[i].grid_h = br.images[i].grid_h;
+        req->images[i].grid_w = br.images[i].grid_w;
+    }
+    req->image_count = br.image_count;
     req->max_new = br.max_new;
     req->eos = br.eos;
     req->user = br.user;

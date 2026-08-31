@@ -11,6 +11,7 @@ use std::os::raw::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::ptr::{self, NonNull};
+use std::sync::Arc;
 
 use ds4_sys::{
     ds4_bridge_batch_ctx, ds4_bridge_batch_ctx_bank_load_payload_range,
@@ -20,6 +21,8 @@ use ds4_sys::{
     ds4_bridge_batch_ctx_raw_cap, ds4_bridge_batch_ctx_seq_cap,
     ds4_bridge_batch_ctx_supports_partial_reuse, ds4_bridge_batch_ctx_trim_free,
     ds4_bridge_cont_request, ds4_bridge_cont_stats, ds4_bridge_continuous_generate,
+    ds4_bridge_qwen_image_info, ds4_bridge_qwen_image_input, ds4_bridge_qwen_image_pixel_hash,
+    ds4_bridge_qwen_image_probe,
 };
 
 use crate::{cstring_payload_path, fail, Error, Model, Result};
@@ -32,12 +35,76 @@ pub fn cont_sample_token(token_id: i32) -> i32 {
     token_id + 2
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QwenImageInfo {
+    pub source_width: u32,
+    pub source_height: u32,
+    pub resized_width: u32,
+    pub resized_height: u32,
+    pub grid_h: u32,
+    pub grid_w: u32,
+    pub token_count: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct QwenImageInput {
+    pub data: Arc<[u8]>,
+    pub token_offset: u32,
+    pub grid_h: u32,
+    pub grid_w: u32,
+}
+
+pub fn qwen_image_probe(data: &[u8]) -> Result<QwenImageInfo> {
+    let mut info = ds4_bridge_qwen_image_info::default();
+    let mut err = [0u8; 512];
+    let rc = unsafe {
+        ds4_bridge_qwen_image_probe(
+            data.as_ptr(),
+            data.len(),
+            &mut info,
+            err.as_mut_ptr() as *mut c_char,
+            err.len(),
+        )
+    };
+    if rc != 0 {
+        return Err(fail(rc, &err));
+    }
+    Ok(QwenImageInfo {
+        source_width: info.source_width,
+        source_height: info.source_height,
+        resized_width: info.resized_width,
+        resized_height: info.resized_height,
+        grid_h: info.grid_h,
+        grid_w: info.grid_w,
+        token_count: info.token_count,
+    })
+}
+
+pub fn qwen_image_pixel_hash(data: &[u8]) -> Result<u64> {
+    let mut hash = 0;
+    let mut err = [0u8; 512];
+    let rc = unsafe {
+        ds4_bridge_qwen_image_pixel_hash(
+            data.as_ptr(),
+            data.len(),
+            &mut hash,
+            err.as_mut_ptr() as *mut c_char,
+            err.len(),
+        )
+    };
+    if rc != 0 {
+        return Err(fail(rc, &err));
+    }
+    Ok(hash)
+}
+
 /// One admission. `tokens` moves into the batch context and stays alive
 /// until that request's `on_done` fires (the engine borrows the buffer).
 #[derive(Debug, Clone)]
 pub struct ContAdmit {
     pub user: usize,
     pub tokens: Vec<i32>,
+    pub images: Vec<QwenImageInput>,
     pub max_new: i32,
     /// `< 0` selects the engine/family default EOS.
     pub eos: i32,
@@ -60,6 +127,7 @@ impl ContAdmit {
         Self {
             user,
             tokens,
+            images: Vec::new(),
             max_new,
             eos: -1,
             temperature: 0.0,
@@ -101,22 +169,44 @@ pub trait ContDriver {
     }
 }
 
+struct LiveAdmit {
+    tokens: Vec<i32>,
+    images: Vec<QwenImageInput>,
+}
+
 struct TrampCtx<'a> {
     driver: &'a mut dyn ContDriver,
-    /// Prompt buffers the engine may still read; freed on that user's done.
-    tokens_live: HashMap<usize, Vec<i32>>,
+    /// Prompt/image buffers the engine may still read; freed on that user's done.
+    live: HashMap<usize, LiveAdmit>,
 }
 
 unsafe extern "C" fn tramp_admit(ud: *mut c_void, req: *mut ds4_bridge_cont_request) -> c_int {
     let t = &mut *(ud as *mut TrampCtx);
     let admitted = catch_unwind(AssertUnwindSafe(|| t.driver.admit())).unwrap_or(None);
     let Some(a) = admitted else { return 0 };
+    if a.images.len() > 4 {
+        return 0;
+    }
     let user = a.user;
-    let entry = t.tokens_live.entry(user).or_default();
-    *entry = a.tokens;
+    let entry = t.live.entry(user).or_insert_with(|| LiveAdmit {
+        tokens: Vec::new(),
+        images: Vec::new(),
+    });
+    entry.tokens = a.tokens;
+    entry.images = a.images;
     let r = &mut *req;
-    r.tokens = entry.as_ptr();
-    r.n = entry.len() as i32;
+    r.tokens = entry.tokens.as_ptr();
+    r.n = entry.tokens.len() as i32;
+    for (dst, image) in r.images.iter_mut().zip(&entry.images) {
+        *dst = ds4_bridge_qwen_image_input {
+            data: image.data.as_ptr(),
+            data_len: image.data.len(),
+            token_offset: image.token_offset,
+            grid_h: image.grid_h,
+            grid_w: image.grid_w,
+        };
+    }
+    r.image_count = entry.images.len() as u32;
     r.max_new = a.max_new;
     r.eos = a.eos;
     r.user = user as *mut c_void;
@@ -168,7 +258,7 @@ unsafe extern "C" fn tramp_on_done(
             stats.decode_steps as i32,
         )
     }));
-    t.tokens_live.remove(&user);
+    t.live.remove(&user);
 }
 
 unsafe extern "C" fn tramp_sample_override(ud: *mut c_void, user: *mut c_void) -> c_int {
@@ -523,7 +613,7 @@ impl BatchCtx<'_> {
     pub fn continuous_generate(&mut self, driver: &mut dyn ContDriver) -> Result<()> {
         let mut t = TrampCtx {
             driver,
-            tokens_live: HashMap::new(),
+            live: HashMap::new(),
         };
         let mut err = [0u8; 512];
         let rc = unsafe {
@@ -564,6 +654,7 @@ mod tests {
         static SAVE_BANK: Cell<i32> = const { Cell::new(-1) };
         static STATIC_INPUT: RefCell<Vec<(Vec<i32>, i32, i32)>> = const { RefCell::new(Vec::new()) };
         static STATIC_OUTPUT_CAP: Cell<i32> = const { Cell::new(0) };
+        static CONT_INPUT: RefCell<Option<(Vec<i32>, Vec<u8>, u32, u32, u32)>> = const { RefCell::new(None) };
     }
 
     #[no_mangle]
@@ -595,6 +686,87 @@ mod tests {
         std::ptr::copy_nonoverlapping([101, 102, 201].as_ptr(), out_tokens, 3);
         std::ptr::copy_nonoverlapping([2, 1].as_ptr(), out_lengths, 2);
         std::ptr::copy_nonoverlapping([1, 0].as_ptr(), out_finish, 2);
+        0
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_qwen_image_probe(
+        _data: *const u8,
+        data_len: usize,
+        info: *mut ds4_bridge_qwen_image_info,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> c_int {
+        if data_len != 3 || info.is_null() {
+            return 1;
+        }
+        *info = ds4_bridge_qwen_image_info {
+            source_width: 1,
+            source_height: 2,
+            resized_width: 256,
+            resized_height: 512,
+            grid_h: 32,
+            grid_w: 16,
+            token_count: 128,
+        };
+        0
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_qwen_image_pixel_hash(
+        _data: *const u8,
+        data_len: usize,
+        hash: *mut u64,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> c_int {
+        if data_len != 3 || hash.is_null() {
+            return 1;
+        }
+        *hash = 0x0123_4567_89ab_cdef;
+        0
+    }
+
+    #[no_mangle]
+    unsafe extern "C" fn ds4_bridge_continuous_generate(
+        _c: *mut ds4_bridge_batch_ctx,
+        admit: Option<unsafe extern "C" fn(*mut c_void, *mut ds4_bridge_cont_request) -> c_int>,
+        _on_token: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, i32) -> c_int>,
+        on_done: Option<
+            unsafe extern "C" fn(
+                *mut c_void,
+                *mut c_void,
+                *const i32,
+                i32,
+                i32,
+                *const ds4_bridge_cont_stats,
+            ),
+        >,
+        ud: *mut c_void,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> c_int {
+        let mut req: ds4_bridge_cont_request = std::mem::zeroed();
+        if admit.is_none_or(|admit| admit(ud, &mut req) == 0) {
+            return 0;
+        }
+        let tokens = std::slice::from_raw_parts(req.tokens, req.n as usize).to_vec();
+        let image = &req.images[0];
+        let data = std::slice::from_raw_parts(image.data, image.data_len).to_vec();
+        CONT_INPUT.with(|input| {
+            *input.borrow_mut() =
+                Some((tokens, data, image.token_offset, image.grid_h, image.grid_w));
+        });
+        if let Some(on_done) = on_done {
+            on_done(
+                ud,
+                req.user,
+                std::ptr::null(),
+                0,
+                1,
+                &ds4_bridge_cont_stats::default(),
+            );
+        }
         0
     }
 
@@ -700,6 +872,77 @@ mod tests {
 
         assert_eq!(snapshot.tokens, [10, 20, 30]);
         assert_eq!(snapshot.generation, 43);
+    }
+
+    #[test]
+    fn qwen_image_probe_and_hash_hide_the_native_layout() {
+        let data = [1, 2, 3];
+        assert_eq!(
+            qwen_image_probe(&data).unwrap(),
+            QwenImageInfo {
+                source_width: 1,
+                source_height: 2,
+                resized_width: 256,
+                resized_height: 512,
+                grid_h: 32,
+                grid_w: 16,
+                token_count: 128,
+            }
+        );
+        assert_eq!(qwen_image_pixel_hash(&data).unwrap(), 0x0123_4567_89ab_cdef);
+    }
+
+    #[test]
+    fn continuous_admit_keeps_qwen_image_payload_alive() {
+        struct Driver {
+            pending: bool,
+            done: bool,
+        }
+        impl ContDriver for Driver {
+            fn admit(&mut self) -> Option<ContAdmit> {
+                if !self.pending {
+                    return None;
+                }
+                self.pending = false;
+                let mut admit = ContAdmit::cold(7, vec![10, 20], 1);
+                admit.images.push(QwenImageInput {
+                    data: vec![1, 2, 3].into(),
+                    token_offset: 11,
+                    grid_h: 32,
+                    grid_w: 16,
+                });
+                Some(admit)
+            }
+
+            fn on_token(&mut self, _user: usize, _token: i32) -> bool {
+                true
+            }
+
+            fn on_done(
+                &mut self,
+                user: usize,
+                _tokens: &[i32],
+                _finish: i32,
+                _decode_ms: f64,
+                _decode_tokens: i32,
+                _decode_steps: i32,
+            ) {
+                assert_eq!(user, 7);
+                self.done = true;
+            }
+        }
+
+        CONT_INPUT.with(|input| *input.borrow_mut() = None);
+        let mut driver = Driver {
+            pending: true,
+            done: false,
+        };
+        fake_batch().continuous_generate(&mut driver).unwrap();
+        assert!(driver.done);
+        assert_eq!(
+            CONT_INPUT.with(|input| input.borrow().clone()).unwrap(),
+            (vec![10, 20], vec![1, 2, 3], 11, 32, 16)
+        );
     }
 
     #[test]

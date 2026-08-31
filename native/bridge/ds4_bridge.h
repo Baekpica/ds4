@@ -317,6 +317,31 @@ int ds4_bridge_mem_census_snap(ds4_bridge_mem_census *out);
 int ds4_bridge_mem_observe_snap(ds4_bridge_mem_observe *out);
 uint64_t ds4_bridge_mem_substrate_outstanding(void);
 
+typedef struct {
+    const uint8_t *data;
+    size_t data_len;
+    uint32_t token_offset;
+    uint32_t grid_h;
+    uint32_t grid_w;
+} ds4_bridge_qwen_image_input;
+
+typedef struct {
+    uint32_t source_width;
+    uint32_t source_height;
+    uint32_t resized_width;
+    uint32_t resized_height;
+    uint32_t grid_h;
+    uint32_t grid_w;
+    uint32_t token_count;
+} ds4_bridge_qwen_image_info;
+
+int ds4_bridge_qwen_image_probe(const uint8_t *data, size_t data_len,
+                                ds4_bridge_qwen_image_info *info,
+                                char *err, size_t errlen);
+int ds4_bridge_qwen_image_pixel_hash(const uint8_t *data, size_t data_len,
+                                     uint64_t *hash,
+                                     char *err, size_t errlen);
+
 /* Continuous batching (mid-flight admit/evict) over a persistent batch
  * context.  Mirrors ds4_batch_ctx / ds4_engine_continuous_generate with
  * a narrow request struct; the engine's rolling scheduler stays native.
@@ -375,6 +400,8 @@ int ds4_bridge_batch_ctx_bank_load_payload_range(ds4_bridge_batch_ctx *c,
 typedef struct {
     const int32_t *tokens;  /* caller-owned; keep alive until on_done */
     int32_t n;
+    ds4_bridge_qwen_image_input images[4];
+    uint32_t image_count;
     int32_t max_new;
     int32_t eos;            /* < 0 => engine default */
     void *user;

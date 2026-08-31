@@ -778,8 +778,13 @@ pub struct GenerateOutcome {
 }
 
 pub fn generation_blocked(parsed: &ParsedRequest, model_id: i32) -> Option<&'static str> {
-    (!parsed.images.is_empty() && model_id != ModelSyntax::Qwen4Exp as i32)
-        .then_some("image input is supported only by Qwen4Exp")
+    if parsed.images.is_empty() {
+        None
+    } else if model_id != ModelSyntax::Qwen4Exp as i32 {
+        Some("image input is supported only by Qwen4Exp")
+    } else {
+        Some("image input requires continuous runtime")
+    }
 }
 
 pub fn chat_format_for_syntax(syntax: ModelSyntax) -> ChatFormat {

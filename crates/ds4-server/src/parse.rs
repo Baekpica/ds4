@@ -12,6 +12,7 @@ use crate::models::{model_alias_disables_thinking, model_alias_enables_thinking}
 use crate::route::{
     compute_needs, think_mode_from_enabled, Api, NeedInput, ReqKind, ThinkMode, WireSurface,
 };
+use std::sync::Arc;
 
 pub const DEFAULT_TEMPERATURE: f32 = 1.0;
 pub const DEFAULT_TOP_P: f32 = 1.0;
@@ -46,7 +47,7 @@ pub enum ImageMime {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestImage {
     pub mime: ImageMime,
-    pub data: Vec<u8>,
+    pub data: Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -290,7 +291,10 @@ fn add_image_base64(
         return Err("image bytes do not match declared media type".into());
     }
     let index = images.len();
-    images.push(RequestImage { mime, data });
+    images.push(RequestImage {
+        mime,
+        data: data.into(),
+    });
     Ok(index)
 }
 

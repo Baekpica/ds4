@@ -15,7 +15,7 @@ use ds4_kv::Store as KvStore;
 #[cfg(feature = "native")]
 use ds4_kv::{bank_checkpoint_due_from_host, HostKvView};
 #[cfg(any(feature = "native", test))]
-use ds4_kv::{bank_persist_ext_flags, Reason as KvReason};
+use ds4_kv::{bank_persist_ext_flags, Reason as KvReason, EXT_IMAGE_PIXELS_V2};
 
 use crate::dsml::{SampleOverride, SamplePolicy};
 use crate::generate::{
@@ -45,6 +45,10 @@ pub struct ContStepper {
     pub job_id: String,
     pub model_id: i32,
     pub prompt: Vec<u8>,
+    #[cfg(feature = "native")]
+    cache_prompt: Option<Vec<u8>>,
+    #[cfg(feature = "native")]
+    image_cache_spans: Vec<ImageCacheSpan>,
     pub prompt_n: i32,
     pub max_tokens: i32,
     acc: SemAccum,
@@ -132,6 +136,10 @@ impl ContStepper {
                 job_id: job_id.to_string(),
                 model_id,
                 prompt,
+                #[cfg(feature = "native")]
+                cache_prompt: None,
+                #[cfg(feature = "native")]
+                image_cache_spans: Vec::new(),
                 prompt_n,
                 max_tokens,
                 acc,
@@ -465,6 +473,121 @@ impl ContStepper {
     }
 }
 
+#[cfg(any(feature = "native", test))]
+const QWEN_IMAGE_CACHE_PREFIX: &[u8] = b"\xffDS4IMG2:";
+#[cfg(any(feature = "native", test))]
+const QWEN_IMAGE_CACHE_MARKER_LEN: usize = 53;
+#[cfg(any(feature = "native", test))]
+const QWEN_IMAGE_PAD: &[u8] = b"<|image_pad|>";
+
+#[cfg(any(feature = "native", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ImageCacheSpan {
+    marker_start: usize,
+    marker_end: usize,
+    token_offset: u32,
+}
+
+#[cfg(any(feature = "native", test))]
+#[derive(Clone, Copy)]
+struct ImageCacheIdentity {
+    pixel_hash: u64,
+    grid_h: u32,
+    grid_w: u32,
+    token_count: u32,
+    token_offset: u32,
+}
+
+#[cfg(any(feature = "native", test))]
+fn qwen_image_cache_text_build(
+    text: &[u8],
+    images: &[ImageCacheIdentity],
+) -> Result<(Vec<u8>, Vec<ImageCacheSpan>), &'static str> {
+    if images.is_empty() || images.len() > 4 {
+        return Err("image cache key requires an image");
+    }
+    let capacity = text
+        .len()
+        .checked_add(
+            images
+                .len()
+                .checked_mul(QWEN_IMAGE_CACHE_MARKER_LEN)
+                .ok_or("image cache key overflow")?,
+        )
+        .ok_or("image cache key overflow")?;
+    let mut key = Vec::with_capacity(capacity);
+    let mut spans = Vec::with_capacity(images.len());
+    let mut cursor = 0;
+    for image in images {
+        let pad = text[cursor..]
+            .windows(QWEN_IMAGE_PAD.len())
+            .position(|window| window == QWEN_IMAGE_PAD)
+            .map(|offset| cursor + offset)
+            .ok_or("image cache key is missing an image placeholder")?;
+        let through_pad = pad + QWEN_IMAGE_PAD.len();
+        key.extend_from_slice(&text[cursor..through_pad]);
+        let marker_start = key.len();
+        key.extend_from_slice(QWEN_IMAGE_CACHE_PREFIX);
+        key.extend_from_slice(
+            format!(
+                "{:016x}:{:08x}:{:08x}:{:08x}",
+                image.pixel_hash, image.grid_h, image.grid_w, image.token_count
+            )
+            .as_bytes(),
+        );
+        key.push(0xfe);
+        let marker_end = key.len();
+        if marker_end - marker_start != QWEN_IMAGE_CACHE_MARKER_LEN {
+            return Err("image cache key overflow");
+        }
+        spans.push(ImageCacheSpan {
+            marker_start,
+            marker_end,
+            token_offset: image.token_offset,
+        });
+        cursor = through_pad;
+    }
+    key.extend_from_slice(&text[cursor..]);
+    Ok((key, spans))
+}
+
+#[cfg(any(feature = "native", test))]
+fn qwen_image_cache_marker_at(bytes: &[u8]) -> bool {
+    bytes.len() >= QWEN_IMAGE_CACHE_MARKER_LEN
+        && bytes.starts_with(QWEN_IMAGE_CACHE_PREFIX)
+        && bytes[25] == b':'
+        && bytes[34] == b':'
+        && bytes[43] == b':'
+        && bytes[52] == 0xfe
+        && (QWEN_IMAGE_CACHE_PREFIX.len()..52)
+            .all(|i| matches!(i, 25 | 34 | 43) || bytes[i].is_ascii_hexdigit())
+}
+
+#[cfg(any(feature = "native", test))]
+fn qwen_image_cache_text_strip(key: &[u8]) -> Option<Vec<u8>> {
+    let mut text = Vec::with_capacity(key.len());
+    let mut markers = 0;
+    let mut i = 0;
+    while i < key.len() {
+        if qwen_image_cache_marker_at(&key[i..]) {
+            i += QWEN_IMAGE_CACHE_MARKER_LEN;
+            markers += 1;
+        } else {
+            text.push(key[i]);
+            i += 1;
+        }
+    }
+    (markers > 0).then_some(text)
+}
+
+#[cfg(any(feature = "native", test))]
+fn qwen_image_cache_token_cap(spans: &[ImageCacheSpan], cache_lcp: usize) -> usize {
+    spans
+        .iter()
+        .find(|span| cache_lcp >= span.marker_start && cache_lcp < span.marker_end)
+        .map_or(usize::MAX, |span| span.token_offset as usize)
+}
+
 fn last_delta(raw: &[u8], emit_limit: usize, piece_len: usize) -> Option<&[u8]> {
     if emit_limit == 0 {
         return None;
@@ -496,6 +619,7 @@ pub(crate) struct WarmBank {
 #[derive(Debug)]
 pub(crate) struct WarmRecord {
     pub(crate) text: Vec<u8>,
+    pub(crate) cache_text: Option<Vec<u8>>,
     pub(crate) generation: u64,
     pub(crate) ext_flags: u8,
     pub(crate) trailer: Vec<u8>,
@@ -504,30 +628,79 @@ pub(crate) struct WarmRecord {
 /// Keep Responses/title bits across retire so the next persist still
 /// writes them. Trailer is rebuilt at persist time.
 #[cfg(any(feature = "native", test))]
-fn retired_record(prev: Option<&WarmRecord>, key: Vec<u8>, generation: u64) -> Option<WarmRecord> {
+fn retired_record(
+    prev: Option<&WarmRecord>,
+    key: Vec<u8>,
+    cache_text: Option<Vec<u8>>,
+    generation: u64,
+) -> Option<WarmRecord> {
+    let mut ext_flags = prev.map(|record| record.ext_flags).unwrap_or(0) & !EXT_IMAGE_PIXELS_V2;
+    if cache_text.is_some() {
+        ext_flags |= EXT_IMAGE_PIXELS_V2;
+    }
     (!key.is_empty()).then(|| WarmRecord {
         text: key,
+        cache_text,
         generation,
-        ext_flags: prev.map(|record| record.ext_flags).unwrap_or(0),
+        ext_flags,
         trailer: Vec::new(),
     })
 }
 
 #[cfg(any(feature = "native", test))]
-fn warm_match_pick(banks: &[WarmBank], prompt: &[u8]) -> Option<usize> {
+fn restored_record(key: Vec<u8>, generation: u64, ext_flags: u8) -> Option<WarmRecord> {
+    if ext_flags & EXT_IMAGE_PIXELS_V2 != 0 {
+        Some(WarmRecord {
+            text: qwen_image_cache_text_strip(&key)?,
+            cache_text: Some(key),
+            generation,
+            ext_flags,
+            trailer: Vec::new(),
+        })
+    } else {
+        Some(WarmRecord {
+            text: key,
+            cache_text: None,
+            generation,
+            ext_flags,
+            trailer: Vec::new(),
+        })
+    }
+}
+
+#[cfg(any(feature = "native", test))]
+fn extended_image_cache_key(prompt: &[u8], cache_prompt: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+    let suffix = key.strip_prefix(prompt)?;
+    let mut cache_key = Vec::with_capacity(cache_prompt.len().checked_add(suffix.len())?);
+    cache_key.extend_from_slice(cache_prompt);
+    cache_key.extend_from_slice(suffix);
+    Some(cache_key)
+}
+
+#[cfg(any(feature = "native", test))]
+fn warm_match_pick(
+    banks: &[WarmBank],
+    prompt: &[u8],
+    cache_prompt: Option<&[u8]>,
+) -> Option<usize> {
+    let request_key = cache_prompt.unwrap_or(prompt);
     let mut best = None;
     let mut best_len = 0;
     for (bank, state) in banks.iter().enumerate() {
         let Some(record) = state.record.as_ref() else {
             continue;
         };
-        if !record.text.is_empty()
-            && record.text.len() < prompt.len()
-            && record.text.len() > best_len
-            && prompt.starts_with(&record.text)
+        if record.cache_text.is_some() != cache_prompt.is_some() {
+            continue;
+        }
+        let key = record.cache_text.as_deref().unwrap_or(&record.text);
+        if !key.is_empty()
+            && key.len() < request_key.len()
+            && key.len() > best_len
+            && request_key.starts_with(key)
         {
             best = Some(bank);
-            best_len = record.text.len();
+            best_len = key.len();
         }
     }
     best
@@ -537,9 +710,11 @@ fn warm_match_pick(banks: &[WarmBank], prompt: &[u8]) -> Option<usize> {
 fn warm_partial_match_pick(
     banks: &[WarmBank],
     prompt: &[u8],
+    cache_prompt: Option<&[u8]>,
     min_prefix: usize,
 ) -> Option<(usize, usize)> {
-    if min_prefix == 0 || prompt.len() < min_prefix {
+    let request_key = cache_prompt.unwrap_or(prompt);
+    if min_prefix == 0 || request_key.len() < min_prefix {
         return None;
     }
     let mut best = None;
@@ -548,9 +723,13 @@ fn warm_partial_match_pick(
         let Some(record) = state.record.as_ref() else {
             continue;
         };
-        let prefix = prompt
+        if record.cache_text.is_some() != cache_prompt.is_some() {
+            continue;
+        }
+        let key = record.cache_text.as_deref().unwrap_or(&record.text);
+        let prefix = request_key
             .iter()
-            .zip(&record.text)
+            .zip(key)
             .take_while(|(left, right)| left == right)
             .count();
         if prefix >= min_prefix && prefix > best_len {
@@ -562,8 +741,16 @@ fn warm_partial_match_pick(
 }
 
 #[cfg(any(feature = "native", test))]
-fn warm_partial_token_cut(source: &[i32], prompt: &[i32], min_tokens: i32) -> Option<i32> {
-    let cap = source.len().min(prompt.len().saturating_sub(1));
+fn warm_partial_token_cut(
+    source: &[i32],
+    prompt: &[i32],
+    min_tokens: i32,
+    token_cap: usize,
+) -> Option<i32> {
+    let cap = source
+        .len()
+        .min(prompt.len().saturating_sub(1))
+        .min(token_cap);
     let cut = source
         .iter()
         .zip(prompt)
@@ -621,15 +808,18 @@ fn warm_record_superseded(banks: &[WarmBank], bank: usize) -> bool {
     let Some(record) = banks.get(bank).and_then(|state| state.record.as_ref()) else {
         return false;
     };
-    if record.text.is_empty() {
+    let key = record.cache_text.as_deref().unwrap_or(&record.text);
+    if key.is_empty() {
         return false;
     }
     banks.iter().enumerate().any(|(other_bank, state)| {
         other_bank != bank
-            && state
-                .record
-                .as_ref()
-                .is_some_and(|other| !other.text.is_empty() && other.text.starts_with(&record.text))
+            && state.record.as_ref().is_some_and(|other| {
+                let other_key = other.cache_text.as_deref().unwrap_or(&other.text);
+                other.cache_text.is_some() == record.cache_text.is_some()
+                    && !other_key.is_empty()
+                    && other_key.starts_with(key)
+            })
     })
 }
 
@@ -714,6 +904,7 @@ fn bank_retire_key(
 fn warm_admit_tokens(
     warm: &WarmBank,
     prompt: &[u8],
+    cache_prompt: Option<&[u8]>,
     snapshot_tokens: &[i32],
     generation: u64,
     seq_cap: i32,
@@ -723,15 +914,24 @@ fn warm_admit_tokens(
     if record.generation != generation {
         return None;
     }
-    let key = &record.text;
-    if key.is_empty() || key.len() >= prompt.len() || !prompt.starts_with(key) {
+    if record.cache_text.is_some() != cache_prompt.is_some() {
+        return None;
+    }
+    let key = record.cache_text.as_deref().unwrap_or(&record.text);
+    let request_key = cache_prompt.unwrap_or(prompt);
+    if key.is_empty()
+        || key.len() >= request_key.len()
+        || !request_key.starts_with(key)
+        || record.text.len() >= prompt.len()
+        || !prompt.starts_with(&record.text)
+    {
         return None;
     }
     let cached = i32::try_from(snapshot_tokens.len())
         .ok()
         .filter(|n| *n > 0)?;
     let mut tokens = snapshot_tokens.to_vec();
-    tokens.extend(tokenize_suffix(&prompt[key.len()..]));
+    tokens.extend(tokenize_suffix(&prompt[record.text.len()..]));
     if tokens.len() <= snapshot_tokens.len()
         || i32::try_from(tokens.len())
             .ok()
@@ -751,6 +951,7 @@ fn warm_partial_admit_tokens(
     generation: u64,
     min_tokens: i32,
     seq_cap: i32,
+    token_cap: usize,
 ) -> Option<(Vec<i32>, i32)> {
     let record = warm.record.as_ref()?;
     if record.generation != generation
@@ -761,7 +962,7 @@ fn warm_partial_admit_tokens(
     {
         return None;
     }
-    let cached = warm_partial_token_cut(snapshot_tokens, prompt_tokens, min_tokens)?;
+    let cached = warm_partial_token_cut(snapshot_tokens, prompt_tokens, min_tokens, token_cap)?;
     Some((prompt_tokens.to_vec(), cached))
 }
 
@@ -846,7 +1047,7 @@ pub(crate) fn save_bank_record(
     else {
         return Ok(false);
     };
-    let text = &record.text;
+    let text = record.cache_text.as_deref().unwrap_or(&record.text);
     let tokens = u32::try_from(committed)
         .map_err(|_| GenerateError::Engine("bank token count exceeds u32".into()))?;
     let keep_ext = record.ext_flags;
@@ -894,6 +1095,20 @@ pub trait ContExec {
     }
     fn encode_chat(&self, rendered: &[u8]) -> Vec<i32>;
     fn encode_text(&self, text: &str) -> Vec<i32>;
+    fn prepare_tokens(
+        &self,
+        parsed: &ParsedRequest,
+        _prompt: &[u8],
+        tokens: Vec<i32>,
+    ) -> Result<Vec<i32>, GenerateError> {
+        if parsed.images.is_empty() {
+            Ok(tokens)
+        } else {
+            Err(GenerateError::Unsupported(
+                "image input requires native continuous runtime",
+            ))
+        }
+    }
     /// `bank_hold_retry` keeps registry locking outside the native owner; a
     /// missing live reference asks the registry to preserve C's fail-closed rule.
     fn generate(
@@ -972,6 +1187,7 @@ pub fn cont_prompt_tokens(
         ReqKind::Completion => exec.encode_text(std::str::from_utf8(&prompt).unwrap_or("")),
         ReqKind::Chat => exec.encode_chat(&prompt),
     };
+    let tokens = exec.prepare_tokens(parsed, &prompt, tokens)?;
     Ok((prompt, tokens))
 }
 
@@ -982,7 +1198,10 @@ pub use native::ContLane;
 mod native {
     use super::*;
 
-    use ds4_core::{BatchCtx, ContAdmit, ContDriver, Vocab, CONT_SAMPLE_GREEDY, CONT_SAMPLE_NONE};
+    use ds4_core::{
+        qwen_image_pixel_hash, qwen_image_probe, BatchCtx, ContAdmit, ContDriver, QwenImageInput,
+        Vocab, CONT_SAMPLE_GREEDY, CONT_SAMPLE_NONE,
+    };
 
     use crate::serve_static::{BatchStatic, CoalesceLimits, StaticExec, StaticJob, StaticRow};
     use crate::tool_memory::ToolMemory;
@@ -1024,6 +1243,117 @@ mod native {
         stepper: ContStepper,
         capture_done: bool,
         t_arrive: Instant,
+    }
+
+    struct PreparedImages {
+        tokens: Vec<i32>,
+        images: Vec<QwenImageInput>,
+        cache_prompt: Option<Vec<u8>>,
+        cache_spans: Vec<ImageCacheSpan>,
+    }
+
+    fn prepare_qwen_images(
+        model_id: i32,
+        parsed: &ParsedRequest,
+        prompt: Option<&[u8]>,
+        tokens: Vec<i32>,
+    ) -> Result<PreparedImages, GenerateError> {
+        const IMAGE_PAD_TOKEN: i32 = 248056;
+        if parsed.images.is_empty() {
+            return Ok(PreparedImages {
+                tokens,
+                images: Vec::new(),
+                cache_prompt: None,
+                cache_spans: Vec::new(),
+            });
+        }
+        if model_id != 6 {
+            return Err(GenerateError::Unsupported(
+                "image input is supported only by Qwen4Exp",
+            ));
+        }
+        let mut probed = Vec::with_capacity(parsed.images.len());
+        let mut expanded_len = tokens.len();
+        for image in &parsed.images {
+            let info = qwen_image_probe(&image.data)
+                .map_err(|error| GenerateError::Engine(error.to_string()))?;
+            if info.token_count == 0 {
+                return Err(GenerateError::Engine(
+                    "Qwen image probe returned zero tokens".into(),
+                ));
+            }
+            expanded_len = expanded_len
+                .checked_add(info.token_count as usize - 1)
+                .ok_or_else(|| {
+                    GenerateError::Engine("expanded image prompt is too large".into())
+                })?;
+            probed.push(info);
+        }
+        if expanded_len > i32::MAX as usize {
+            return Err(GenerateError::Engine(
+                "expanded image prompt is too large".into(),
+            ));
+        }
+        let mut expanded = Vec::with_capacity(expanded_len);
+        let mut images = Vec::with_capacity(parsed.images.len());
+        let mut image_index = 0;
+        for token in tokens {
+            if token != IMAGE_PAD_TOKEN {
+                expanded.push(token);
+                continue;
+            }
+            let Some((image, info)) = parsed.images.get(image_index).zip(probed.get(image_index))
+            else {
+                return Err(GenerateError::Engine(
+                    "ambiguous literal <|image_pad|> in prompt".into(),
+                ));
+            };
+            let token_offset = u32::try_from(expanded.len())
+                .map_err(|_| GenerateError::Engine("expanded image prompt is too large".into()))?;
+            expanded.extend(std::iter::repeat_n(
+                IMAGE_PAD_TOKEN,
+                info.token_count as usize,
+            ));
+            images.push(QwenImageInput {
+                data: image.data.clone(),
+                token_offset,
+                grid_h: info.grid_h,
+                grid_w: info.grid_w,
+            });
+            image_index += 1;
+        }
+        if image_index != parsed.images.len() || expanded.len() != expanded_len {
+            return Err(GenerateError::Engine(
+                "Qwen image placeholder count does not match payloads".into(),
+            ));
+        }
+        let (cache_prompt, cache_spans) = if let Some(prompt) = prompt {
+            let identities = images
+                .iter()
+                .zip(&probed)
+                .map(|(image, info)| {
+                    Ok(ImageCacheIdentity {
+                        pixel_hash: qwen_image_pixel_hash(&image.data)
+                            .map_err(|error| GenerateError::Engine(error.to_string()))?,
+                        grid_h: info.grid_h,
+                        grid_w: info.grid_w,
+                        token_count: info.token_count,
+                        token_offset: image.token_offset,
+                    })
+                })
+                .collect::<Result<Vec<_>, GenerateError>>()?;
+            let (key, spans) = qwen_image_cache_text_build(prompt, &identities)
+                .map_err(|error| GenerateError::Engine(error.into()))?;
+            (Some(key), spans)
+        } else {
+            (None, Vec::new())
+        };
+        Ok(PreparedImages {
+            tokens: expanded,
+            images,
+            cache_prompt,
+            cache_spans,
+        })
     }
 
     impl PreparedSlot {
@@ -1279,12 +1609,17 @@ mod native {
             }
         }
 
-        fn warm_full_plan(&mut self, prompt: &[u8]) -> Option<WarmAdmitPlan> {
-            let source = warm_match_pick(&self.warm, prompt)?;
+        fn warm_full_plan(
+            &mut self,
+            prompt: &[u8],
+            cache_prompt: Option<&[u8]>,
+        ) -> Option<WarmAdmitPlan> {
+            let source = warm_match_pick(&self.warm, prompt, cache_prompt)?;
             let snapshot = self.batch.bank_snapshot(i32::try_from(source).ok()?).ok()?;
             let (tokens, cached) = warm_admit_tokens(
                 self.warm.get(source)?,
                 prompt,
+                cache_prompt,
                 &snapshot.tokens,
                 snapshot.generation,
                 self.batch.seq_cap(),
@@ -1302,13 +1637,16 @@ mod native {
         fn warm_partial_plan(
             &mut self,
             prompt: &[u8],
+            cache_prompt: Option<&[u8]>,
+            cache_spans: &[ImageCacheSpan],
             prompt_tokens: &[i32],
         ) -> Option<WarmAdmitPlan> {
             if !self.warm_fork_partial {
                 return None;
             }
             let min_prefix = usize::try_from(self.warm_partial_min).ok()?;
-            let (source, _) = warm_partial_match_pick(&self.warm, prompt, min_prefix)?;
+            let (source, cache_lcp) =
+                warm_partial_match_pick(&self.warm, prompt, cache_prompt, min_prefix)?;
             let snapshot = self.batch.bank_snapshot(i32::try_from(source).ok()?).ok()?;
             let (tokens, cached) = warm_partial_admit_tokens(
                 self.warm.get(source)?,
@@ -1317,6 +1655,7 @@ mod native {
                 snapshot.generation,
                 self.warm_partial_min,
                 self.batch.seq_cap(),
+                qwen_image_cache_token_cap(cache_spans, cache_lcp),
             )?;
             self.warm[source].committed_tokens = i32::try_from(snapshot.tokens.len()).ok()?;
             Some(WarmAdmitPlan {
@@ -1327,9 +1666,15 @@ mod native {
             })
         }
 
-        fn warm_plan(&mut self, prompt: &[u8], prompt_tokens: &[i32]) -> Option<WarmAdmitPlan> {
-            let full = self.warm_full_plan(prompt);
-            let partial = self.warm_partial_plan(prompt, prompt_tokens);
+        fn warm_plan(
+            &mut self,
+            prompt: &[u8],
+            cache_prompt: Option<&[u8]>,
+            cache_spans: &[ImageCacheSpan],
+            prompt_tokens: &[i32],
+        ) -> Option<WarmAdmitPlan> {
+            let full = self.warm_full_plan(prompt, cache_prompt);
+            let partial = self.warm_partial_plan(prompt, cache_prompt, cache_spans, prompt_tokens);
             match (full, partial) {
                 (Some(full), Some(partial)) if partial.cached > full.cached => Some(partial),
                 (Some(full), _) => Some(full),
@@ -1374,11 +1719,23 @@ mod native {
             &mut self,
             store: &mut KvStore,
             prompt: &[u8],
+            cache_prompt: Option<&[u8]>,
             protected: &[bool],
         ) -> Option<WarmAdmitPlan> {
             let identity = self.identity()?;
+            let request_key = cache_prompt.unwrap_or(prompt);
+            let identity_flags = cache_prompt
+                .is_some()
+                .then_some(EXT_IMAGE_PIXELS_V2)
+                .unwrap_or(0);
             let (path, envelope) = store
-                .bank_text_prefix_candidate(prompt, identity.0, identity.1, identity.2)
+                .bank_text_prefix_candidate_identity(
+                    request_key,
+                    identity.0,
+                    identity.1,
+                    identity.2,
+                    identity_flags,
+                )
                 .ok()??;
             let target = self.disk_victim(protected, envelope.header.tokens)?;
             if !disk_restore_target_allowed(
@@ -1389,6 +1746,7 @@ mod native {
             ) {
                 return None;
             }
+            let mut record = restored_record(envelope.text, 0, envelope.header.ext_flags)?;
             let snapshot = match self.batch.load_bank_payload_range(
                 i32::try_from(target).ok()?,
                 &path,
@@ -1406,12 +1764,8 @@ mod native {
                 return None;
             }
             let committed = i32::try_from(snapshot.tokens.len()).ok()?;
-            self.warm[target].record = Some(WarmRecord {
-                text: envelope.text,
-                generation: snapshot.generation,
-                ext_flags: envelope.header.ext_flags,
-                trailer: Vec::new(),
-            });
+            record.generation = snapshot.generation;
+            self.warm[target].record = Some(record);
             self.warm[target].committed_tokens = committed;
             self.warm[target].stored_tokens = committed;
             self.note_use(target);
@@ -1419,6 +1773,7 @@ mod native {
             let (tokens, cached) = warm_admit_tokens(
                 &self.warm[target],
                 prompt,
+                cache_prompt,
                 &snapshot.tokens,
                 snapshot.generation,
                 self.batch.seq_cap(),
@@ -1436,6 +1791,8 @@ mod native {
             &mut self,
             store: &mut KvStore,
             prompt: &[u8],
+            cache_prompt: Option<&[u8]>,
+            cache_spans: &[ImageCacheSpan],
             prompt_tokens: &[i32],
             protected: &[bool],
         ) -> Option<WarmAdmitPlan> {
@@ -1444,8 +1801,20 @@ mod native {
             }
             let identity = self.identity()?;
             let min_prefix = usize::try_from(self.warm_partial_min).ok()?;
-            let (path, envelope, _) = store
-                .bank_text_lcp_candidate(prompt, identity.0, identity.1, identity.2, min_prefix)
+            let request_key = cache_prompt.unwrap_or(prompt);
+            let identity_flags = cache_prompt
+                .is_some()
+                .then_some(EXT_IMAGE_PIXELS_V2)
+                .unwrap_or(0);
+            let (path, envelope, cache_lcp) = store
+                .bank_text_lcp_candidate_identity(
+                    request_key,
+                    identity.0,
+                    identity.1,
+                    identity.2,
+                    min_prefix,
+                    identity_flags,
+                )
                 .ok()??;
             let target = self.disk_victim(protected, envelope.header.tokens)?;
             if !disk_restore_target_allowed(
@@ -1456,6 +1825,7 @@ mod native {
             ) {
                 return None;
             }
+            let mut record = restored_record(envelope.text, 0, envelope.header.ext_flags)?;
             let snapshot = match self.batch.load_bank_payload_range(
                 i32::try_from(target).ok()?,
                 &path,
@@ -1473,12 +1843,8 @@ mod native {
                 return None;
             }
             let committed = i32::try_from(snapshot.tokens.len()).ok()?;
-            self.warm[target].record = Some(WarmRecord {
-                text: envelope.text,
-                generation: snapshot.generation,
-                ext_flags: envelope.header.ext_flags,
-                trailer: Vec::new(),
-            });
+            record.generation = snapshot.generation;
+            self.warm[target].record = Some(record);
             self.warm[target].committed_tokens = committed;
             self.warm[target].stored_tokens = committed;
             self.note_use(target);
@@ -1490,6 +1856,7 @@ mod native {
                 snapshot.generation,
                 self.warm_partial_min,
                 self.batch.seq_cap(),
+                qwen_image_cache_token_cap(cache_spans, cache_lcp),
             )?;
             Some(WarmAdmitPlan {
                 source: target,
@@ -1503,6 +1870,7 @@ mod native {
             &mut self,
             bank: i32,
             prompt: &[u8],
+            cache_prompt: Option<&[u8]>,
             done_tokens: &[i32],
             allow_generated_snapshot: bool,
         ) {
@@ -1537,8 +1905,18 @@ mod native {
                     .stored_tokens
                     .min(snapshot.tokens.len() as i32);
             }
-            self.warm[bank].record =
-                retired_record(self.warm[bank].record.as_ref(), key, snapshot.generation);
+            let cache_text = cache_prompt
+                .and_then(|cache_prompt| extended_image_cache_key(prompt, cache_prompt, &key));
+            if cache_prompt.is_some() && cache_text.is_none() {
+                self.warm[bank].record = None;
+                return;
+            }
+            self.warm[bank].record = retired_record(
+                self.warm[bank].record.as_ref(),
+                key,
+                cache_text,
+                snapshot.generation,
+            );
         }
 
         /// Live evict: same `save_bank_record` path as `persist_bank`,
@@ -1715,8 +2093,14 @@ mod native {
                     .encode_text(std::str::from_utf8(&prompt).unwrap_or("")),
                 ReqKind::Chat => self.vocab.encode_rendered_bytes(&prompt),
             };
+            let prepared_images =
+                prepare_qwen_images(self.model_id, parsed, Some(&prompt), tokens)?;
+            let tokens = prepared_images.tokens;
+            let images = prepared_images.images;
+            let cache_prompt = prepared_images.cache_prompt;
+            let cache_spans = prepared_images.cache_spans;
             let prompt_n = tokens.len() as i32;
-            let (stepper, head) = ContStepper::new(
+            let (mut stepper, head) = ContStepper::new(
                 parsed,
                 self.model_id,
                 work.job_id,
@@ -1727,6 +2111,8 @@ mod native {
                 prompt_n,
                 self.batch.seq_cap(),
             );
+            stepper.cache_prompt = cache_prompt;
+            stepper.image_cache_spans = cache_spans;
             let (temperature, top_k, top_p, min_p) = stepper.sampling(parsed);
             let capture_done = bank_scope(parsed);
             crate::serve_cont_roll::charge_roll_admit(
@@ -1746,17 +2132,34 @@ mod native {
                 let (hold, hold_retry) = self.protected_banks(bank_hold_retry);
                 let protected = reserve.protect(&hold);
                 let warm = if capture_done {
-                    self.warm_plan(&stepper.prompt, &tokens)
-                        .or_else(|| {
-                            store.as_deref_mut().and_then(|store| {
-                                self.disk_plan(store, &stepper.prompt, &protected)
-                            })
+                    self.warm_plan(
+                        &stepper.prompt,
+                        stepper.cache_prompt.as_deref(),
+                        &stepper.image_cache_spans,
+                        &tokens,
+                    )
+                    .or_else(|| {
+                        store.as_deref_mut().and_then(|store| {
+                            self.disk_plan(
+                                store,
+                                &stepper.prompt,
+                                stepper.cache_prompt.as_deref(),
+                                &protected,
+                            )
                         })
-                        .or_else(|| {
-                            store.as_deref_mut().and_then(|store| {
-                                self.disk_partial_plan(store, &stepper.prompt, &tokens, &protected)
-                            })
+                    })
+                    .or_else(|| {
+                        store.as_deref_mut().and_then(|store| {
+                            self.disk_partial_plan(
+                                store,
+                                &stepper.prompt,
+                                stepper.cache_prompt.as_deref(),
+                                &stepper.image_cache_spans,
+                                &tokens,
+                                &protected,
+                            )
                         })
+                    })
                 } else {
                     None
                 };
@@ -1788,6 +2191,7 @@ mod native {
             admit.top_p = top_p;
             admit.min_p = min_p;
             admit.seed = parsed.seed;
+            admit.images = images;
             Ok(PreparedSlot {
                 admit,
                 head,
@@ -1846,6 +2250,7 @@ mod native {
                 self.retire(
                     bank,
                     &job.stepper.prompt,
+                    job.stepper.cache_prompt.as_deref(),
                     &done_tokens,
                     allow_generated_snapshot,
                 );
@@ -1944,6 +2349,15 @@ mod native {
 
         fn encode_text(&self, text: &str) -> Vec<i32> {
             self.vocab.encode_text(text)
+        }
+
+        fn prepare_tokens(
+            &self,
+            parsed: &ParsedRequest,
+            _prompt: &[u8],
+            tokens: Vec<i32>,
+        ) -> Result<Vec<i32>, GenerateError> {
+            prepare_qwen_images(self.model_id, parsed, None, tokens).map(|prepared| prepared.tokens)
         }
 
         fn bank_live(&self, bank: i32) -> Option<(u64, i32)> {
@@ -2130,6 +2544,7 @@ mod bank_tests {
         WarmBank {
             record: Some(WarmRecord {
                 text: text.as_bytes().to_vec(),
+                cache_text: None,
                 generation: 1,
                 ext_flags: 0,
                 trailer: Vec::new(),
@@ -2254,6 +2669,7 @@ mod bank_tests {
         let warm = WarmBank {
             record: Some(WarmRecord {
                 text: b"shared".to_vec(),
+                cache_text: None,
                 generation: 7,
                 ext_flags: 0,
                 trailer: Vec::new(),
@@ -2262,13 +2678,14 @@ mod bank_tests {
             stored_tokens: 0,
             last_use: 0,
         };
-        assert!(warm_admit_tokens(&warm, b"shared", &[10, 11], 7, 8, |_| vec![12]).is_none());
-        assert!(warm_admit_tokens(&warm, b"other", &[10, 11], 7, 8, |_| vec![12]).is_none());
+        assert!(warm_admit_tokens(&warm, b"shared", None, &[10, 11], 7, 8, |_| vec![12]).is_none());
+        assert!(warm_admit_tokens(&warm, b"other", None, &[10, 11], 7, 8, |_| vec![12]).is_none());
         assert!(
-            warm_admit_tokens(&warm, b"shared suffix", &[10, 11], 8, 8, |_| vec![12]).is_none()
+            warm_admit_tokens(&warm, b"shared suffix", None, &[10, 11], 8, 8, |_| vec![12])
+                .is_none()
         );
         let (tokens, cached) =
-            warm_admit_tokens(&warm, b"shared suffix", &[10, 11], 7, 8, |suffix| {
+            warm_admit_tokens(&warm, b"shared suffix", None, &[10, 11], 7, 8, |suffix| {
                 assert_eq!(suffix, b" suffix");
                 vec![20, 21]
             })
@@ -2276,16 +2693,22 @@ mod bank_tests {
         assert_eq!(tokens, vec![10, 11, 20, 21]);
         assert_eq!(cached, 2);
         assert!(
-            warm_admit_tokens(&warm, b"shared suffix", &[10, 11], 7, 3, |_| vec![20, 21]).is_none()
+            warm_admit_tokens(&warm, b"shared suffix", None, &[10, 11], 7, 3, |_| {
+                vec![20, 21]
+            })
+            .is_none()
         );
     }
 
     #[test]
     fn multi_bank_match_uses_the_longest_strict_prefix() {
         let banks = vec![warm("shared", 3), warm("shared turn", 2), warm("other", 1)];
-        assert_eq!(warm_match_pick(&banks, b"shared turn suffix"), Some(1));
-        assert_eq!(warm_match_pick(&banks, b"shared turn"), Some(0));
-        assert_eq!(warm_match_pick(&banks, b"unrelated"), None);
+        assert_eq!(
+            warm_match_pick(&banks, b"shared turn suffix", None),
+            Some(1)
+        );
+        assert_eq!(warm_match_pick(&banks, b"shared turn", None), Some(0));
+        assert_eq!(warm_match_pick(&banks, b"unrelated", None), None);
     }
 
     #[test]
@@ -2296,11 +2719,11 @@ mod bank_tests {
             warm("other", 1),
         ];
         assert_eq!(
-            warm_partial_match_pick(&banks, b"shared system gamma", 5),
+            warm_partial_match_pick(&banks, b"shared system gamma", None, 5),
             Some((0, b"shared system ".len()))
         );
         assert_eq!(
-            warm_partial_match_pick(&banks, b"shared system gamma", 15),
+            warm_partial_match_pick(&banks, b"shared system gamma", None, 15),
             None
         );
     }
@@ -2308,35 +2731,121 @@ mod bank_tests {
     #[test]
     fn partial_cut_is_a_canonical_token_prefix_with_a_suffix_left_to_prefill() {
         assert_eq!(
-            warm_partial_token_cut(&[10, 11, 12, 13], &[10, 11, 12, 20], 3),
+            warm_partial_token_cut(&[10, 11, 12, 13], &[10, 11, 12, 20], 3, usize::MAX),
             Some(3)
         );
         assert_eq!(
-            warm_partial_token_cut(&[10, 11, 12, 13], &[10, 11, 12, 20], 4),
+            warm_partial_token_cut(&[10, 11, 12, 13], &[10, 11, 12, 20], 4, usize::MAX),
             None
         );
         assert_eq!(
-            warm_partial_token_cut(&[10, 11, 12], &[10, 11, 12], 2),
+            warm_partial_token_cut(&[10, 11, 12], &[10, 11, 12], 2, usize::MAX),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn qwen_image_cache_key_separates_pixels_and_caps_partial_reuse() {
+        let prompt = b"before<|image_pad|>after";
+        let identity = |pixel_hash| ImageCacheIdentity {
+            pixel_hash,
+            grid_h: 16,
+            grid_w: 16,
+            token_count: 64,
+            token_offset: 17,
+        };
+        let (red, spans) = qwen_image_cache_text_build(prompt, &[identity(1)]).unwrap();
+        let (same, _) = qwen_image_cache_text_build(prompt, &[identity(1)]).unwrap();
+        let (blue, _) = qwen_image_cache_text_build(prompt, &[identity(2)]).unwrap();
+        assert_eq!(
+            red,
+            b"before<|image_pad|>\xffDS4IMG2:0000000000000001:00000010:00000010:00000040\xfeafter"
+        );
+        assert_eq!(red, same);
+        assert_ne!(red, blue);
+        assert_eq!(qwen_image_cache_text_strip(&red).unwrap(), prompt);
+        let extended =
+            extended_image_cache_key(prompt, &red, b"before<|image_pad|>after answer").unwrap();
+        assert_eq!(&extended[..red.len()], red);
+        assert_eq!(&extended[red.len()..], b" answer");
+        let lcp = red.iter().zip(&blue).take_while(|(a, b)| a == b).count();
+        assert_eq!(qwen_image_cache_token_cap(&spans, lcp), 17);
+
+        let mut record_key = red.clone();
+        record_key.extend_from_slice(b" answer");
+        let banks = [WarmBank {
+            record: Some(WarmRecord {
+                text: b"before<|image_pad|>after answer".to_vec(),
+                cache_text: Some(record_key.clone()),
+                generation: 1,
+                ext_flags: EXT_IMAGE_PIXELS_V2,
+                trailer: Vec::new(),
+            }),
+            committed_tokens: 80,
+            stored_tokens: 0,
+            last_use: 1,
+        }];
+        let mut same_request = record_key;
+        same_request.extend_from_slice(b" tail");
+        let mut different_request = blue;
+        different_request.extend_from_slice(b" answer tail");
+        assert_eq!(
+            warm_match_pick(
+                &banks,
+                b"before<|image_pad|>after answer tail",
+                Some(&same_request),
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            warm_match_pick(
+                &banks,
+                b"before<|image_pad|>after answer tail",
+                Some(&different_request),
+            ),
+            None
+        );
+        assert_eq!(
+            warm_match_pick(&banks, b"before<|image_pad|>after answer tail", None),
+            None
         );
     }
 
     #[test]
     fn partial_admit_uses_canonical_prompt_tokens_and_validates_generation() {
         let warm = warm("shared system alpha", 7);
-        let (tokens, cached) =
-            warm_partial_admit_tokens(&warm, &[10, 11, 12, 20, 21], &[10, 11, 12, 13], 1, 3, 8)
-                .unwrap();
+        let (tokens, cached) = warm_partial_admit_tokens(
+            &warm,
+            &[10, 11, 12, 20, 21],
+            &[10, 11, 12, 13],
+            1,
+            3,
+            8,
+            usize::MAX,
+        )
+        .unwrap();
         assert_eq!(tokens, [10, 11, 12, 20, 21]);
         assert_eq!(cached, 3);
-        assert!(
-            warm_partial_admit_tokens(&warm, &[10, 11, 12, 20], &[10, 11, 12, 13], 2, 3, 8)
-                .is_none()
-        );
-        assert!(
-            warm_partial_admit_tokens(&warm, &[10, 11, 12, 20], &[10, 11, 12, 13], 1, 3, 3)
-                .is_none()
-        );
+        assert!(warm_partial_admit_tokens(
+            &warm,
+            &[10, 11, 12, 20],
+            &[10, 11, 12, 13],
+            2,
+            3,
+            8,
+            usize::MAX,
+        )
+        .is_none());
+        assert!(warm_partial_admit_tokens(
+            &warm,
+            &[10, 11, 12, 20],
+            &[10, 11, 12, 13],
+            1,
+            3,
+            3,
+            usize::MAX,
+        )
+        .is_none());
     }
 
     #[test]
@@ -2515,6 +3024,7 @@ mod bank_tests {
         let live = WarmBank {
             record: Some(WarmRecord {
                 text: b"live".to_vec(),
+                cache_text: None,
                 generation: 7,
                 ext_flags: 0,
                 trailer: Vec::new(),
@@ -2573,17 +3083,18 @@ mod bank_tests {
         use ds4_kv::{EXT_RESPONSES_VISIBLE, EXT_SESSION_TITLE};
         let prev = WarmRecord {
             text: b"old".to_vec(),
+            cache_text: None,
             generation: 1,
             ext_flags: EXT_RESPONSES_VISIBLE | EXT_SESSION_TITLE,
             trailer: b"ktm".to_vec(),
         };
-        let retired = retired_record(Some(&prev), b"new-key".to_vec(), 9).unwrap();
+        let retired = retired_record(Some(&prev), b"new-key".to_vec(), None, 9).unwrap();
         assert_eq!(retired.text, b"new-key");
         assert_eq!(retired.generation, 9);
         assert_eq!(retired.ext_flags, EXT_RESPONSES_VISIBLE | EXT_SESSION_TITLE);
-        assert!(retired_record(Some(&prev), Vec::new(), 9).is_none());
+        assert!(retired_record(Some(&prev), Vec::new(), None, 9).is_none());
         assert_eq!(
-            retired_record(None, b"fresh".to_vec(), 2)
+            retired_record(None, b"fresh".to_vec(), None, 2)
                 .unwrap()
                 .ext_flags,
             0
@@ -2598,6 +3109,7 @@ mod bank_tests {
         let mut warm = WarmBank {
             record: Some(WarmRecord {
                 text: b"shared prefix".to_vec(),
+                cache_text: None,
                 generation: 7,
                 ext_flags: 0,
                 trailer: trailer.clone(),
@@ -2653,6 +3165,58 @@ mod bank_tests {
         assert_eq!(error.to_string(), "stage failed");
         assert_eq!(warm.stored_tokens, 1);
         assert_eq!(store.read(&path).unwrap().payload, b"opaque");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn bank_save_persists_the_image_identity_key() {
+        let (dir, mut store) = temp_store("image-key");
+        let visible = b"before<|image_pad|>after".to_vec();
+        let (cache_key, _) = qwen_image_cache_text_build(
+            &visible,
+            &[ImageCacheIdentity {
+                pixel_hash: 7,
+                grid_h: 16,
+                grid_w: 16,
+                token_count: 64,
+                token_offset: 5,
+            }],
+        )
+        .unwrap();
+        let mut warm = WarmBank {
+            record: Some(WarmRecord {
+                text: visible.clone(),
+                cache_text: Some(cache_key.clone()),
+                generation: 3,
+                ext_flags: EXT_IMAGE_PIXELS_V2,
+                trailer: Vec::new(),
+            }),
+            committed_tokens: 64,
+            stored_tokens: 0,
+            last_use: 0,
+        };
+        assert!(save_bank_record(
+            &mut store,
+            &mut warm,
+            (6, 2, 8192),
+            64,
+            3,
+            Reason::BankCheckpoint,
+            |path| fs::write(path, b"opaque").map_err(|e| GenerateError::Engine(e.to_string())),
+        )
+        .unwrap());
+        let record = store.read(&store.entries()[0].path).unwrap();
+        assert_eq!(record.text, cache_key);
+        assert_eq!(
+            record.header.ext_flags,
+            EXT_BANK_REPLAY_V1 | EXT_IMAGE_PIXELS_V2
+        );
+        assert_eq!(
+            restored_record(record.text, 4, record.header.ext_flags)
+                .unwrap()
+                .text,
+            visible
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }

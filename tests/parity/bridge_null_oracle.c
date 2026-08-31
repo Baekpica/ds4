@@ -106,6 +106,29 @@ int main(void) {
     size_t tn = 99;
     uint64_t rng = 1;
 
+    {
+        const uint8_t image[] = {1, 2, 3};
+        ds4_bridge_qwen_image_info info;
+        uint64_t hash = 0;
+        memset(&info, 0, sizeof(info));
+        memset(err, 0, sizeof(err));
+        if (ds4_bridge_qwen_image_probe(image, sizeof(image), &info,
+                                        err, sizeof(err)) != 0 ||
+            info.source_width != 1 || info.source_height != 2 ||
+            info.grid_h != 32 || info.grid_w != 16 ||
+            info.token_count != 128)
+            fail("qwen image probe bridge");
+        if (ds4_bridge_qwen_image_pixel_hash(image, sizeof(image), &hash,
+                                             err, sizeof(err)) != 0 ||
+            hash != UINT64_C(0x0123456789abcdef))
+            fail("qwen image hash bridge");
+        memset(err, 0, sizeof(err));
+        if (ds4_bridge_qwen_image_probe(image, sizeof(image), NULL,
+                                        err, sizeof(err)) == 0 ||
+            !strstr(err, "NULL"))
+            fail("qwen image probe NULL info");
+    }
+
     memset(err, 0, sizeof(err));
     if (ds4_bridge_tokenize_text(NULL, "hi", toks, 4, &n, err, sizeof(err)) == 0)
         fail("tokenize_text NULL model");

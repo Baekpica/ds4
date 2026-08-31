@@ -21,6 +21,7 @@ pub const EXT_RESPONSES_VISIBLE: u8 = 1 << 1;
 pub const EXT_THINKING_VISIBLE: u8 = 1 << 2;
 pub const EXT_SESSION_TITLE: u8 = 1 << 3;
 pub const EXT_BANK_REPLAY_V1: u8 = 1 << 4;
+pub const EXT_IMAGE_PIXELS_V2: u8 = 1 << 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]

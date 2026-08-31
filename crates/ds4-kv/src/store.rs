@@ -3,7 +3,7 @@
 use crate::format::{
     fill_header, is_automatic_exact_replay, is_bank_replay_v1, path_for_sha, read_envelope,
     read_metadata, read_path, read_text_prefix, sha_hex_name, stage_stream, text_sha_hex,
-    write_path, Envelope, FormatError, Header, Record, EXT_TOOL_MAP,
+    write_path, Envelope, FormatError, Header, Record, EXT_IMAGE_PIXELS_V2, EXT_TOOL_MAP,
 };
 use crate::policy::{
     eviction_score, file_size_bytes, file_size_fits, EvictionContext, Options, ScoreEntry,
@@ -300,6 +300,25 @@ impl Store {
         self.prefix_candidate(prompt, model_id, quant_bits, ctx_size, true)
     }
 
+    pub fn bank_text_prefix_candidate_identity(
+        &mut self,
+        prompt: &[u8],
+        model_id: u8,
+        quant_bits: u8,
+        ctx_size: u32,
+        identity_flags: u8,
+    ) -> io::Result<Option<(PathBuf, Envelope)>> {
+        self.prefix_candidate_identity(
+            prompt,
+            model_id,
+            quant_bits,
+            ctx_size,
+            true,
+            EXT_IMAGE_PIXELS_V2,
+            identity_flags,
+        )
+    }
+
     pub fn bank_text_lcp_candidate(
         &mut self,
         prompt: &[u8],
@@ -308,8 +327,50 @@ impl Store {
         ctx_size: u32,
         min_lcp: usize,
     ) -> io::Result<Option<(PathBuf, Envelope, usize)>> {
-        let Some((index, _)) = self.find_text_lcp(prompt, model_id, quant_bits, ctx_size, min_lcp)
-        else {
+        self.bank_text_lcp_candidate_with_identity(
+            prompt, model_id, quant_bits, ctx_size, min_lcp, 0, 0,
+        )
+    }
+
+    pub fn bank_text_lcp_candidate_identity(
+        &mut self,
+        prompt: &[u8],
+        model_id: u8,
+        quant_bits: u8,
+        ctx_size: u32,
+        min_lcp: usize,
+        identity_flags: u8,
+    ) -> io::Result<Option<(PathBuf, Envelope, usize)>> {
+        self.bank_text_lcp_candidate_with_identity(
+            prompt,
+            model_id,
+            quant_bits,
+            ctx_size,
+            min_lcp,
+            EXT_IMAGE_PIXELS_V2,
+            identity_flags,
+        )
+    }
+
+    fn bank_text_lcp_candidate_with_identity(
+        &mut self,
+        prompt: &[u8],
+        model_id: u8,
+        quant_bits: u8,
+        ctx_size: u32,
+        min_lcp: usize,
+        identity_mask: u8,
+        identity_flags: u8,
+    ) -> io::Result<Option<(PathBuf, Envelope, usize)>> {
+        let Some((index, _)) = self.find_text_lcp_with_identity(
+            prompt,
+            model_id,
+            quant_bits,
+            ctx_size,
+            min_lcp,
+            identity_mask,
+            identity_flags,
+        ) else {
             return Ok(None);
         };
         let entry = self.entries[index].clone();
@@ -330,6 +391,7 @@ impl Store {
             || header.model_id != model_id
             || (self.reject_different_quant && header.quant_bits != quant_bits)
             || header.ctx_size > ctx_size
+            || header.ext_flags & identity_mask != identity_flags & identity_mask
             || lcp < min_lcp
             || 8 * (lcp as u64) < u64::from(header.text_bytes)
             || text_sha_hex(&envelope.text) != entry.sha
@@ -347,10 +409,39 @@ impl Store {
         ctx_size: u32,
         require_suffix: bool,
     ) -> io::Result<Option<(PathBuf, Envelope)>> {
+        self.prefix_candidate_identity(prompt, model_id, quant_bits, ctx_size, require_suffix, 0, 0)
+    }
+
+    fn prefix_candidate_identity(
+        &mut self,
+        prompt: &[u8],
+        model_id: u8,
+        quant_bits: u8,
+        ctx_size: u32,
+        require_suffix: bool,
+        identity_mask: u8,
+        identity_flags: u8,
+    ) -> io::Result<Option<(PathBuf, Envelope)>> {
         let index = if require_suffix {
-            self.find_bank_text_prefix(prompt, model_id, quant_bits, ctx_size)
+            self.find_prefix_with_identity(
+                prompt,
+                model_id,
+                quant_bits,
+                ctx_size,
+                true,
+                identity_mask,
+                identity_flags,
+            )
         } else {
-            self.find_text_prefix(prompt, model_id, quant_bits, ctx_size)
+            self.find_prefix_with_identity(
+                prompt,
+                model_id,
+                quant_bits,
+                ctx_size,
+                false,
+                identity_mask,
+                identity_flags,
+            )
         };
         let Some(index) = index else {
             return Ok(None);
@@ -369,6 +460,7 @@ impl Store {
         if !is_automatic_exact_replay(header.reason, header.ext_flags)
             || !unchanged
             || header.model_id != model_id
+            || header.ext_flags & identity_mask != identity_flags & identity_mask
             || bank_without_logits
             || missing_suffix
             || envelope.text.len() > prompt.len()
@@ -447,11 +539,27 @@ impl Store {
         ctx_size: u32,
         require_suffix: bool,
     ) -> Option<usize> {
+        self.find_prefix_with_identity(prompt, model_id, quant_bits, ctx_size, require_suffix, 0, 0)
+    }
+
+    fn find_prefix_with_identity(
+        &mut self,
+        prompt: &[u8],
+        model_id: u8,
+        quant_bits: u8,
+        ctx_size: u32,
+        require_suffix: bool,
+        identity_mask: u8,
+        identity_flags: u8,
+    ) -> Option<usize> {
         self.refresh();
         let prompt_bytes = prompt.len();
         let mut best: Option<usize> = None;
         for (i, e) in self.entries.iter().enumerate() {
             if !is_automatic_exact_replay(e.header.reason, e.header.ext_flags) {
+                continue;
+            }
+            if e.header.ext_flags & identity_mask != identity_flags & identity_mask {
                 continue;
             }
             if e.header.text_bytes as usize > prompt_bytes {
@@ -501,6 +609,19 @@ impl Store {
         ctx_size: u32,
         min_lcp: usize,
     ) -> Option<(usize, usize)> {
+        self.find_text_lcp_with_identity(prompt, model_id, quant_bits, ctx_size, min_lcp, 0, 0)
+    }
+
+    fn find_text_lcp_with_identity(
+        &mut self,
+        prompt: &[u8],
+        model_id: u8,
+        quant_bits: u8,
+        ctx_size: u32,
+        min_lcp: usize,
+        identity_mask: u8,
+        identity_flags: u8,
+    ) -> Option<(usize, usize)> {
         if min_lcp == 0 || prompt.len() < min_lcp {
             return None;
         }
@@ -508,6 +629,9 @@ impl Store {
         let mut best: Option<(usize, usize, u64)> = None;
         for (i, e) in self.entries.iter().enumerate() {
             if !is_automatic_exact_replay(e.header.reason, e.header.ext_flags) {
+                continue;
+            }
+            if e.header.ext_flags & identity_mask != identity_flags & identity_mask {
                 continue;
             }
             if (e.header.tokens as i32) < self.opt.min_tokens {
@@ -882,6 +1006,61 @@ mod tests {
         store.write(r).unwrap();
         assert!(store.find_bank_text_prefix(b"hello", 0, 2, 2048).is_none());
         assert!(store.find_bank_text_prefix(b"hello!", 0, 2, 2048).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bank_identity_lookup_separates_image_and_text_records() {
+        let dir = std::env::temp_dir().join(format!("ds4-kv-bank-identity-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = Store::open(&dir, 16, false, Options::default()).unwrap();
+        let mut plain = rec(b"plain identity", 512);
+        plain.header.reason = Reason::BankCheckpoint;
+        plain.header.ext_flags = crate::format::EXT_BANK_REPLAY_V1;
+        store.write(plain).unwrap();
+        let mut image = rec(b"image identity", 512);
+        image.header.reason = Reason::BankCheckpoint;
+        image.header.ext_flags =
+            crate::format::EXT_BANK_REPLAY_V1 | crate::format::EXT_IMAGE_PIXELS_V2;
+        store.write(image).unwrap();
+
+        assert!(store
+            .bank_text_prefix_candidate_identity(
+                b"plain identity tail",
+                0,
+                2,
+                2048,
+                EXT_IMAGE_PIXELS_V2,
+            )
+            .unwrap()
+            .is_none());
+        assert!(store
+            .bank_text_prefix_candidate_identity(b"image identity tail", 0, 2, 2048, 0)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .bank_text_prefix_candidate_identity(
+                b"image identity tail",
+                0,
+                2,
+                2048,
+                EXT_IMAGE_PIXELS_V2,
+            )
+            .unwrap()
+            .is_some());
+        assert!(
+            store
+                .bank_text_lcp_candidate_identity(
+                    b"image identitX",
+                    0,
+                    2,
+                    2048,
+                    8,
+                    EXT_IMAGE_PIXELS_V2,
+                )
+                .unwrap()
+                .is_some()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
