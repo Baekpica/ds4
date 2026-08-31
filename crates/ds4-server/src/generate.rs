@@ -777,8 +777,9 @@ pub struct GenerateOutcome {
     pub finish: String,
 }
 
-pub fn generation_blocked(_parsed: &ParsedRequest, _model_id: i32) -> Option<&'static str> {
-    None
+pub fn generation_blocked(parsed: &ParsedRequest, model_id: i32) -> Option<&'static str> {
+    (!parsed.images.is_empty() && model_id != ModelSyntax::Qwen4Exp as i32)
+        .then_some("image input is supported only by Qwen4Exp")
 }
 
 pub fn chat_format_for_syntax(syntax: ModelSyntax) -> ChatFormat {

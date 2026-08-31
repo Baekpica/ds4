@@ -1,8 +1,9 @@
 //! C↔Rust four-surface JSON parsers (tokenize/render stay C).
 
 use ds4_server::{
-    parse_anthropic_request, parse_chat_request, parse_completion_request, parse_request,
-    parse_responses_request, ParseEnv, ParsedRequest, ToolChoice, WireSurface,
+    generation_blocked, parse_anthropic_request, parse_chat_request, parse_completion_request,
+    parse_request, parse_responses_request, ChatPart, ImageMime, ParseEnv, ParsedRequest,
+    ToolChoice, WireSurface, NEED_IMAGE,
 };
 
 use std::path::PathBuf;
@@ -324,4 +325,77 @@ fn parse_request_dispatcher_and_needs() {
     assert_eq!(r.kind as i32, 0);
     let r = parse_request(WireSurface::OpenaiCompletion, &e, r#"{"prompt":""}"#).unwrap();
     assert_eq!(r.kind as i32, 1);
+}
+
+#[test]
+fn qwen_image_inputs_normalize_across_all_three_surfaces() {
+    const PNG: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mP8",
+        "z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+    );
+    let bodies = [
+        format!(
+            r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"before"}},{{"type":"image_url","image_url":{{"url":"data:image/png;base64,{PNG}"}}}},{{"type":"text","text":"after"}}]}}]}}"#
+        ),
+        format!(
+            r#"{{"input":[{{"type":"message","role":"user","content":[{{"type":"input_text","text":"before"}},{{"type":"input_image","image_url":"data:image/png;base64,{PNG}"}},{{"type":"input_text","text":"after"}}]}}]}}"#
+        ),
+        format!(
+            r#"{{"messages":[{{"role":"user","content":[{{"type":"text","text":"before"}},{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{PNG}"}}}},{{"type":"text","text":"after"}}]}}]}}"#
+        ),
+    ];
+    let parsed = [
+        rust_parse("chat", &bodies[0]).unwrap(),
+        rust_parse("responses", &bodies[1]).unwrap(),
+        rust_parse("anthropic", &bodies[2]).unwrap(),
+    ];
+    for request in &parsed {
+        assert_eq!(request.images.len(), 1);
+        assert_eq!(request.images[0].mime, ImageMime::Png);
+        assert_eq!(request.messages[0].content, "beforeafter");
+        assert_eq!(
+            request.messages[0].parts,
+            [
+                ChatPart::Text("before".into()),
+                ChatPart::Image(0),
+                ChatPart::Text("after".into()),
+            ]
+        );
+        assert_ne!(request.needs & NEED_IMAGE, 0);
+        assert_eq!(
+            generation_blocked(request, 0),
+            Some("image input is supported only by Qwen4Exp")
+        );
+        assert_eq!(generation_blocked(request, 6), None);
+    }
+    assert_eq!(parsed[0].images[0].data, parsed[1].images[0].data);
+    assert_eq!(parsed[0].images[0].data, parsed[2].images[0].data);
+}
+
+#[test]
+fn image_input_rejects_remote_urls_wrong_magic_and_non_user_roles() {
+    let remote = r#"{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/x.png"}}]}]}"#;
+    assert_eq!(
+        rust_parse("chat", remote).unwrap_err(),
+        "image_url must be a base64 data URI"
+    );
+
+    const PNG: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mP8",
+        "z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+    );
+    let wrong_magic = format!(
+        r#"{{"messages":[{{"role":"user","content":[{{"type":"image_url","image_url":"data:image/jpeg;base64,{PNG}"}}]}}]}}"#
+    );
+    assert_eq!(
+        rust_parse("chat", &wrong_magic).unwrap_err(),
+        "image bytes do not match declared media type"
+    );
+    let assistant = format!(
+        r#"{{"messages":[{{"role":"assistant","content":[{{"type":"image_url","image_url":"data:image/png;base64,{PNG}"}}]}}]}}"#
+    );
+    assert_eq!(
+        rust_parse("chat", &assistant).unwrap_err(),
+        "images are allowed only in user messages"
+    );
 }

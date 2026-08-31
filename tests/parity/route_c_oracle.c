@@ -1,5 +1,5 @@
 /* C route_decide / request_compute_needs oracle. Copied from ds4_server.c
- * at v0.6.3-dfm so Rust can compare lane+reason without linking the server. */
+ * at v0.6.5-dfm so Rust can compare lane+reason without linking the server. */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,11 +20,13 @@ enum {
     DS4_NEED_DURABLE_RESPONSE     = 1u << 9,
     DS4_NEED_PREFILL_ONLY         = 1u << 10,
     DS4_NEED_BANK_FRONTIER        = 1u << 11,
+    DS4_NEED_IMAGE                = 1u << 12,
 };
 
 #define ROUTE_CONT_MASK  (DS4_NEED_STREAMING | DS4_NEED_PER_ROW_SAMPLING | \
                           DS4_NEED_THINKING | DS4_NEED_STOP_SCAN |         \
-                          DS4_NEED_TOOL_SCAN | DS4_NEED_TOKEN_IDS)
+                          DS4_NEED_TOOL_SCAN | DS4_NEED_TOKEN_IDS |         \
+                          DS4_NEED_IMAGE)
 #define ROUTE_STATIC_MASK ((uint32_t)0)
 #define ROUTE_LANE_NONE 0xFF
 enum { ROUTE_LANE_SERIAL = 0, ROUTE_LANE_CONTINUOUS, ROUTE_LANE_STATIC };
@@ -119,6 +121,11 @@ static ds4_route_decision route_decide(uint32_t needs, int surf,
                                                     : ROUTE_REASON_CONT;
         return d;
     }
+    if (needs & DS4_NEED_IMAGE) {
+        d.lane = ROUTE_LANE_NONE;
+        d.reason = ROUTE_REASON_CONT_UNAVAILABLE;
+        return d;
+    }
     if ((needs & ~ROUTE_STATIC_MASK) == 0 &&
         (surf == DS4_WIRE_OPENAI_CHAT || surf == DS4_WIRE_OPENAI_COMPLETION ||
          cont_promoted)) {
@@ -135,6 +142,7 @@ enum { API_OPENAI = 0, API_ANTHROPIC, API_RESPONSES };
 
 static uint32_t compute_needs(int api, int stream, float temperature, int think,
                               int stop_count, int has_tools, int echo,
+                              int has_images,
                               int resp_live_tool, int resp_live_reason,
                               int anth_live_tool, int bank_owned,
                               int max_set, int max_tokens) {
@@ -145,6 +153,7 @@ static uint32_t compute_needs(int api, int stream, float temperature, int think,
     if (stop_count > 0) n |= DS4_NEED_STOP_SCAN;
     if (has_tools) n |= DS4_NEED_TOOL_SCAN;
     if (echo) n |= DS4_NEED_TOKEN_IDS;
+    if (has_images) n |= DS4_NEED_IMAGE;
     if (resp_live_tool || resp_live_reason || anth_live_tool) {
         const int bank = bank_owned && !resp_live_reason;
         n |= bank ? DS4_NEED_BANK_FRONTIER : DS4_NEED_LIVE_FRONTIER;
@@ -198,13 +207,14 @@ int main(int argc, char **argv) {
         if (mode < 0) printf("ERROR");
         else printf("%d", mode);
     } else if (!strcmp(argv[1], "needs")) {
-        if (argc < 15) die("needs api stream temp think stops tools echo rlt rlr alt bank maxset maxt");
+        if (argc < 16) die("needs api stream temp think stops tools echo images rlt rlr alt bank maxset maxt");
         float temp = (float)strtod(argv[4], NULL);
         uint32_t n = compute_needs(
             need_i(argv[2]), need_i(argv[3]), temp, need_i(argv[5]),
             need_i(argv[6]), need_i(argv[7]), need_i(argv[8]),
             need_i(argv[9]), need_i(argv[10]), need_i(argv[11]),
-            need_i(argv[12]), need_i(argv[13]), need_i(argv[14]));
+            need_i(argv[12]), need_i(argv[13]), need_i(argv[14]),
+            need_i(argv[15]));
         printf("%u", n);
     } else {
         die("unknown command");

@@ -5,7 +5,7 @@
 use crate::json::{
     json_args_parse, json_escape_bytes, json_minify_raw_value, json_raw_value, Json,
 };
-use crate::parse::{ChatMsg, ToolCall, ToolChoice, ToolSchemaOrder};
+use crate::parse::{ChatMsg, ChatPart, ToolCall, ToolChoice, ToolSchemaOrder};
 use crate::route::{think_mode_enabled, ThinkMode};
 
 /// Copied from `ds4.c` `DS4_REASONING_EFFORT_HIGH_PREFIX`.
@@ -50,6 +50,9 @@ pub const QWEN_TOOL_CALL_START: &str = "<tool_call>";
 pub const QWEN_TOOL_CALL_END: &str = "</tool_call>";
 pub const QWEN_TOOL_RESPONSE_START: &str = "<tool_response>";
 pub const QWEN_TOOL_RESPONSE_END: &str = "</tool_response>";
+pub const QWEN_VISION_START: &str = "<|vision_start|>";
+pub const QWEN_IMAGE_PAD: &str = "<|image_pad|>";
+pub const QWEN_VISION_END: &str = "<|vision_end|>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSyntax {
@@ -1451,7 +1454,22 @@ pub fn render_qwen_chat_ex(
         if m.role == "user" && !chat_msg_is_model_tool_result(m) {
             put(&mut out, QWEN_IM_START);
             put(&mut out, "user\n");
-            put_trimmed(&mut out, &m.content);
+            if m.parts.is_empty() {
+                put_trimmed(&mut out, &m.content);
+            } else {
+                let mut content = String::new();
+                for part in &m.parts {
+                    match part {
+                        ChatPart::Text(text) => content.push_str(text),
+                        ChatPart::Image(_) => {
+                            content.push_str(QWEN_VISION_START);
+                            content.push_str(QWEN_IMAGE_PAD);
+                            content.push_str(QWEN_VISION_END);
+                        }
+                    }
+                }
+                put_trimmed(&mut out, &content);
+            }
             put(&mut out, QWEN_IM_END);
             out.push(b'\n');
             i += 1;

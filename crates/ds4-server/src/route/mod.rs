@@ -1,4 +1,4 @@
-//! `route_decide` + `request_compute_needs` from `ds4_server.c` at v0.6.3-dfm.
+//! `route_decide` + `request_compute_needs` from `ds4_server.c` at v0.6.5-dfm.
 //! Pure functions. Do not improve the table.
 // allow: SIZE_OK — frozen C route_decide / compute_needs table; do not split.
 
@@ -17,13 +17,15 @@ pub const NEED_CORRECTIVE_RECOVERY: u32 = 1 << 8;
 pub const NEED_DURABLE_RESPONSE: u32 = 1 << 9;
 pub const NEED_PREFILL_ONLY: u32 = 1 << 10;
 pub const NEED_BANK_FRONTIER: u32 = 1 << 11;
+pub const NEED_IMAGE: u32 = 1 << 12;
 
 pub const ROUTE_CONT_MASK: u32 = NEED_STREAMING
     | NEED_PER_ROW_SAMPLING
     | NEED_THINKING
     | NEED_STOP_SCAN
     | NEED_TOOL_SCAN
-    | NEED_TOKEN_IDS;
+    | NEED_TOKEN_IDS
+    | NEED_IMAGE;
 pub const ROUTE_STATIC_MASK: u32 = 0;
 
 pub const LANE_SERIAL: u8 = 0;
@@ -118,6 +120,7 @@ pub struct NeedInput {
     pub live_state_bank_owned: bool,
     pub max_tokens_set: bool,
     pub max_tokens: i32,
+    pub has_images: bool,
 }
 
 pub fn wire_surface_for(api: Api, kind: ReqKind) -> WireSurface {
@@ -150,6 +153,9 @@ pub fn compute_needs(r: &NeedInput) -> u32 {
     }
     if r.return_token_ids {
         n |= NEED_TOKEN_IDS;
+    }
+    if r.has_images {
+        n |= NEED_IMAGE;
     }
     if r.responses_requires_live_tool_state
         || r.responses_requires_live_reasoning
@@ -246,6 +252,11 @@ pub fn route_decide(needs: u32, surf: WireSurface, env: &RouteEnv) -> RouteDecis
         } else {
             REASON_CONT
         };
+        return d;
+    }
+    if needs & NEED_IMAGE != 0 {
+        d.lane = LANE_NONE;
+        d.reason = REASON_CONT_UNAVAILABLE;
         return d;
     }
     if (needs & !ROUTE_STATIC_MASK) == 0

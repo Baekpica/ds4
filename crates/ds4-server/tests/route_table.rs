@@ -3,12 +3,13 @@
 use ds4_server::{
     compute_needs, route_decide, Api, NeedInput, ReqKind, RouteEnv, WireSurface, LANE_CONTINUOUS,
     LANE_NONE, LANE_SERIAL, LANE_STATIC, NEED_BANK_FRONTIER, NEED_CONTINUATION_PUBLISH,
-    NEED_CORRECTIVE_RECOVERY, NEED_DURABLE_RESPONSE, NEED_LIVE_FRONTIER, NEED_PER_ROW_SAMPLING,
-    NEED_PREFILL_ONLY, NEED_STOP_SCAN, NEED_STREAMING, NEED_THINKING, NEED_TOKEN_IDS,
-    NEED_TOOL_SCAN, REASON_COALESCE_OFF, REASON_CONT, REASON_CONT_BANK, REASON_CONT_UNAVAILABLE,
-    REASON_NEED_CONTINUATION_PUBLISH, REASON_NEED_DURABLE, REASON_NEED_LIVE_FRONTIER,
-    REASON_NEED_PREFILL_ONLY, REASON_STATIC_NO_CONT, REASON_STATIC_PROMPT_BOUNDS, REASON_SURFACE,
-    REASON_TOKEN_IDS_PROJECTION, REASON_TOOLS_COMPLETION,
+    NEED_CORRECTIVE_RECOVERY, NEED_DURABLE_RESPONSE, NEED_IMAGE, NEED_LIVE_FRONTIER,
+    NEED_PER_ROW_SAMPLING, NEED_PREFILL_ONLY, NEED_STOP_SCAN, NEED_STREAMING, NEED_THINKING,
+    NEED_TOKEN_IDS, NEED_TOOL_SCAN, REASON_COALESCE_OFF, REASON_CONT, REASON_CONT_BANK,
+    REASON_CONT_UNAVAILABLE, REASON_NEED_CONTINUATION_PUBLISH, REASON_NEED_DURABLE,
+    REASON_NEED_LIVE_FRONTIER, REASON_NEED_PREFILL_ONLY, REASON_STATIC_NO_CONT,
+    REASON_STATIC_PROMPT_BOUNDS, REASON_SURFACE, REASON_TOKEN_IDS_PROJECTION,
+    REASON_TOOLS_COMPLETION,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -143,6 +144,20 @@ fn reason_table_matches_c() {
         WireSurface::OpenaiChat,
         &no_ctx,
         LANE_SERIAL,
+        REASON_CONT_UNAVAILABLE,
+    );
+    assert_row(
+        NEED_IMAGE,
+        WireSurface::OpenaiChat,
+        &on,
+        LANE_CONTINUOUS,
+        REASON_CONT,
+    );
+    assert_row(
+        NEED_IMAGE,
+        WireSurface::OpenaiChat,
+        &no_ctx,
+        LANE_NONE,
         REASON_CONT_UNAVAILABLE,
     );
     assert_row(
@@ -547,6 +562,7 @@ fn c_needs(r: &NeedInput) -> u32 {
             &r.stop_count.to_string(),
             &(r.has_tools as i32).to_string(),
             &(r.return_token_ids as i32).to_string(),
+            &(r.has_images as i32).to_string(),
             &(r.responses_requires_live_tool_state as i32).to_string(),
             &(r.responses_requires_live_reasoning as i32).to_string(),
             &(r.anthropic_requires_live_tool_state as i32).to_string(),
@@ -580,6 +596,7 @@ fn blank() -> NeedInput {
         live_state_bank_owned: false,
         max_tokens_set: false,
         max_tokens: 128,
+        has_images: false,
     }
 }
 
@@ -635,6 +652,10 @@ fn compute_needs_matches_c() {
             api: Api::Responses,
             responses_requires_live_reasoning: true,
             live_state_bank_owned: true,
+            ..blank()
+        },
+        NeedInput {
+            has_images: true,
             ..blank()
         },
     ];

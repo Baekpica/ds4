@@ -95,8 +95,9 @@ pub use models::{
 };
 pub use parse::{
     default_temperature, parse_anthropic_request, parse_chat_request, parse_completion_request,
-    parse_request, parse_responses_request, ChatMsg, ParseEnv, ParsedRequest, ToolCall, ToolChoice,
-    ToolSchemaOrder, DEFAULT_MIN_P, DEFAULT_TEMPERATURE, DEFAULT_TOP_P,
+    parse_request, parse_responses_request, ChatMsg, ChatPart, ImageMime, ParseEnv, ParsedRequest,
+    RequestImage, ToolCall, ToolChoice, ToolSchemaOrder, DEFAULT_MIN_P, DEFAULT_TEMPERATURE,
+    DEFAULT_TOP_P,
 };
 pub use render::{
     append_tool_result_text, render_chat, render_chat_choice, render_dots3_chat, render_dsml_chat,
@@ -112,12 +113,13 @@ pub use route::{
     think_mode_from_enabled, wire_surface_for, Api, NeedInput, ReqKind, RouteDecision, RouteEnv,
     ThinkMode, WireSurface, LANE_CONTINUOUS, LANE_NONE, LANE_SERIAL, LANE_STATIC,
     NEED_BANK_FRONTIER, NEED_CONTINUATION_PUBLISH, NEED_CORRECTIVE_RECOVERY, NEED_DURABLE_RESPONSE,
-    NEED_LIVE_FRONTIER, NEED_PER_ROW_SAMPLING, NEED_PREFILL_ONLY, NEED_STOP_SCAN, NEED_STREAMING,
-    NEED_THINKING, NEED_TOKEN_IDS, NEED_TOOL_SCAN, REASON_COALESCE_OFF, REASON_CONT,
-    REASON_CONT_BANK, REASON_CONT_UNAVAILABLE, REASON_NAMES, REASON_NEED_CONTINUATION_PUBLISH,
-    REASON_NEED_CORRECTIVE_RECOVERY, REASON_NEED_DURABLE, REASON_NEED_LIVE_FRONTIER,
-    REASON_NEED_PREFILL_ONLY, REASON_STATIC_NO_CONT, REASON_STATIC_PROMPT_BOUNDS, REASON_SURFACE,
-    REASON_TOKEN_IDS_PROJECTION, REASON_TOOLS_COMPLETION,
+    NEED_IMAGE, NEED_LIVE_FRONTIER, NEED_PER_ROW_SAMPLING, NEED_PREFILL_ONLY, NEED_STOP_SCAN,
+    NEED_STREAMING, NEED_THINKING, NEED_TOKEN_IDS, NEED_TOOL_SCAN, REASON_COALESCE_OFF,
+    REASON_CONT, REASON_CONT_BANK, REASON_CONT_UNAVAILABLE, REASON_NAMES,
+    REASON_NEED_CONTINUATION_PUBLISH, REASON_NEED_CORRECTIVE_RECOVERY, REASON_NEED_DURABLE,
+    REASON_NEED_LIVE_FRONTIER, REASON_NEED_PREFILL_ONLY, REASON_STATIC_NO_CONT,
+    REASON_STATIC_PROMPT_BOUNDS, REASON_SURFACE, REASON_TOKEN_IDS_PROJECTION,
+    REASON_TOOLS_COMPLETION,
 };
 pub use serve::{
     accept_loop, accept_loop_with_engine, accept_loop_with_engine_cont, handle_client,

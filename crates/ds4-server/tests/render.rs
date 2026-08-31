@@ -2,8 +2,8 @@
 
 use ds4_server::{
     render_chat, render_chat_choice, render_dsml_chat, render_dsml_chat_choice,
-    render_motif3_chat_ex, ChatMsg, ModelSyntax, ThinkMode, ToolCall, ToolChoice, ToolSchemaOrder,
-    THINK_HIGH_PREFIX, THINK_MAX_PREFIX,
+    render_motif3_chat_ex, ChatMsg, ChatPart, ModelSyntax, ThinkMode, ToolCall, ToolChoice,
+    ToolSchemaOrder, THINK_HIGH_PREFIX, THINK_MAX_PREFIX,
 };
 
 use std::path::PathBuf;
@@ -420,6 +420,20 @@ fn qwen4exp_native_chat_protocol_matches_c() {
         )
         .as_bytes()
     );
+}
+
+#[test]
+fn qwen4exp_renders_image_parts_in_source_order() {
+    let mut user = msg("user", "beforeafter");
+    user.parts = vec![
+        ChatPart::Text("before".into()),
+        ChatPart::Image(0),
+        ChatPart::Text("after".into()),
+    ];
+    let prompt = render_chat(ModelSyntax::Qwen4Exp, &[user], "", ThinkMode::None).unwrap();
+    assert!(String::from_utf8(prompt)
+        .unwrap()
+        .contains("before<|vision_start|><|image_pad|><|vision_end|>after"));
 }
 
 #[test]

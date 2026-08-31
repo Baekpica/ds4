@@ -31,6 +31,24 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatPart {
+    Text(String),
+    Image(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageMime {
+    Png,
+    Jpeg,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestImage {
+    pub mime: ImageMime,
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ChatMsg {
     pub role: String,
@@ -41,6 +59,7 @@ pub struct ChatMsg {
     pub calls: Vec<ToolCall>,
     pub raw_dsml: String,
     pub raw_tool_text: String,
+    pub parts: Vec<ChatPart>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -114,6 +133,7 @@ pub struct ParsedRequest {
     pub directed_bank: Option<i32>,
     pub live_call_ids: Vec<String>,
     pub messages: Vec<ChatMsg>,
+    pub images: Vec<RequestImage>,
     pub tool_schemas: String,
     pub tool_orders: Vec<ToolSchemaOrder>,
     pub prompt_text: Option<String>,
@@ -152,6 +172,7 @@ impl ParsedRequest {
             directed_bank: None,
             live_call_ids: Vec::new(),
             messages: Vec::new(),
+            images: Vec::new(),
             tool_schemas: String::new(),
             tool_orders: Vec::new(),
             prompt_text: None,
@@ -175,8 +196,145 @@ impl ParsedRequest {
             live_state_bank_owned: self.live_state_bank_owned,
             max_tokens_set: self.max_tokens_set,
             max_tokens: self.max_tokens,
+            has_images: !self.images.is_empty(),
         });
     }
+}
+
+const CHAT_IMAGE_MAX_COUNT: usize = 4;
+const CHAT_IMAGE_MAX_BYTES: usize = 10 * 1024 * 1024;
+const CHAT_IMAGE_TOTAL_MAX: usize = 20 * 1024 * 1024;
+
+fn base64_value(c: u8) -> Option<u32> {
+    match c {
+        b'A'..=b'Z' => Some((c - b'A') as u32),
+        b'a'..=b'z' => Some((26 + c - b'a') as u32),
+        b'0'..=b'9' => Some((52 + c - b'0') as u32),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn base64_decode_image(src: &str, request_remaining: usize) -> Result<Vec<u8>, String> {
+    let src = src.as_bytes();
+    if src.is_empty() || src.len() & 3 != 0 {
+        return Err("invalid image base64 length".into());
+    }
+    let padding = usize::from(src[src.len() - 1] == b'=') + usize::from(src[src.len() - 2] == b'=');
+    let decoded = src.len() / 4 * 3 - padding;
+    if decoded == 0 || decoded > CHAT_IMAGE_MAX_BYTES {
+        return Err("image exceeds 10 MiB decoded limit".into());
+    }
+    if decoded > request_remaining {
+        return Err("images exceed 20 MiB request limit".into());
+    }
+    let mut out = Vec::with_capacity(decoded);
+    for (i, chunk) in src.chunks_exact(4).enumerate() {
+        let last = i + 1 == src.len() / 4;
+        let a = base64_value(chunk[0]);
+        let b = base64_value(chunk[1]);
+        let c = (chunk[2] != b'=').then(|| base64_value(chunk[2])).flatten();
+        let d = (chunk[3] != b'=').then(|| base64_value(chunk[3])).flatten();
+        if a.is_none()
+            || b.is_none()
+            || (chunk[2] != b'=' && c.is_none())
+            || (chunk[3] != b'=' && d.is_none())
+            || (!last && (c.is_none() || d.is_none()))
+            || (chunk[2] == b'=' && chunk[3] != b'=')
+            || (chunk[2] == b'=' && b.unwrap() & 15 != 0)
+            || (chunk[3] == b'=' && c.is_some_and(|v| v & 3 != 0))
+        {
+            return Err("invalid image base64 data".into());
+        }
+        let v = a.unwrap() << 18 | b.unwrap() << 12 | c.unwrap_or(0) << 6 | d.unwrap_or(0);
+        if out.len() < decoded {
+            out.push((v >> 16) as u8);
+        }
+        if out.len() < decoded {
+            out.push((v >> 8) as u8);
+        }
+        if out.len() < decoded {
+            out.push(v as u8);
+        }
+    }
+    if out.len() != decoded {
+        return Err("invalid image base64 padding".into());
+    }
+    Ok(out)
+}
+
+fn add_image_base64(
+    images: &mut Vec<RequestImage>,
+    mime_type: &str,
+    payload: &str,
+) -> Result<usize, String> {
+    let mime = match mime_type {
+        "image/png" => ImageMime::Png,
+        "image/jpeg" => ImageMime::Jpeg,
+        _ => return Err(format!("unsupported image media type: {mime_type}")),
+    };
+    if images.len() >= CHAT_IMAGE_MAX_COUNT {
+        return Err("at most 4 images are supported".into());
+    }
+    let total = images.iter().map(|image| image.data.len()).sum::<usize>();
+    if total > CHAT_IMAGE_TOTAL_MAX {
+        return Err("images exceed 20 MiB request limit".into());
+    }
+    let data = base64_decode_image(payload, CHAT_IMAGE_TOTAL_MAX - total)?;
+    let magic_matches = match mime {
+        ImageMime::Png => data.starts_with(b"\x89PNG\r\n\x1a\n"),
+        ImageMime::Jpeg => data.starts_with(&[0xff, 0xd8, 0xff]),
+    };
+    if !magic_matches {
+        return Err("image bytes do not match declared media type".into());
+    }
+    let index = images.len();
+    images.push(RequestImage { mime, data });
+    Ok(index)
+}
+
+fn add_image_data_uri(images: &mut Vec<RequestImage>, uri: &str) -> Result<usize, String> {
+    let Some(rest) = uri.strip_prefix("data:") else {
+        return Err("image_url must be a base64 data URI".into());
+    };
+    let Some((mime, payload)) = rest.split_once(";base64,") else {
+        return Err("image_url must be a base64 data URI".into());
+    };
+    if mime.is_empty() {
+        return Err("image_url must be a base64 data URI".into());
+    }
+    add_image_base64(images, mime, payload)
+}
+
+fn append_text_part(msg: &mut ChatMsg, text: String) {
+    msg.content.push_str(&text);
+    msg.parts.push(ChatPart::Text(text));
+}
+
+fn validate_image_references(msgs: &[ChatMsg], images: &[RequestImage]) -> Result<(), String> {
+    if images.is_empty() {
+        return Ok(());
+    }
+    let mut seen = vec![false; images.len()];
+    for msg in msgs {
+        for part in &msg.parts {
+            let ChatPart::Image(index) = part else {
+                continue;
+            };
+            if msg.role != "user" {
+                return Err("images are allowed only in user messages".into());
+            }
+            let Some(slot) = seen.get_mut(*index) else {
+                return Err("invalid image reference".into());
+            };
+            *slot = true;
+        }
+    }
+    if seen.iter().any(|seen| !seen) {
+        return Err("unreferenced image payload".into());
+    }
+    Ok(())
 }
 
 fn bad<T>(err: &mut String, fallback: &str) -> Result<T, String> {
@@ -515,7 +673,134 @@ fn parse_tool_calls_value(p: &mut Json<'_>) -> Option<Vec<ToolCall>> {
     Some(calls)
 }
 
-fn parse_messages(p: &mut Json<'_>) -> Option<Vec<ChatMsg>> {
+fn parse_chat_image_url(p: &mut Json<'_>) -> Option<String> {
+    p.ws();
+    if p.peek() == Some(b'"') {
+        return json_string(p);
+    }
+    if p.bump() != Some(b'{') {
+        return None;
+    }
+    let mut url = None;
+    p.ws();
+    while p.peek().is_some() && p.peek() != Some(b'}') {
+        let key = json_string(p)?;
+        p.ws();
+        if p.bump() != Some(b':') {
+            return None;
+        }
+        if key == "url" {
+            url = Some(json_string(p)?);
+        } else if !json_skip_value(p) {
+            return None;
+        }
+        p.ws();
+        if p.peek() == Some(b',') {
+            p.i += 1;
+        }
+        p.ws();
+    }
+    if p.bump() != Some(b'}') {
+        return None;
+    }
+    url
+}
+
+fn parse_openai_message_content(
+    p: &mut Json<'_>,
+    msg: &mut ChatMsg,
+    images: &mut Vec<RequestImage>,
+    err: &mut String,
+) -> bool {
+    p.ws();
+    if p.peek() == Some(b'"') {
+        return json_string(p).map(|s| msg.content = s).is_some();
+    }
+    if p.lit("null") {
+        msg.content.clear();
+        return true;
+    }
+    if p.bump() != Some(b'[') {
+        return false;
+    }
+    p.ws();
+    while p.peek().is_some() && p.peek() != Some(b']') {
+        if p.peek() == Some(b'"') {
+            let Some(text) = json_string(p) else {
+                return false;
+            };
+            append_text_part(msg, text);
+        } else if p.bump() == Some(b'{') {
+            let mut typ = None;
+            let mut text = None;
+            let mut image_url = None;
+            p.ws();
+            while p.peek().is_some() && p.peek() != Some(b'}') {
+                let Some(key) = json_string(p) else {
+                    return false;
+                };
+                p.ws();
+                if p.bump() != Some(b':') {
+                    return false;
+                }
+                if key == "type" {
+                    typ = json_string(p);
+                    if typ.is_none() {
+                        return false;
+                    }
+                } else if key == "text" {
+                    text = json_string(p);
+                    if text.is_none() {
+                        return false;
+                    }
+                } else if key == "image_url" {
+                    image_url = parse_chat_image_url(p);
+                    if image_url.is_none() {
+                        return false;
+                    }
+                } else if !json_skip_value(p) {
+                    return false;
+                }
+                p.ws();
+                if p.peek() == Some(b',') {
+                    p.i += 1;
+                }
+                p.ws();
+            }
+            if p.bump() != Some(b'}') {
+                return false;
+            }
+            match (typ.as_deref(), text, image_url) {
+                (Some("text"), Some(text), _) => append_text_part(msg, text),
+                (Some("image_url"), _, Some(url)) => match add_image_data_uri(images, &url) {
+                    Ok(index) => msg.parts.push(ChatPart::Image(index)),
+                    Err(error) => {
+                        *err = error;
+                        return false;
+                    }
+                },
+                _ => {
+                    *err = "unsupported chat content block".into();
+                    return false;
+                }
+            }
+        } else {
+            return false;
+        }
+        p.ws();
+        if p.peek() == Some(b',') {
+            p.i += 1;
+        }
+        p.ws();
+    }
+    p.bump() == Some(b']')
+}
+
+fn parse_messages(
+    p: &mut Json<'_>,
+    images: &mut Vec<RequestImage>,
+    err: &mut String,
+) -> Option<Vec<ChatMsg>> {
     p.ws();
     if p.bump() != Some(b'[') {
         return None;
@@ -537,7 +822,14 @@ fn parse_messages(p: &mut Json<'_>) -> Option<Vec<ChatMsg>> {
             if key == "role" {
                 msg.role = json_string(p)?;
             } else if key == "content" {
-                msg.content = json_content(p)?;
+                msg.content.clear();
+                msg.parts.clear();
+                if !parse_openai_message_content(p, &mut msg, images, err) {
+                    if err.is_empty() {
+                        *err = "invalid chat content".into();
+                    }
+                    return None;
+                }
             } else if key == "reasoning_content" {
                 msg.reasoning = json_content(p)?;
             } else if key == "tool_call_id" {
@@ -588,7 +880,52 @@ fn append_tool_result_text(out: &mut String, s: &str) {
     }
 }
 
-fn parse_anthropic_content_block(p: &mut Json<'_>, msg: &mut ChatMsg) -> bool {
+fn parse_anthropic_image_source(p: &mut Json<'_>) -> Option<(String, String, String)> {
+    p.ws();
+    if p.bump() != Some(b'{') {
+        return None;
+    }
+    let mut source_type = None;
+    let mut media_type = None;
+    let mut data = None;
+    p.ws();
+    while p.peek().is_some() && p.peek() != Some(b'}') {
+        let key = json_string(p)?;
+        p.ws();
+        if p.bump() != Some(b':') {
+            return None;
+        }
+        if key == "type" {
+            source_type = Some(json_string(p)?);
+        } else if key == "media_type" {
+            media_type = Some(json_string(p)?);
+        } else if key == "data" {
+            data = Some(json_string(p)?);
+        } else if !json_skip_value(p) {
+            return None;
+        }
+        p.ws();
+        if p.peek() == Some(b',') {
+            p.i += 1;
+        }
+        p.ws();
+    }
+    if p.bump() != Some(b'}') {
+        return None;
+    }
+    Some((
+        source_type.unwrap_or_default(),
+        media_type.unwrap_or_default(),
+        data.unwrap_or_default(),
+    ))
+}
+
+fn parse_anthropic_content_block(
+    p: &mut Json<'_>,
+    msg: &mut ChatMsg,
+    images: &mut Vec<RequestImage>,
+    err: &mut String,
+) -> bool {
     if p.bump() != Some(b'{') {
         return false;
     }
@@ -599,6 +936,7 @@ fn parse_anthropic_content_block(p: &mut Json<'_>, msg: &mut ChatMsg) -> bool {
     let mut name = None;
     let mut input = None;
     let mut tool_result = None;
+    let mut source = None;
     p.ws();
     while p.peek().is_some() && p.peek() != Some(b'}') {
         let Some(key) = json_string(p) else {
@@ -643,6 +981,11 @@ fn parse_anthropic_content_block(p: &mut Json<'_>, msg: &mut ChatMsg) -> bool {
             if tool_result.is_none() {
                 return false;
             }
+        } else if key == "source" {
+            source = parse_anthropic_image_source(p);
+            if source.is_none() {
+                return false;
+            }
         } else if !json_skip_value(p) {
             return false;
         }
@@ -656,6 +999,23 @@ fn parse_anthropic_content_block(p: &mut Json<'_>, msg: &mut ChatMsg) -> bool {
         return false;
     }
     match typ.as_deref() {
+        Some("image") => {
+            let Some((source_type, media_type, data)) = source else {
+                *err = "Anthropic image source must use base64 data".into();
+                return false;
+            };
+            if source_type != "base64" || media_type.is_empty() || data.is_empty() {
+                *err = "Anthropic image source must use base64 data".into();
+                return false;
+            }
+            match add_image_base64(images, &media_type, &data) {
+                Ok(index) => msg.parts.push(ChatPart::Image(index)),
+                Err(error) => {
+                    *err = error;
+                    return false;
+                }
+            }
+        }
         Some("tool_use") => {
             msg.calls.push(ToolCall {
                 id: id.unwrap_or_default(),
@@ -675,7 +1035,7 @@ fn parse_anthropic_content_block(p: &mut Json<'_>, msg: &mut ChatMsg) -> bool {
         }
         _ => {
             if let Some(t) = text {
-                msg.content.push_str(&t);
+                append_text_part(msg, t);
             }
             if let Some(t) = thinking {
                 msg.reasoning.push_str(&t);
@@ -685,7 +1045,12 @@ fn parse_anthropic_content_block(p: &mut Json<'_>, msg: &mut ChatMsg) -> bool {
     true
 }
 
-fn parse_anthropic_content(p: &mut Json<'_>, msg: &mut ChatMsg) -> bool {
+fn parse_anthropic_content(
+    p: &mut Json<'_>,
+    msg: &mut ChatMsg,
+    images: &mut Vec<RequestImage>,
+    err: &mut String,
+) -> bool {
     p.ws();
     if p.peek() == Some(b'"') {
         return json_string(p).map(|s| msg.content = s).is_some();
@@ -702,12 +1067,12 @@ fn parse_anthropic_content(p: &mut Json<'_>, msg: &mut ChatMsg) -> bool {
     while p.peek().is_some() && p.peek() != Some(b']') {
         if p.peek() == Some(b'"') {
             if let Some(s) = json_string(p) {
-                msg.content.push_str(&s);
+                append_text_part(msg, s);
             } else {
                 return false;
             }
         } else if p.peek() == Some(b'{') {
-            if !parse_anthropic_content_block(p, msg) {
+            if !parse_anthropic_content_block(p, msg, images, err) {
                 return false;
             }
         } else if !json_skip_value(p) {
@@ -722,7 +1087,11 @@ fn parse_anthropic_content(p: &mut Json<'_>, msg: &mut ChatMsg) -> bool {
     p.bump() == Some(b']')
 }
 
-fn parse_anthropic_messages(p: &mut Json<'_>) -> Option<Vec<ChatMsg>> {
+fn parse_anthropic_messages(
+    p: &mut Json<'_>,
+    images: &mut Vec<RequestImage>,
+    err: &mut String,
+) -> Option<Vec<ChatMsg>> {
     p.ws();
     if p.bump() != Some(b'[') {
         return None;
@@ -745,7 +1114,8 @@ fn parse_anthropic_messages(p: &mut Json<'_>) -> Option<Vec<ChatMsg>> {
                 msg.role = json_string(p)?;
             } else if key == "content" {
                 msg.content.clear();
-                if !parse_anthropic_content(p, &mut msg) {
+                msg.parts.clear();
+                if !parse_anthropic_content(p, &mut msg, images, err) {
                     return None;
                 }
             } else if !json_skip_value(p) {
@@ -1407,27 +1777,36 @@ fn responses_validate_tool_outputs(
     Ok((live_tool, live_reason))
 }
 
-fn parse_responses_content_array(p: &mut Json<'_>) -> Option<String> {
+fn parse_responses_content_array_mm(
+    p: &mut Json<'_>,
+    mut images: Option<&mut Vec<RequestImage>>,
+    err: &mut String,
+) -> Option<(String, Vec<ChatPart>)> {
     p.ws();
     if p.peek() == Some(b'"') {
-        return json_string(p);
+        let text = json_string(p)?;
+        return Some((text.clone(), vec![ChatPart::Text(text)]));
     }
     if p.lit("null") {
-        return Some(String::new());
+        return Some((String::new(), Vec::new()));
     }
     if p.peek() != Some(b'[') {
         return None;
     }
     p.i += 1;
     let mut b = String::new();
+    let mut parts = Vec::new();
     p.ws();
     while p.peek().is_some() && p.peek() != Some(b']') {
         if p.peek() == Some(b'"') {
-            b.push_str(&json_string(p)?);
+            let text = json_string(p)?;
+            b.push_str(&text);
+            parts.push(ChatPart::Text(text));
         } else if p.peek() == Some(b'{') {
             p.i += 1;
             let mut typ = None;
             let mut text = None;
+            let mut image_url = None;
             p.ws();
             while p.peek().is_some() && p.peek() != Some(b'}') {
                 let key = json_string(p)?;
@@ -1444,6 +1823,8 @@ fn parse_responses_content_array(p: &mut Json<'_>) -> Option<String> {
                     } else {
                         text = Some(json_string(p)?);
                     }
+                } else if key == "image_url" {
+                    image_url = Some(json_string(p)?);
                 } else if !json_skip_value(p) {
                     return None;
                 }
@@ -1460,10 +1841,30 @@ fn parse_responses_content_array(p: &mut Json<'_>) -> Option<String> {
                 typ.as_deref(),
                 Some("input_text" | "output_text" | "text" | "summary_text" | "reasoning_text")
             );
-            if !is_text || text.is_none() {
+            if is_text {
+                let text = text?;
+                b.push_str(&text);
+                parts.push(ChatPart::Text(text));
+            } else if typ.as_deref() == Some("input_image") {
+                let Some(images) = images.as_deref_mut() else {
+                    *err = "unsupported Responses content block".into();
+                    return None;
+                };
+                let Some(image_url) = image_url else {
+                    *err = "unsupported Responses content block".into();
+                    return None;
+                };
+                match add_image_data_uri(images, &image_url) {
+                    Ok(index) => parts.push(ChatPart::Image(index)),
+                    Err(error) => {
+                        *err = error;
+                        return None;
+                    }
+                }
+            } else {
+                *err = "unsupported Responses content block".into();
                 return None;
             }
-            b.push_str(&text.unwrap());
         } else {
             return None;
         }
@@ -1476,7 +1877,11 @@ fn parse_responses_content_array(p: &mut Json<'_>) -> Option<String> {
     if p.bump() != Some(b']') {
         return None;
     }
-    Some(b)
+    Some((b, parts))
+}
+
+fn parse_responses_content_array(p: &mut Json<'_>) -> Option<String> {
+    parse_responses_content_array_mm(p, None, &mut String::new()).map(|(text, _)| text)
 }
 
 fn parse_responses_reasoning(
@@ -1538,6 +1943,8 @@ fn parse_responses_input(
     p: &mut Json<'_>,
     loaded: &mut String,
     orders: &mut Vec<ToolSchemaOrder>,
+    images: &mut Vec<RequestImage>,
+    err: &mut String,
 ) -> Option<Vec<ChatMsg>> {
     p.ws();
     if p.bump() != Some(b'[') {
@@ -1553,6 +1960,7 @@ fn parse_responses_input(
         let mut typ = None;
         let mut role = None;
         let mut content = None;
+        let mut content_parts = Vec::new();
         let mut name = None;
         let mut namespace = None;
         let mut call_id = None;
@@ -1577,7 +1985,9 @@ fn parse_responses_input(
             } else if key == "role" {
                 role = Some(json_string(p)?);
             } else if key == "content" {
-                content = Some(parse_responses_content_array(p)?);
+                let parsed = parse_responses_content_array_mm(p, Some(images), err)?;
+                content = Some(parsed.0);
+                content_parts = parsed.1;
             } else if key == "name" {
                 name = Some(json_string(p)?);
             } else if key == "namespace" {
@@ -1665,6 +2075,7 @@ fn parse_responses_input(
             let mut msg = ChatMsg {
                 role: role.unwrap_or_else(|| "user".into()),
                 content: content.take().unwrap_or_default(),
+                parts: std::mem::take(&mut content_parts),
                 ..Default::default()
             };
             if msg.role == "assistant" && !pending.is_empty() {
@@ -1840,6 +2251,7 @@ pub fn parse_chat_request(env: &ParseEnv, body: &str) -> Result<ParsedRequest, S
     let mut thinking_enabled = true;
     let mut reasoning_effort = env.default_effort;
     let mut msgs = Vec::new();
+    let mut images = Vec::new();
     let mut tool_schemas = String::new();
     let mut orders = Vec::new();
 
@@ -1857,7 +2269,7 @@ pub fn parse_chat_request(env: &ParseEnv, body: &str) -> Result<ParsedRequest, S
             return bad(&mut err, "invalid JSON request");
         }
         let ok = if key == "messages" {
-            match parse_messages(&mut p) {
+            match parse_messages(&mut p, &mut images, &mut err) {
                 Some(m) => {
                     msgs = m;
                     got_messages = true;
@@ -1974,12 +2386,14 @@ pub fn parse_chat_request(env: &ParseEnv, body: &str) -> Result<ParsedRequest, S
     if !got_messages {
         return Err("missing messages".into());
     }
+    validate_image_references(&msgs, &images)?;
     r.has_tool_results = chat_history_has_pending_tool_results(&msgs);
     if !prepare_tool_choice(&mut r, !tool_schemas.is_empty(), &mut err) {
         return Err(err);
     }
     apply_think(&mut r, got_thinking, thinking_enabled, reasoning_effort);
     r.messages = msgs;
+    r.images = images;
     r.tool_schemas = tool_schemas;
     r.tool_orders = orders;
     r.finish_needs();
@@ -2124,6 +2538,7 @@ pub fn parse_anthropic_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
     let mut thinking_enabled = true;
     let mut reasoning_effort = env.default_effort;
     let mut msgs = Vec::new();
+    let mut images = Vec::new();
     let mut system = None;
     let mut tool_schemas = String::new();
     let mut orders = Vec::new();
@@ -2142,7 +2557,7 @@ pub fn parse_anthropic_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
             return bad(&mut err, "invalid JSON request");
         }
         let ok = if key == "messages" {
-            match parse_anthropic_messages(&mut p) {
+            match parse_anthropic_messages(&mut p, &mut images, &mut err) {
                 Some(m) => {
                     msgs = m;
                     got_messages = true;
@@ -2268,6 +2683,7 @@ pub fn parse_anthropic_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
             });
         }
     }
+    validate_image_references(&msgs, &images)?;
     r.has_tool_results = chat_history_has_pending_tool_results(&msgs);
     if !prepare_tool_choice(&mut r, !tool_schemas.is_empty(), &mut err) {
         return Err(err);
@@ -2279,6 +2695,7 @@ pub fn parse_anthropic_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
     }
     r.live_call_ids = crate::cont::live_tool_result_ids(Api::Anthropic, &msgs);
     r.messages = msgs;
+    r.images = images;
     r.tool_schemas = tool_schemas;
     r.tool_orders = orders;
     r.finish_needs();
@@ -2295,6 +2712,7 @@ pub fn parse_responses_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
     let mut thinking_enabled = true;
     let mut reasoning_effort = env.default_effort;
     let mut msgs = Vec::new();
+    let mut images = Vec::new();
     let mut loaded = String::new();
     let mut orders = Vec::new();
     let mut instructions = None;
@@ -2329,7 +2747,8 @@ pub fn parse_responses_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
                     None => false,
                 }
             } else {
-                match parse_responses_input(&mut p, &mut loaded, &mut orders) {
+                match parse_responses_input(&mut p, &mut loaded, &mut orders, &mut images, &mut err)
+                {
                     Some(m) => {
                         msgs = m;
                         got_input = true;
@@ -2448,6 +2867,7 @@ pub fn parse_responses_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
             }
         }
     }
+    validate_image_references(&msgs, &images)?;
     let mut combined = tool_schemas.clone();
     if !loaded.is_empty() {
         if !combined.is_empty() {
@@ -2469,6 +2889,7 @@ pub fn parse_responses_request(env: &ParseEnv, body: &str) -> Result<ParsedReque
     }
     r.live_call_ids = crate::cont::live_tool_result_ids(Api::Responses, &msgs);
     r.messages = msgs;
+    r.images = images;
     r.tool_schemas = combined;
     r.tool_orders = orders;
     r.finish_needs();
