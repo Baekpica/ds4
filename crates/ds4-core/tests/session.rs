@@ -106,6 +106,10 @@ fn sync_plans_match_c() {
     );
     assert_cmd(
         "plan",
+        &["qwen4exp", "cuda", "8", "8", "0", "1", "0", "-;n:8"],
+    );
+    assert_cmd(
+        "plan",
         &["deepseek4", "cuda", "16384", "9000", "0", "1", "0", "-;1"],
     );
     assert_cmd(

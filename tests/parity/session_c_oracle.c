@@ -1,5 +1,5 @@
 /* Session host-policy oracle. Includes ds4.c (DS4_NO_GPU) so rewrite /
- * common_prefix / rewind / invalidate match v0.6.3-dfm. Sync plans dump
+ * common_prefix / rewind / invalidate match v0.6.5-dfm. Sync plans dump
  * the session_sync reuse/rebuild/generation rules without a GPU graph. */
 
 #include "../../ds4.c"
@@ -104,7 +104,7 @@ static void cmd_rewrite_from(int argc, char **argv)
     /* Same guards as ds4_session_rewrite_from_common, without calling
      * ds4_session_sync (that pulls the distributed GPU path). */
     (void)err;
-    if (prompt.len <= 0 || prompt.len >= ctx || !s->checkpoint_valid ||
+    if (prompt.len <= 0 || prompt.len > ctx || !s->checkpoint_valid ||
         common < 0 || common > s->checkpoint.len || common > prompt.len) {
         printf("REWRITE error\n");
     } else {
@@ -159,7 +159,7 @@ static void cmd_plan(int argc, char **argv)
         parse_ids(prompt_s, &prompt);
     }
     plen = prompt.len;
-    if (plen <= 0 || plen >= ctx) {
+    if (plen <= 0 || plen > ctx) {
         err = 1;
         bounds = 1;
         printf("PLAN err=%d start=%d rebuild=%d bump=%d fence=%d bounds=%d\n",

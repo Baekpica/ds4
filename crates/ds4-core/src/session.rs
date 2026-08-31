@@ -154,7 +154,7 @@ impl SessionLedger {
     }
 
     pub fn prompt_exceeds_context(&self, prompt_len: i32) -> bool {
-        prompt_len <= 0 || prompt_len >= self.ctx
+        prompt_len <= 0 || prompt_len > self.ctx
     }
 
     pub fn rewrite_from_common(&self, prompt: &[i32], common: i32) -> RewriteKind {
@@ -576,6 +576,19 @@ fn split_pair(s: &str) -> (Vec<i32>, Vec<i32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allows_prompt_that_exactly_fills_context() {
+        let host = SessionLedger::new(ModelFamily::Qwen4Exp, SessionBackend::Cuda, 8, 8);
+
+        let exact = host.plan_sync(&[1; 8], 0);
+        assert!(!exact.err);
+        assert!(!exact.bounds);
+
+        let oversized = host.plan_sync(&[1; 9], 0);
+        assert!(oversized.err);
+        assert!(oversized.bounds);
+    }
 
     #[test]
     fn exaone_rewind_span_matches_c_kernel_fixture() {
