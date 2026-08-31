@@ -6,19 +6,26 @@
 //! When `Model::open` succeeds, native applies the host shape and skips
 //! C `config_validate_model`.
 
-use crate::bind::{dots3_layer_is_full_attention, expected_compress_ratio, solar_layer_is_gqa};
+use crate::bind::{
+    dots3_layer_is_full_attention, expected_compress_ratio, qwen4exp_layer_is_full_attention,
+    solar_layer_is_gqa,
+};
 use crate::gguf::{
     GgufError, GgufFile, GGUF_VALUE_BOOL, GGUF_VALUE_FLOAT32, GGUF_VALUE_FLOAT64, GGUF_VALUE_INT32,
-    GGUF_VALUE_UINT32,
+    GGUF_VALUE_STRING, GGUF_VALUE_UINT32,
 };
 use crate::identify::{identify_file, IdentifyError};
 use crate::shape::{
     route_architecture, ArchRoute, ModelFamily, Shape, Variant, SHAPE_DOTS3_NOTE_PREV, SHAPE_FLASH,
-    SHAPE_KEXAONE_236B, SHAPE_MOTIF3, SHAPE_PRO, SHAPE_SOLAR_OPEN2_250B,
+    SHAPE_KEXAONE_236B, SHAPE_MOTIF3, SHAPE_PRO, SHAPE_QWEN38_FLASH_NEXT, SHAPE_SOLAR_OPEN2_250B,
 };
+use crate::tensors::TensorInventory;
 
 const MOTIF_SHA: &[u8] = b"30f14b635d3258a18c3ff7e69829f8fbfa775e87477ffabb59a79115bba820a5";
 const DOTS3_SHA: &[u8] = b"99b7de680dd456111c36efb8749f8ae7177328e97b65a3e39a6700cbc1173833";
+const QWEN_REVISION: &[u8] = b"f5d08274bafd880402bd16f5e3e6c514136ec06c";
+const QWEN_CONFIG_SHA: &[u8] = b"889658f2508e8c61d409b02e70e0d78d8d4452ec65aaafbe129805d213d2e74b";
+const QWEN_LICENSE_SHA: &[u8] = b"a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08";
 
 #[derive(Debug)]
 pub enum ValidateError {
@@ -136,6 +143,51 @@ fn expect_bool(name: &'static str, got: bool, want: bool) -> Result<(), Validate
     } else {
         Err(mismatch_bool(name))
     }
+}
+
+fn expect_string(g: &GgufFile, key: &'static str, want: &[u8]) -> Result<(), ValidateError> {
+    if g.get_string(key) == Some(want) {
+        Ok(())
+    } else {
+        Err(ValidateError::TokenKey("mismatch-string", key.into()))
+    }
+}
+
+fn has_key(g: &GgufFile, key: &str) -> bool {
+    g.kv_entries()
+        .iter()
+        .any(|e| g.key_bytes(e) == key.as_bytes())
+}
+
+fn array_nonnegative_u32s(
+    g: &GgufFile,
+    key: &'static str,
+    len: u64,
+) -> Result<Vec<u32>, ValidateError> {
+    let arr = g
+        .get_array(key)
+        .ok_or(ValidateError::TokenKey("missing-array", key.into()))?;
+    if arr.len != len || (arr.typ != GGUF_VALUE_UINT32 && arr.typ != GGUF_VALUE_INT32) {
+        return Err(ValidateError::TokenKey("array-shape", key.into()));
+    }
+    if arr.typ == GGUF_VALUE_UINT32 {
+        return Ok(g.array_le_u32s(&arr)?);
+    }
+    let mut out = Vec::with_capacity(len as usize);
+    let mut pos = arr.data_pos;
+    for _ in 0..len {
+        let bytes = g
+            .as_bytes()
+            .get(pos..pos + 4)
+            .ok_or(ValidateError::Gguf(GgufError::Truncated))?;
+        let value = i32::from_le_bytes(bytes.try_into().unwrap());
+        if value < 0 {
+            return Err(ValidateError::TokenKey("negative-array", key.into()));
+        }
+        out.push(value as u32);
+        pos += 4;
+    }
+    Ok(out)
 }
 
 fn motif3_layer_is_full_attention(shape: &Shape, il: u32) -> bool {
@@ -1046,9 +1098,348 @@ fn validate_exaone(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
     Ok(())
 }
 
+fn qwen_ssd_precision(quant: Option<&[u8]>) -> Option<(u32, u32, u32, u32)> {
+    match quant {
+        Some(b"MQ-Q6-SSD-PLE-BF16") => Some((14, 13, 14, 6)),
+        Some(b"MQ-Q5-SSD-PLE-BF16") => Some((13, 12, 13, 6)),
+        _ => None,
+    }
+}
+
+fn validate_qwen_external_ple(g: &GgufFile) -> Result<(), ValidateError> {
+    let external = qwen_ssd_precision(g.get_string("general.quantization")).is_some();
+    if external != has_key(g, "qwen4exp.ple.weight_storage") {
+        return Err(ValidateError::Token("ple-contract"));
+    }
+    if !external {
+        return Ok(());
+    }
+    expect_string(
+        g,
+        "qwen4exp.ple.weight_storage",
+        b"ssd_backed_bounded_page_cache",
+    )?;
+    expect_string(g, "qwen4exp.ple.storage_dtype", b"BF16")?;
+    expect_string(g, "qwen4exp.ple.sidecar_manifest", b"ple/ple-manifest.json")?;
+    expect_bool(
+        "ple.resident_weight",
+        req_bool(g, "qwen4exp.ple.resident_weight")?,
+        false,
+    )?;
+    expect_u64(
+        "ple.sidecar_payload_bytes",
+        req_u64c(g, "qwen4exp.ple.sidecar_payload_bytes")?,
+        102_400_491_520,
+    )?;
+    expect_u32(
+        "ple.sidecar_alignment",
+        req_u32(g, "qwen4exp.ple.sidecar_alignment")?,
+        4096,
+    )
+}
+
+fn validate_qwen4exp(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
+    let u32s = [
+        ("block_count", "qwen4exp.block_count", shape.n_layer),
+        (
+            "embedding_length",
+            "qwen4exp.embedding_length",
+            shape.n_embd,
+        ),
+        ("vocab_size", "qwen4exp.vocab_size", shape.n_vocab),
+        (
+            "feed_forward_length",
+            "qwen4exp.feed_forward_length",
+            shape.n_ff_exp,
+        ),
+        (
+            "attention.head_count",
+            "qwen4exp.attention.head_count",
+            shape.n_head,
+        ),
+        (
+            "attention.head_count_kv",
+            "qwen4exp.attention.head_count_kv",
+            shape.n_head_kv,
+        ),
+        (
+            "attention.key_length",
+            "qwen4exp.attention.key_length",
+            shape.n_head_dim,
+        ),
+        (
+            "attention.value_length",
+            "qwen4exp.attention.value_length",
+            shape.n_value_dim,
+        ),
+        (
+            "rope.dimension_count",
+            "qwen4exp.rope.dimension_count",
+            shape.n_rot,
+        ),
+        ("expert_count", "qwen4exp.expert_count", shape.n_expert),
+        (
+            "expert_used_count",
+            "qwen4exp.expert_used_count",
+            shape.n_expert_used,
+        ),
+        (
+            "expert_feed_forward_length",
+            "qwen4exp.expert_feed_forward_length",
+            shape.n_ff_exp,
+        ),
+        (
+            "expert_shared_count",
+            "qwen4exp.expert_shared_count",
+            shape.n_expert_shared,
+        ),
+        (
+            "expert_shared_feed_forward_length",
+            "qwen4exp.expert_shared_feed_forward_length",
+            shape.n_ff_shexp,
+        ),
+        ("nextn_predict_layers", "qwen4exp.nextn_predict_layers", 1),
+        (
+            "full_attention_interval",
+            "qwen4exp.full_attention_interval",
+            4,
+        ),
+        (
+            "attention.indexer.head_count",
+            "qwen4exp.attention.indexer.head_count",
+            shape.n_indexer_head,
+        ),
+        (
+            "attention.indexer.key_length",
+            "qwen4exp.attention.indexer.key_length",
+            shape.n_indexer_head_dim,
+        ),
+        (
+            "attention.indexer.top_k",
+            "qwen4exp.attention.indexer.top_k",
+            shape.n_indexer_top_k,
+        ),
+        (
+            "attention.linear_key_head_count",
+            "qwen4exp.attention.linear_key_head_count",
+            16,
+        ),
+        (
+            "attention.linear_value_head_count",
+            "qwen4exp.attention.linear_value_head_count",
+            48,
+        ),
+        (
+            "attention.linear_key_length",
+            "qwen4exp.attention.linear_key_length",
+            128,
+        ),
+        (
+            "attention.linear_value_length",
+            "qwen4exp.attention.linear_value_length",
+            128,
+        ),
+        (
+            "attention.linear_conv_kernel",
+            "qwen4exp.attention.linear_conv_kernel",
+            4,
+        ),
+        (
+            "attention.indexer.compress_ratio",
+            "qwen4exp.attention.indexer.compress_ratio",
+            4,
+        ),
+        (
+            "attention.indexer.kv_head_count",
+            "qwen4exp.attention.indexer.kv_head_count",
+            1,
+        ),
+        (
+            "hyper_connection.count",
+            "qwen4exp.hyper_connection.count",
+            shape.n_hc,
+        ),
+        (
+            "hyper_connection.lowrank",
+            "qwen4exp.hyper_connection.lowrank",
+            320,
+        ),
+        ("ple.ngram_size", "qwen4exp.ple.ngram_size", 3),
+        ("ple.heads_per_ngram", "qwen4exp.ple.heads_per_ngram", 8),
+        (
+            "ple.ngram_vocab_size_base",
+            "qwen4exp.ple.ngram_vocab_size_base",
+            20_000_000,
+        ),
+        ("ple.ngram_parts", "qwen4exp.ple.ngram_parts", 128),
+        (
+            "ple.embedding_length",
+            "qwen4exp.ple.embedding_length",
+            shape.n_embd,
+        ),
+        ("ple.conv_kernel", "qwen4exp.ple.conv_kernel", 4),
+        ("mtp.block_count", "qwen4exp.mtp.block_count", 1),
+        ("vision.block_count", "qwen4exp.vision.block_count", 27),
+        (
+            "vision.embedding_length",
+            "qwen4exp.vision.embedding_length",
+            1152,
+        ),
+        (
+            "vision.feed_forward_length",
+            "qwen4exp.vision.feed_forward_length",
+            4304,
+        ),
+        ("vision.head_count", "qwen4exp.vision.head_count", 16),
+        (
+            "vision.output_embedding_length",
+            "qwen4exp.vision.output_embedding_length",
+            shape.n_embd,
+        ),
+        ("vision.patch_size", "qwen4exp.vision.patch_size", 16),
+        (
+            "vision.temporal_patch_size",
+            "qwen4exp.vision.temporal_patch_size",
+            2,
+        ),
+        (
+            "vision.spatial_merge_size",
+            "qwen4exp.vision.spatial_merge_size",
+            2,
+        ),
+        (
+            "vision.position_count",
+            "qwen4exp.vision.position_count",
+            2304,
+        ),
+    ];
+    for (name, key, want) in u32s {
+        expect_u32(name, req_u32(g, key)?, want)?;
+    }
+    expect_u64(
+        "context_length",
+        req_u64c(g, "qwen4exp.context_length")?,
+        shape.rope_orig_ctx,
+    )?;
+    expect_bool(
+        "rms_norm.zero_centered",
+        req_bool(g, "qwen4exp.rms_norm.zero_centered")?,
+        true,
+    )?;
+    validate_qwen_external_ple(g)?;
+    expect_bool("mtp.present", req_bool(g, "qwen4exp.mtp.present")?, true)?;
+    expect_bool(
+        "vision.present",
+        req_bool(g, "qwen4exp.vision.present")?,
+        true,
+    )?;
+    expect_f32(
+        "attention.layer_norm_rms_epsilon",
+        req_f32(g, "qwen4exp.attention.layer_norm_rms_epsilon")?,
+        shape.rms_eps,
+    )?;
+    expect_f32(
+        "rope.freq_base",
+        req_f32(g, "qwen4exp.rope.freq_base")?,
+        shape.rope_freq_base,
+    )?;
+    for (key, want) in [
+        ("qwen4exp.attention.output_gate_type", b"sigmoid".as_slice()),
+        ("general.source.revision", QWEN_REVISION),
+        ("qwen4exp.source.config_sha256", QWEN_CONFIG_SHA),
+        ("qwen4exp.source.license_sha256", QWEN_LICENSE_SHA),
+        ("general.license", b"other".as_slice()),
+        ("general.license.name", b"qwen-community-1.0".as_slice()),
+    ] {
+        expect_string(g, key, want)?;
+    }
+
+    let types = g
+        .get_array("qwen4exp.attention.layer_types")
+        .ok_or(ValidateError::TokenKey(
+            "missing-array",
+            "qwen4exp.attention.layer_types".into(),
+        ))?;
+    if types.typ != GGUF_VALUE_STRING || types.len != u64::from(shape.n_layer) {
+        return Err(ValidateError::TokenKey(
+            "array-shape",
+            "qwen4exp.attention.layer_types".into(),
+        ));
+    }
+    for (il, got) in g.array_strings(&types)?.into_iter().enumerate() {
+        let full = qwen4exp_layer_is_full_attention(shape, il as u32);
+        let want: &[u8] = if full {
+            b"full_attention"
+        } else {
+            b"linear_attention"
+        };
+        if got != want {
+            return Err(ValidateError::TokenLayer("layer-type", il as u32));
+        }
+    }
+    for (i, got) in array_nonnegative_u32s(
+        g,
+        "qwen4exp.attention.full_layers",
+        u64::from(shape.n_full_attn_count),
+    )?
+    .into_iter()
+    .enumerate()
+    {
+        if got != 4 * i as u32 + 3 {
+            return Err(ValidateError::TokenLayer("full-layer", i as u32));
+        }
+    }
+    for (key, want) in [
+        ("qwen4exp.ple.layer_ids_one_based", 2),
+        ("qwen4exp.ple.checkpoint_layer_ids_zero_based", 1),
+    ] {
+        if array_nonnegative_u32s(g, key, 1)? != [want] {
+            return Err(mismatch(key));
+        }
+    }
+    Ok(())
+}
+
+/// Qwen tensor-side storage and Q5/Q6 SSD precision contract.
+pub fn validate_qwen_inventory(
+    g: &GgufFile,
+    inventory: &TensorInventory,
+) -> Result<(), ValidateError> {
+    let Some((edge, interior, down, tail)) =
+        qwen_ssd_precision(g.get_string("general.quantization"))
+    else {
+        return Ok(());
+    };
+    for part in 0..128 {
+        let name = format!("blk.1.ple.ngram_embd.part_{part:03}.weight");
+        if inventory.find(&name).is_some() {
+            return Err(ValidateError::TokenKey("resident-ple", name));
+        }
+    }
+    for il in 0..48 {
+        let gate = if il < 2 || il >= 46 { edge } else { interior };
+        for (suffix, want) in [
+            ("ffn_gate_exps.weight", gate),
+            ("ffn_up_exps.weight", gate),
+            ("ffn_down_exps.main.weight", down),
+            ("ffn_down_exps.tail.weight", tail),
+        ] {
+            let name = format!("blk.{il}.{suffix}");
+            let got = inventory
+                .find(&name)
+                .ok_or_else(|| ValidateError::TokenKey("missing-tensor", name.clone()))?;
+            if got.typ != want {
+                return Err(ValidateError::TokenLayer("precision-map", il));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Full C `config_validate_model` against an already-identified shape.
 pub fn validate_file(g: &GgufFile, shape: &Shape) -> Result<(), ValidateError> {
     match shape.family {
+        ModelFamily::Qwen4Exp => validate_qwen4exp(g, shape),
         ModelFamily::DeepSeek4 => validate_deepseek(g, shape),
         ModelFamily::Motif3 => validate_motif3(g, shape),
         ModelFamily::Dots3Note => validate_dots3(g, shape),
@@ -1097,6 +1488,7 @@ pub fn dump_validate(path: &std::path::Path) -> String {
                         Variant::SolarOpen2_250B => SHAPE_SOLAR_OPEN2_250B,
                         Variant::Kexaone236B => SHAPE_KEXAONE_236B,
                         Variant::Dots3NotePrev => SHAPE_DOTS3_NOTE_PREV,
+                        Variant::Qwen38FlashNext => SHAPE_QWEN38_FLASH_NEXT,
                         Variant::Flash => SHAPE_FLASH,
                         Variant::Pro => SHAPE_PRO,
                     };

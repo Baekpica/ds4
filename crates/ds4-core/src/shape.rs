@@ -1,4 +1,4 @@
-//! Frozen `g_ds4_shape` catalog copied from `ds4.c` at v0.6.3-dfm.
+//! Frozen `g_ds4_shape` catalog copied from the v0.6.5-dfm Qwen golden.
 //!
 //! Unset C designated-init fields are 0 / false / 0.0. Do not "fill in"
 //! Motif `rope_freq_base_swa` or EXAONE `use_rope` from the validator.
@@ -23,6 +23,7 @@ pub enum ModelFamily {
     Motif3 = 2,
     ExaoneMoe = 3,
     Dots3Note = 4,
+    Qwen4Exp = 5,
 }
 
 impl ModelFamily {
@@ -33,6 +34,7 @@ impl ModelFamily {
             "motif3" => Some(Self::Motif3),
             "exaone-moe" => Some(Self::ExaoneMoe),
             "dots3-note" => Some(Self::Dots3Note),
+            "qwen4exp" => Some(Self::Qwen4Exp),
             _ => None,
         }
     }
@@ -44,6 +46,7 @@ impl ModelFamily {
             Self::Motif3 => "motif3",
             Self::ExaoneMoe => "exaone-moe",
             Self::Dots3Note => "dots3-note",
+            Self::Qwen4Exp => "qwen4exp",
         }
     }
 }
@@ -57,6 +60,7 @@ pub enum Variant {
     Motif3 = 3,
     Kexaone236B = 4,
     Dots3NotePrev = 5,
+    Qwen38FlashNext = 6,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -296,6 +300,7 @@ pub fn route_architecture(arch: Option<&[u8]>) -> ArchRoute {
         Some(b"solar-open2") => ArchRoute::Fixed(Variant::SolarOpen2_250B),
         Some(b"motif3") => ArchRoute::Fixed(Variant::Motif3),
         Some(b"dots3-note") => ArchRoute::Fixed(Variant::Dots3NotePrev),
+        Some(b"qwen4exp") => ArchRoute::Fixed(Variant::Qwen38FlashNext),
         Some(_) => ArchRoute::Unsupported,
     }
 }
@@ -308,6 +313,7 @@ pub fn shape_for_variant(v: Variant) -> Shape {
         Variant::Motif3 => SHAPE_MOTIF3,
         Variant::Kexaone236B => SHAPE_KEXAONE_236B,
         Variant::Dots3NotePrev => SHAPE_DOTS3_NOTE_PREV,
+        Variant::Qwen38FlashNext => SHAPE_QWEN38_FLASH_NEXT,
     }
 }
 
@@ -321,8 +327,8 @@ fn arch_dump_name(route: ArchRoute) -> &'static str {
 
 pub fn dump_oracle() -> String {
     let mut out = String::new();
-    let _ = writeln!(out, "FAMILY\t0\t1\t2\t3\t4");
-    let _ = writeln!(out, "VARIANT\t0\t1\t2\t3\t4\t5");
+    let _ = writeln!(out, "FAMILY\t0\t1\t2\t3\t4\t5");
+    let _ = writeln!(out, "VARIANT\t0\t1\t2\t3\t4\t5\t6");
     let _ = writeln!(out, "{}", SHAPE_FLASH.dump_line("DEFAULT"));
     let _ = writeln!(out, "{}", SHAPE_FLASH.dump_line("FLASH"));
     let _ = writeln!(out, "{}", SHAPE_PRO.dump_line("PRO"));
@@ -330,6 +336,7 @@ pub fn dump_oracle() -> String {
     let _ = writeln!(out, "{}", SHAPE_SOLAR_OPEN2_250B.dump_line("SOLAR"));
     let _ = writeln!(out, "{}", SHAPE_KEXAONE_236B.dump_line("KEXAONE"));
     let _ = writeln!(out, "{}", SHAPE_DOTS3_NOTE_PREV.dump_line("DOTS3"));
+    let _ = writeln!(out, "{}", SHAPE_QWEN38_FLASH_NEXT.dump_line("QWEN38"));
 
     let flash = DeepSeekDims::from_shape(&SHAPE_FLASH);
     let pro = DeepSeekDims::from_shape(&SHAPE_PRO);
@@ -364,6 +371,7 @@ pub fn dump_oracle() -> String {
         ("solar-open2", Some(&b"solar-open2"[..])),
         ("motif3", Some(&b"motif3"[..])),
         ("dots3-note", Some(&b"dots3-note"[..])),
+        ("qwen4exp", Some(&b"qwen4exp"[..])),
         ("glm-dsa", Some(&b"glm-dsa"[..])),
     ] {
         let _ = writeln!(
@@ -721,4 +729,62 @@ pub const SHAPE_DOTS3_NOTE_PREV: Shape = Shape {
     rope_yarn_beta_slow: 0.0,
     compress_rope_freq_base: 0.0,
     rope_orig_ctx: 524288,
+};
+
+pub const SHAPE_QWEN38_FLASH_NEXT: Shape = Shape {
+    name: "Qwen3.8-Flash-Next",
+    family: ModelFamily::Qwen4Exp,
+    variant: Variant::Qwen38FlashNext,
+    n_layer: 48,
+    n_embd: 2560,
+    n_vocab: 248320,
+    n_head: 24,
+    n_head_kv: 2,
+    n_noise_head: 0,
+    n_head_dim: 256,
+    n_value_dim: 256,
+    n_rot: 64,
+    n_out_group: 0,
+    n_lora_q: 0,
+    n_lora_o: 0,
+    n_expert: 512,
+    n_expert_used: 10,
+    n_expert_shared: 1,
+    n_ff_exp: 640,
+    n_ff_dense: 0,
+    n_ff_shexp: 640,
+    n_hash_layer: 0,
+    n_swa: 0,
+    n_swa_period: 4,
+    n_indexer_head: 4,
+    n_indexer_head_dim: 128,
+    n_indexer_top_k: 2048,
+    n_hc: 4,
+    n_hc_sinkhorn_iter: 0,
+    n_nextn_predict: 1,
+    n_leading_dense: 0,
+    n_kv_lora: 0,
+    n_key_mla: 0,
+    n_value_mla: 0,
+    n_swa_head: 0,
+    n_swa_kv_lora: 0,
+    n_swa_key_mla: 0,
+    n_full_attn_count: 12,
+    n_kda_head_dim: 128,
+    n_ssm_conv: 4,
+    use_rope: true,
+    use_qk_norm: true,
+    rms_eps: 1.0e-6,
+    kda_l2_eps: 0.0,
+    kda_gate_clamp_min: 0.0,
+    hc_eps: 1.0e-6,
+    expert_weight_scale: 1.0,
+    swiglu_clamp_exp: 0.0,
+    rope_freq_base: 10_000_000.0,
+    rope_freq_base_swa: 0.0,
+    rope_scale_factor: 1.0,
+    rope_yarn_beta_fast: 0.0,
+    rope_yarn_beta_slow: 0.0,
+    compress_rope_freq_base: 0.0,
+    rope_orig_ctx: 262144,
 };

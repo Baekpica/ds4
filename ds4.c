@@ -7386,7 +7386,7 @@ static void weights_bind(
             weights_bind_qwen4exp_layer(&w->layer[il], m, il);
         weights_bind_qwen4exp_mtp(w, m);
         weights_bind_qwen4exp_vision(&w->qwen_vision, m);
-        weights_validate_layout(w, m);
+        if (!g_host_bind_map) weights_validate_layout(w, m);
         return;
     }
 

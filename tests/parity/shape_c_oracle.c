@@ -1,5 +1,6 @@
 /* C g_ds4_shape catalog + DeepSeek select + architecture dispatch.
- * Copied from ds4.c at v0.6.3-dfm so Rust can compare without linking ds4.o. */
+ * Copied from the v0.6.5-dfm Qwen golden so Rust can compare without linking
+ * ds4.o. */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -22,6 +23,7 @@ typedef enum {
     DS4_MODEL_FAMILY_MOTIF3 = 2,
     DS4_MODEL_FAMILY_EXAONE_MOE = 3,
     DS4_MODEL_FAMILY_DOTS3_NOTE = 4,
+    DS4_MODEL_FAMILY_QWEN4EXP = 5,
 } ds4_model_family;
 
 typedef enum {
@@ -31,6 +33,7 @@ typedef enum {
     DS4_VARIANT_MOTIF3 = 3,
     DS4_VARIANT_KEXAONE_236B = 4,
     DS4_VARIANT_DOTS3_NOTE_PREV = 5,
+    DS4_VARIANT_QWEN38_FLASH_NEXT = 6,
 } ds4_variant;
 
 typedef struct {
@@ -343,6 +346,42 @@ static const ds4_shape DS4_SHAPE_DOTS3_NOTE_PREV = {
     .rope_orig_ctx = 524288,
 };
 
+static const ds4_shape DS4_SHAPE_QWEN38_FLASH_NEXT = {
+    .name = "Qwen3.8-Flash-Next",
+    .family = DS4_MODEL_FAMILY_QWEN4EXP,
+    .variant = DS4_VARIANT_QWEN38_FLASH_NEXT,
+    .n_layer = 48,
+    .n_embd = 2560,
+    .n_vocab = 248320,
+    .n_head = 24,
+    .n_head_kv = 2,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,
+    .n_expert = 512,
+    .n_expert_used = 10,
+    .n_expert_shared = 1,
+    .n_ff_exp = 640,
+    .n_ff_shexp = 640,
+    .n_swa_period = 4,
+    .n_indexer_head = 4,
+    .n_indexer_head_dim = 128,
+    .n_indexer_top_k = 2048,
+    .n_hc = 4,
+    .n_nextn_predict = 1,
+    .n_full_attn_count = 12,
+    .n_kda_head_dim = 128,
+    .n_ssm_conv = 4,
+    .use_rope = true,
+    .use_qk_norm = true,
+    .rms_eps = 1.0e-6f,
+    .hc_eps = 1.0e-6f,
+    .expert_weight_scale = 1.0f,
+    .rope_freq_base = 10000000.0f,
+    .rope_scale_factor = 1.0f,
+    .rope_orig_ctx = UINT64_C(262144),
+};
+
 static void dump_shape(const char *tag, const ds4_shape *s)
 {
     uint32_t bits;
@@ -443,14 +482,15 @@ static const char *arch_route(const char *arch)
     if (strcmp(arch, "solar-open2") == 0) return DS4_SHAPE_SOLAR_OPEN2_250B.name;
     if (strcmp(arch, "motif3") == 0) return DS4_SHAPE_MOTIF3.name;
     if (strcmp(arch, "dots3-note") == 0) return DS4_SHAPE_DOTS3_NOTE_PREV.name;
+    if (strcmp(arch, "qwen4exp") == 0) return DS4_SHAPE_QWEN38_FLASH_NEXT.name;
     return "unsupported";
 }
 
 int main(void)
 {
     ds4_shape miss;
-    printf("FAMILY\t0\t1\t2\t3\t4\n");
-    printf("VARIANT\t0\t1\t2\t3\t4\t5\n");
+    printf("FAMILY\t0\t1\t2\t3\t4\t5\n");
+    printf("VARIANT\t0\t1\t2\t3\t4\t5\t6\n");
     dump_shape("DEFAULT", &DS4_SHAPE_FLASH);
     dump_shape("FLASH", &DS4_SHAPE_FLASH);
     dump_shape("PRO", &DS4_SHAPE_PRO);
@@ -458,6 +498,7 @@ int main(void)
     dump_shape("SOLAR", &DS4_SHAPE_SOLAR_OPEN2_250B);
     dump_shape("KEXAONE", &DS4_SHAPE_KEXAONE_236B);
     dump_shape("DOTS3", &DS4_SHAPE_DOTS3_NOTE_PREV);
+    dump_shape("QWEN38", &DS4_SHAPE_QWEN38_FLASH_NEXT);
     printf("SELECT\tflash\t%s\n", select_name(&DS4_SHAPE_FLASH));
     printf("SELECT\tpro\t%s\n", select_name(&DS4_SHAPE_PRO));
     miss = DS4_SHAPE_FLASH;
@@ -469,6 +510,7 @@ int main(void)
     printf("ARCH\tsolar-open2\t%s\n", arch_route("solar-open2"));
     printf("ARCH\tmotif3\t%s\n", arch_route("motif3"));
     printf("ARCH\tdots3-note\t%s\n", arch_route("dots3-note"));
+    printf("ARCH\tqwen4exp\t%s\n", arch_route("qwen4exp"));
     printf("ARCH\tglm-dsa\t%s\n", arch_route("glm-dsa"));
     return 0;
 }

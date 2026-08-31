@@ -8,7 +8,9 @@ use ds4_dist::{resolved_layer_end, Layers, SliceExec, WorkOutput, WorkRequest};
 
 pub fn hidden_values(shape: &Shape) -> u64 {
     match shape.family {
-        ModelFamily::SolarOpen2 | ModelFamily::ExaoneMoe => u64::from(shape.n_embd),
+        ModelFamily::SolarOpen2 | ModelFamily::ExaoneMoe | ModelFamily::Qwen4Exp => {
+            u64::from(shape.n_embd)
+        }
         ModelFamily::DeepSeek4 | ModelFamily::Motif3 | ModelFamily::Dots3Note => {
             u64::from(shape.n_hc) * u64::from(shape.n_embd)
         }
@@ -163,7 +165,9 @@ impl SliceExec for SessionSliceExec<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ds4_core::{SHAPE_FLASH, SHAPE_KEXAONE_236B, SHAPE_SOLAR_OPEN2_250B};
+    use ds4_core::{
+        SHAPE_FLASH, SHAPE_KEXAONE_236B, SHAPE_QWEN38_FLASH_NEXT, SHAPE_SOLAR_OPEN2_250B,
+    };
 
     #[test]
     fn hidden_values_match_c_family_split() {
@@ -178,6 +182,10 @@ mod tests {
         assert_eq!(
             hidden_values(&SHAPE_KEXAONE_236B),
             u64::from(SHAPE_KEXAONE_236B.n_embd)
+        );
+        assert_eq!(
+            hidden_values(&SHAPE_QWEN38_FLASH_NEXT),
+            u64::from(SHAPE_QWEN38_FLASH_NEXT.n_embd)
         );
     }
 

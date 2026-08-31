@@ -342,6 +342,27 @@ impl Vocab {
                 self.latent_end_id = -1;
                 self.dsml_id = -1;
             }
+            ModelFamily::Qwen4Exp => {
+                self.bos_id = g
+                    .get_token_id("tokenizer.ggml.bos_token_id")
+                    .unwrap_or(self.lookup("<|endoftext|>")?);
+                self.eos_id = g
+                    .get_token_id("tokenizer.ggml.eos_token_id")
+                    .unwrap_or(self.lookup("<|im_end|>")?);
+                self.eot_id = self.lookup("<|endoftext|>")?;
+                self.im_start_id = self.lookup("<|im_start|>")?;
+                self.im_end_id = self.lookup("<|im_end|>")?;
+                self.think_start_id = self.lookup("<think>")?;
+                self.think_end_id = self.lookup("</think>")?;
+                self.tool_call_start_id = self.lookup("<tool_call>")?;
+                self.tool_call_end_id = self.lookup("</tool_call>")?;
+                self.tool_response_start_id = self.lookup("<tool_response>")?;
+                self.tool_response_end_id = self.lookup("</tool_response>")?;
+                self.system_id = -1;
+                self.user_id = -1;
+                self.assistant_id = -1;
+                self.dsml_id = -1;
+            }
             ModelFamily::SolarOpen2 => {
                 self.bos_id = g
                     .get_token_id("tokenizer.ggml.bos_token_id")
@@ -472,7 +493,7 @@ impl Vocab {
         }
         if !matches!(
             self.family,
-            ModelFamily::SolarOpen2 | ModelFamily::Dots3Note
+            ModelFamily::SolarOpen2 | ModelFamily::Dots3Note | ModelFamily::Qwen4Exp
         ) {
             tokens.push(self.bos_id);
         }
@@ -482,7 +503,10 @@ impl Vocab {
     pub fn chat_append_effort_prefix(&self, tokens: &mut TokenBuffer, mode: ChatThinkMode) {
         if matches!(
             self.family,
-            ModelFamily::Motif3 | ModelFamily::SolarOpen2 | ModelFamily::Dots3Note
+            ModelFamily::Motif3
+                | ModelFamily::SolarOpen2
+                | ModelFamily::Dots3Note
+                | ModelFamily::Qwen4Exp
         ) {
             return;
         }
@@ -583,6 +607,32 @@ impl Vocab {
                     self.solar_chat_close_role(tokens);
                 }
             }
+            ModelFamily::Qwen4Exp => {
+                if role == "system" || role == "developer" {
+                    self.qwen_chat_open_role(tokens, b"system");
+                    bpe_tokenize_text(self, content, &mut tokens.tokens);
+                } else if role == "assistant" {
+                    self.qwen_chat_open_role(tokens, b"assistant");
+                    if !content.starts_with(b"<think>") {
+                        tokens.push(self.think_start_id);
+                        bpe_tokenize_text(self, b"\n\n", &mut tokens.tokens);
+                        tokens.push(self.think_end_id);
+                        bpe_tokenize_text(self, b"\n\n", &mut tokens.tokens);
+                    }
+                    tokenize_rendered_chat(self, content, &mut tokens.tokens);
+                } else if role == "tool" || role == "function" {
+                    self.qwen_chat_open_role(tokens, b"user");
+                    tokens.push(self.tool_response_start_id);
+                    bpe_tokenize_text(self, b"\n", &mut tokens.tokens);
+                    self.chat_append_wrapped_payload(tokens, content, b"</tool_response>");
+                    bpe_tokenize_text(self, b"\n", &mut tokens.tokens);
+                    tokens.push(self.tool_response_end_id);
+                } else {
+                    self.qwen_chat_open_role(tokens, b"user");
+                    tokenize_rendered_chat(self, content, &mut tokens.tokens);
+                }
+                self.qwen_chat_close_role(tokens);
+            }
             _ => {
                 if role == "system" || role == "developer" {
                     bpe_tokenize_text(self, content, &mut tokens.tokens);
@@ -648,6 +698,17 @@ impl Vocab {
                     tokens.push(self.think_end_id);
                 }
             }
+            ModelFamily::Qwen4Exp => {
+                self.qwen_chat_open_role(tokens, b"assistant");
+                tokens.push(self.think_start_id);
+                if thinking {
+                    bpe_tokenize_text(self, b"\n", &mut tokens.tokens);
+                } else {
+                    bpe_tokenize_text(self, b"\n\n", &mut tokens.tokens);
+                    tokens.push(self.think_end_id);
+                    bpe_tokenize_text(self, b"\n\n", &mut tokens.tokens);
+                }
+            }
             _ => {
                 if self.family == ModelFamily::ExaoneMoe {
                     self.require_chat_ids(&[
@@ -700,6 +761,17 @@ impl Vocab {
         self.chat_push_fragment(tokens, b"\n", b"");
     }
 
+    fn qwen_chat_open_role(&self, tokens: &mut TokenBuffer, role: &[u8]) {
+        tokens.push(self.im_start_id);
+        bpe_tokenize_text(self, role, &mut tokens.tokens);
+        bpe_tokenize_text(self, b"\n", &mut tokens.tokens);
+    }
+
+    fn qwen_chat_close_role(&self, tokens: &mut TokenBuffer) {
+        tokens.push(self.im_end_id);
+        bpe_tokenize_text(self, b"\n", &mut tokens.tokens);
+    }
+
     fn chat_append_wrapped_payload(
         &self,
         tokens: &mut TokenBuffer,
@@ -730,7 +802,9 @@ impl Vocab {
             return true;
         }
         match self.family {
-            ModelFamily::SolarOpen2 => self.eot_id >= 0 && token == self.eot_id,
+            ModelFamily::SolarOpen2 | ModelFamily::Qwen4Exp => {
+                self.eot_id >= 0 && token == self.eot_id
+            }
             ModelFamily::Motif3 => {
                 (self.user_id >= 0 && token == self.user_id)
                     || (self.end_of_turn_id >= 0 && token == self.end_of_turn_id)
@@ -1748,6 +1822,7 @@ fn bpe_tokenize_text(vocab: &Vocab, text: &[u8], out: &mut Vec<i32>) {
         ModelFamily::Motif3 => bpe_tokenize_text_motif3(vocab, text, out),
         ModelFamily::SolarOpen2 => bpe_tokenize_text_solar(vocab, text, out),
         ModelFamily::Dots3Note => bpe_tokenize_text_dots3(vocab, text, out),
+        ModelFamily::Qwen4Exp => bpe_tokenize_text_dots3(vocab, text, out),
         ModelFamily::ExaoneMoe => bpe_tokenize_text_exaone(vocab, text, out),
         ModelFamily::DeepSeek4 => bpe_tokenize_text_joyai(vocab, text, out),
     }
@@ -1786,6 +1861,54 @@ fn special_token_at(vocab: &Vocab, p: &[u8]) -> Option<(i32, usize)> {
             b"<|assistant|>",
             if vocab.dots3_endofuser_id >= 0 {
                 vocab.assistant_id
+            } else {
+                -1
+            },
+        ),
+        (
+            b"<|endoftext|>",
+            if vocab.family == ModelFamily::Qwen4Exp {
+                vocab.eot_id
+            } else {
+                -1
+            },
+        ),
+        (
+            b"<|im_start|>",
+            if vocab.family == ModelFamily::Qwen4Exp {
+                vocab.im_start_id
+            } else {
+                -1
+            },
+        ),
+        (
+            b"<|im_end|>",
+            if vocab.family == ModelFamily::Qwen4Exp {
+                vocab.im_end_id
+            } else {
+                -1
+            },
+        ),
+        (
+            b"<|vision_start|>",
+            if vocab.family == ModelFamily::Qwen4Exp {
+                248053
+            } else {
+                -1
+            },
+        ),
+        (
+            b"<|vision_end|>",
+            if vocab.family == ModelFamily::Qwen4Exp {
+                248054
+            } else {
+                -1
+            },
+        ),
+        (
+            b"<|image_pad|>",
+            if vocab.family == ModelFamily::Qwen4Exp {
+                248056
             } else {
                 -1
             },

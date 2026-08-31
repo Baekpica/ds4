@@ -8,14 +8,16 @@
 //! and sibling validate stay C until a separate sibling bind map exists.
 
 use crate::bind::{
-    dots3_layer_is_full_attention, expected_compress_ratio, solar_layer_is_gqa, BindPlan,
-    DSPARK_MARKOV_RANK, DSPARK_N_LAYER,
+    dots3_layer_is_full_attention, expected_compress_ratio, qwen4exp_layer_is_full_attention,
+    solar_layer_is_gqa, BindPlan, DSPARK_MARKOV_RANK, DSPARK_N_LAYER,
 };
 use crate::shape::{shape_for_variant, ModelFamily, Shape, Variant};
 use crate::tensors::{tensor_type_name, TensorInfo};
 
 const T_F32: u32 = 0;
 const T_F16: u32 = 1;
+const T_Q4_0: u32 = 2;
+const T_Q5_0: u32 = 6;
 const T_Q8_0: u32 = 8;
 const T_Q2_K: u32 = 10;
 const T_Q3_K: u32 = 11;
@@ -24,6 +26,7 @@ const T_Q5_K: u32 = 13;
 const T_Q6_K: u32 = 14;
 const T_IQ2_XXS: u32 = 16;
 const T_I32: u32 = 26;
+const T_I64: u32 = 27;
 const T_BF16: u32 = 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +41,9 @@ pub enum TypeClass {
     SolarDown,
     SolarConv,
     SolarDecay,
+    QwenMatrix,
+    QwenPlain,
+    QwenMtpRouted,
 }
 
 impl TypeClass {
@@ -53,6 +59,9 @@ impl TypeClass {
             TypeClass::SolarDown => "solar-down".into(),
             TypeClass::SolarConv => "solar-conv".into(),
             TypeClass::SolarDecay => "solar-decay".into(),
+            TypeClass::QwenMatrix => "qwen-matrix".into(),
+            TypeClass::QwenPlain => "qwen-plain".into(),
+            TypeClass::QwenMtpRouted => "qwen-mtp-routed".into(),
         }
     }
 
@@ -66,7 +75,7 @@ pub struct LayoutSpec {
     pub name: String,
     pub class: TypeClass,
     pub ndim: u32,
-    pub dim: [u64; 4],
+    pub dim: [u64; 8],
 }
 
 #[derive(Debug)]
@@ -105,11 +114,24 @@ fn spec(
     ndim: u32,
     dim: [u64; 4],
 ) {
+    let mut dims = [0; 8];
+    dims[..4].copy_from_slice(&dim);
     out.push(LayoutSpec {
         name: name.into(),
         class,
         ndim,
-        dim,
+        dim: dims,
+    });
+}
+
+fn spec5(out: &mut Vec<LayoutSpec>, name: impl Into<String>, class: TypeClass, dim: [u64; 5]) {
+    let mut dims = [0; 8];
+    dims[..5].copy_from_slice(&dim);
+    out.push(LayoutSpec {
+        name: name.into(),
+        class,
+        ndim: 5,
+        dim: dims,
     });
 }
 
@@ -148,6 +170,21 @@ fn type_ok(class: TypeClass, typ: u32) -> bool {
         TypeClass::SolarGateUp => typ == T_Q4_K || typ == T_Q2_K || typ == T_IQ2_XXS,
         TypeClass::SolarDown => typ == T_Q4_K || typ == T_Q3_K || typ == T_Q2_K,
         TypeClass::SolarConv | TypeClass::SolarDecay => typ == T_F32,
+        TypeClass::QwenMatrix => matches!(
+            typ,
+            T_BF16
+                | T_Q8_0
+                | T_Q6_K
+                | T_Q5_K
+                | T_Q5_0
+                | T_Q4_K
+                | T_Q4_0
+                | T_Q3_K
+                | T_Q2_K
+                | T_IQ2_XXS
+        ),
+        TypeClass::QwenPlain => typ == T_F32 || typ == T_BF16,
+        TypeClass::QwenMtpRouted => typ == T_Q8_0 || typ == T_BF16,
     }
 }
 
@@ -1378,6 +1415,469 @@ fn expected_exaone(shape: &Shape) -> Vec<LayoutSpec> {
     out
 }
 
+fn qwen_hc(out: &mut Vec<LayoutSpec>, prefix: &str, shape: &Shape, inject: bool) {
+    let e = shape.n_embd as u64;
+    let hc = shape.n_hc as u64;
+    let hc_dim = e * hc;
+    spec(
+        out,
+        format!("{prefix}.norm.weight"),
+        TypeClass::QwenPlain,
+        1,
+        [hc_dim, 0, 0, 0],
+    );
+    spec(
+        out,
+        format!("{prefix}.mix_down.weight"),
+        TypeClass::Exact(T_BF16),
+        2,
+        [hc_dim, 320, 0, 0],
+    );
+    spec(
+        out,
+        format!("{prefix}.mix_up.weight"),
+        TypeClass::Exact(T_BF16),
+        2,
+        [320, hc_dim, 0, 0],
+    );
+    if inject {
+        spec(
+            out,
+            format!("{prefix}.inject.weight"),
+            TypeClass::Exact(T_BF16),
+            2,
+            [hc_dim, hc, 0, 0],
+        );
+    }
+}
+
+fn qwen_linear_attention(out: &mut Vec<LayoutSpec>, prefix: &str, shape: &Shape) {
+    let e = shape.n_embd as u64;
+    let key_heads = 16;
+    let value_heads = 48;
+    let head_dim = shape.n_kda_head_dim as u64;
+    let key_dim = key_heads * head_dim;
+    let value_dim = value_heads * head_dim;
+    let conv_dim = 2 * key_dim + value_dim;
+    for (suffix, class, ndim, dims) in [
+        ("a_log", TypeClass::QwenPlain, 1, [value_heads, 0, 0, 0]),
+        (
+            "conv.weight",
+            TypeClass::Exact(T_BF16),
+            3,
+            [shape.n_ssm_conv as u64, 1, conv_dim, 0],
+        ),
+        ("dt_bias", TypeClass::QwenPlain, 1, [value_heads, 0, 0, 0]),
+        (
+            "in_a.weight",
+            TypeClass::QwenMatrix,
+            2,
+            [e, value_heads, 0, 0],
+        ),
+        (
+            "in_b.weight",
+            TypeClass::QwenMatrix,
+            2,
+            [e, value_heads, 0, 0],
+        ),
+        ("qkv.weight", TypeClass::QwenMatrix, 2, [e, conv_dim, 0, 0]),
+        ("z.weight", TypeClass::QwenMatrix, 2, [e, value_dim, 0, 0]),
+        ("norm.weight", TypeClass::QwenPlain, 1, [head_dim, 0, 0, 0]),
+        ("out.weight", TypeClass::QwenMatrix, 2, [value_dim, e, 0, 0]),
+    ] {
+        spec(out, format!("{prefix}.{suffix}"), class, ndim, dims);
+    }
+}
+
+fn qwen_qsa(out: &mut Vec<LayoutSpec>, prefix: &str, shape: &Shape) {
+    let e = shape.n_embd as u64;
+    let head_dim = shape.n_head_dim as u64;
+    let index_head_dim = shape.n_indexer_head_dim as u64;
+    let index_dim = (shape.n_indexer_head as u64 + 1) * index_head_dim;
+    let q_dim = 2 * shape.n_head as u64 * head_dim;
+    let kv_dim = shape.n_head_kv as u64 * head_dim;
+    let value_dim = shape.n_head as u64 * head_dim;
+    for (suffix, class, ndim, dims) in [
+        (
+            "attn_index_qk.weight",
+            TypeClass::QwenMatrix,
+            2,
+            [e, index_dim, 0, 0],
+        ),
+        (
+            "attn_index_q_norm.weight",
+            TypeClass::QwenPlain,
+            1,
+            [index_head_dim, 0, 0, 0],
+        ),
+        (
+            "attn_index_k_norm.weight",
+            TypeClass::QwenPlain,
+            1,
+            [index_head_dim, 0, 0, 0],
+        ),
+        ("attn_q.weight", TypeClass::QwenMatrix, 2, [e, q_dim, 0, 0]),
+        (
+            "attn_q_norm.weight",
+            TypeClass::QwenPlain,
+            1,
+            [head_dim, 0, 0, 0],
+        ),
+        ("attn_k.weight", TypeClass::QwenMatrix, 2, [e, kv_dim, 0, 0]),
+        (
+            "attn_k_norm.weight",
+            TypeClass::QwenPlain,
+            1,
+            [head_dim, 0, 0, 0],
+        ),
+        ("attn_v.weight", TypeClass::QwenMatrix, 2, [e, kv_dim, 0, 0]),
+        (
+            "attn_output.weight",
+            TypeClass::QwenMatrix,
+            2,
+            [value_dim, e, 0, 0],
+        ),
+    ] {
+        spec(out, format!("{prefix}.{suffix}"), class, ndim, dims);
+    }
+}
+
+fn qwen_moe(out: &mut Vec<LayoutSpec>, prefix: &str, shape: &Shape, mtp: bool) {
+    let e = shape.n_embd as u64;
+    let experts = shape.n_expert as u64;
+    let ff = shape.n_ff_exp as u64;
+    let sh = shape.n_ff_shexp as u64;
+    let routed = if mtp {
+        TypeClass::QwenMtpRouted
+    } else {
+        TypeClass::QwenMatrix
+    };
+    for (suffix, class, ndim, dims) in [
+        (
+            "ffn_gate_inp.weight",
+            TypeClass::QwenPlain,
+            2,
+            [e, experts, 0, 0],
+        ),
+        ("ffn_gate_exps.weight", routed, 3, [e, ff, experts, 0]),
+        ("ffn_up_exps.weight", routed, 3, [e, ff, experts, 0]),
+        (
+            "ffn_down_exps.main.weight",
+            TypeClass::QwenMatrix,
+            3,
+            [512, e, experts, 0],
+        ),
+        (
+            "ffn_down_exps.tail.weight",
+            TypeClass::QwenMatrix,
+            3,
+            [128, e, experts, 0],
+        ),
+        (
+            "ffn_gate_shexp.weight",
+            TypeClass::QwenMatrix,
+            2,
+            [e, sh, 0, 0],
+        ),
+        (
+            "ffn_up_shexp.weight",
+            TypeClass::QwenMatrix,
+            2,
+            [e, sh, 0, 0],
+        ),
+        (
+            "ffn_down_shexp.weight",
+            TypeClass::QwenMatrix,
+            2,
+            [sh, e, 0, 0],
+        ),
+        (
+            "ffn_shexp_gate_inp.weight",
+            TypeClass::QwenPlain,
+            2,
+            [e, 1, 0, 0],
+        ),
+    ] {
+        spec(out, format!("{prefix}.{suffix}"), class, ndim, dims);
+    }
+}
+
+fn qwen_ple(out: &mut Vec<LayoutSpec>, shape: &Shape) {
+    let e = shape.n_embd as u64;
+    let hc_dim = e * shape.n_hc as u64;
+    for (name, class, ndim, dims) in [
+        (
+            "blk.1.ple.conv.weight",
+            TypeClass::Exact(T_BF16),
+            3,
+            [shape.n_ssm_conv as u64, 1, hc_dim, 0],
+        ),
+        (
+            "blk.1.ple.key.weight",
+            TypeClass::QwenMatrix,
+            2,
+            [e, hc_dim, 0, 0],
+        ),
+        (
+            "blk.1.ple.value.weight",
+            TypeClass::QwenMatrix,
+            2,
+            [e, e, 0, 0],
+        ),
+        (
+            "blk.1.ple.conv_norm.weight",
+            TypeClass::QwenPlain,
+            1,
+            [hc_dim, 0, 0, 0],
+        ),
+        (
+            "blk.1.ple.key_norm.weight",
+            TypeClass::QwenPlain,
+            1,
+            [hc_dim, 0, 0, 0],
+        ),
+        (
+            "blk.1.ple.query_norm.weight",
+            TypeClass::QwenPlain,
+            1,
+            [hc_dim, 0, 0, 0],
+        ),
+        (
+            "blk.1.ple.layer_multipliers",
+            TypeClass::Exact(T_I64),
+            1,
+            [3, 0, 0, 0],
+        ),
+        (
+            "blk.1.ple.head_offsets",
+            TypeClass::Exact(T_I64),
+            1,
+            [16, 0, 0, 0],
+        ),
+        (
+            "blk.1.ple.head_vocab_sizes",
+            TypeClass::Exact(T_I64),
+            1,
+            [16, 0, 0, 0],
+        ),
+    ] {
+        spec(out, name, class, ndim, dims);
+    }
+}
+
+fn qwen_vision(out: &mut Vec<LayoutSpec>, shape: &Shape) {
+    const HIDDEN: u64 = 1152;
+    const FF: u64 = 4304;
+    const MERGED: u64 = 4 * HIDDEN;
+    spec5(
+        out,
+        "vision.patch_embed.weight",
+        TypeClass::Exact(T_BF16),
+        [16, 16, 2, 3, HIDDEN],
+    );
+    spec(
+        out,
+        "vision.patch_embed.bias",
+        TypeClass::Exact(T_F32),
+        1,
+        [HIDDEN, 0, 0, 0],
+    );
+    spec(
+        out,
+        "vision.position_embd.weight",
+        TypeClass::Exact(T_Q8_0),
+        2,
+        [HIDDEN, 2304, 0, 0],
+    );
+    for il in 0..27 {
+        for (fmt, class, ndim, dims) in [
+            (
+                "vblk.%u.norm1.weight",
+                TypeClass::Exact(T_F32),
+                1,
+                [HIDDEN, 0, 0, 0],
+            ),
+            (
+                "vblk.%u.norm1.bias",
+                TypeClass::Exact(T_F32),
+                1,
+                [HIDDEN, 0, 0, 0],
+            ),
+            (
+                "vblk.%u.attn_qkv.weight",
+                TypeClass::Exact(T_Q8_0),
+                2,
+                [HIDDEN, 3 * HIDDEN, 0, 0],
+            ),
+            (
+                "vblk.%u.attn_qkv.bias",
+                TypeClass::Exact(T_F32),
+                1,
+                [3 * HIDDEN, 0, 0, 0],
+            ),
+            (
+                "vblk.%u.attn_output.weight",
+                TypeClass::Exact(T_Q8_0),
+                2,
+                [HIDDEN, HIDDEN, 0, 0],
+            ),
+            (
+                "vblk.%u.attn_output.bias",
+                TypeClass::Exact(T_F32),
+                1,
+                [HIDDEN, 0, 0, 0],
+            ),
+            (
+                "vblk.%u.norm2.weight",
+                TypeClass::Exact(T_F32),
+                1,
+                [HIDDEN, 0, 0, 0],
+            ),
+            (
+                "vblk.%u.norm2.bias",
+                TypeClass::Exact(T_F32),
+                1,
+                [HIDDEN, 0, 0, 0],
+            ),
+            (
+                "vblk.%u.ffn_up.weight",
+                TypeClass::Exact(T_Q8_0),
+                2,
+                [HIDDEN, FF, 0, 0],
+            ),
+            (
+                "vblk.%u.ffn_up.bias",
+                TypeClass::Exact(T_F32),
+                1,
+                [FF, 0, 0, 0],
+            ),
+            (
+                "vblk.%u.ffn_down.weight",
+                TypeClass::Exact(T_BF16),
+                2,
+                [FF, HIDDEN, 0, 0],
+            ),
+            (
+                "vblk.%u.ffn_down.bias",
+                TypeClass::Exact(T_F32),
+                1,
+                [HIDDEN, 0, 0, 0],
+            ),
+        ] {
+            specf(out, fmt, il, class, ndim, dims);
+        }
+    }
+    for (name, class, ndim, dims) in [
+        (
+            "vision.merger.norm.weight",
+            TypeClass::Exact(T_F32),
+            1,
+            [HIDDEN, 0, 0, 0],
+        ),
+        (
+            "vision.merger.norm.bias",
+            TypeClass::Exact(T_F32),
+            1,
+            [HIDDEN, 0, 0, 0],
+        ),
+        (
+            "vision.merger.ffn_up.weight",
+            TypeClass::Exact(T_Q8_0),
+            2,
+            [MERGED, MERGED, 0, 0],
+        ),
+        (
+            "vision.merger.ffn_up.bias",
+            TypeClass::Exact(T_F32),
+            1,
+            [MERGED, 0, 0, 0],
+        ),
+        (
+            "vision.merger.ffn_down.weight",
+            TypeClass::Exact(T_Q8_0),
+            2,
+            [MERGED, shape.n_embd as u64, 0, 0],
+        ),
+        (
+            "vision.merger.ffn_down.bias",
+            TypeClass::Exact(T_F32),
+            1,
+            [shape.n_embd as u64, 0, 0, 0],
+        ),
+    ] {
+        spec(out, name, class, ndim, dims);
+    }
+}
+
+fn expected_qwen4exp(shape: &Shape) -> Vec<LayoutSpec> {
+    let mut out = Vec::new();
+    let e = shape.n_embd as u64;
+    spec(
+        &mut out,
+        "token_embd.weight",
+        TypeClass::QwenMatrix,
+        2,
+        [e, shape.n_vocab as u64, 0, 0],
+    );
+    spec(
+        &mut out,
+        "output.weight",
+        TypeClass::QwenMatrix,
+        2,
+        [e, shape.n_vocab as u64, 0, 0],
+    );
+    qwen_hc(&mut out, "hc_input", shape, false);
+    qwen_vision(&mut out, shape);
+    for il in 0..shape.n_layer {
+        let prefix = format!("blk.{il}");
+        qwen_hc(&mut out, &format!("{prefix}.hc_attn"), shape, true);
+        if qwen4exp_layer_is_full_attention(shape, il) {
+            qwen_qsa(&mut out, &prefix, shape);
+        } else {
+            qwen_linear_attention(&mut out, &format!("{prefix}.linear_attn"), shape);
+        }
+        qwen_moe(&mut out, &prefix, shape, false);
+        qwen_hc(&mut out, &format!("{prefix}.hc_ffn"), shape, true);
+        if il == 1 {
+            qwen_ple(&mut out, shape);
+        }
+    }
+    for (name, class, ndim, dims) in [
+        (
+            "mtp.fc_embedding.weight",
+            TypeClass::QwenMatrix,
+            2,
+            [e, e, 0, 0],
+        ),
+        (
+            "mtp.fc_hidden.weight",
+            TypeClass::QwenMatrix,
+            2,
+            [e, e, 0, 0],
+        ),
+        (
+            "mtp.fc_embedding_norm.weight",
+            TypeClass::QwenPlain,
+            1,
+            [e, 0, 0, 0],
+        ),
+        (
+            "mtp.fc_hidden_norm.weight",
+            TypeClass::QwenPlain,
+            1,
+            [e * shape.n_hc as u64, 0, 0, 0],
+        ),
+    ] {
+        spec(&mut out, name, class, ndim, dims);
+    }
+    qwen_hc(&mut out, "mtp.hc_input", shape, false);
+    qwen_hc(&mut out, "mtp.blk.0.hc_attn", shape, true);
+    qwen_qsa(&mut out, "mtp.blk.0", shape);
+    qwen_moe(&mut out, "mtp.blk.0", shape, true);
+    qwen_hc(&mut out, "mtp.blk.0.hc_ffn", shape, true);
+    out
+}
+
 fn expected_deepseek(shape: &Shape) -> Vec<LayoutSpec> {
     let mut out = Vec::new();
     let e = shape.n_embd as u64;
@@ -2053,6 +2553,7 @@ pub fn expected_dspark_layouts(shape: &Shape, markov_rank: u32) -> Vec<LayoutSpe
 
 pub fn expected_layouts(shape: &Shape) -> Vec<LayoutSpec> {
     match shape.family {
+        ModelFamily::Qwen4Exp => expected_qwen4exp(shape),
         ModelFamily::Motif3 => expected_motif3(shape),
         ModelFamily::Dots3Note => expected_dots3(shape),
         ModelFamily::SolarOpen2 => expected_solar(shape),
@@ -2152,6 +2653,7 @@ pub fn dump_expected_layouts() -> String {
         Variant::Motif3,
         Variant::Kexaone236B,
         Variant::Dots3NotePrev,
+        Variant::Qwen38FlashNext,
     ] {
         out.push_str(&dump_expected_layouts_shape(&shape_for_variant(v)));
     }
@@ -2194,7 +2696,7 @@ pub fn validate_layouts(plan: &BindPlan) -> Result<(), LayoutError> {
     expect_specs(&expected_layouts(&plan.shape), &by_name)?;
     if matches!(
         plan.shape.family,
-        ModelFamily::DeepSeek4 | ModelFamily::SolarOpen2
+        ModelFamily::DeepSeek4 | ModelFamily::SolarOpen2 | ModelFamily::Qwen4Exp
     ) {
         for il in 0..plan.shape.n_layer {
             expect_gate_up(
@@ -2204,6 +2706,14 @@ pub fn validate_layouts(plan: &BindPlan) -> Result<(), LayoutError> {
                 il,
             )?;
         }
+    }
+    if plan.shape.family == ModelFamily::Qwen4Exp {
+        expect_gate_up(
+            &by_name,
+            "mtp.blk.0.ffn_gate_exps.weight",
+            "mtp.blk.0.ffn_up_exps.weight",
+            0,
+        )?;
     }
     Ok(())
 }
@@ -2266,13 +2776,13 @@ pub fn dump_layout_check_tapes() -> String {
         name: "token_embd.weight".into(),
         class: TypeClass::Exact(T_Q8_0),
         ndim: 2,
-        dim: [4, 8, 0, 0],
+        dim: [4, 8, 0, 0, 0, 0, 0, 0],
     };
     let opt = LayoutSpec {
         name: "exp_probs_b.bias".into(),
         class: TypeClass::OptionalExact(T_F32),
         ndim: 1,
-        dim: [4, 0, 0, 0],
+        dim: [4, 0, 0, 0, 0, 0, 0, 0],
     };
     let mut out = String::new();
     out.push_str(&format!(
@@ -2313,7 +2823,7 @@ pub fn dump_layout_check_tapes() -> String {
         name: "ssm_conv.weight".into(),
         class: TypeClass::SolarConv,
         ndim: 3,
-        dim: [4, 1, 16, 0],
+        dim: [4, 1, 16, 0, 0, 0, 0, 0],
     };
     let conv3 = fake_tensor("ssm_conv.weight", T_F32, 3, [4, 1, 16, 0, 0, 0, 0, 0]);
     out.push_str(&format!(

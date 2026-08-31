@@ -69,7 +69,7 @@ pub use session::{
 pub use shape::{
     dump_oracle, route_architecture, select_shape_from_metadata, shape_for_variant, ArchRoute,
     DeepSeekDims, ModelFamily, Shape, Variant, SHAPE_DOTS3_NOTE_PREV, SHAPE_FLASH,
-    SHAPE_KEXAONE_236B, SHAPE_MOTIF3, SHAPE_PRO, SHAPE_SOLAR_OPEN2_250B,
+    SHAPE_KEXAONE_236B, SHAPE_MOTIF3, SHAPE_PRO, SHAPE_QWEN38_FLASH_NEXT, SHAPE_SOLAR_OPEN2_250B,
 };
 pub use sibling::SiblingAttach;
 pub use tensors::{
@@ -79,7 +79,8 @@ pub use tensors::{
 };
 pub use tok::{dump_cmd, dump_vocab_apply_tapes, ChatThinkMode, TokError, Vocab};
 pub use validate::{
-    dump_validate, host_compress_ratios, validate_file, validate_gguf, ValidateError,
+    dump_validate, host_compress_ratios, validate_file, validate_gguf, validate_qwen_inventory,
+    ValidateError,
 };
 
 use std::ffi::CString;
@@ -1042,6 +1043,10 @@ impl Model {
         let inventory = TensorInventory::open(std::path::Path::new(path)).map_err(|e| Error {
             code: 1,
             message: format!("tensor inventory failed: {}", e.token()),
+        })?;
+        validate_qwen_inventory(&g, &inventory).map_err(|e| Error {
+            code: 1,
+            message: format!("validate failed: {}", e.token()),
         })?;
         let bind_plan = BindPlan::resolve(identified.shape, &inventory);
         if let Some(name) = bind_plan.missing_required().first() {

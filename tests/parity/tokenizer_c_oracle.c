@@ -1,5 +1,5 @@
 /* C tokenizer oracle. Includes ds4.c (DS4_NO_GPU) so encode/decode/stop
- * match v0.6.3-dfm without linking CUDA. Synthetic metadata-only GGUFs
+ * match v0.6.5-dfm without linking CUDA. Synthetic metadata-only GGUFs
  * are opened with model_open; g_ds4_shape is assigned from the family
  * argument so vocab_load does not need config_validate_model. */
 
@@ -11,7 +11,7 @@ static void die_usage(void)
 {
     fprintf(stderr,
             "usage: tokenizer_c_oracle FAMILY GGUF CMD [ARG]\n"
-            "  FAMILY: deepseek4|motif3|solar-open2|exaone-moe|dots3-note\n"
+            "  FAMILY: deepseek4|motif3|solar-open2|exaone-moe|dots3-note|qwen4exp\n"
             "  CMD: specials | encode HEX | render HEX | decode ID | stop ID | chat MODE\n");
     exit(2);
 }
@@ -23,6 +23,7 @@ static void set_family(const char *fam)
     else if (strcmp(fam, "solar-open2") == 0) g_ds4_shape = DS4_SHAPE_SOLAR_OPEN2_250B;
     else if (strcmp(fam, "exaone-moe") == 0) g_ds4_shape = DS4_SHAPE_KEXAONE_236B;
     else if (strcmp(fam, "dots3-note") == 0) g_ds4_shape = DS4_SHAPE_DOTS3_NOTE_PREV;
+    else if (strcmp(fam, "qwen4exp") == 0) g_ds4_shape = DS4_SHAPE_QWEN38_FLASH_NEXT;
     else {
         fprintf(stderr, "unknown family: %s\n", fam);
         exit(2);

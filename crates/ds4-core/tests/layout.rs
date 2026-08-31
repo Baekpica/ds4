@@ -57,9 +57,7 @@ fn support_dump_matches_c_oracle() {
     assert_eq!(c_out(&["support"]), dump_expected_support());
 }
 
-fn fake_tensor(name: &str, typ: u32, ndim: u32, dim4: [u64; 4]) -> TensorInfo {
-    let mut dim = [0u64; 8];
-    dim[..4].copy_from_slice(&dim4);
+fn fake_tensor(name: &str, typ: u32, ndim: u32, dim: [u64; 8]) -> TensorInfo {
     TensorInfo {
         name: name.into(),
         ndim,
@@ -164,6 +162,7 @@ fn layout_covers_bind_catalog() {
         Variant::Motif3,
         Variant::Kexaone236B,
         Variant::Dots3NotePrev,
+        Variant::Qwen38FlashNext,
     ] {
         let shape = shape_for_variant(v);
         let bind: HashSet<String> = bind_names(&shape).into_iter().map(|n| n.name).collect();

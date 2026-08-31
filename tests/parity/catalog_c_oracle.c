@@ -1,4 +1,4 @@
-/* mmap GGUF v3 metadata + identify dump. Copied from ds4.c at v0.6.3-dfm. */
+/* mmap GGUF v3 metadata + identify dump. Copied from ds4.c at v0.6.5-dfm. */
 
 #include <fcntl.h>
 #include <stdbool.h>
@@ -381,6 +381,10 @@ static void identify(const ds4_model *m)
     }
     if (ds4_streq(arch, "dots3-note")) {
         printf("IDENTIFY dots3-note-prev family=4 variant=5\n");
+        return;
+    }
+    if (ds4_streq(arch, "qwen4exp")) {
+        printf("IDENTIFY Qwen3.8-Flash-Next family=5 variant=6\n");
         return;
     }
     printf("ERROR unsupported-arch %.*s\n", (int)arch.len, arch.ptr);

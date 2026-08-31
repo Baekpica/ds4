@@ -11,6 +11,8 @@
 enum {
     T_F32 = 0,
     T_F16 = 1,
+    T_Q4_0 = 2,
+    T_Q5_0 = 6,
     T_Q8_0 = 8,
     T_Q2_K = 10,
     T_Q3_K = 11,
@@ -19,6 +21,7 @@ enum {
     T_Q6_K = 14,
     T_IQ2_XXS = 16,
     T_I32 = 26,
+    T_I64 = 27,
     T_BF16 = 30
 };
 
@@ -27,7 +30,8 @@ enum {
     FAM_SOLAR = 1,
     FAM_MOTIF3 = 2,
     FAM_EXAONE = 3,
-    FAM_DOTS3 = 4
+    FAM_DOTS3 = 4,
+    FAM_QWEN = 5
 };
 
 enum {
@@ -36,7 +40,8 @@ enum {
     VAR_SOLAR = 2,
     VAR_MOTIF3 = 3,
     VAR_KEXAONE = 4,
-    VAR_DOTS3 = 5
+    VAR_DOTS3 = 5,
+    VAR_QWEN = 6
 };
 
 typedef enum {
@@ -49,7 +54,10 @@ typedef enum {
     CLS_SOLAR_GATEUP,
     CLS_SOLAR_DOWN,
     CLS_SOLAR_CONV,
-    CLS_SOLAR_DECAY
+    CLS_SOLAR_DECAY,
+    CLS_QWEN_MATRIX,
+    CLS_QWEN_PLAIN,
+    CLS_QWEN_MTP_ROUTED
 } type_class;
 
 typedef struct {
@@ -121,6 +129,31 @@ static const layout_shape SHAPE_DOTS3 = {
     47, 5120, 152064, 128, 128, 0, 192, 128, 64, 0, 1024, 0,
     256, 8, 1536, 13824, 0, 0, 4, 64, 128, 0, 1, 1, 512, 192, 128, 64, 1024, 256, 0, 0, false
 };
+static const layout_shape SHAPE_QWEN = {
+    .name = "Qwen3.8-Flash-Next",
+    .family = FAM_QWEN,
+    .variant = VAR_QWEN,
+    .n_layer = 48,
+    .n_embd = 2560,
+    .n_vocab = 248320,
+    .n_head = 24,
+    .n_head_kv = 2,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,
+    .n_expert = 512,
+    .n_expert_used = 10,
+    .n_ff_exp = 640,
+    .n_ff_shexp = 640,
+    .n_swa_period = 4,
+    .n_indexer_head = 4,
+    .n_indexer_head_dim = 128,
+    .n_hc = 4,
+    .n_nextn_predict = 1,
+    .n_kda_head_dim = 128,
+    .n_ssm_conv = 4,
+    .use_qk_norm = true
+};
 
 static uint32_t g_n;
 
@@ -177,6 +210,15 @@ static void spec(const char *name, type_class cls, uint32_t typ, uint32_t ndim,
     case CLS_SOLAR_DECAY:
         ct = "solar-decay";
         break;
+    case CLS_QWEN_MATRIX:
+        ct = "qwen-matrix";
+        break;
+    case CLS_QWEN_PLAIN:
+        ct = "qwen-plain";
+        break;
+    case CLS_QWEN_MTP_ROUTED:
+        ct = "qwen-mtp-routed";
+        break;
     default:
         ct = "unknown";
         break;
@@ -191,6 +233,17 @@ static void spec(const char *name, type_class cls, uint32_t typ, uint32_t ndim,
         printf("%" PRIu64, ds[i]);
     }
     putchar('\n');
+    g_n++;
+}
+
+static void spec5(const char *name, type_class cls, uint32_t typ,
+                  uint64_t d0, uint64_t d1, uint64_t d2, uint64_t d3,
+                  uint64_t d4)
+{
+    const char *ct = cls == CLS_EXACT ? type_name(typ) : "unknown";
+    printf("SPEC %s exact:%s 5 %" PRIu64 ",%" PRIu64 ",%" PRIu64
+           ",%" PRIu64 ",%" PRIu64 "\n",
+           name, ct, d0, d1, d2, d3, d4);
     g_n++;
 }
 
@@ -226,6 +279,12 @@ static bool dots3_layer_is_full_attention(const layout_shape *s, uint32_t il)
     if (s->family != FAM_DOTS3 || il >= s->n_layer) return false;
     if (s->n_nextn_predict != 0 && il + s->n_nextn_predict >= s->n_layer) return false;
     return il == 0u || (s->n_swa_period != 0 && (il % s->n_swa_period) == 1u);
+}
+
+static bool qwen4exp_layer_is_full_attention(const layout_shape *s, uint32_t il)
+{
+    return s->family == FAM_QWEN && il < s->n_layer &&
+           s->n_swa_period != 0 && (il % s->n_swa_period) == 3u;
 }
 
 static bool is_nextn(const layout_shape *s, uint32_t il)
@@ -500,6 +559,175 @@ static void expected_exaone(const layout_shape *s)
     }
 }
 
+static void qwen_spec(const char *prefix, const char *suffix,
+                      type_class cls, uint32_t typ, uint32_t ndim,
+                      uint64_t d0, uint64_t d1, uint64_t d2)
+{
+    char name[160];
+    snprintf(name, sizeof(name), "%s.%s", prefix, suffix);
+    spec(name, cls, typ, ndim, d0, d1, d2, 0);
+}
+
+static void qwen_hc(const char *prefix, const layout_shape *s, bool inject)
+{
+    uint64_t hc_dim = (uint64_t)s->n_embd * s->n_hc;
+    qwen_spec(prefix, "norm.weight", CLS_QWEN_PLAIN, 0, 1, hc_dim, 0, 0);
+    qwen_spec(prefix, "mix_down.weight", CLS_EXACT, T_BF16, 2, hc_dim, 320, 0);
+    qwen_spec(prefix, "mix_up.weight", CLS_EXACT, T_BF16, 2, 320, hc_dim, 0);
+    if (inject)
+        qwen_spec(prefix, "inject.weight", CLS_EXACT, T_BF16, 2,
+                  hc_dim, s->n_hc, 0);
+}
+
+static void qwen_linear_attention(const char *prefix, const layout_shape *s)
+{
+    uint64_t e = s->n_embd;
+    uint64_t key_dim = 16u * s->n_kda_head_dim;
+    uint64_t value_dim = 48u * s->n_kda_head_dim;
+    uint64_t conv_dim = 2u * key_dim + value_dim;
+    qwen_spec(prefix, "a_log", CLS_QWEN_PLAIN, 0, 1, 48, 0, 0);
+    qwen_spec(prefix, "conv.weight", CLS_EXACT, T_BF16, 3,
+              s->n_ssm_conv, 1, conv_dim);
+    qwen_spec(prefix, "dt_bias", CLS_QWEN_PLAIN, 0, 1, 48, 0, 0);
+    qwen_spec(prefix, "in_a.weight", CLS_QWEN_MATRIX, 0, 2, e, 48, 0);
+    qwen_spec(prefix, "in_b.weight", CLS_QWEN_MATRIX, 0, 2, e, 48, 0);
+    qwen_spec(prefix, "qkv.weight", CLS_QWEN_MATRIX, 0, 2, e, conv_dim, 0);
+    qwen_spec(prefix, "z.weight", CLS_QWEN_MATRIX, 0, 2, e, value_dim, 0);
+    qwen_spec(prefix, "norm.weight", CLS_QWEN_PLAIN, 0, 1,
+              s->n_kda_head_dim, 0, 0);
+    qwen_spec(prefix, "out.weight", CLS_QWEN_MATRIX, 0, 2, value_dim, e, 0);
+}
+
+static void qwen_qsa(const char *prefix, const layout_shape *s)
+{
+    uint64_t e = s->n_embd;
+    uint64_t index_dim = (uint64_t)(s->n_indexer_head + 1u) * s->n_indexer_head_dim;
+    uint64_t q_dim = 2u * (uint64_t)s->n_head * s->n_head_dim;
+    uint64_t kv_dim = (uint64_t)s->n_head_kv * s->n_head_dim;
+    uint64_t value_dim = (uint64_t)s->n_head * s->n_head_dim;
+    qwen_spec(prefix, "attn_index_qk.weight", CLS_QWEN_MATRIX, 0, 2, e, index_dim, 0);
+    qwen_spec(prefix, "attn_index_q_norm.weight", CLS_QWEN_PLAIN, 0, 1,
+              s->n_indexer_head_dim, 0, 0);
+    qwen_spec(prefix, "attn_index_k_norm.weight", CLS_QWEN_PLAIN, 0, 1,
+              s->n_indexer_head_dim, 0, 0);
+    qwen_spec(prefix, "attn_q.weight", CLS_QWEN_MATRIX, 0, 2, e, q_dim, 0);
+    qwen_spec(prefix, "attn_q_norm.weight", CLS_QWEN_PLAIN, 0, 1,
+              s->n_head_dim, 0, 0);
+    qwen_spec(prefix, "attn_k.weight", CLS_QWEN_MATRIX, 0, 2, e, kv_dim, 0);
+    qwen_spec(prefix, "attn_k_norm.weight", CLS_QWEN_PLAIN, 0, 1,
+              s->n_head_dim, 0, 0);
+    qwen_spec(prefix, "attn_v.weight", CLS_QWEN_MATRIX, 0, 2, e, kv_dim, 0);
+    qwen_spec(prefix, "attn_output.weight", CLS_QWEN_MATRIX, 0, 2,
+              value_dim, e, 0);
+}
+
+static void qwen_moe(const char *prefix, const layout_shape *s, bool mtp)
+{
+    type_class routed = mtp ? CLS_QWEN_MTP_ROUTED : CLS_QWEN_MATRIX;
+    uint64_t e = s->n_embd, experts = s->n_expert;
+    qwen_spec(prefix, "ffn_gate_inp.weight", CLS_QWEN_PLAIN, 0, 2, e, experts, 0);
+    qwen_spec(prefix, "ffn_gate_exps.weight", routed, 0, 3,
+              e, s->n_ff_exp, experts);
+    qwen_spec(prefix, "ffn_up_exps.weight", routed, 0, 3,
+              e, s->n_ff_exp, experts);
+    qwen_spec(prefix, "ffn_down_exps.main.weight", CLS_QWEN_MATRIX, 0, 3,
+              512, e, experts);
+    qwen_spec(prefix, "ffn_down_exps.tail.weight", CLS_QWEN_MATRIX, 0, 3,
+              128, e, experts);
+    qwen_spec(prefix, "ffn_gate_shexp.weight", CLS_QWEN_MATRIX, 0, 2,
+              e, s->n_ff_shexp, 0);
+    qwen_spec(prefix, "ffn_up_shexp.weight", CLS_QWEN_MATRIX, 0, 2,
+              e, s->n_ff_shexp, 0);
+    qwen_spec(prefix, "ffn_down_shexp.weight", CLS_QWEN_MATRIX, 0, 2,
+              s->n_ff_shexp, e, 0);
+    qwen_spec(prefix, "ffn_shexp_gate_inp.weight", CLS_QWEN_PLAIN, 0, 2,
+              e, 1, 0);
+}
+
+static void qwen_ple(const layout_shape *s)
+{
+    uint64_t e = s->n_embd;
+    uint64_t hc_dim = e * s->n_hc;
+    spec("blk.1.ple.conv.weight", CLS_EXACT, T_BF16, 3,
+         s->n_ssm_conv, 1, hc_dim, 0);
+    spec("blk.1.ple.key.weight", CLS_QWEN_MATRIX, 0, 2, e, hc_dim, 0, 0);
+    spec("blk.1.ple.value.weight", CLS_QWEN_MATRIX, 0, 2, e, e, 0, 0);
+    spec("blk.1.ple.conv_norm.weight", CLS_QWEN_PLAIN, 0, 1, hc_dim, 0, 0, 0);
+    spec("blk.1.ple.key_norm.weight", CLS_QWEN_PLAIN, 0, 1, hc_dim, 0, 0, 0);
+    spec("blk.1.ple.query_norm.weight", CLS_QWEN_PLAIN, 0, 1, hc_dim, 0, 0, 0);
+    spec("blk.1.ple.layer_multipliers", CLS_EXACT, T_I64, 1, 3, 0, 0, 0);
+    spec("blk.1.ple.head_offsets", CLS_EXACT, T_I64, 1, 16, 0, 0, 0);
+    spec("blk.1.ple.head_vocab_sizes", CLS_EXACT, T_I64, 1, 16, 0, 0, 0);
+}
+
+static void qwen_vision(const layout_shape *s)
+{
+    const uint64_t h = 1152, ff = 4304, merged = 4u * 1152u;
+    uint32_t il;
+    spec5("vision.patch_embed.weight", CLS_EXACT, T_BF16, 16, 16, 2, 3, h);
+    spec("vision.patch_embed.bias", CLS_EXACT, T_F32, 1, h, 0, 0, 0);
+    spec("vision.position_embd.weight", CLS_EXACT, T_Q8_0, 2, h, 2304, 0, 0);
+    for (il = 0; il < 27u; il++) {
+        specf("vblk.%u.norm1.weight", il, CLS_EXACT, T_F32, 1, h, 0, 0, 0);
+        specf("vblk.%u.norm1.bias", il, CLS_EXACT, T_F32, 1, h, 0, 0, 0);
+        specf("vblk.%u.attn_qkv.weight", il, CLS_EXACT, T_Q8_0, 2, h, 3u * h, 0, 0);
+        specf("vblk.%u.attn_qkv.bias", il, CLS_EXACT, T_F32, 1, 3u * h, 0, 0, 0);
+        specf("vblk.%u.attn_output.weight", il, CLS_EXACT, T_Q8_0, 2, h, h, 0, 0);
+        specf("vblk.%u.attn_output.bias", il, CLS_EXACT, T_F32, 1, h, 0, 0, 0);
+        specf("vblk.%u.norm2.weight", il, CLS_EXACT, T_F32, 1, h, 0, 0, 0);
+        specf("vblk.%u.norm2.bias", il, CLS_EXACT, T_F32, 1, h, 0, 0, 0);
+        specf("vblk.%u.ffn_up.weight", il, CLS_EXACT, T_Q8_0, 2, h, ff, 0, 0);
+        specf("vblk.%u.ffn_up.bias", il, CLS_EXACT, T_F32, 1, ff, 0, 0, 0);
+        specf("vblk.%u.ffn_down.weight", il, CLS_EXACT, T_BF16, 2, ff, h, 0, 0);
+        specf("vblk.%u.ffn_down.bias", il, CLS_EXACT, T_F32, 1, h, 0, 0, 0);
+    }
+    spec("vision.merger.norm.weight", CLS_EXACT, T_F32, 1, h, 0, 0, 0);
+    spec("vision.merger.norm.bias", CLS_EXACT, T_F32, 1, h, 0, 0, 0);
+    spec("vision.merger.ffn_up.weight", CLS_EXACT, T_Q8_0, 2,
+         merged, merged, 0, 0);
+    spec("vision.merger.ffn_up.bias", CLS_EXACT, T_F32, 1, merged, 0, 0, 0);
+    spec("vision.merger.ffn_down.weight", CLS_EXACT, T_Q8_0, 2,
+         merged, s->n_embd, 0, 0);
+    spec("vision.merger.ffn_down.bias", CLS_EXACT, T_F32, 1,
+         s->n_embd, 0, 0, 0);
+}
+
+static void expected_qwen(const layout_shape *s)
+{
+    uint64_t e = s->n_embd;
+    uint32_t il;
+    char prefix[64];
+    spec("token_embd.weight", CLS_QWEN_MATRIX, 0, 2, e, s->n_vocab, 0, 0);
+    spec("output.weight", CLS_QWEN_MATRIX, 0, 2, e, s->n_vocab, 0, 0);
+    qwen_hc("hc_input", s, false);
+    qwen_vision(s);
+    for (il = 0; il < s->n_layer; il++) {
+        snprintf(prefix, sizeof(prefix), "blk.%u.hc_attn", il);
+        qwen_hc(prefix, s, true);
+        snprintf(prefix, sizeof(prefix), "blk.%u", il);
+        if (qwen4exp_layer_is_full_attention(s, il)) qwen_qsa(prefix, s);
+        else {
+            snprintf(prefix, sizeof(prefix), "blk.%u.linear_attn", il);
+            qwen_linear_attention(prefix, s);
+        }
+        snprintf(prefix, sizeof(prefix), "blk.%u", il);
+        qwen_moe(prefix, s, false);
+        snprintf(prefix, sizeof(prefix), "blk.%u.hc_ffn", il);
+        qwen_hc(prefix, s, true);
+        if (il == 1u) qwen_ple(s);
+    }
+    spec("mtp.fc_embedding.weight", CLS_QWEN_MATRIX, 0, 2, e, e, 0, 0);
+    spec("mtp.fc_hidden.weight", CLS_QWEN_MATRIX, 0, 2, e, e, 0, 0);
+    spec("mtp.fc_embedding_norm.weight", CLS_QWEN_PLAIN, 0, 1, e, 0, 0, 0);
+    spec("mtp.fc_hidden_norm.weight", CLS_QWEN_PLAIN, 0, 1,
+         e * s->n_hc, 0, 0, 0);
+    qwen_hc("mtp.hc_input", s, false);
+    qwen_hc("mtp.blk.0.hc_attn", s, true);
+    qwen_qsa("mtp.blk.0", s);
+    qwen_moe("mtp.blk.0", s, true);
+    qwen_hc("mtp.blk.0.hc_ffn", s, true);
+}
+
 static void expected_deepseek(const layout_shape *s)
 {
     uint64_t e = s->n_embd;
@@ -572,6 +800,9 @@ static void dump_shape(const layout_shape *s)
     printf("LAYOUT name=%s family=%u variant=%u n_layer=%u\n",
            s->name, s->family, s->variant, s->n_layer);
     switch (s->family) {
+    case FAM_QWEN:
+        expected_qwen(s);
+        break;
     case FAM_MOTIF3:
         expected_motif3(s);
         break;
@@ -629,6 +860,15 @@ static bool type_ok2(const expect_spec *sp, uint32_t typ)
     case CLS_SOLAR_CONV:
     case CLS_SOLAR_DECAY:
         return typ == T_F32;
+    case CLS_QWEN_MATRIX:
+        return typ == T_BF16 || typ == T_Q8_0 || typ == T_Q6_K ||
+               typ == T_Q5_K || typ == T_Q5_0 || typ == T_Q4_K ||
+               typ == T_Q4_0 || typ == T_Q3_K || typ == T_Q2_K ||
+               typ == T_IQ2_XXS;
+    case CLS_QWEN_PLAIN:
+        return typ == T_F32 || typ == T_BF16;
+    case CLS_QWEN_MTP_ROUTED:
+        return typ == T_Q8_0 || typ == T_BF16;
     }
     return false;
 }
@@ -830,5 +1070,6 @@ int main(int argc, char **argv)
     dump_shape(&SHAPE_MOTIF3);
     dump_shape(&SHAPE_KEXAONE);
     dump_shape(&SHAPE_DOTS3);
+    dump_shape(&SHAPE_QWEN);
     return 0;
 }

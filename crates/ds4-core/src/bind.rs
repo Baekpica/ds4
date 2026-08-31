@@ -174,6 +174,14 @@ pub fn dots3_layer_is_full_attention(shape: &Shape, il: u32) -> bool {
     il == 0 || (shape.n_swa_period != 0 && (il % shape.n_swa_period) == 1)
 }
 
+/// C `ds4_qwen4exp_layer_is_full_attention`.
+pub fn qwen4exp_layer_is_full_attention(shape: &Shape, il: u32) -> bool {
+    shape.family == ModelFamily::Qwen4Exp
+        && il < shape.n_layer
+        && shape.n_swa_period != 0
+        && (il % shape.n_swa_period) == 3
+}
+
 fn is_nextn(shape: &Shape, il: u32) -> bool {
     shape.n_nextn_predict != 0 && il + shape.n_nextn_predict >= shape.n_layer
 }
@@ -360,6 +368,152 @@ fn bind_solar_open2_layer(out: &mut Vec<BindName>, shape: &Shape, il: u32) {
     reqf(out, "blk.%u.ffn_down_shexp.weight", il);
 }
 
+fn bind_qwen4exp_layer(out: &mut Vec<BindName>, shape: &Shape, il: u32) {
+    for name in [
+        "blk.%u.hc_attn.norm.weight",
+        "blk.%u.hc_attn.mix_down.weight",
+        "blk.%u.hc_attn.mix_up.weight",
+        "blk.%u.hc_attn.inject.weight",
+    ] {
+        reqf(out, name, il);
+    }
+    if qwen4exp_layer_is_full_attention(shape, il) {
+        for name in [
+            "blk.%u.attn_index_qk.weight",
+            "blk.%u.attn_index_q_norm.weight",
+            "blk.%u.attn_index_k_norm.weight",
+            "blk.%u.attn_q.weight",
+            "blk.%u.attn_q_norm.weight",
+            "blk.%u.attn_k.weight",
+            "blk.%u.attn_k_norm.weight",
+            "blk.%u.attn_v.weight",
+            "blk.%u.attn_output.weight",
+        ] {
+            reqf(out, name, il);
+        }
+    } else {
+        for name in [
+            "blk.%u.linear_attn.a_log",
+            "blk.%u.linear_attn.conv.weight",
+            "blk.%u.linear_attn.dt_bias",
+            "blk.%u.linear_attn.in_a.weight",
+            "blk.%u.linear_attn.in_b.weight",
+            "blk.%u.linear_attn.qkv.weight",
+            "blk.%u.linear_attn.z.weight",
+            "blk.%u.linear_attn.norm.weight",
+            "blk.%u.linear_attn.out.weight",
+        ] {
+            reqf(out, name, il);
+        }
+    }
+    for name in [
+        "blk.%u.ffn_gate_inp.weight",
+        "blk.%u.ffn_gate_exps.weight",
+        "blk.%u.ffn_up_exps.weight",
+        "blk.%u.ffn_down_exps.main.weight",
+        "blk.%u.ffn_down_exps.tail.weight",
+        "blk.%u.ffn_gate_shexp.weight",
+        "blk.%u.ffn_up_shexp.weight",
+        "blk.%u.ffn_down_shexp.weight",
+        "blk.%u.ffn_shexp_gate_inp.weight",
+        "blk.%u.hc_ffn.norm.weight",
+        "blk.%u.hc_ffn.mix_down.weight",
+        "blk.%u.hc_ffn.mix_up.weight",
+        "blk.%u.hc_ffn.inject.weight",
+    ] {
+        reqf(out, name, il);
+    }
+    if il == 1 {
+        for name in [
+            "blk.1.ple.conv.weight",
+            "blk.1.ple.key.weight",
+            "blk.1.ple.value.weight",
+            "blk.1.ple.conv_norm.weight",
+            "blk.1.ple.key_norm.weight",
+            "blk.1.ple.query_norm.weight",
+            "blk.1.ple.layer_multipliers",
+            "blk.1.ple.head_offsets",
+            "blk.1.ple.head_vocab_sizes",
+        ] {
+            req(out, name);
+        }
+    }
+}
+
+fn bind_qwen4exp_mtp(out: &mut Vec<BindName>) {
+    for name in [
+        "mtp.fc_embedding.weight",
+        "mtp.fc_hidden.weight",
+        "mtp.fc_embedding_norm.weight",
+        "mtp.fc_hidden_norm.weight",
+        "mtp.hc_input.norm.weight",
+        "mtp.hc_input.mix_down.weight",
+        "mtp.hc_input.mix_up.weight",
+        "mtp.blk.0.hc_attn.norm.weight",
+        "mtp.blk.0.hc_attn.mix_down.weight",
+        "mtp.blk.0.hc_attn.mix_up.weight",
+        "mtp.blk.0.hc_attn.inject.weight",
+        "mtp.blk.0.attn_index_qk.weight",
+        "mtp.blk.0.attn_index_q_norm.weight",
+        "mtp.blk.0.attn_index_k_norm.weight",
+        "mtp.blk.0.attn_q.weight",
+        "mtp.blk.0.attn_q_norm.weight",
+        "mtp.blk.0.attn_k.weight",
+        "mtp.blk.0.attn_k_norm.weight",
+        "mtp.blk.0.attn_v.weight",
+        "mtp.blk.0.attn_output.weight",
+        "mtp.blk.0.ffn_gate_inp.weight",
+        "mtp.blk.0.ffn_gate_exps.weight",
+        "mtp.blk.0.ffn_up_exps.weight",
+        "mtp.blk.0.ffn_down_exps.main.weight",
+        "mtp.blk.0.ffn_down_exps.tail.weight",
+        "mtp.blk.0.ffn_gate_shexp.weight",
+        "mtp.blk.0.ffn_up_shexp.weight",
+        "mtp.blk.0.ffn_down_shexp.weight",
+        "mtp.blk.0.ffn_shexp_gate_inp.weight",
+        "mtp.blk.0.hc_ffn.norm.weight",
+        "mtp.blk.0.hc_ffn.mix_down.weight",
+        "mtp.blk.0.hc_ffn.mix_up.weight",
+        "mtp.blk.0.hc_ffn.inject.weight",
+    ] {
+        req(out, name);
+    }
+}
+
+fn bind_qwen4exp_vision(out: &mut Vec<BindName>) {
+    req(out, "vision.patch_embed.weight");
+    req(out, "vision.patch_embed.bias");
+    req(out, "vision.position_embd.weight");
+    for il in 0..27 {
+        for name in [
+            "vblk.%u.norm1.weight",
+            "vblk.%u.norm1.bias",
+            "vblk.%u.attn_qkv.weight",
+            "vblk.%u.attn_qkv.bias",
+            "vblk.%u.attn_output.weight",
+            "vblk.%u.attn_output.bias",
+            "vblk.%u.norm2.weight",
+            "vblk.%u.norm2.bias",
+            "vblk.%u.ffn_up.weight",
+            "vblk.%u.ffn_up.bias",
+            "vblk.%u.ffn_down.weight",
+            "vblk.%u.ffn_down.bias",
+        ] {
+            reqf(out, name, il);
+        }
+    }
+    for name in [
+        "vision.merger.norm.weight",
+        "vision.merger.norm.bias",
+        "vision.merger.ffn_up.weight",
+        "vision.merger.ffn_up.bias",
+        "vision.merger.ffn_down.weight",
+        "vision.merger.ffn_down.bias",
+    ] {
+        req(out, name);
+    }
+}
+
 fn bind_deepseek_layer(out: &mut Vec<BindName>, shape: &Shape, il: u32) {
     let compress_ratio = expected_compress_ratio(shape.variant, shape.n_layer, il);
     reqf(out, "blk.%u.hc_attn_fn.weight", il);
@@ -512,6 +666,18 @@ fn dump_name_table(header: String, names: &[BindName]) -> String {
 pub fn bind_names(shape: &Shape) -> Vec<BindName> {
     let mut out = Vec::new();
     match shape.family {
+        ModelFamily::Qwen4Exp => {
+            req(&mut out, "token_embd.weight");
+            req(&mut out, "output.weight");
+            req(&mut out, "hc_input.norm.weight");
+            req(&mut out, "hc_input.mix_down.weight");
+            req(&mut out, "hc_input.mix_up.weight");
+            for il in 0..shape.n_layer {
+                bind_qwen4exp_layer(&mut out, shape, il);
+            }
+            bind_qwen4exp_mtp(&mut out);
+            bind_qwen4exp_vision(&mut out);
+        }
         ModelFamily::Motif3 => {
             req(&mut out, "token_embd.weight");
             req(&mut out, "output_norm.weight");
@@ -610,6 +776,7 @@ pub fn dump_bind_names() -> String {
         Variant::Motif3,
         Variant::Kexaone236B,
         Variant::Dots3NotePrev,
+        Variant::Qwen38FlashNext,
     ] {
         out.push_str(&dump_bind_names_shape(&shape_for_variant(v)));
     }
@@ -947,6 +1114,7 @@ pub fn variant_from_bind_name(s: &str) -> Option<Variant> {
         "motif3" => Some(Variant::Motif3),
         "exaone-moe" => Some(Variant::Kexaone236B),
         "dots3-note" => Some(Variant::Dots3NotePrev),
+        "qwen4exp" => Some(Variant::Qwen38FlashNext),
         _ => None,
     }
 }

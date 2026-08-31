@@ -204,6 +204,10 @@ fn identify_families_and_errors_match_c() {
     write_gguf(&dots, &[("general.architecture", Val::Str("dots3-note"))]);
     assert_same(&dots);
 
+    let qwen = tmp("qwen.gguf");
+    write_gguf(&qwen, &[("general.architecture", Val::Str("qwen4exp"))]);
+    assert_same(&qwen);
+
     let glm = tmp("glm.gguf");
     write_gguf(&glm, &[("general.architecture", Val::Str("glm-dsa"))]);
     assert_same(&glm);

@@ -1,5 +1,5 @@
 /* weights_bind name catalog + bind-plan check/match oracle from ds4.c at
- * v0.6.3-dfm. Standalone: do not include ds4.c. */
+ * v0.6.5-dfm. Standalone: do not include ds4.c. */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -12,7 +12,8 @@ typedef enum {
     DS4_MODEL_FAMILY_SOLAR_OPEN2 = 1,
     DS4_MODEL_FAMILY_MOTIF3 = 2,
     DS4_MODEL_FAMILY_EXAONE_MOE = 3,
-    DS4_MODEL_FAMILY_DOTS3_NOTE = 4
+    DS4_MODEL_FAMILY_DOTS3_NOTE = 4,
+    DS4_MODEL_FAMILY_QWEN4EXP = 5
 } ds4_model_family;
 
 typedef enum {
@@ -21,7 +22,8 @@ typedef enum {
     DS4_VARIANT_SOLAR_OPEN2_250B = 2,
     DS4_VARIANT_MOTIF3 = 3,
     DS4_VARIANT_KEXAONE_236B = 4,
-    DS4_VARIANT_DOTS3_NOTE_PREV = 5
+    DS4_VARIANT_DOTS3_NOTE_PREV = 5,
+    DS4_VARIANT_QWEN38_FLASH_NEXT = 6
 } ds4_variant;
 
 typedef struct {
@@ -60,6 +62,10 @@ static const bind_shape SHAPE_DOTS3 = {
     "dots3-note-prev", DS4_MODEL_FAMILY_DOTS3_NOTE, DS4_VARIANT_DOTS3_NOTE_PREV,
     47, 0, 4, 1, 1, false
 };
+static const bind_shape SHAPE_QWEN = {
+    "Qwen3.8-Flash-Next", DS4_MODEL_FAMILY_QWEN4EXP, DS4_VARIANT_QWEN38_FLASH_NEXT,
+    48, 0, 4, 1, 0, true
+};
 
 static uint32_t g_n, g_req, g_opt;
 
@@ -84,6 +90,11 @@ static bool dots3_layer_is_full_attention(const bind_shape *s, uint32_t il) {
     if (s->family != DS4_MODEL_FAMILY_DOTS3_NOTE || il >= s->n_layer) return false;
     if (s->n_nextn_predict != 0 && il + s->n_nextn_predict >= s->n_layer) return false;
     return il == 0u || (s->n_swa_period != 0 && (il % s->n_swa_period) == 1u);
+}
+
+static bool qwen4exp_layer_is_full_attention(const bind_shape *s, uint32_t il) {
+    return s->family == DS4_MODEL_FAMILY_QWEN4EXP && il < s->n_layer &&
+           s->n_swa_period != 0 && (il % s->n_swa_period) == 3u;
 }
 
 static bool is_nextn(const bind_shape *s, uint32_t il) {
@@ -252,6 +263,99 @@ static void bind_dots3_note_layer(const bind_shape *s, uint32_t il) {
     }
 }
 
+static void bind_qwen4exp_layer(const bind_shape *s, uint32_t il) {
+    static const char *const hc_attn[] = {
+        "blk.%u.hc_attn.norm.weight", "blk.%u.hc_attn.mix_down.weight",
+        "blk.%u.hc_attn.mix_up.weight", "blk.%u.hc_attn.inject.weight"
+    };
+    static const char *const qsa[] = {
+        "blk.%u.attn_index_qk.weight", "blk.%u.attn_index_q_norm.weight",
+        "blk.%u.attn_index_k_norm.weight", "blk.%u.attn_q.weight",
+        "blk.%u.attn_q_norm.weight", "blk.%u.attn_k.weight",
+        "blk.%u.attn_k_norm.weight", "blk.%u.attn_v.weight",
+        "blk.%u.attn_output.weight"
+    };
+    static const char *const gdn[] = {
+        "blk.%u.linear_attn.a_log", "blk.%u.linear_attn.conv.weight",
+        "blk.%u.linear_attn.dt_bias", "blk.%u.linear_attn.in_a.weight",
+        "blk.%u.linear_attn.in_b.weight", "blk.%u.linear_attn.qkv.weight",
+        "blk.%u.linear_attn.z.weight", "blk.%u.linear_attn.norm.weight",
+        "blk.%u.linear_attn.out.weight"
+    };
+    static const char *const tail[] = {
+        "blk.%u.ffn_gate_inp.weight", "blk.%u.ffn_gate_exps.weight",
+        "blk.%u.ffn_up_exps.weight", "blk.%u.ffn_down_exps.main.weight",
+        "blk.%u.ffn_down_exps.tail.weight", "blk.%u.ffn_gate_shexp.weight",
+        "blk.%u.ffn_up_shexp.weight", "blk.%u.ffn_down_shexp.weight",
+        "blk.%u.ffn_shexp_gate_inp.weight", "blk.%u.hc_ffn.norm.weight",
+        "blk.%u.hc_ffn.mix_down.weight", "blk.%u.hc_ffn.mix_up.weight",
+        "blk.%u.hc_ffn.inject.weight"
+    };
+    static const char *const ple[] = {
+        "blk.1.ple.conv.weight", "blk.1.ple.key.weight",
+        "blk.1.ple.value.weight", "blk.1.ple.conv_norm.weight",
+        "blk.1.ple.key_norm.weight", "blk.1.ple.query_norm.weight",
+        "blk.1.ple.layer_multipliers", "blk.1.ple.head_offsets",
+        "blk.1.ple.head_vocab_sizes"
+    };
+    size_t i;
+    for (i = 0; i < sizeof(hc_attn) / sizeof(hc_attn[0]); i++) emitf(hc_attn[i], il, 1);
+    if (qwen4exp_layer_is_full_attention(s, il)) {
+        for (i = 0; i < sizeof(qsa) / sizeof(qsa[0]); i++) emitf(qsa[i], il, 1);
+    } else {
+        for (i = 0; i < sizeof(gdn) / sizeof(gdn[0]); i++) emitf(gdn[i], il, 1);
+    }
+    for (i = 0; i < sizeof(tail) / sizeof(tail[0]); i++) emitf(tail[i], il, 1);
+    if (il == 1u)
+        for (i = 0; i < sizeof(ple) / sizeof(ple[0]); i++) emit(ple[i], 1);
+}
+
+static void bind_qwen4exp_mtp(void) {
+    static const char *const names[] = {
+        "mtp.fc_embedding.weight", "mtp.fc_hidden.weight",
+        "mtp.fc_embedding_norm.weight", "mtp.fc_hidden_norm.weight",
+        "mtp.hc_input.norm.weight", "mtp.hc_input.mix_down.weight",
+        "mtp.hc_input.mix_up.weight", "mtp.blk.0.hc_attn.norm.weight",
+        "mtp.blk.0.hc_attn.mix_down.weight", "mtp.blk.0.hc_attn.mix_up.weight",
+        "mtp.blk.0.hc_attn.inject.weight", "mtp.blk.0.attn_index_qk.weight",
+        "mtp.blk.0.attn_index_q_norm.weight", "mtp.blk.0.attn_index_k_norm.weight",
+        "mtp.blk.0.attn_q.weight", "mtp.blk.0.attn_q_norm.weight",
+        "mtp.blk.0.attn_k.weight", "mtp.blk.0.attn_k_norm.weight",
+        "mtp.blk.0.attn_v.weight", "mtp.blk.0.attn_output.weight",
+        "mtp.blk.0.ffn_gate_inp.weight", "mtp.blk.0.ffn_gate_exps.weight",
+        "mtp.blk.0.ffn_up_exps.weight", "mtp.blk.0.ffn_down_exps.main.weight",
+        "mtp.blk.0.ffn_down_exps.tail.weight", "mtp.blk.0.ffn_gate_shexp.weight",
+        "mtp.blk.0.ffn_up_shexp.weight", "mtp.blk.0.ffn_down_shexp.weight",
+        "mtp.blk.0.ffn_shexp_gate_inp.weight", "mtp.blk.0.hc_ffn.norm.weight",
+        "mtp.blk.0.hc_ffn.mix_down.weight", "mtp.blk.0.hc_ffn.mix_up.weight",
+        "mtp.blk.0.hc_ffn.inject.weight"
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) emit(names[i], 1);
+}
+
+static void bind_qwen4exp_vision(void) {
+    static const char *const layer[] = {
+        "vblk.%u.norm1.weight", "vblk.%u.norm1.bias",
+        "vblk.%u.attn_qkv.weight", "vblk.%u.attn_qkv.bias",
+        "vblk.%u.attn_output.weight", "vblk.%u.attn_output.bias",
+        "vblk.%u.norm2.weight", "vblk.%u.norm2.bias",
+        "vblk.%u.ffn_up.weight", "vblk.%u.ffn_up.bias",
+        "vblk.%u.ffn_down.weight", "vblk.%u.ffn_down.bias"
+    };
+    static const char *const merger[] = {
+        "vision.merger.norm.weight", "vision.merger.norm.bias",
+        "vision.merger.ffn_up.weight", "vision.merger.ffn_up.bias",
+        "vision.merger.ffn_down.weight", "vision.merger.ffn_down.bias"
+    };
+    emit("vision.patch_embed.weight", 1);
+    emit("vision.patch_embed.bias", 1);
+    emit("vision.position_embd.weight", 1);
+    for (uint32_t il = 0; il < 27u; il++)
+        for (size_t i = 0; i < sizeof(layer) / sizeof(layer[0]); i++)
+            emitf(layer[i], il, 1);
+    for (size_t i = 0; i < sizeof(merger) / sizeof(merger[0]); i++) emit(merger[i], 1);
+}
+
 static void bind_solar_open2_layer(const bind_shape *s, uint32_t il) {
     emitf("blk.%u.attn_norm.weight", il, 1);
     emitf("blk.%u.attn_q.weight", il, 1);
@@ -332,7 +436,16 @@ static void dump_shape(const bind_shape *s) {
     g_n = g_req = g_opt = 0;
     printf("BIND name=%s family=%u variant=%u n_layer=%u\n",
            s->name, (unsigned)s->family, (unsigned)s->variant, s->n_layer);
-    if (s->family == DS4_MODEL_FAMILY_MOTIF3) {
+    if (s->family == DS4_MODEL_FAMILY_QWEN4EXP) {
+        emit("token_embd.weight", 1);
+        emit("output.weight", 1);
+        emit("hc_input.norm.weight", 1);
+        emit("hc_input.mix_down.weight", 1);
+        emit("hc_input.mix_up.weight", 1);
+        for (il = 0; il < s->n_layer; il++) bind_qwen4exp_layer(s, il);
+        bind_qwen4exp_mtp();
+        bind_qwen4exp_vision();
+    } else if (s->family == DS4_MODEL_FAMILY_MOTIF3) {
         emit("token_embd.weight", 1);
         emit("output_norm.weight", 1);
         emit("output.weight", 1);
@@ -719,6 +832,7 @@ int main(int argc, char **argv) {
         dump_shape(&SHAPE_MOTIF3);
         dump_shape(&SHAPE_KEXAONE);
         dump_shape(&SHAPE_DOTS3);
+        dump_shape(&SHAPE_QWEN);
         return 0;
     }
     if (strcmp(cmd, "support") == 0) {

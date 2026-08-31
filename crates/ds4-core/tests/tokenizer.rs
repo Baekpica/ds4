@@ -395,6 +395,19 @@ fn write_family(family: ModelFamily) -> PathBuf {
             b.push_str("<no_think>", 4);
             b.write(&path, "dots3-note");
         }
+        ModelFamily::Qwen4Exp => {
+            let mut b = Builder::with_bytes().with_he();
+            b.push_str("<|endoftext|>", 3);
+            b.push_str("<|im_start|>", 3);
+            b.push_str("<|im_end|>", 3);
+            b.push_str("<think>", 3);
+            b.push_str("</think>", 3);
+            b.push_str("<tool_call>", 3);
+            b.push_str("</tool_call>", 3);
+            b.push_str("<tool_response>", 3);
+            b.push_str("</tool_response>", 3);
+            b.write(&path, "qwen4exp");
+        }
     }
     path
 }
@@ -450,6 +463,11 @@ fn family_cases(family: ModelFamily) {
             renders.push("<|user|>hi<|endofassistant|>".into());
             renders.push("<|endoftext|>".into());
         }
+        ModelFamily::Qwen4Exp => {
+            encodes.push("hello <think>x</think>");
+            renders.push("<|im_start|>user\nhi<|im_end|>\n".into());
+            renders.push("<think>x</think>".into());
+        }
     }
     for t in encodes {
         assert_cmd(family, &path, &vocab, "encode", &hex_text(t));
@@ -478,7 +496,7 @@ fn family_cases(family: ModelFamily) {
 
     let mut stops = vec![vocab.eos_id, vocab.engine_eos(), 7, -1];
     match family {
-        ModelFamily::SolarOpen2 => stops.push(vocab.eot_id),
+        ModelFamily::SolarOpen2 | ModelFamily::Qwen4Exp => stops.push(vocab.eot_id),
         ModelFamily::Motif3 => {
             stops.push(vocab.user_id);
             stops.push(vocab.end_of_turn_id);
@@ -543,7 +561,7 @@ fn family_cases(family: ModelFamily) {
                 .unwrap_err();
             assert!(matches!(err, TokError::EmbeddedNul));
         }
-        ModelFamily::Motif3 | ModelFamily::Dots3Note => {}
+        ModelFamily::Motif3 | ModelFamily::Dots3Note | ModelFamily::Qwen4Exp => {}
     }
     assert_eq!(tokens.as_slice(), &[7]);
 }
@@ -574,6 +592,7 @@ fn tokenizer_families_match_c_oracle() {
         ModelFamily::SolarOpen2,
         ModelFamily::ExaoneMoe,
         ModelFamily::Dots3Note,
+        ModelFamily::Qwen4Exp,
     ] {
         family_cases(family);
     }
