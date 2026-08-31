@@ -31,6 +31,7 @@
       "selected_token_ids_md5": "6f1a24a5adf105053e9bed63fded9337"
     }
   ],
+  "expanded_plan_inputs_sha256": "df4065094b7364e57861bba6049f98f1bf45c405a3847fcb62702c75944bbeaa",
   "expanded_plan_sha256": "7072c94b00a68e4a9dd9bc52f06a235aeb5670de46902370167aa50d61539b8c",
   "scenario": "cuda-opp-c-full",
   "schema": "ds4-proof-expected-v1"

@@ -1995,6 +1995,13 @@ def expanded_plan_sha256(plan: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def expanded_plan_inputs_sha256(plan: dict[str, Any]) -> str:
+    """Fingerprint semantic inputs, independent of the runner's location."""
+    inputs = dict(plan)
+    inputs.pop("bin_path", None)
+    return expanded_plan_sha256(inputs)
+
+
 def load_expected_snapshot(path: Path) -> dict[str, Any]:
     """Read tests/proof/expected/<scenario>.json.
 
@@ -2002,7 +2009,8 @@ def load_expected_snapshot(path: Path) -> dict[str, Any]:
       {
         "schema": "ds4-proof-expected-v1",
         "scenario": "<name>",
-        "expanded_plan_sha256": "<hex>",   # plan-input fingerprint
+        "expanded_plan_sha256": "<hex>",          # legacy full-plan fingerprint
+        "expanded_plan_inputs_sha256": "<hex>",   # path-independent inputs
         "cells": [
           { "prompt_id": "...", "profile": "...",
             "selected_token_ids_md5": "<hex>", "gen_token_count": N },
@@ -2026,13 +2034,23 @@ def validate_against_expected(
 ) -> tuple[bool, list[str]]:
     """Compare run results against a snapshot. Returns (passed, reasons)."""
     reasons: list[str] = []
-    plan_sha = expanded_plan_sha256(expanded_plan)
-    expected_sha = expected.get("expanded_plan_sha256", "")
-    if expected_sha and expected_sha != plan_sha:
-        reasons.append(
-            f"expanded-plan SHA256 mismatch: expected {expected_sha} run {plan_sha} "
-            "(plan inputs drifted from snapshot; refresh snapshot or revert input change)"
-        )
+    expected_inputs_sha = expected.get("expanded_plan_inputs_sha256", "")
+    if expected_inputs_sha:
+        plan_inputs_sha = expanded_plan_inputs_sha256(expanded_plan)
+        if expected_inputs_sha != plan_inputs_sha:
+            reasons.append(
+                f"expanded-plan inputs SHA256 mismatch: expected {expected_inputs_sha} "
+                f"run {plan_inputs_sha} (plan inputs drifted from snapshot; "
+                "refresh snapshot or revert input change)"
+            )
+    else:
+        plan_sha = expanded_plan_sha256(expanded_plan)
+        expected_sha = expected.get("expanded_plan_sha256", "")
+        if expected_sha and expected_sha != plan_sha:
+            reasons.append(
+                f"expanded-plan SHA256 mismatch: expected {expected_sha} run {plan_sha} "
+                "(plan inputs drifted from snapshot; refresh snapshot or revert input change)"
+            )
     by_cell = {
         (c["prompt_id"], c["profile"]): c
         for c in expected.get("cells", [])
@@ -2066,10 +2084,9 @@ def write_expected_snapshot(
     golden snapshot at `path` (ds4-proof-expected-v1). Symmetric with
     --check-expected. Returns the number of cells written.
 
-    The expanded_plan_sha256 fingerprint is stored alongside so a later
-    --check-expected run fails loudly if the plan inputs (prompts, profiles,
-    budget) have drifted from what was blessed, rather than silently comparing
-    different inputs."""
+    Both the legacy full-plan fingerprint and a path-independent input
+    fingerprint are stored so a later --check-expected run catches semantic
+    drift without coupling the snapshot to the proof runner's location."""
     cells = [
         {
             "prompt_id": prompt_id,
@@ -2083,6 +2100,9 @@ def write_expected_snapshot(
         "schema": "ds4-proof-expected-v1",
         "scenario": scenario_name,
         "expanded_plan_sha256": expanded_plan_sha256(expanded_plan) if expanded_plan else "",
+        "expanded_plan_inputs_sha256": (
+            expanded_plan_inputs_sha256(expanded_plan) if expanded_plan else ""
+        ),
         "cells": cells,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2405,7 +2425,11 @@ def main(argv: list[str] | None = None) -> int:
         expanded_plan_path.write_text(
             json.dumps(expanded_plan, indent=2, sort_keys=True) + "\n"
         )
-        print(f"expanded_plan={expanded_plan_path} sha256={expanded_plan_sha256(expanded_plan)}")
+        print(
+            f"expanded_plan={expanded_plan_path} "
+            f"sha256={expanded_plan_sha256(expanded_plan)} "
+            f"inputs_sha256={expanded_plan_inputs_sha256(expanded_plan)}"
+        )
 
     weight_ipc_manifest = args.weight_ipc_manifest
     weight_server: WeightServer | None = None
@@ -2616,6 +2640,9 @@ def main(argv: list[str] | None = None) -> int:
         "work_dir": str(work_dir),
         "expanded_plan_path": str(expanded_plan_path) if expanded_plan_path else "",
         "expanded_plan_sha256": expanded_plan_sha256(expanded_plan) if expanded_plan else "",
+        "expanded_plan_inputs_sha256": (
+            expanded_plan_inputs_sha256(expanded_plan) if expanded_plan else ""
+        ),
         "expected_validation": expected_validation,
         "weight_ipc_manifest": weight_ipc_manifest,
         "weight_ipc_scope": weight_server_scope,

@@ -97,13 +97,19 @@ as `sm_121a`. The frozen C binary SHA-256 is
 Its five 512-token cells use expanded-plan SHA-256
 `7072c94b00a68e4a9dd9bc52f06a235aeb5670de46902370167aa50d61539b8c`;
 all selected-token streams retain MD5 `6f1a24a5adf105053e9bed63fded9337`.
+The portable plan-input SHA-256 is
+`df4065094b7364e57861bba6049f98f1bf45c405a3847fcb62702c75944bbeaa`;
+it excludes only the proof runner path, not any model, prompt, profile, or
+runtime setting.
 
 The frozen binary first wrote the new file and then independently checked it
 5/5 under the 109/115 GiB memory guard. Evidence is under
 `scratch/rust-host-live/v065-full-restamp-20260831-184200/c-oracle-oppc{,-check}/`.
 With `CUDA_ARCH=sm_121`, `make proof-cuda-opp-c` now selects this v0.6.5 file.
-The current C-native and Rust-host proof manifest must still be re-run before
-split readiness.
+The current C-native committed-snapshot proof and the Rust-host parity proof
+both passed on 2026-08-31. Their retry logs are
+`g1b-logs/proof-{cuda-opp-c,rust-cuda-opp-c}-retry.log` under the same evidence
+root.
 
 ## What `v0.6.3-dfm` itself proved
 
