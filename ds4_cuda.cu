@@ -36048,10 +36048,11 @@ extern "C" int ds4_gpu_motif3_routed_moe_batch_tensor(
             (float *)gate->ptr, (float *)up->ptr,
             (int)expert_mid_dim, (int)expert_in_dim,
             (int)n_tokens, (int)n_total_expert,
-            /* Motif decode (8 assignments) measures 13.14 -> 15.06 tok/s
-             * at 8K on the D2R schedule; prefill shapes sit far above
-             * either floor, so this only moves the decode engagement. */
-            (int)n_expert_used, /*d2r_ncols_floor=*/8, stream)
+            /* Keep the measured 13.14 -> 15.06 tok/s scalar decode tier.
+             * Multi-row IQ2 D2R changes Motif's greedy stream as the live
+             * width changes; the existing aligned MMQ fallback is exact. */
+            (int)n_expert_used,
+            /*d2r_ncols_floor=*/n_tokens == 1u ? 8 : INT_MAX, stream)
         : ds4_mmq_iq2_xxs_moe_pair(
             gate_w, up_w, (const float *)x->ptr,
             (const int32_t *)selected->ptr,
