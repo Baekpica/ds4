@@ -307,6 +307,7 @@ native/bridge/ds4_bridge.o: native/bridge/ds4_bridge.c native/bridge/ds4_bridge.
 # ./ds4-eval stays C.
 DS4_RS_ROOT := $(abspath .)
 DS4_RS_LINK_OBJS := native/bridge/ds4_bridge.o $(CORE_OBJS)
+DS4_RS_SOURCES := Cargo.toml Cargo.lock $(shell find crates -type f -print)
 # Cargo does not fingerprint external link-object contents; include them in rustc metadata.
 DS4_RS_LINK_FINGERPRINT = $(shell cksum $(DS4_RS_LINK_OBJS) 2>/dev/null | cksum | awk '{print $$1}')
 # Cargo honors an externally supplied CARGO_TARGET_DIR. Copy the binary from
@@ -326,21 +327,21 @@ DS4_RS_LIBS := -C link-arg=-L$(CUDA_HOME)/targets/sbsa-linux/lib \
 	-C link-arg=-ldl -C link-arg=-lm -C link-arg=-lpthread -C link-arg=-lc
 endif
 
-ds4: native/bridge/ds4_bridge.o $(CORE_OBJS)
+ds4: $(DS4_RS_SOURCES) native/bridge/ds4_bridge.o $(CORE_OBJS)
 	cargo rustc -p ds4-cli --bin ds4-rs --release --features native -- \
 		-C metadata=$(DS4_RS_LINK_FINGERPRINT) \
 		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
 		$(DS4_RS_LIBS)
 	cp -f "$(DS4_RS_TARGET_DIR)/release/ds4-rs" $@
 
-ds4-agent: native/bridge/ds4_bridge.o $(CORE_OBJS)
+ds4-agent: $(DS4_RS_SOURCES) native/bridge/ds4_bridge.o $(CORE_OBJS)
 	cargo rustc -p ds4-cli --bin ds4-agent-rs --release --features native -- \
 		-C metadata=$(DS4_RS_LINK_FINGERPRINT) \
 		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
 		$(DS4_RS_LIBS)
 	cp -f "$(DS4_RS_TARGET_DIR)/release/ds4-agent-rs" $@
 
-ds4-bench: native/bridge/ds4_bridge.o $(CORE_OBJS)
+ds4-bench: $(DS4_RS_SOURCES) native/bridge/ds4_bridge.o $(CORE_OBJS)
 	cargo rustc -p ds4-cli --bin ds4-bench-rs --release --features native -- \
 		-C metadata=$(DS4_RS_LINK_FINGERPRINT) \
 		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
@@ -493,7 +494,7 @@ test-session-parity: tests/parity/session_c_oracle tests/parity/payload_c_oracle
 	DS4_PAYLOAD_C_ORACLE=$(DS4_RS_ROOT)/tests/parity/payload_c_oracle \
 		cargo test -p ds4-core --test session --test payload
 
-ds4-server: native/bridge/ds4_bridge.o $(CORE_OBJS)
+ds4-server: $(DS4_RS_SOURCES) native/bridge/ds4_bridge.o $(CORE_OBJS)
 	cargo rustc -p ds4-server --bin ds4-server-rs --release --features native -- \
 		-C metadata=$(DS4_RS_LINK_FINGERPRINT) \
 		$(patsubst %,-C link-arg=$(DS4_RS_ROOT)/%,$(DS4_RS_LINK_OBJS)) \
