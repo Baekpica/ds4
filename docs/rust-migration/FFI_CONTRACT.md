@@ -23,9 +23,9 @@ existing ds4.h / ds4.c / ds4_cuda.cu internals
 2. Do **not** expose C struct layouts to Rust. Handles are opaque.
 3. Do **not** put `CUstream`, device pointers, MMQ descriptors, or
    graph execs in Rust application code.
-4. `unsafe` belongs in `ds4-sys` or a tiny native adapter. Application
-   crates (`ds4-server`, `ds4-cli`, `ds4-kv`, `ds4-dist`) showing
-   `unsafe {` is an architecture defect.
+4. `unsafe` belongs in `ds4-sys` or a tiny reviewed native/OS adapter.
+   Application policy/runtime code showing `unsafe {` is an architecture
+   defect; localized POSIX/linenoise adapters must carry a `SAFETY` rationale.
 5. Errors cross the boundary as `int` + caller-provided `char *err`
    buffer, matching the existing C session helpers. No C++ exceptions.
    No Rust panic across FFI.

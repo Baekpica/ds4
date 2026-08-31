@@ -16,10 +16,10 @@ repository, not to this branch.
 |---|---|
 | Branch | `rust-host` |
 | C golden baseline | `v0.6.5-dfm` (`d02e2a4`), Qwen cut `4d40d97` |
-| Current phase | Post-promotion revalidation is active after importing the v0.6.5/Qwen delta. Q5+Sidecar text, image, three API surfaces, continuous/static/serial routing, image-aware live/disk KV, component/batch gates, and C→Rust→Rust→C ABBA are green at `6ca85c8`. Remaining host ownership work plus the complete family/proof/soak manifest still gate the split. |
+| Current phase | The v0.6.5/Qwen post-promotion revalidation is green: live matrix `eb4ba77`, final host/parity audit `d126e56`. The 60 logical cells are PASS 57 + PASS* 3, with no Rust-only failure. Qwen Q5+Sidecar passed text/image, KV, ABBA, exact/configured 262K, MTP/static, and the campaign's only two-hour soak. |
 | Default production path | Rust host names over the unchanged native CUDA/MMQ backend; explicit `*-c` oracles retained |
 | Target production path | Rust host + unchanged native CUDA/MMQ backend |
-| Repo split | Destination `../ds4-dfm-rs` exists with README/gitignore only; production-code genesis has not started and requires `SPLIT_READINESS.md` green. |
+| Repo split | Destination `../ds4-dfm-rs` is the clean `b01d1fa` scaffold. `SPLIT_READINESS.md` is green; archive-tag + guarded genesis seeding is next. |
 
 Live subsystem progress lives in [STATUS.md](STATUS.md).
 
@@ -34,7 +34,7 @@ Live subsystem progress lives in [STATUS.md](STATUS.md).
 | [STATUS.md](STATUS.md) | Subsystem matrix (always current) |
 | [QWEN_V065_RESTAMP_2026-08-31.md](QWEN_V065_RESTAMP_2026-08-31.md) | Q5+Sidecar Rust live gate, family tests, and ABBA evidence |
 | [DFM_RS_SPLIT_PLAN.md](DFM_RS_SPLIT_PLAN.md) | Post-split work instruction (§0–§60), lineage/license preservation, and v0.1.0 parity release. Execute only after `SPLIT_READINESS.md` is green; the destination name is now `ds4-dfm-rs`. |
-| `SPLIT_READINESS.md` | Last artifact before production code enters `ds4-dfm-rs`. Do not create until green. |
+| [SPLIT_READINESS.md](SPLIT_READINESS.md) | Green genesis contract and current evidence index. |
 
 Related frozen oracles outside this directory:
 
@@ -67,7 +67,7 @@ Do not do any of the following on `rust-host`:
 - Translate `ds4.c` into one `ds4.rs`
 - Rewrite CUDA/MMQ kernels or change quantization
 - Change speculative/MTP semantics, tokenizer behavior, or checkpoint format
-- Introduce Tokio / Axum / async schedulers before `dfm-rs` exists
+- Introduce Tokio / Axum / async schedulers before `ds4-dfm-rs` exists
 - Clean up HTTP IDs, `finish_reason`, stream event order, or error envelopes
 - `git merge dfm` (that makes the oracle a moving target)
 - Mix a port commit with an optimization commit
@@ -81,7 +81,7 @@ parity matrix. Do not absorb the whole branch.
 
 0. Freeze the `v0.6.5-dfm` lineage and the Qwen C cut.
 1. Rust workspace + `native/bridge` FFI skeleton. No C port.
-2. Safe `ds4-core` wrappers. `unsafe` stays in `ds4-sys`.
+2. Safe `ds4-core` wrappers. `unsafe` stays in `ds4-sys` or a reviewed native/OS adapter.
 3. Shadow binaries `ds4-rs` / `ds4-bench-rs` calling the same C core.
 4. KV store (`ds4_kvstore.c` → `crates/ds4-kv`), 4-way checkpoint matrix.
 5. Web/utility (`ds4_web.c`) with std blocking I/O. No HTTP redesign.

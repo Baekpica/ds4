@@ -1,6 +1,6 @@
 # Engine gaps (C-shared) — living backlog
 
-C `v0.6.3-dfm`과 Rust 호스트가 **동일하게** 보이는 엔진 측 결함의
+C `v0.6.5-dfm` 계보와 Rust 호스트가 **동일하게** 보이는 엔진 측 결함의
 레지스트리다. 호스트 마이그레이션 게이트는 호스트-패리티 계약이므로,
 여기 등재된 갭은 게이트 셀에서 `PASS*(engine-gap E-n)` annotation의
 근거가 된다 — 단 **같은 명령의 C 대조 실행이 증거로 기록된 항목만**
@@ -9,7 +9,7 @@ C `v0.6.3-dfm`과 Rust 호스트가 **동일하게** 보이는 엔진 측 결함
 
 규율: 갭 수리는 엔진(C/CUDA) 작업이며 `AGENT.md`를 따른다.
 **엔진 수리 커밋과 호스트 마이그레이션 커밋을 혼합하지 않는다.**
-이 파일은 genesis 트리에 남아 `dfm-rs`로 이관된다. 항목이 수리되면
+이 파일은 genesis 트리에 남아 `ds4-dfm-rs`로 이관된다. 항목이 수리되면
 "Fixed" 상태와 수리 커밋을 남기고 삭제하지 않는다.
 
 ---
@@ -38,17 +38,16 @@ C `v0.6.3-dfm`과 Rust 호스트가 **동일하게** 보이는 엔진 측 결함
 - **C-control:** **reproduced** — ① C `ds4-server` 동일 플래그에서 같은
   IMA·같은 500 (2026-08-26 phase B); ② `test-exaone-batch`(순수 C)도
   같은 클래스 IMA로 실패했다. candidate는 "exaone prefill logits
-  readback" (`g4-logs/exaone-batch.log`); **v0.6.3-dfm golden
-  `test_exaone_batch`는 `cudaStreamBeginCapture (dense)` →
-  `cudaMallocAsync` `ds4_ggml_stubs.cu:139`**
-  (`golden-logs/exaone-batch.log`). rust-host 무관.
+  readback" (`g4-logs/exaone-batch.log`); exact `v0.6.5-dfm` sm_121a
+  `test_exaone_batch`도 같은 routed-prefill 뒤 CUDA IMA를 logits
+  readback에서 표면화했다. rust-host 무관.
 - **Canonical 경로:** VMM owner + worker는 정상 — worker prewarm 2.0s
   PASS, serial 생성 200 (`openai_chat_serial=1`, TTFT 480 ms).
 - **증거:**
   `scratch/rust-host-live/task53/exaone-serial-rightsize-20260826-154403/`
   (phase A rust / phase B C-control / phase C owner+worker),
-  `gate-20260826/g4-logs/exaone-batch.log`,
-  `gate-20260826/golden-logs/exaone-batch.log`.
+  `v065-full-restamp-20260831-184200/g4-logs/exaone-batch.log`,
+  `v065-full-restamp-20260831-184200/g4-logs/exaone-batch-v065-tag-sm121a.log`.
 - **스코프:** 엔진 (EXAONE prefill + in-process artifacts 경로, CUDA).
 - **상태:** Open.
 
@@ -60,10 +59,8 @@ C `v0.6.3-dfm`과 Rust 호스트가 **동일하게** 보이는 엔진 측 결함
   `ds4_ggml_stubs.cu:139`, `cudaStreamBeginCapture (dense)` 실패).
 - **C-control:** **reproduced** — ① C `ds4-server` standalone Solar
   `-c 2048` 부트에서 동일 IMA (2026-08-26 §10 셰이크아웃 G3,
-  `gate-20260826/g3-logs/e3-c-control.server.log`); ② **v0.6.3-dfm
-  golden worktree의 `test_solar_session`도 동일 IMA·동일 지점**
-  (`gate-20260826/golden-logs/solar-session.log`). rust-host C delta
-  (`a3325ff`) 무관.
+  `v065-full-restamp-20260831-184200/g3-logs/e3-c-control.server.log`);
+  candidate session test도 같은 `cudaMallocAsync` IMA를 표면화했다.
 - **Canonical 경로:** VMM owner + rust worker `-c 2048` PASS
   (chat `ok` stop, `continuous=1`, TTFT 254 ms).
 - **증거:** `scratch/rust-host-live/family-serve-20260826-retry/solar/`
@@ -71,7 +68,7 @@ C `v0.6.3-dfm`과 Rust 호스트가 **동일하게** 보이는 엔진 측 결함
 - **스코프:** 엔진 (Solar in-process 경로, CUDA).
 - **상태:** Open.
 
-## E-4 — Motif-3 batch 테스트 디코드 divergence
+## E-4 — Motif-3 batch 테스트 디코드 divergence — Fixed
 
 - **증상:** `test-motif3-batch`가 row 1에서 기대 토큰과 불일치
   (`got=2753,173,122,689 want=2753,173,203024,439`).
@@ -81,10 +78,13 @@ C `v0.6.3-dfm`과 Rust 호스트가 **동일하게** 보이는 엔진 측 결함
   기대 벡터가 현 GGUF/드라이버/커널 상태와 어긋나는 pre-existing.
 - **증거:** `gate-20260826/g2-logs/motif-batch.log` (candidate),
   `gate-20260826/golden-logs/motif-batch.log` (golden).
-- **스코프:** 엔진/픽스처 (Motif batch 기대값 재검증 필요).
-- **상태:** Open.
+- **수리:** `2bbdc1b`에서 multi-row IQ2 D2R을 exact aligned-MMQ fallback으로
+  제한했다. scalar decode의 측정된 D2R tier는 유지한다.
+- **재검증:** current `test-motif3-batch` widths 1/2/3/2/1 PASS
+  (`v065-full-restamp-20260831-184200/g2-logs/motif-batch-fixed.log`).
+- **상태:** Fixed (`2bbdc1b`).
 
-## E-5 — Motif-3 residency smoke RSS 한계 초과
+## E-5 — Motif-3 residency smoke RSS 한계 초과 — Fixed
 
 - **증상:** VMM owner 하에 `test-motif3-resident`가 source GGUF map RSS
   370,412 KiB로 한계(262,144 KiB)를 초과해 실패 (VMM import 직후에도
@@ -95,8 +95,12 @@ C `v0.6.3-dfm`과 Rust 호스트가 **동일하게** 보이는 엔진 측 결함
   동작 대비 스모크 한계가 낡은 pre-existing.
 - **증거:** `gate-20260826/g2-logs/motif-resident-owner.log` (candidate),
   `gate-20260826/golden-logs/motif-resident.log` (golden).
-- **스코프:** 엔진/테스트 한계 (residency 스모크 한계 재산정 필요).
-- **상태:** Open.
+- **수리:** `eb4ba77`에서 성공한 VMM manifest import 뒤 source mapping
+  cache를 해제하고, 256K 물리 할당 측정은 eager graph로 고정했다.
+- **재검증:** import 직후 source RSS 0 KiB, inference 뒤 21,848 KiB,
+  256K allocation 9.687 GiB, cleanup remainder 0
+  (`v065-full-restamp-20260831-184200/g2-logs/motif-resident-retry.log`).
+- **상태:** Fixed (`eb4ba77`).
 
 ## E-6 — dots3 residency smoke chunk/ring logit parity
 
@@ -105,13 +109,16 @@ C `v0.6.3-dfm`과 Rust 호스트가 **동일하게** 보이는 엔진 측 결함
   `first=63594/63594 batch_cos=0.98607464 batch_nrmse=0.201895
   cache_cos=1 cache_nrmse=0 decode=0 tok/s`. residency gate는
   `chunk=0` (나머지 metadata/forward/session/dsa/cache256/release=1).
-- **C-control:** **reproduced** — v0.6.3-dfm golden
-  `test_dots3_resident`가 **동일 수치·동일 gate**로 실패
-  (`gate-11c59e4/golden-logs/dots3-resident.log`; 토큰속도만
-  264 vs 216 tok/s). rust-host 무관.
+- **C-control:** **reproduced** — exact `v0.6.5-dfm` sm_121a
+  `test_dots3_resident --chunk-only`가 candidate와 **동일 수치·동일
+  gate**로 실패. worker SHA-256은
+  `3f264c70de24499d5cb24dc4b84dfaeb7032f45336d1570507a433d76769d4ad`.
 - **Canonical 경로:** loader/tokenizer PASS. 서빙 스모크는 별도
   (`family-serve` dots3 standalone는 이전에 PASS).
-- **증거:** `gate-11c59e4/g5-logs/dots3-resident-owner.log` (candidate),
-  `gate-11c59e4/golden-logs/dots3-resident.log` (golden).
+- **증거:**
+  `v065-full-restamp-20260831-184200/g5-logs/dots3-resident-owner.log`
+  (candidate),
+  `v065-full-restamp-20260831-184200/g5-logs/dots3-resident-v065-tag-sm121a-chunk.log`
+  (exact tag).
 - **스코프:** 엔진/픽스처 (dots3 chunk/ring logit 게이트).
 - **상태:** Open.

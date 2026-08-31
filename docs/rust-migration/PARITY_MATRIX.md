@@ -1,12 +1,11 @@
 # Parity matrix
 
-> **Freshness (2026-08-31 KST):** the Qwen delta from the `v0.6.5-dfm`
-> lineage is re-stamped through `8006198`. Production defaults remain Rust.
-> The Qwen-only two-hour soak, exact 262K direct comparison, KV four-way,
-> MTP target, and forced static lane are green. The older post-promote matrix
-> is retained as provenance; the complete cross-family v0.6.5/proof re-stamp
-> remains a gate. DeepSeek keeps its normal gates but does not repeat a long
-> soak.
+> **Freshness (2026-08-31 KST):** the complete `v0.6.5-dfm` live matrix is
+> green at `eb4ba77`: PASS 57 + PASS* 3 (C-shared E-2, E-3, E-6), FAIL 0,
+> BLOCKED 0. The final host-only fix and 13/13 cheap/parity re-audit are green
+> at `d126e56`. Qwen Q5+Sidecar owns the campaign's only two-hour soak;
+> DeepSeek retains its ordinary functional, KV, API, proof, and performance
+> cells.
 
 ## Qwen v0.6.5 delta re-stamp (`8006198`)
 
@@ -25,6 +24,39 @@ recorded in
 
 This is the requested Q5 main GGUF plus shared Sidecar scope. Safetensors,
 resident BF16, Q6, and their reference gates were intentionally not loaded.
+
+## Current v0.6.5 full re-stamp (`eb4ba77` + `d126e56`)
+
+Evidence root:
+`scratch/rust-host-live/v065-full-restamp-20260831-184200/`. The classified
+live ledger is `gates-results.txt`; the final host/parity audit is under
+`final-audit-d126e56/`.
+
+| Group | Logical result |
+|---|---|
+| G0 cheap/parity/shared kernels | 13 PASS |
+| G1 DeepSeek KV/API/proof | 23 PASS |
+| G2 Motif family/shutdown/barrier/ABBA | 9 PASS; E-4/E-5 fixed and re-run green |
+| G3 Solar | 8 PASS + 1 PASS*(E-3) |
+| G4 K-EXAONE | 2 PASS + 1 PASS*(E-2) |
+| G5 dots3-note | 2 PASS + 1 PASS*(E-6) |
+
+All three PASS* cells were re-run against a C control in this campaign. E-2
+and E-6 used exact `v0.6.5-dfm` sm_121a test binaries; E-3 reproduced in the
+frozen C server. The candidate and exact-tag Dots3 runs produced identical
+`first=63594/63594`, `batch_cos=0.98607464`, and
+`batch_nrmse=0.201895`. No C-pass/Rust-fail cell remains.
+
+The current Motif ABBA ratios are 99.90% prefill, 99.33% decode, +1.07% TTFT,
+and +1.03% host VmHWM, with exact GPU residency and zero swap. The proof set
+passes smoke 2/2, captured/eager long 6/6, tracked v0.6.5 OPP-C 5/5, and
+C→Rust OPP-C 5/5. After the host-only socket compatibility fix, all 13 G0
+cells, clippy, final default/C builds, and `ds4-eval --self-test-extractors`
+pass at `d126e56`.
+
+The detailed incremental evidence below is retained for provenance. Statements
+that a later phase was “pending” describe the named historical commit only and
+are superseded by this current re-stamp.
 
 ## Historical post-promote §10 (`cb11c0b`)
 
@@ -72,7 +104,7 @@ Do not refresh goldens to hide a Rust miss.
 - Header exists; no bindgen of `ds4.h`
 - No production binary replaced
 
-### Phase 3 — FFI shadow (`ds4-rs` / `ds4-bench-rs` / `ds4-agent-rs`)
+### Phase 3 — FFI shadow (`ds4-rs` / `ds4-bench-rs` / `ds4-agent-rs`, historical)
 
 Same model, same arguments, C vs Rust wrapper around the **same**
 C core:
@@ -88,7 +120,7 @@ C core:
 If FFI alone regresses performance, **stop**. Do not port subsystems
 on a dirty seam.
 
-### Phase 4 — KV store
+### Phase 4 — KV store (historical incremental evidence; current gate green)
 
 Preserve magic `KVC`, file version `1`, payload ABI `2`
 (`ds4_kvstore.c`), 48-byte fixed header, endianness, key = rendered
@@ -387,7 +419,7 @@ short-response timing-porcelain discrepancy. The 114-token ABBA was not
 repeated after this timing-only commit; its `15b016c` binary provenance remains
 explicit above.
 
-This is still not the whole Phase 4 gate. Live default configured
+At that historical snapshot this was not the whole Phase 4 gate. Live default configured
 10,000-token/effective aligned 10,240-token reason-bank-checkpoint, live
 reason-bank-evict, full default-policy ABBA, multi-bank fork/partial and
 pin/claim behavior, bank tool/thinking/extension integration, other families
@@ -405,11 +437,10 @@ without changing the subprocess/search contract. No Tokio.
 Explicit integer codecs. Wire bytes match C. Do not serialize
 `#[repr(C)]` Rust structs.
 
-Runtime (blocking, one WORK at a time): CLI/option error strings,
-route-plan search order, HELLO register + stale prepend, WORK
-validate strings, RESULT logits/hidden. Not yet: pipelined prefetch
-(`DS4_DIST_WORKER_PREFETCH_DEPTH`), worker-to-worker relay threads,
-SNAPSHOT_* / DSV4 gather, `ds4_dist_session_*` wired through `ds4.c`.
+Runtime is production-integrated through blocking Rust coordinator/worker
+orchestration: CLI/route, HELLO/WORK/RESULT, receive prefetch, hop relay,
+reconnect, and snapshot gather/scatter ordering are host-owned. Layer-slice
+evaluation and opaque GPU snapshot bytes stay native.
 
 ### Phase 7 — server shadow
 
@@ -443,13 +474,11 @@ Live Motif generate: content/finish/usage-count/`cache_write_tokens`
 match. Live CUDA census: `census_supported=1` epoch=1636
 weight_artifact 86.07 GiB (`scratch/rust-host-live/`).
 Serial buffered responses emit a C-shaped `timings` object.
-Live Motif width-1 continuous, scoped no-think/no-tools bank shutdown/replay,
-and the Rust smoke/long/OPP-C proof harness are green. Remaining: static lane,
-live multi-client rolling width and multi-bank fork/partial semantics,
-bank tool/thinking/extension integration, Anthropic/Responses continuous, and
-the full live API fixture inventory. `DS4_SERVER_CLIENT_SNDBUF` is also not
-applied by the safe stdlib socket path, so the pinned-buffer live slow-reader
-leg remains pending.
+Live serial/continuous/static routing, width-2 barriers, multi-bank
+fork/partial/evict/shutdown, four surfaces, tool/continuation/KV extensions,
+disconnect/slow-reader handling, and the smoke/long/OPP-C proof harness are
+green in the current 60-cell matrix. Qwen additionally covers image requests,
+MTP, exact/configured 262K, and the two-hour soak.
 Do not improve the table.
 
 All four surfaces:
@@ -492,7 +521,8 @@ make proof-rust-cuda-opp-c
 
 `proof-cuda-opp-c` remains the native-drift gate against a tracked
 golden. A persisted `CUDA_ARCH=sm_121` build selects the GB10 snapshot
-validated against `v0.6.3-dfm`; other builds keep their original generic
+validated against the `v0.6.5-dfm`/Qwen C cut; the older v0.6.3 snapshot is
+retained under its own namespace. Other builds keep their original generic
 snapshot and require separate architecture approval. `proof-rust-cuda-opp-c`
 is the separate host-parity gate: it writes a temporary snapshot with the
 current C oracle, then checks the Rust binary through the same stable runner
@@ -504,9 +534,9 @@ default. Long-context captured-vs-eager stays a release gate.
 
 ### Phase 9 / split
 
-See work instruction §26. `SPLIT_READINESS.md` is written only when
-Runtime, Correctness, Performance, and Architecture (`unsafe` confined
-to `ds4-sys` / native wrappers) are all green.
+See work instruction §26. `SPLIT_READINESS.md` is now green because Runtime,
+Correctness, Performance, and Architecture (unsafe confined to reviewed
+FFI/native/OS adapters) passed the current audit.
 
 ```bash
 rg -n 'unsafe \{' crates/
@@ -604,7 +634,7 @@ Same protocol, `ds4-server-rs --cont-width 2` routing
 Rust pair spread 0.4%; the C pair spread is 9.0% (579/634 — the
 cross-lane run's C pair sat at 633.4/633.0), so the −2.4% Rust mean
 prefill delta is inside the C cell noise; decode is within 1%. No
-unexplained regression. Rust continuous still has one active job today:
+unexplained regression. At that recorded snapshot Rust continuous still had one active job:
 client ingress is concurrent behind the FIFO, but the sole owner runs
 each job to completion. The rolling scheduler, bank admit, per-seq eos,
 and engine usage split are the same native path; live multi-client width

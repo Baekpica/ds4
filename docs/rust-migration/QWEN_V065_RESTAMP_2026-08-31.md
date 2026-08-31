@@ -164,7 +164,8 @@ GPU compute process and restored 119 GiB `MemAvailable` after `clear_cache`.
 
 The Qwen Q5+Sidecar migration gate is green through `8006198`, including the
 Qwen-only two-hour soak, exact 262K direct parity, MTP target, and forced static
-lane. It does not make `SPLIT_READINESS.md` green: the remaining v0.6.5
-cross-family/proof re-stamp and unresolved host ownership work still gate the
-`ds4-dfm-rs` split. DeepSeek retains its ordinary gates and does not repeat a
-two-hour soak.
+lane. The later full-family/proof re-stamp is green at `eb4ba77`; the final
+host/parity audit is green at `d126e56`. Both are recorded in
+[PARITY_MATRIX.md](PARITY_MATRIX.md) and
+[SPLIT_READINESS.md](SPLIT_READINESS.md). DeepSeek retained its ordinary gates
+and did not repeat a two-hour soak.

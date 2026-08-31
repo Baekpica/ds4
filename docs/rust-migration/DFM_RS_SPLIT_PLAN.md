@@ -1,13 +1,13 @@
-# dfm-rs 독립 Repository 분리 및 후속 작업 지시서
+# ds4-dfm-rs 독립 Repository 분리 및 후속 작업 지시서
 
-### 범위: `ds4:rust-host` Split Readiness 통과 → `Baekpica/dfm-rs` 독립 운영 안정화
+### 범위: `ds4:rust-host` Split Readiness 통과 → `Baekpica/ds4-dfm-rs` 독립 운영 안정화
 
 > **목표:** `ds4-dfm`의 C → Rust host migration이 완료되고 `SPLIT_READINESS.md`가 green 상태가 된
-> commit을 기준으로, 기존 GitHub fork 관계에서 벗어난 독립 `dfm-rs` repository를 생성하고
+> commit을 기준으로, 기존 GitHub fork 관계에서 벗어난 독립 `ds4-dfm-rs` repository를 생성하고
 > Rust-first inference runtime으로 운영 체계를 전환한다.
 >
 > **핵심 원칙:** 새 repository는 clean-room rewrite가 아니다.
-> `antirez/ds4 → Entrpi/ds4 → Baekpica/ds4 → dfm-rs`의 기술적·저작권적 lineage를 명확히
+> `antirez/ds4 → Entrpi/ds4 → Baekpica/ds4 → ds4-dfm-rs`의 기술적·저작권적 lineage를 명확히
 > 보존하면서, 프로젝트의 architecture와 release lifecycle만 독립시킨다.
 
 이 문서는 `SPLIT_READINESS.md`가 작성되기 **전**에는 실행하지 않는 후속 지시서다.
@@ -21,20 +21,21 @@ tracked)과 이 문서를 **의도적으로 통합**한 결과이며, 이 문서
 권위다. 초안의 "두 문서 통합 전 remote add/push 금지" 조건은 이 통합으로
 해소됐다.
 
-1. **레포 선생성 사실:** `Baekpica/dfm-rs`는 2026-08-26 16:24 KST에
-   GitHub 웹 UI로 이미 생성됐다 (initial commit `a293973`, README +
-   stock Rust `.gitignore`만; PUBLIC, non-fork, default `main`,
-   **branch protection 없음** — 2026-08-26 확인). §0의 "생성하지 않는다"
-   전제는 이 사실로 대체된다. **시딩 시점은 불변**: genesis 확정 전에는
-   어떤 코드도 push하지 않는다.
-2. **시딩 방식 보정:** genesis push는 `a293973` 위에 **force-push**
-   (`git push dfm-rs +<GENESIS_SHA>:refs/heads/main`)가 된다. §2.1의
-   fast-forward push 표기는 이 형태로 읽는다. baseline 태그도 함께
-   push한다 (`git push dfm-rs v0.6.3-dfm`).
-3. **원격 URL:** 로컬 클론의 origin은 HTTPS
-   (`https://github.com/Baekpica/dfm-rs.git`)다. §2.1의 SSH 표기는
-   예시이며 HTTPS를 허용한다.
-4. **로컬 클론 위치:** `/home/sunghoon/workspace/ds4-exaone/dfm-rs`
+1. **레포 선생성 및 rename 사실:** initial scaffold `a293973`은
+   `b01d1fa`에서 `ds4-dfm-rs`로 rename됐다. 2026-08-31 현재 원격은
+   `Baekpica/ds4-dfm-rs`, PUBLIC, non-fork, default `main`이고 remote
+   `main`은 `b01d1fa4172a5c957fe1232774629a192493efe4`다.
+   **시딩 시점은 불변**: genesis 확정 전에는 코드를 push하지 않는다.
+2. **시딩 방식 보정:** 기존 scaffold를 annotated archival tag
+   `pre-genesis-scaffold-b01d1fa`로 먼저 보존한다. remote `main`이 여전히
+   exact `b01d1fa`일 때만
+   `--force-with-lease=refs/heads/main:b01d1fa4172a5c957fe1232774629a192493efe4`
+   로 genesis를 시딩한다. baseline `v0.6.5-dfm` provenance tag도 함께
+   push한다.
+3. **원격 URL:** canonical HTTPS URL은
+   `https://github.com/Baekpica/ds4-dfm-rs.git`이다. rename 전 URL은
+   redirect로만 취급한다.
+4. **로컬 클론 위치:** `/home/sunghoon/workspace/ds4-exaone/ds4-dfm-rs`
    (workspace 루트; 2026-08-26에 ds4-dfm 내부 중첩 위치에서 이동).
 5. **GREEN 판정 스코프 (사용자 결정 2026-08-26):** §26 게이트는
    호스트-패리티 계약이다. 어떤 셀의 실패 모드가 **같은 명령의 C 대조
@@ -64,14 +65,15 @@ docs/rust-migration/SPLIT_READINESS.md
 최소 상태:
 
 ```text
-Baseline:              v0.6.3-dfm
+Baseline:              v0.6.5-dfm
 Rust host parity:      PASS
 CUDA backend:          unchanged / native
 Model families:        PASS
 API surfaces:          PASS
 KV:                    PASS
 Performance:           PASS
-Known regressions:     NONE
+Known Rust regressions: NONE
+C-shared engine gaps:  E-2, E-3, E-6
 Recommended split commit: <DFM_RS_GENESIS_SHA>
 ```
 
@@ -83,7 +85,7 @@ Recommended split commit: <DFM_RS_GENESIS_SHA>
 
 새 repository는 GitHub의 `Fork` 버튼으로 생성하지 않는다.
 
-대상: `Baekpica/dfm-rs` (확정. `ds4-rs` 안은 기각)
+대상: `Baekpica/ds4-dfm-rs` (확정. `ds4-rs` 안은 기각)
 
 이유:
 
@@ -104,15 +106,19 @@ Recommended split commit: <DFM_RS_GENESIS_SHA>
 
 ```bash
 git checkout rust-host
-git remote add dfm-rs git@github.com:Baekpica/dfm-rs.git
-git push dfm-rs <DFM_RS_GENESIS_SHA>:refs/heads/main
+git remote add ds4-dfm-rs https://github.com/Baekpica/ds4-dfm-rs.git
+git push ds4-dfm-rs pre-genesis-scaffold-b01d1fa
+git push ds4-dfm-rs \
+  --force-with-lease=refs/heads/main:b01d1fa4172a5c957fe1232774629a192493efe4 \
+  <DFM_RS_GENESIS_SHA>:refs/heads/main
+git push ds4-dfm-rs v0.6.5-dfm
 ```
 
 또는 local branch를 먼저 정리한 뒤:
 
 ```bash
 git checkout -b main <DFM_RS_GENESIS_SHA>
-git push -u dfm-rs main
+git push -u ds4-dfm-rs main
 ```
 
 이렇게 하면 GitHub상 repository는 non-fork이지만 Git object ancestry는 보존된다.
@@ -136,7 +142,7 @@ git push -u dfm-rs main
 README 최상단 또는 별도 문서 `docs/LINEAGE.md`를 만든다.
 
 ```text
-dfm-rs originates from the ds4 codebase and the DFM/Blackwell
+ds4-dfm-rs originates from the ds4 codebase and the DFM/Blackwell
 work developed in Baekpica/ds4.
 
 Project lineage:
@@ -147,7 +153,7 @@ Entrpi/ds4
     ↓
 Baekpica/ds4 (DFM edition)
     ↓
-Baekpica/dfm-rs
+Baekpica/ds4-dfm-rs
 ```
 
 README에서는 최소한 다음을 명시한다.
@@ -170,7 +176,7 @@ around Rust ownership, lifecycle, serving, and scheduling primitives.
 copyright notice(The ds4.c authors / Entrpi / ggml authors 등)를 삭제하지 않는다.
 
 Rust migration 이후 사용자 기여분에 대해 필요하면
-`Copyright (c) 2026 Baekpica / dfm-rs contributors` 형태로 병기한다.
+`Copyright (c) 2026 Baekpica / ds4-dfm-rs contributors` 형태로 병기한다.
 
 **라이선스 변경 금지:** 초기 split 과정에서 MIT → Apache-2.0, MIT → dual license
 같은 변경은 하지 않는다. 라이선스 정책 변경은 독립 repo 안정화 이후 별도 decision.
@@ -182,7 +188,7 @@ Rust migration 이후 사용자 기여분에 대해 필요하면
 Genesis 시점 tree는 최소 다음 형태를 권장한다.
 
 ```text
-dfm-rs/
+ds4-dfm-rs/
 ├── Cargo.toml / Cargo.lock / rust-toolchain.toml
 ├── LICENSE / README.md / CHANGELOG.md / VERSION
 ├── crates/
@@ -221,15 +227,15 @@ dfm-rs/
 # 7. Versioning 전략
 
 새 version namespace `v0.1.0`에서 시작. README / CHANGELOG에
-`dfm-rs v0.1.0 — derived from ds4-dfm v0.6.3-dfm baseline`을 명시한다.
+`ds4-dfm-rs v0.1.0 — derived from ds4-dfm v0.6.5-dfm baseline`을 명시한다.
 
-피해야 할 방식: `v0.6.4-dfm-rs`, `v0.6.3.1`처럼 기존 ds4 version sequence에 종속되는 형태.
+피해야 할 방식: `v0.6.6-dfm-rs`, `v0.6.5.1`처럼 기존 ds4 version sequence에 종속되는 형태.
 
 ---
 
 # 8. 첫 Release의 의미
 
-`dfm-rs v0.1.0`은 feature release가 아니라 **Repository split / Rust-host parity release**다.
+`ds4-dfm-rs v0.1.0`은 feature release가 아니라 **Repository split / Rust-host parity release**다.
 
 ```text
 same observable serving contract
@@ -248,12 +254,13 @@ different host-language architecture
 바로 `v0.1.0`을 찍지 않고 `v0.1.0-rc.1`, `v0.1.0-rc.2`, … 를 거친다.
 
 각 RC는 최소: build / unit / parity / CUDA proof / server surface tests / long-context /
-GB10 benchmark / soak 를 통과해야 한다. 최종 `v0.1.0`은 RC와 source-identical 또는
-documentation-only delta.
+GB10 benchmark / soak 를 통과해야 한다. 이 campaign의 long soak 대상은 Qwen
+Q5+Sidecar 한 모델이며 DeepSeek는 ordinary functional/parity/performance gate만
+반복한다. 최종 `v0.1.0`은 RC와 source-identical 또는 documentation-only delta.
 
 **추가 게이트 (2026-08-26 통합으로 흡수; 승격·genesis·RC에 공통):**
 
-- native tracked-golden OPP-C: 고정 `v0.6.3-dfm` golden 대비 OPP-C가
+- native tracked-golden OPP-C: 고정 `v0.6.5-dfm` golden 대비 OPP-C가
   현 candidate에서 green일 것.
 - C→Rust host OPP-C를 **명시적 binary 경로**로 실행 (oracle과 candidate
   경로를 커맨드에 적고 로그에 남긴다; 기본 이름 추론 금지).
@@ -402,7 +409,7 @@ new admission policy를 한 작업으로 묶지 않는다(회귀 attribution 불
 
 # 24. Performance Baseline 재정의
 
-`dfm-rs v0.1.0`을 새 baseline으로 `docs/PERFORMANCE.md`에 기록한다
+`ds4-dfm-rs v0.1.0`을 새 baseline으로 `docs/PERFORMANCE.md`에 기록한다
 (Reference release / Hardware DGX Spark GB10 / CUDA / Models / Prefill / Decode / TTFT /
 Context / Memory). 이후 모든 major optimization은 이 baseline 또는 직전 stable과 비교.
 
@@ -502,7 +509,7 @@ CUDA fixes / model semantics fixes / vendor updates만 수동 분석해서 port�
 
 # 37. Upstream Port Log
 
-`docs/UPSTREAM_PORTS.md`에 Source SHA / Topic / dfm-rs commit / Port type / Notes를 기록.
+`docs/UPSTREAM_PORTS.md`에 Source SHA / Topic / ds4-dfm-rs commit / Port type / Notes를 기록.
 cherry-pick 가능 여부보다 **semantic provenance**가 중요하다.
 
 ---
@@ -533,7 +540,7 @@ native backend boundary stable enough, release gates automated/reproducible —
 
 # 41. README 개편
 
-1. What is dfm-rs? 2. Hardware / backend support 3. Supported model families
+1. What is ds4-dfm-rs? 2. Hardware / backend support 3. Supported model families
 4. Quick start 5. Performance 6. Architecture 7. API compatibility 8. DFM lineage
 9. Build 10. Testing / proof methodology 11. License / acknowledgements
 
@@ -637,7 +644,7 @@ hypothesis → profile → patch → correctness proof → speed proof.
 # 55. Repo 분리 완료 Definition of Done
 
 ```text
-Baekpica/dfm-rs exists as non-fork
+Baekpica/ds4-dfm-rs exists as non-fork
 main points to DFM-RS Genesis Commit
 git ancestry preserved
 LICENSE preserved
@@ -649,7 +656,7 @@ native build green
 v0.1.0-rc.1 released
 CUDA live proof green
 GB10 benchmark recorded
-old Baekpica/ds4 points users to dfm-rs
+old Baekpica/ds4 points users to ds4-dfm-rs
 ```
 
 ---
@@ -657,13 +664,13 @@ old Baekpica/ds4 points users to dfm-rs
 # 56. 기존 `Baekpica/ds4` 처리
 
 새 repo 생성 직후 기존 repo를 삭제하지 않는다. README 상단에
-"Active development moved to: Baekpica/dfm-rs" migration notice.
+"Active development moved to: Baekpica/ds4-dfm-rs" migration notice.
 
 ---
 
 # 57. 기존 Repo Archive 시점
 
-dfm-rs stable release ≥ 1, critical regression 없음, documentation migration 완료,
+ds4-dfm-rs stable release ≥ 1, critical regression 없음, documentation migration 완료,
 issue/PR migration 불필요, old repo 신규 개발 없음 — 이후 archive 검토. 바로 archive하지 않는다.
 
 ---
@@ -671,7 +678,7 @@ issue/PR migration 불필요, old repo 신규 개발 없음 — 이후 archive �
 # 58. 최종 Architecture 목표
 
 ```text
-                    dfm-rs
+                    ds4-dfm-rs
 ┌────────────────────────────────────────┐
 │                Rust                    │
 │ API / protocol / scheduler / admission │
@@ -712,15 +719,15 @@ genesis commit freeze
      ↓
 independent non-fork repository
      ↓
-dfm-rs v0.1 parity release
+ds4-dfm-rs v0.1 parity release
      ↓
 legacy host C cleanup
      ↓
 independent architecture evolution
 ```
 
-프로젝트의 provenance는 보존하면서 lifecycle만 독립시킨다. `dfm-rs` 생성 직후에는 여전히
-`ds4-dfm v0.6.3-dfm`의 semantics와 성능이 기준점이다. 새 repository의 진짜 독립성은
+프로젝트의 provenance는 보존하면서 lifecycle만 독립시킨다. `ds4-dfm-rs` 생성 직후에는 여전히
+`ds4-dfm v0.6.5-dfm`의 semantics와 성능이 기준점이다. 새 repository의 진짜 독립성은
 source history를 끊는 데서 오는 것이 아니라:
 
 - Rust가 host runtime의 ownership을 완전히 담당하고
